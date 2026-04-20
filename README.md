@@ -62,6 +62,12 @@ Use `pdf-translator profile /path/to/file.pdf --profile auto` to classify pages 
 
 Use `pdf-translator articles /path/to/newspaper.pdf` to extract and rank article candidates for newspaper-style PDFs. The command writes `articles.json`, includes article-level `deck/byline/dateline/quality`, and prints a quality summary to support a "translate the most important half" workflow.
 
+The `articles` command now also writes `articles.md`, a readable edition for direct review. By default it includes the selected top-half articles; use `--reading-all` to include every ranked candidate.
+
+Use `pdf-translator reading /path/to/articles.json` to regenerate a readable `articles.md` from an existing JSON artifact without rerunning ingest.
+
+Use `pdf-translator reading-rebuild /path/to/articles.json` to generate a continuity-focused `articles.rebuilt.md` (plus `articles.rebuilt.json`) from existing extraction output. This post-processes article bodies and trims obvious break fragments without rerunning ingest.
+
 Use `pdf-translator validate /path/to/manifest.json` to run a reusable batch regression suite. Each manifest case must include `source_pdf` and `mode`, where `mode` is `profile` or `articles`. Profile cases can also set `profile`; article cases can set `selected_pass_min_pct`.
 
 ## Guardrails

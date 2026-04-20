@@ -10,11 +10,39 @@ from pdf_translator.guardrails import (
     IngestGuardrailError,
     ingest_pdf_guarded,
 )
-from pdf_translator.newspaper import write_newspaper_articles
+from pdf_translator.newspaper import write_newspaper_articles, write_newspaper_reading_markdown
 from pdf_translator.profile import build_document_profile
 
 
 DEFAULT_ARTICLE_PASS_PCT = 0.85
+
+
+def discover_newspaper_cases(
+    source_dir: Path,
+    *,
+    selected_pass_min_pct: float = DEFAULT_ARTICLE_PASS_PCT,
+    recursive: bool = False,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    walker = source_dir.rglob("*.pdf") if recursive else source_dir.glob("*.pdf")
+    cases: list[dict[str, Any]] = []
+    skipped_files: list[str] = []
+
+    for pdf_path in sorted(path.resolve() for path in walker):
+        upper_name = pdf_path.name.upper()
+        if "OCR" in upper_name:
+            skipped_files.append(str(pdf_path))
+            continue
+        cases.append(
+            {
+                "name": pdf_path.stem,
+                "source_pdf": str(pdf_path),
+                "mode": "articles",
+                "profile": "newspaper",
+                "selected_pass_min_pct": selected_pass_min_pct,
+            }
+        )
+
+    return cases, skipped_files
 
 
 def load_validation_manifest(manifest_path: Path) -> list[dict[str, Any]]:
@@ -42,6 +70,10 @@ def _profile_artifact_path(source_pdf: Path, output_dir: Path) -> Path:
 
 def _articles_artifact_path(source_pdf: Path, output_dir: Path) -> Path:
     return output_dir / source_pdf.stem / "articles.json"
+
+
+def _articles_reading_artifact_path(source_pdf: Path, output_dir: Path) -> Path:
+    return output_dir / source_pdf.stem / "articles.md"
 
 
 def _profile_metrics(result: dict[str, Any]) -> dict[str, Any]:
@@ -116,10 +148,14 @@ def _run_articles_case(
     timeout_seconds: int | None,
     max_file_size_mb: float | None,
     max_page_count: int | None,
-) -> tuple[dict[str, Any], Path]:
+) -> tuple[dict[str, Any], Path, Path]:
     artifact_path = _articles_artifact_path(source_pdf, output_dir)
+    reading_artifact_path = _articles_reading_artifact_path(source_pdf, output_dir)
     if reuse_existing and artifact_path.exists():
-        return json.loads(artifact_path.read_text(encoding="utf-8")), artifact_path
+        result = json.loads(artifact_path.read_text(encoding="utf-8"))
+        if not reading_artifact_path.exists():
+            write_newspaper_reading_markdown(result, reading_artifact_path)
+        return result, artifact_path, reading_artifact_path
 
     normalized, preflight = ingest_pdf_guarded(
         source_pdf,
@@ -132,7 +168,8 @@ def _run_articles_case(
     result = write_newspaper_articles(normalized.structured, source_pdf, artifact_path)
     result["preflight"] = preflight.as_dict()
     artifact_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-    return result, artifact_path
+    write_newspaper_reading_markdown(result, reading_artifact_path)
+    return result, artifact_path, reading_artifact_path
 
 
 def run_validation_case(
@@ -179,7 +216,7 @@ def run_validation_case(
             return summary
 
         if mode == "articles":
-            result, artifact_path = _run_articles_case(
+            result, artifact_path, reading_artifact_path = _run_articles_case(
                 source_pdf=source_pdf,
                 output_dir=output_dir,
                 reuse_existing=reuse_existing,
@@ -196,6 +233,7 @@ def run_validation_case(
                 "profile": profile_name,
                 "source_pdf": str(source_pdf),
                 "artifact_path": str(artifact_path),
+                "reading_artifact_path": str(reading_artifact_path),
                 "passed": passed,
                 "thresholds": {
                     "selected_pass_min_pct": min_pass_pct,
@@ -252,17 +290,14 @@ def run_validation_manifest(
     max_page_count: int | None = None,
 ) -> dict[str, Any]:
     cases = load_validation_manifest(manifest_path)
-    case_reports = [
-        run_validation_case(
-            case,
-            output_dir=output_dir,
-            reuse_existing=reuse_existing,
-            ingest_timeout_seconds=ingest_timeout_seconds,
-            max_file_size_mb=max_file_size_mb,
-            max_page_count=max_page_count,
-        )
-        for case in cases
-    ]
+    case_reports = run_validation_cases(
+        cases,
+        output_dir=output_dir,
+        reuse_existing=reuse_existing,
+        ingest_timeout_seconds=ingest_timeout_seconds,
+        max_file_size_mb=max_file_size_mb,
+        max_page_count=max_page_count,
+    )
     passed_cases = sum(1 for report in case_reports if report["passed"])
     mode_counter = Counter(report["mode"] for report in case_reports)
     profile_counter = Counter(report["profile"] for report in case_reports)
@@ -277,6 +312,75 @@ def run_validation_manifest(
         "passed_cases": passed_cases,
         "failed_cases": len(case_reports) - passed_cases,
         "pass_rate": round(pass_rate, 3),
+        "by_mode": dict(mode_counter),
+        "by_profile": dict(profile_counter),
+        "failure_types": dict(failure_counter),
+        "cases": case_reports,
+    }
+
+
+def run_validation_cases(
+    cases: list[dict[str, Any]],
+    *,
+    output_dir: Path,
+    reuse_existing: bool = True,
+    ingest_timeout_seconds: int | None = DEFAULT_INGEST_TIMEOUT_SECONDS,
+    max_file_size_mb: float | None = None,
+    max_page_count: int | None = None,
+) -> list[dict[str, Any]]:
+    return [
+        run_validation_case(
+            case,
+            output_dir=output_dir,
+            reuse_existing=reuse_existing,
+            ingest_timeout_seconds=ingest_timeout_seconds,
+            max_file_size_mb=max_file_size_mb,
+            max_page_count=max_page_count,
+        )
+        for case in cases
+    ]
+
+
+def run_newspaper_directory(
+    source_dir: Path,
+    *,
+    output_dir: Path,
+    reuse_existing: bool = True,
+    ingest_timeout_seconds: int | None = DEFAULT_INGEST_TIMEOUT_SECONDS,
+    max_file_size_mb: float | None = None,
+    max_page_count: int | None = None,
+    selected_pass_min_pct: float = DEFAULT_ARTICLE_PASS_PCT,
+    recursive: bool = False,
+) -> dict[str, Any]:
+    cases, skipped_files = discover_newspaper_cases(
+        source_dir,
+        selected_pass_min_pct=selected_pass_min_pct,
+        recursive=recursive,
+    )
+    case_reports = run_validation_cases(
+        cases,
+        output_dir=output_dir,
+        reuse_existing=reuse_existing,
+        ingest_timeout_seconds=ingest_timeout_seconds,
+        max_file_size_mb=max_file_size_mb,
+        max_page_count=max_page_count,
+    )
+    passed_cases = sum(1 for report in case_reports if report["passed"])
+    mode_counter = Counter(report["mode"] for report in case_reports)
+    profile_counter = Counter(report["profile"] for report in case_reports)
+    failure_counter = Counter(
+        report["failure"]["type"] for report in case_reports if not report["passed"] and "failure" in report
+    )
+    pass_rate = passed_cases / len(case_reports) if case_reports else 0.0
+
+    return {
+        "source_dir": str(source_dir),
+        "total_cases": len(case_reports),
+        "passed_cases": passed_cases,
+        "failed_cases": len(case_reports) - passed_cases,
+        "pass_rate": round(pass_rate, 3),
+        "selected_pass_min_pct": selected_pass_min_pct,
+        "skipped_files": skipped_files,
         "by_mode": dict(mode_counter),
         "by_profile": dict(profile_counter),
         "failure_types": dict(failure_counter),

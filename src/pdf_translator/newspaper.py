@@ -38,6 +38,10 @@ NON_EDITORIAL_HEADLINE_PATTERNS = [
         r"\b(?:merchandise|rentals|recruit|roommates|apartments)\b",
         r"\bmetal\s*&\s*petroleum\s*futures\b",
         r"\binterest rate futures\b",
+        r"\bcommon sense media\b",
+        r"\bwhat parents need to know\b",
+        r"\bfuneral services directory\b",
+        r"\bdeath notices\b",
     ]
 ]
 
@@ -60,6 +64,32 @@ NON_EDITORIAL_BODY_PATTERNS = [
         r"\btax deductible\b",
         r"\bpriced to sell\b",
         r"\bbring offers\b",
+        r"\bterms of sale\b",
+        r"\bcertified check\b",
+        r"\bcashier'?s check\b",
+        r"\bratification of sale\b",
+        r"\bhoa assessments?\b",
+        r"\bavailable in theaters\b",
+        r"\bage \d{1,2}\+\b",
+        r"\bfuneral services directory\b",
+        r"\bmuseum\.[a-z]+\b",
+    ]
+]
+
+LISTING_FRAGMENT_PATTERNS = [
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in [
+        r"\bW\s+L\b",
+        r"\bR\s+H\s+E\b",
+        r"\bR\s+H\s+BI\b",
+        r"\bIP\s+H\s+R(?:ER)?\b",
+        r"\bWP:\b",
+        r"\bLP:\b",
+        r"\bERA\b",
+        r"\bshowtimes?\b",
+        r"\bin theaters\b",
+        r"\bstandings\b",
+        r"\bschedule\b",
     ]
 ]
 
@@ -291,7 +321,28 @@ def _is_headline(block: NewsBlock) -> bool:
         or _is_section_banner(block.text)
     ):
         return False
+    if _looks_like_fragmented_headline(block.text):
+        return False
     return True
+
+
+def _looks_like_fragmented_headline(text: str) -> bool:
+    normalized = _normalize_text(text)
+    if not normalized:
+        return True
+    if normalized.startswith(("*", ",")):
+        return True
+    if normalized[:1].islower():
+        return True
+    if normalized.startswith("BY ") and len(normalized) > 70:
+        return True
+    if len(normalized) > 120:
+        return True
+    if normalized.count(".") >= 2 and len(normalized) > 70:
+        return True
+    if normalized.count('"') >= 2 and len(normalized) > 90:
+        return True
+    return False
 
 
 def _is_briefing_header(block: NewsBlock) -> bool:
@@ -628,10 +679,91 @@ def _is_non_editorial_article(*, headline: str, deck: str | None, body_text: str
     if excerpt.count("www.") >= 1 or excerpt.count("@") >= 1:
         signal_count += 1
 
+    if _looks_like_listing_fragment(headline=headline, deck=deck, body_text=body_text):
+        signal_count += 3
+
     # Be more aggressive on late newspaper pages, where classifieds and notices cluster.
     if page_start >= 20 and signal_count >= 2:
         return True
     return signal_count >= 3
+
+
+def _looks_like_listing_fragment(*, headline: str, deck: str | None, body_text: str) -> bool:
+    combined = " ".join(
+        part for part in [_normalize_text(headline), _normalize_text(deck or ""), _normalize_text(body_text)] if part
+    )
+    if not combined:
+        return False
+
+    paragraphs = [paragraph.strip() for paragraph in body_text.split("\n\n") if paragraph.strip()]
+    paragraph_count = len(paragraphs)
+    short_paragraph_count = sum(1 for paragraph in paragraphs if len(paragraph.split()) <= 4)
+    short_para_ratio = short_paragraph_count / paragraph_count if paragraph_count else 0.0
+
+    tokens = re.findall(r"\S+", body_text)
+    token_count = len(tokens)
+    digit_token_count = sum(1 for token in tokens if any(char.isdigit() for char in token))
+    digit_ratio = digit_token_count / token_count if token_count else 0.0
+
+    dot_leader_count = len(re.findall(r"\.{4,}", combined))
+    time_count = len(re.findall(r"\b\d{1,2}:\d{2}\b", combined))
+    calendar_marker_count = len(
+        re.findall(
+            r"\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)(?:day)?\b|"
+            r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\b",
+            combined,
+            re.IGNORECASE,
+        )
+    )
+    listing_pattern_hits = sum(1 for pattern in LISTING_FRAGMENT_PATTERNS if pattern.search(combined))
+
+    headline_dot_leader = bool(re.search(r"\.{4,}", headline))
+    headline_starts_with_date = bool(
+        re.match(
+            r"^\s*(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)(?:day)?\b|"
+            r"^\s*(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\s+\d{1,2}(?:[-/]\d{1,2})?",
+            headline,
+            re.IGNORECASE,
+        )
+    )
+    headline_alpha_count = sum(1 for char in headline if char.isalpha())
+    headline_nonalpha_count = sum(1 for char in headline if not char.isspace() and not char.isalpha())
+
+    signal_count = 0
+    if dot_leader_count >= 6:
+        signal_count += 2
+    if digit_ratio >= 0.40:
+        signal_count += 2
+    elif digit_ratio >= 0.28 and paragraph_count >= 6:
+        signal_count += 1
+    if digit_ratio >= 0.35 and short_para_ratio >= 0.20 and paragraph_count >= 5:
+        signal_count += 2
+    if short_paragraph_count >= 14:
+        signal_count += 2
+    elif short_para_ratio >= 0.45 and paragraph_count >= 8:
+        signal_count += 2
+    if time_count >= 5:
+        signal_count += 2
+    elif time_count >= 3 and digit_ratio >= 0.25:
+        signal_count += 1
+    if calendar_marker_count >= 8 and paragraph_count >= 6:
+        signal_count += 1
+    if calendar_marker_count >= 6 and time_count >= 2:
+        signal_count += 2
+    if headline_starts_with_date and len(body_text) < 2200:
+        signal_count += 2
+    if listing_pattern_hits >= 2:
+        signal_count += 2
+    elif listing_pattern_hits == 1:
+        signal_count += 1
+    if headline_dot_leader:
+        signal_count += 2
+    if len(headline) >= 24 and headline_nonalpha_count > headline_alpha_count:
+        signal_count += 1
+
+    if signal_count >= 4:
+        return True
+    return signal_count >= 3 and paragraph_count >= 8 and len(body_text) < 2600
 
 
 def _article_score(*, page_no: int, total_pages: int, headline: str, body_chars: int, article_type: str) -> float:
@@ -657,13 +789,115 @@ def _article_score(*, page_no: int, total_pages: int, headline: str, body_chars:
     return round(front_page_bonus + body_bonus + headline_bonus + type_bonus - penalty, 2)
 
 
+def _quality_score_penalty(quality: dict[str, Any], page_no: int) -> float:
+    grade = quality.get("grade")
+    warnings = set(quality.get("warnings", []))
+    penalty = 0.0
+    if grade == "medium":
+        penalty += 6.0
+    elif grade == "low":
+        penalty += 22.0
+    if "starts_mid_sentence" in warnings:
+        penalty += 20.0
+    if "truncated_tail" in warnings:
+        penalty += 10.0
+    if "fragment_paragraph" in warnings:
+        penalty += 8.0
+    if "weak_lead" in warnings:
+        penalty += 6.0
+    if page_no >= 15 and grade == "low":
+        penalty += 8.0
+    return penalty
+
+
+def _page_fragment_metrics(
+    *,
+    page_blocks: list[NewsBlock],
+    headline_candidates: list[NewsBlock],
+    page_width: float,
+) -> dict[str, Any]:
+    text_blocks = [
+        block
+        for block in page_blocks
+        if block.label in {"text", "list_item", "section_header"} and not _is_utility_header(block.text)
+    ]
+    if not text_blocks:
+        return {
+            "block_count": 0,
+            "short_ratio": 0.0,
+            "digit_heavy_ratio": 0.0,
+            "dot_blocks": 0,
+            "time_blocks": 0,
+            "headline_count": len(headline_candidates),
+            "wide_headlines": 0,
+            "big_blocks": 0,
+        }
+
+    token_lists = [re.findall(r"\S+", block.text) for block in text_blocks]
+    block_count = len(token_lists)
+    short_blocks = sum(1 for tokens in token_lists if len(tokens) <= 6)
+    digit_heavy_blocks = 0
+    for tokens in token_lists:
+        if not tokens:
+            continue
+        digit_ratio = sum(1 for token in tokens if any(char.isdigit() for char in token)) / len(tokens)
+        if digit_ratio >= 0.35:
+            digit_heavy_blocks += 1
+
+    dot_blocks = sum(1 for block in text_blocks if re.search(r"\.{4,}", block.text))
+    time_blocks = sum(1 for block in text_blocks if re.search(r"\b\d{1,2}:\d{2}\b", block.text))
+    big_blocks = sum(1 for tokens in token_lists if len(tokens) >= 80)
+    wide_headlines = sum(1 for headline in headline_candidates if headline.width >= page_width * 0.34)
+
+    return {
+        "block_count": block_count,
+        "short_ratio": short_blocks / block_count,
+        "digit_heavy_ratio": digit_heavy_blocks / block_count,
+        "dot_blocks": dot_blocks,
+        "time_blocks": time_blocks,
+        "headline_count": len(headline_candidates),
+        "wide_headlines": wide_headlines,
+        "big_blocks": big_blocks,
+    }
+
+
+def _page_skip_reason(metrics: dict[str, Any]) -> str | None:
+    block_count = metrics["block_count"]
+    short_ratio = metrics["short_ratio"]
+    digit_heavy_ratio = metrics["digit_heavy_ratio"]
+    dot_blocks = metrics["dot_blocks"]
+    time_blocks = metrics["time_blocks"]
+    headline_count = metrics["headline_count"]
+    wide_headlines = metrics["wide_headlines"]
+    big_blocks = metrics["big_blocks"]
+
+    if (
+        block_count >= 180
+        and short_ratio >= 0.75
+        and (digit_heavy_ratio >= 0.35 or dot_blocks >= 10 or time_blocks >= 20)
+        and wide_headlines <= 1
+    ):
+        return "dense_fragment_page"
+    if block_count >= 500 and short_ratio >= 0.88 and digit_heavy_ratio >= 0.45 and wide_headlines <= 1:
+        return "numeric_grid_page"
+    if block_count >= 220 and short_ratio >= 0.80 and wide_headlines == 0 and big_blocks <= 2:
+        return "no_story_high_fragment_page"
+    if block_count >= 30 and short_ratio >= 0.96 and headline_count <= 1 and big_blocks == 0:
+        return "tiny_entries_page"
+    return None
+
+
 def _keep_article(article: dict[str, Any]) -> bool:
     headline = article["headline"]
     body_chars = article["body_chars"]
     article_type = article["article_type"]
+    quality = article.get("quality", {})
+    warnings = set(quality.get("warnings", []))
     if not headline:
         return False
     if _is_non_article_text(headline) or _is_section_banner(headline):
+        return False
+    if _looks_like_fragmented_headline(headline):
         return False
     if _is_non_editorial_article(
         headline=headline,
@@ -682,6 +916,10 @@ def _keep_article(article: dict[str, Any]) -> bool:
         return False
     if article["page_start"] <= 2 and body_chars < 900:
         return False
+    if "starts_mid_sentence" in warnings and article["page_start"] >= 8:
+        return False
+    if quality.get("grade") == "low" and article["page_start"] >= 20:
+        return False
     return True
 
 
@@ -690,11 +928,30 @@ def extract_newspaper_articles(structured: dict[str, Any], source_pdf: Path) -> 
     page_sizes = _page_sizes(source_pdf)
     total_pages = len(page_sizes)
     articles: list[dict[str, Any]] = []
+    skipped_pages: list[dict[str, Any]] = []
+    processed_page_count = 0
 
     for page_no in range(1, total_pages + 1):
         page_width = page_sizes[page_no][0]
         page_blocks = [block for block in blocks if block.page_no == page_no]
         headline_candidates = [block for block in page_blocks if _is_headline(block)]
+        page_metrics = _page_fragment_metrics(
+            page_blocks=page_blocks,
+            headline_candidates=headline_candidates,
+            page_width=page_width,
+        )
+        skip_reason = _page_skip_reason(page_metrics)
+        if skip_reason is not None:
+            skipped_pages.append(
+                {
+                    "page_no": page_no,
+                    "reason": skip_reason,
+                    "metrics": page_metrics,
+                }
+            )
+            continue
+
+        processed_page_count += 1
         headlines, dependent_headlines = _group_headlines(headline_candidates, page_width)
         assignments = _assign_blocks_to_headlines(page_blocks, headlines, page_width)
 
@@ -742,7 +999,7 @@ def extract_newspaper_articles(structured: dict[str, Any], source_pdf: Path) -> 
                         headline=cleaned_headline,
                         body_chars=len(cleaned_body_text),
                         article_type=article_type,
-                    ),
+                    ) - _quality_score_penalty(quality, page_no),
                 }
             )
 
@@ -763,12 +1020,138 @@ def extract_newspaper_articles(structured: dict[str, Any], source_pdf: Path) -> 
     return {
         "source_pdf": str(source_pdf),
         "total_pages": total_pages,
+        "processed_page_count": processed_page_count,
+        "skipped_pages": skipped_pages,
         "article_count": len(ranked_articles),
         "selected_top_half_count": top_count,
         "quality_summary": quality_summary,
         "articles": ranked_articles,
         "selected_article_indexes": list(range(top_count)),
     }
+
+
+def _select_articles_for_reading(
+    result: dict[str, Any],
+    *,
+    selected_only: bool,
+) -> list[dict[str, Any]]:
+    articles = result.get("articles")
+    if not isinstance(articles, list):
+        return []
+    if not selected_only:
+        return [article for article in articles if isinstance(article, dict)]
+
+    indexes = result.get("selected_article_indexes")
+    if not isinstance(indexes, list):
+        top_count = int(result.get("selected_top_half_count", 0) or 0)
+        return [article for article in articles[:top_count] if isinstance(article, dict)]
+
+    selected: list[dict[str, Any]] = []
+    for raw_index in indexes:
+        if not isinstance(raw_index, int):
+            continue
+        if raw_index < 0 or raw_index >= len(articles):
+            continue
+        article = articles[raw_index]
+        if isinstance(article, dict):
+            selected.append(article)
+    return selected
+
+
+def _single_line(text: str | None) -> str:
+    if not text:
+        return ""
+    return _normalize_text(text)
+
+
+def _optional_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return _single_line(str(value).strip())
+
+
+def render_newspaper_reading_markdown(
+    result: dict[str, Any],
+    *,
+    selected_only: bool = True,
+    max_articles: int | None = None,
+) -> str:
+    selected_articles = _select_articles_for_reading(result, selected_only=selected_only)
+    if max_articles is not None and max_articles > 0:
+        selected_articles = selected_articles[:max_articles]
+
+    source_pdf = str(result.get("source_pdf", ""))
+    source_name = Path(source_pdf).name if source_pdf else "unknown.pdf"
+    all_articles = result.get("articles")
+    all_count = len(all_articles) if isinstance(all_articles, list) else 0
+    selected_count = int(result.get("selected_top_half_count", 0) or 0)
+
+    lines = [
+        f"# Reading Edition: {source_name}",
+        "",
+        f"Source PDF: {source_pdf or 'unknown'}",
+        f"Article candidates: {all_count}",
+        f"Selected top-half: {selected_count}",
+        f"Included in this file: {len(selected_articles)} ({'selected' if selected_only else 'all'})",
+        "",
+    ]
+
+    if not selected_articles:
+        lines.append("_No article content available._")
+        lines.append("")
+        return "\n".join(lines)
+
+    for position, article in enumerate(selected_articles, start=1):
+        headline = _optional_text(article.get("headline")) or f"Untitled article {position}"
+        page_start = article.get("page_start", "?")
+        article_type = _optional_text(article.get("article_type")) or "unknown"
+        quality = article.get("quality") if isinstance(article.get("quality"), dict) else {}
+        quality_grade = _optional_text(quality.get("grade")) or "unknown"
+        quality_score = quality.get("score", "?")
+        rank_score = article.get("score", "?")
+
+        lines.append(f"## {position}. {headline}")
+        lines.append("")
+        lines.append(
+            f"Page: {page_start} | Type: {article_type} | Quality: {quality_grade} ({quality_score}) | Rank score: {rank_score}"
+        )
+
+        byline = _optional_text(article.get("byline"))
+        if byline:
+            lines.append(f"Byline: {byline}")
+
+        dateline = _optional_text(article.get("dateline"))
+        if dateline:
+            lines.append(f"Dateline: {dateline}")
+
+        deck = _optional_text(article.get("deck"))
+        if deck:
+            lines.append(f"Deck: {deck}")
+
+        body_text = str(article.get("body_text", "")).strip()
+        if body_text:
+            lines.append("")
+            lines.append(body_text)
+        lines.append("")
+
+    return "\n".join(lines).strip() + "\n"
+
+
+def write_newspaper_reading_markdown(
+    result: dict[str, Any],
+    output_path: Path,
+    *,
+    selected_only: bool = True,
+    max_articles: int | None = None,
+) -> str:
+    markdown_text = render_newspaper_reading_markdown(
+        result,
+        selected_only=selected_only,
+        max_articles=max_articles,
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(markdown_text, encoding="utf-8")
+    return markdown_text
 
 
 def write_newspaper_articles(structured: dict[str, Any], source_pdf: Path, output_path: Path) -> dict[str, Any]:

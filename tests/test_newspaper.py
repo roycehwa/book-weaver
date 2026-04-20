@@ -1,6 +1,10 @@
 from pathlib import Path
 
-from pdf_translator.newspaper import extract_newspaper_articles
+from pdf_translator.newspaper import (
+    extract_newspaper_articles,
+    render_newspaper_reading_markdown,
+    write_newspaper_reading_markdown,
+)
 
 
 def _prov(page_no: int, left: float, top: float, right: float, bottom: float) -> list[dict]:
@@ -268,3 +272,219 @@ def test_extract_newspaper_articles_sanitizes_inline_photo_credit(tmp_path: Path
     article = next(article for article in result["articles"])
     assert "REUTERS" not in article["headline"]
     assert article["headline"].startswith("Tariff Clock Is Ticking After")
+
+
+def test_extract_newspaper_articles_filters_fragmented_headline_and_notice_copy(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "stub.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4 stub")
+
+    from pdf_translator import newspaper as newspaper_module
+
+    original_page_sizes = newspaper_module._page_sizes
+    try:
+        newspaper_module._page_sizes = lambda _: {1: (2200.0, 3200.0)}
+        structured = {
+            "body": {"children": [{"$ref": f"#/texts/{index}"} for index in range(8)]},
+            "texts": [
+                {
+                    "label": "section_header",
+                    "text": "growing tensions in the coalition were on display late Thursday after lawmakers returned",
+                    "prov": _prov(1, 50, 2920, 1500, 2790),
+                },
+                {"label": "text", "text": "Broken deck line.", "prov": _prov(1, 60, 2700, 1200, 2640)},
+                {"label": "text", "text": "Broken body paragraph. " * 35, "prov": _prov(1, 60, 2500, 360, 2100)},
+                {
+                    "label": "section_header",
+                    "text": "Common Sense Media What parents need to know",
+                    "prov": _prov(1, 1450, 1800, 2100, 1700),
+                },
+                {
+                    "label": "text",
+                    "text": "Available in theaters. Age 15+. Terms of sale and certified check information do not belong in an article.",
+                    "prov": _prov(1, 1450, 1650, 2100, 1500),
+                },
+                {"label": "section_header", "text": "Clean political article", "prov": _prov(1, 200, 1500, 1100, 1400)},
+                {"label": "text", "text": "Deck for clean political article.", "prov": _prov(1, 220, 1360, 1080, 1300)},
+                {"label": "text", "text": "Clean political body paragraph. " * 60, "prov": _prov(1, 220, 1260, 1080, 700)},
+            ],
+        }
+        result = extract_newspaper_articles(structured, pdf_path)
+    finally:
+        newspaper_module._page_sizes = original_page_sizes
+
+    headlines = [article["headline"] for article in result["articles"]]
+    assert "Clean political article" in headlines
+    assert "Common Sense Media What parents need to know" not in headlines
+    assert not any(headline.startswith("growing tensions in the coalition") for headline in headlines)
+
+
+def test_render_newspaper_reading_markdown_uses_selected_indexes() -> None:
+    result = {
+        "source_pdf": "/tmp/sample.pdf",
+        "selected_top_half_count": 1,
+        "articles": [
+            {
+                "headline": "Lower ranked story",
+                "page_start": 5,
+                "article_type": "secondary_story",
+                "quality": {"grade": "medium", "score": 70},
+                "score": 12.5,
+                "body_text": "Body A",
+            },
+            {
+                "headline": "Primary story",
+                "page_start": 1,
+                "article_type": "main_story",
+                "quality": {"grade": "high", "score": 93},
+                "score": 45.2,
+                "body_text": "Body B",
+            },
+        ],
+        "selected_article_indexes": [1],
+    }
+
+    markdown_text = render_newspaper_reading_markdown(result)
+
+    assert "Primary story" in markdown_text
+    assert "Lower ranked story" not in markdown_text
+    assert "Included in this file: 1 (selected)" in markdown_text
+
+
+def test_write_newspaper_reading_markdown_writes_markdown_file(tmp_path: Path) -> None:
+    output_path = tmp_path / "articles.md"
+    result = {
+        "source_pdf": "/tmp/sample.pdf",
+        "selected_top_half_count": 1,
+        "articles": [
+            {
+                "headline": "Story headline",
+                "page_start": 2,
+                "article_type": "main_story",
+                "quality": {"grade": "high", "score": 90},
+                "score": 33.1,
+                "body_text": "First paragraph.\n\nSecond paragraph.",
+            }
+        ],
+        "selected_article_indexes": [0],
+    }
+
+    write_newspaper_reading_markdown(result, output_path)
+
+    assert output_path.exists()
+    content = output_path.read_text(encoding="utf-8")
+    assert "# Reading Edition: sample.pdf" in content
+    assert "## 1. Story headline" in content
+    assert "Byline: None" not in content
+
+
+def test_extract_newspaper_articles_filters_listing_fragments(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "stub.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4 stub")
+
+    from pdf_translator import newspaper as newspaper_module
+
+    original_page_sizes = newspaper_module._page_sizes
+    try:
+        newspaper_module._page_sizes = lambda _: {1: (2200.0, 3200.0)}
+        listing_body = "\n\n".join(
+            [
+                "W L 26 39 82 z-Vegas .......................",
+                "y-Anaheim 82 43 33 ..................",
+                "xy-Edmonton 40 30 81 ..............",
+                "x-Seattle 36 81 34 .....................",
+                "Miami at Real Salt Lake, 9:30",
+                "Colorado at Los Angeles FC, 10:30",
+                "Austin FC at San Jose, 10:30",
+                "WP: Beeter (1-0); LP: Santana (2-1).",
+                "R H BI BBSOAVG 0 2 .238 3 0 .246",
+            ]
+        )
+        structured = {
+            "body": {"children": [{"$ref": f"#/texts/{index}"} for index in range(6)]},
+            "texts": [
+                {"label": "section_header", "text": "Serious politics story holds coalition together", "prov": _prov(1, 50, 2920, 1400, 2790)},
+                {"label": "text", "text": "Deck for coalition story.", "prov": _prov(1, 60, 2700, 1200, 2640)},
+                {"label": "text", "text": "Coalition body paragraph. " * 60, "prov": _prov(1, 60, 2500, 360, 2000)},
+                {"label": "section_header", "text": "Miami at Real Salt Lake, 9:30 Colorado at Los Angeles FC, 10:30", "prov": _prov(1, 1450, 2200, 2100, 2100)},
+                {"label": "text", "text": listing_body, "prov": _prov(1, 1450, 2050, 2100, 1300)},
+                {"label": "text", "text": "...............", "prov": _prov(1, 1450, 1250, 2100, 1200)},
+            ],
+        }
+        result = extract_newspaper_articles(structured, pdf_path)
+    finally:
+        newspaper_module._page_sizes = original_page_sizes
+
+    headlines = [article["headline"] for article in result["articles"]]
+    assert "Serious politics story holds coalition together" in headlines
+    assert not any("Miami at Real Salt Lake" in headline for headline in headlines)
+
+
+def test_extract_newspaper_articles_filters_calendar_listing_headlines(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "stub.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4 stub")
+
+    from pdf_translator import newspaper as newspaper_module
+
+    original_page_sizes = newspaper_module._page_sizes
+    try:
+        newspaper_module._page_sizes = lambda _: {1: (2200.0, 3200.0)}
+        structured = {
+            "body": {"children": [{"$ref": f"#/texts/{index}"} for index in range(6)]},
+            "texts": [
+                {"label": "section_header", "text": "Regional policy fight escalates in congress", "prov": _prov(1, 50, 2920, 1400, 2790)},
+                {"label": "text", "text": "Policy deck line.", "prov": _prov(1, 60, 2700, 1200, 2640)},
+                {"label": "text", "text": "Policy body paragraph. " * 55, "prov": _prov(1, 60, 2500, 360, 2000)},
+                {"label": "section_header", "text": "Saturday, April 26 Earth Day at Brookside Gardens", "prov": _prov(1, 1450, 2200, 2100, 2100)},
+                {
+                    "label": "text",
+                    "text": "Saturday 10:00 a.m. Sunday 11:00 a.m. Monday 12:00 p.m. April 26. April 27. April 28. May 1. May 2. May 3.",
+                    "prov": _prov(1, 1450, 2050, 2100, 1300),
+                },
+                {"label": "text", "text": "Admission and location details.", "prov": _prov(1, 1450, 1250, 2100, 1200)},
+            ],
+        }
+        result = extract_newspaper_articles(structured, pdf_path)
+    finally:
+        newspaper_module._page_sizes = original_page_sizes
+
+    headlines = [article["headline"] for article in result["articles"]]
+    assert "Regional policy fight escalates in congress" in headlines
+    assert "Saturday, April 26 Earth Day at Brookside Gardens" not in headlines
+
+
+def test_extract_newspaper_articles_skips_dense_fragment_page(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "stub.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4 stub")
+
+    from pdf_translator import newspaper as newspaper_module
+
+    original_page_sizes = newspaper_module._page_sizes
+    try:
+        newspaper_module._page_sizes = lambda _: {1: (2200.0, 3200.0), 2: (2200.0, 3200.0)}
+
+        texts = [
+            {"label": "section_header", "text": "Front-page policy analysis", "prov": _prov(1, 80, 2920, 1500, 2800)},
+            {"label": "text", "text": "Policy body paragraph. " * 65, "prov": _prov(1, 90, 2660, 1560, 2000)},
+            {"label": "section_header", "text": "League standings and schedules board", "prov": _prov(2, 1500, 2950, 1960, 2860)},
+        ]
+        for index in range(220):
+            texts.append(
+                {
+                    "label": "text",
+                    "text": f"T{index} ............. {index % 9} {index % 7} {index % 5}",
+                    "prov": _prov(2, 1510, 2800 - index * 5, 1980, 2790 - index * 5),
+                }
+            )
+
+        structured = {
+            "body": {"children": [{"$ref": f"#/texts/{index}"} for index in range(len(texts))]},
+            "texts": texts,
+        }
+        result = extract_newspaper_articles(structured, pdf_path)
+    finally:
+        newspaper_module._page_sizes = original_page_sizes
+
+    headlines = [article["headline"] for article in result["articles"]]
+    assert "Front-page policy analysis" in headlines
+    assert not any("League standings and schedules board" in headline for headline in headlines)
+    assert any(page["page_no"] == 2 for page in result["skipped_pages"])

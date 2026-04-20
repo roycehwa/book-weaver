@@ -52,6 +52,8 @@ class PdfPreflight:
     max_page_count: int | None
     warn_file_size_mb: float | None
     max_file_size_mb: float | None
+    text_layer_chars: int | None = None
+    image_marker_count: int | None = None
     warnings: list[str] = field(default_factory=list)
 
     @property
@@ -172,6 +174,34 @@ def enforce_pdf_preflight(preflight: PdfPreflight) -> PdfPreflight:
     return preflight
 
 
+def _visible_text_chars(markdown: str) -> int:
+    cleaned = markdown.replace("<!-- image -->", " ")
+    cleaned = "".join(char if not char.isspace() else " " for char in cleaned)
+    cleaned = " ".join(cleaned.split())
+    return len(cleaned)
+
+
+def _enforce_text_layer(normalized: NormalizedDocument, preflight: PdfPreflight) -> None:
+    text_layer_chars = _visible_text_chars(normalized.reconstructed_markdown)
+    image_marker_count = normalized.raw_markdown.count("<!-- image -->")
+    preflight.text_layer_chars = text_layer_chars
+    preflight.image_marker_count = image_marker_count
+
+    if text_layer_chars >= max(400, preflight.page_count * 30):
+        return
+    if image_marker_count < max(12, preflight.page_count):
+        return
+
+    preflight.warnings.append(
+        "No usable embedded text layer detected; document appears scan-like and falls outside the non-OCR input policy."
+    )
+    raise InputGateError(
+        f"Input gate rejected {preflight.source_pdf.name}: no usable embedded text layer detected; "
+        "scan-like PDFs are not supported by the non-OCR pipeline.",
+        preflight=preflight,
+    )
+
+
 def _ingest_worker(source_pdf: str, queue: mp.Queue) -> None:
     try:
         normalized = ingest_pdf(Path(source_pdf))
@@ -281,4 +311,5 @@ def ingest_pdf_guarded(
         structured=payload_data["structured"],
         detected_language=payload_data["detected_language"],
     )
+    _enforce_text_layer(normalized, preflight)
     return normalized, preflight
