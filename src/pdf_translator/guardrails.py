@@ -1,0 +1,284 @@
+from __future__ import annotations
+
+import multiprocessing as mp
+import json
+import tempfile
+import traceback
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+
+from pdf_translator.ingest import ingest_pdf
+from pdf_translator.models import NormalizedDocument
+
+
+DEFAULT_INGEST_TIMEOUT_SECONDS = 240
+
+DEFAULT_WARN_PAGE_COUNT = {
+    "auto": 160,
+    "newspaper": 96,
+    "magazine": 140,
+    "book": 320,
+}
+
+DEFAULT_MAX_PAGE_COUNT = {
+    "auto": 320,
+    "newspaper": 160,
+    "magazine": 220,
+    "book": 600,
+}
+
+DEFAULT_WARN_FILE_SIZE_MB = {
+    "auto": 40.0,
+    "newspaper": 35.0,
+    "magazine": 50.0,
+    "book": 60.0,
+}
+
+DEFAULT_MAX_FILE_SIZE_MB = {
+    "auto": 80.0,
+    "newspaper": 80.0,
+    "magazine": 100.0,
+    "book": 120.0,
+}
+
+
+@dataclass(slots=True)
+class PdfPreflight:
+    source_pdf: Path
+    profile_name: str
+    page_count: int
+    file_size_bytes: int
+    warn_page_count: int | None
+    max_page_count: int | None
+    warn_file_size_mb: float | None
+    max_file_size_mb: float | None
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def file_size_mb(self) -> float:
+        return self.file_size_bytes / (1024 * 1024)
+
+    def as_dict(self) -> dict[str, object]:
+        payload = asdict(self)
+        payload["source_pdf"] = str(self.source_pdf)
+        payload["file_size_mb"] = round(self.file_size_mb, 2)
+        return payload
+
+
+class IngestGuardrailError(RuntimeError):
+    failure_type = "ingest_guardrail"
+
+    def __init__(self, message: str, *, preflight: PdfPreflight | None = None) -> None:
+        super().__init__(message)
+        self.preflight = preflight
+
+
+class InputGateError(IngestGuardrailError):
+    failure_type = "input_gate"
+
+
+class IngestTimeoutError(IngestGuardrailError):
+    failure_type = "timeout"
+
+
+class IngestExecutionError(IngestGuardrailError):
+    failure_type = "ingest_error"
+
+
+def _normalize_profile_name(profile_name: str | None) -> str:
+    candidate = (profile_name or "auto").strip().lower()
+    if candidate not in DEFAULT_MAX_PAGE_COUNT:
+        return "auto"
+    return candidate
+
+
+def _effective_warn_threshold(default_value: float | int | None, max_value: float | int | None) -> float | int | None:
+    if max_value is None:
+        return default_value
+    if default_value is None:
+        return max_value
+    return min(default_value, max_value * 0.8)
+
+
+def _read_page_count(source_pdf: Path) -> int:
+    import pypdfium2 as pdfium
+
+    document = pdfium.PdfDocument(str(source_pdf))
+    try:
+        return len(document)
+    finally:
+        document.close()
+
+
+def inspect_pdf_preflight(
+    source_pdf: Path,
+    *,
+    profile_name: str = "auto",
+    max_file_size_mb: float | None = None,
+    max_page_count: int | None = None,
+) -> PdfPreflight:
+    profile_key = _normalize_profile_name(profile_name)
+    try:
+        page_count = _read_page_count(source_pdf)
+    except Exception as exc:
+        raise IngestExecutionError(f"Unable to inspect page count for {source_pdf.name}: {exc}") from exc
+
+    file_size_bytes = source_pdf.stat().st_size
+    resolved_max_page_count = max_page_count if max_page_count is not None else DEFAULT_MAX_PAGE_COUNT[profile_key]
+    resolved_max_file_size_mb = (
+        max_file_size_mb if max_file_size_mb is not None else DEFAULT_MAX_FILE_SIZE_MB[profile_key]
+    )
+    warn_page_count = _effective_warn_threshold(DEFAULT_WARN_PAGE_COUNT[profile_key], resolved_max_page_count)
+    warn_file_size_mb = _effective_warn_threshold(DEFAULT_WARN_FILE_SIZE_MB[profile_key], resolved_max_file_size_mb)
+
+    warnings: list[str] = []
+    file_size_mb = file_size_bytes / (1024 * 1024)
+    if warn_page_count is not None and page_count > warn_page_count:
+        warnings.append(
+            f"Page count {page_count} is above the warning threshold {int(warn_page_count)} for profile '{profile_key}'."
+        )
+    if warn_file_size_mb is not None and file_size_mb > warn_file_size_mb:
+        warnings.append(
+            f"File size {file_size_mb:.1f}MB is above the warning threshold {warn_file_size_mb:.1f}MB "
+            f"for profile '{profile_key}'."
+        )
+
+    return PdfPreflight(
+        source_pdf=source_pdf,
+        profile_name=profile_key,
+        page_count=page_count,
+        file_size_bytes=file_size_bytes,
+        warn_page_count=int(warn_page_count) if warn_page_count is not None else None,
+        max_page_count=int(resolved_max_page_count) if resolved_max_page_count is not None else None,
+        warn_file_size_mb=round(float(warn_file_size_mb), 1) if warn_file_size_mb is not None else None,
+        max_file_size_mb=round(float(resolved_max_file_size_mb), 1) if resolved_max_file_size_mb is not None else None,
+        warnings=warnings,
+    )
+
+
+def enforce_pdf_preflight(preflight: PdfPreflight) -> PdfPreflight:
+    if preflight.max_page_count is not None and preflight.page_count > preflight.max_page_count:
+        raise InputGateError(
+            f"Input gate rejected {preflight.source_pdf.name}: page count {preflight.page_count} "
+            f"exceeds limit {preflight.max_page_count} for profile '{preflight.profile_name}'.",
+            preflight=preflight,
+        )
+    if preflight.max_file_size_mb is not None and preflight.file_size_mb > preflight.max_file_size_mb:
+        raise InputGateError(
+            f"Input gate rejected {preflight.source_pdf.name}: file size {preflight.file_size_mb:.1f}MB "
+            f"exceeds limit {preflight.max_file_size_mb:.1f}MB for profile '{preflight.profile_name}'.",
+            preflight=preflight,
+        )
+    return preflight
+
+
+def _ingest_worker(source_pdf: str, queue: mp.Queue) -> None:
+    try:
+        normalized = ingest_pdf(Path(source_pdf))
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            suffix=".json",
+            prefix="pdf-translator-ingest-",
+            delete=False,
+        ) as handle:
+            json.dump(
+                {
+                    "source_pdf": str(normalized.source_pdf),
+                    "raw_markdown": normalized.raw_markdown,
+                    "reconstructed_markdown": normalized.reconstructed_markdown,
+                    "structured": normalized.structured,
+                    "detected_language": normalized.detected_language,
+                },
+                handle,
+                ensure_ascii=False,
+            )
+            result_path = handle.name
+        queue.put({"ok": True, "result_path": result_path})
+    except Exception as exc:
+        queue.put(
+            {
+                "ok": False,
+                "error_type": exc.__class__.__name__,
+                "message": str(exc),
+                "traceback": traceback.format_exc(),
+            }
+        )
+
+
+def _terminate_process(process: mp.Process) -> None:
+    if not process.is_alive():
+        return
+    process.terminate()
+    process.join(timeout=5)
+    if process.is_alive():
+        process.kill()
+        process.join(timeout=5)
+
+
+def ingest_pdf_guarded(
+    source_pdf: Path,
+    *,
+    profile_name: str = "auto",
+    timeout_seconds: int | None = DEFAULT_INGEST_TIMEOUT_SECONDS,
+    max_file_size_mb: float | None = None,
+    max_page_count: int | None = None,
+) -> tuple[NormalizedDocument, PdfPreflight]:
+    preflight = enforce_pdf_preflight(
+        inspect_pdf_preflight(
+            source_pdf,
+            profile_name=profile_name,
+            max_file_size_mb=max_file_size_mb,
+            max_page_count=max_page_count,
+        )
+    )
+
+    if timeout_seconds is None or timeout_seconds <= 0:
+        return ingest_pdf(source_pdf), preflight
+
+    context = mp.get_context("spawn")
+    queue: mp.Queue = context.Queue(maxsize=1)
+    process = context.Process(target=_ingest_worker, args=(str(source_pdf), queue))
+    process.start()
+    process.join(timeout_seconds)
+
+    try:
+        if process.is_alive():
+            _terminate_process(process)
+            queue.cancel_join_thread()
+            raise IngestTimeoutError(
+                f"Ingest timed out after {timeout_seconds}s for {source_pdf.name}.",
+                preflight=preflight,
+            )
+
+        if queue.empty():
+            queue.cancel_join_thread()
+            raise IngestExecutionError(
+                f"Ingest exited without returning a result for {source_pdf.name} (exit code {process.exitcode}).",
+                preflight=preflight,
+            )
+
+        payload = queue.get()
+    finally:
+        queue.close()
+        process.close()
+
+    if not payload.get("ok"):
+        message = payload.get("message") or "Unknown ingest failure."
+        error_type = payload.get("error_type") or "UnknownError"
+        raise IngestExecutionError(
+            f"Ingest failed for {source_pdf.name} with {error_type}: {message}",
+            preflight=preflight,
+        )
+
+    result_path = Path(payload["result_path"])
+    payload_data = json.loads(result_path.read_text(encoding="utf-8"))
+    result_path.unlink(missing_ok=True)
+    normalized = NormalizedDocument(
+        source_pdf=Path(payload_data["source_pdf"]),
+        raw_markdown=payload_data["raw_markdown"],
+        reconstructed_markdown=payload_data["reconstructed_markdown"],
+        structured=payload_data["structured"],
+        detected_language=payload_data["detected_language"],
+    )
+    return normalized, preflight

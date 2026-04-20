@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pdf-translator"
+version = "0.1.0"
+description = "Zero-intervention PDF translator built on a normalized Markdown/JSON pipeline."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+  { name = "Codex" }
+]
+dependencies = [
+  "docling>=2.90.0",
+  "markdown>=3.8",
+  "reportlab>=4.4.0",
+  "beautifulsoup4>=4.12.3",
+  "openai>=1.109.1",
+  "langdetect>=1.0.9",
+  "pydantic>=2.11.4",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3.5",
+]
+
+[project.scripts]
+pdf-translator = "pdf_translator.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]

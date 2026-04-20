@@ -1,0 +1,270 @@
+from pathlib import Path
+
+from pdf_translator.newspaper import extract_newspaper_articles
+
+
+def _prov(page_no: int, left: float, top: float, right: float, bottom: float) -> list[dict]:
+    return [{"page_no": page_no, "bbox": {"l": left, "t": top, "r": right, "b": bottom}}]
+
+
+def test_extract_newspaper_articles_finds_main_and_secondary_story(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "stub.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4 stub")
+
+    from pdf_translator import newspaper as newspaper_module
+
+    original_page_sizes = newspaper_module._page_sizes
+    try:
+        newspaper_module._page_sizes = lambda _: {1: (2000.0, 3200.0)}
+        structured = {
+            "body": {
+                "children": [{"$ref": f"#/texts/{index}"} for index in range(8)]
+            },
+            "texts": [
+                {"label": "section_header", "text": "Main front-page story", "prov": _prov(1, 50, 2900, 1100, 2800)},
+                {"label": "text", "text": "Lead deck for the main story.", "prov": _prov(1, 60, 2700, 1000, 2630)},
+                {"label": "text", "text": "Main story body paragraph one. " * 40, "prov": _prov(1, 60, 2500, 500, 2100)},
+                {"label": "text", "text": "Main story body paragraph two. " * 40, "prov": _prov(1, 540, 2500, 1000, 2100)},
+                {"label": "section_header", "text": "Secondary market story", "prov": _prov(1, 1100, 1700, 1600, 1620)},
+                {"label": "text", "text": "Secondary story body paragraph. " * 35, "prov": _prov(1, 1100, 1500, 1600, 1100)},
+                {"label": "section_header", "text": "Briefing", "prov": _prov(1, 1650, 2800, 1900, 2740)},
+                {
+                    "label": "list_item",
+                    "text": "Rates hold steady in bond markets as policymakers signal caution.",
+                    "prov": _prov(1, 1660, 2600, 1940, 2500),
+                },
+            ],
+        }
+        result = extract_newspaper_articles(structured, pdf_path)
+    finally:
+        newspaper_module._page_sizes = original_page_sizes
+
+    headlines = [article["headline"] for article in result["articles"]]
+    assert "Main front-page story" in headlines
+    assert "Secondary market story" in headlines
+    assert any(article["article_type"] == "briefing_item" for article in result["articles"])
+    assert result["selected_top_half_count"] >= 1
+
+
+def test_extract_newspaper_articles_filters_banners_and_short_quotes(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "stub.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4 stub")
+
+    from pdf_translator import newspaper as newspaper_module
+
+    original_page_sizes = newspaper_module._page_sizes
+    try:
+        newspaper_module._page_sizes = lambda _: {1: (2000.0, 3200.0)}
+        structured = {
+            "body": {
+                "children": [{"$ref": f"#/texts/{index}"} for index in range(7)]
+            },
+            "texts": [
+                {"label": "section_header", "text": "COMPANIES & MARKETS", "prov": _prov(1, 900, 3150, 1300, 3100)},
+                {"label": "text", "text": "Section rail copy." * 20, "prov": _prov(1, 920, 3000, 1260, 2400)},
+                {
+                    "label": "section_header",
+                    "text": '"The card will be made of gold. It will be beautiful."',
+                    "prov": _prov(1, 200, 1800, 600, 1650),
+                },
+                {"label": "text", "text": "Short pull quote body." * 10, "prov": _prov(1, 220, 1600, 620, 1350)},
+                {"label": "section_header", "text": "Real market story develops", "prov": _prov(1, 700, 2300, 1500, 2200)},
+                {"label": "text", "text": "Lead deck for the market story.", "prov": _prov(1, 720, 2150, 1480, 2080)},
+                {"label": "text", "text": "Detailed market story body." * 60, "prov": _prov(1, 720, 2050, 1480, 900)},
+            ],
+        }
+        result = extract_newspaper_articles(structured, pdf_path)
+    finally:
+        newspaper_module._page_sizes = original_page_sizes
+
+    headlines = [article["headline"] for article in result["articles"]]
+    assert "COMPANIES & MARKETS" not in headlines
+    assert '"The card will be made of gold. It will be beautiful."' not in headlines
+    assert "Real market story develops" in headlines
+
+
+def test_extract_newspaper_articles_uses_column_reading_order(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "stub.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4 stub")
+
+    from pdf_translator import newspaper as newspaper_module
+
+    original_page_sizes = newspaper_module._page_sizes
+    try:
+        newspaper_module._page_sizes = lambda _: {
+            1: (2000.0, 3200.0),
+            2: (2000.0, 3200.0),
+            3: (2000.0, 3200.0),
+        }
+        structured = {
+            "body": {
+                "children": [{"$ref": f"#/texts/{index}"} for index in range(5)]
+            },
+            "texts": [
+                {"label": "section_header", "text": "Two-column story heading", "prov": _prov(3, 50, 2900, 900, 2800)},
+                {"label": "text", "text": "Deck text for the article.", "prov": _prov(3, 60, 2700, 880, 2640)},
+                {"label": "text", "text": "LEFT TOP " * 30, "prov": _prov(3, 60, 2500, 360, 2400)},
+                {"label": "text", "text": "LEFT BOTTOM " * 30, "prov": _prov(3, 60, 2200, 360, 2100)},
+                {"label": "text", "text": "RIGHT TOP " * 30, "prov": _prov(3, 420, 2450, 720, 2350)},
+            ],
+        }
+        result = extract_newspaper_articles(structured, pdf_path)
+    finally:
+        newspaper_module._page_sizes = original_page_sizes
+
+    article = next(article for article in result["articles"] if article["headline"] == "Two-column story heading")
+    body_parts = article["body_text"].split("\n\n")
+    assert [part.strip() for part in body_parts] == [
+        ("LEFT TOP " * 30).strip(),
+        ("LEFT BOTTOM " * 30).strip(),
+        ("RIGHT TOP " * 30).strip(),
+    ]
+
+
+def test_extract_newspaper_articles_does_not_pull_briefing_into_main_story(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "stub.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4 stub")
+
+    from pdf_translator import newspaper as newspaper_module
+
+    original_page_sizes = newspaper_module._page_sizes
+    try:
+        newspaper_module._page_sizes = lambda _: {
+            1: (2200.0, 3200.0),
+            2: (2200.0, 3200.0),
+            3: (2200.0, 3200.0),
+        }
+        structured = {
+            "body": {
+                "children": [{"$ref": f"#/texts/{index}"} for index in range(7)]
+            },
+            "texts": [
+                {"label": "section_header", "text": "Main story headline with breadth", "prov": _prov(3, 50, 2900, 1750, 2780)},
+                {"label": "text", "text": "Wide deck text for the lead story.", "prov": _prov(3, 60, 2700, 1740, 2630)},
+                {"label": "text", "text": "Lead body left. " * 30, "prov": _prov(3, 60, 2500, 360, 2400)},
+                {"label": "text", "text": "Lead body right. " * 30, "prov": _prov(3, 420, 2500, 720, 2400)},
+                {"label": "section_header", "text": "Briefing", "prov": _prov(3, 1820, 2880, 1910, 2840)},
+                {
+                    "label": "text",
+                    "text": "Briefing item should stay separate and never enter the lead story.",
+                    "prov": _prov(3, 1800, 2200, 2060, 2120),
+                },
+                {"label": "text", "text": "Lead body far right. " * 30, "prov": _prov(3, 1420, 2500, 1710, 2400)},
+            ],
+        }
+        result = extract_newspaper_articles(structured, pdf_path)
+    finally:
+        newspaper_module._page_sizes = original_page_sizes
+
+    article = next(article for article in result["articles"] if article["headline"] == "Main story headline with breadth")
+    assert "Briefing item should stay separate" not in article["body_text"]
+
+
+def test_extract_newspaper_articles_extracts_front_matter_and_quality(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "stub.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4 stub")
+
+    from pdf_translator import newspaper as newspaper_module
+
+    original_page_sizes = newspaper_module._page_sizes
+    try:
+        newspaper_module._page_sizes = lambda _: {1: (2200.0, 3200.0), 2: (2200.0, 3200.0), 3: (2200.0, 3200.0)}
+        structured = {
+            "body": {
+                "children": [{"$ref": f"#/texts/{index}"} for index in range(7)]
+            },
+            "texts": [
+                {"label": "section_header", "text": "Lead political story expands", "prov": _prov(3, 50, 2920, 1750, 2790)},
+                {"label": "section_header", "text": "Subheadline explains the policy split in detail", "prov": _prov(3, 50, 2760, 820, 2680)},
+                {"label": "text", "text": "JANE DOE AND JOHN SMITH", "prov": _prov(3, 60, 2640, 420, 2600)},
+                {"label": "text", "text": "LONDON - WESTMINSTER", "prov": _prov(3, 60, 2580, 340, 2540)},
+                {"label": "text", "text": "Deck line for the article.", "prov": _prov(3, 60, 2520, 960, 2470)},
+                {"label": "text", "text": "First body paragraph. " * 35, "prov": _prov(3, 60, 2400, 360, 2100)},
+                {"label": "text", "text": "Second body paragraph. " * 35, "prov": _prov(3, 420, 2400, 720, 2100)},
+            ],
+        }
+        result = extract_newspaper_articles(structured, pdf_path)
+    finally:
+        newspaper_module._page_sizes = original_page_sizes
+
+    article = next(article for article in result["articles"] if article["headline"] == "Lead political story expands")
+    assert article["deck"] == "Subheadline explains the policy split in detail Deck line for the article."
+    assert article["byline"] == "JANE DOE AND JOHN SMITH"
+    assert article["dateline"] == "LONDON - WESTMINSTER"
+    assert "JANE DOE AND JOHN SMITH" not in article["body_text"]
+    assert "LONDON - WESTMINSTER" not in article["body_text"]
+    assert article["quality"]["score"] > 0
+    assert article["quality"]["grade"] in {"high", "medium", "low"}
+
+
+def test_extract_newspaper_articles_filters_legal_notice_content(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "stub.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4 stub")
+
+    from pdf_translator import newspaper as newspaper_module
+
+    original_page_sizes = newspaper_module._page_sizes
+    try:
+        newspaper_module._page_sizes = lambda _: {1: (2200.0, 3200.0), 2: (2200.0, 3200.0), 3: (2200.0, 3200.0)}
+        structured = {
+            "body": {
+                "children": [{"$ref": f"#/texts/{index}"} for index in range(7)]
+            },
+            "texts": [
+                {"label": "section_header", "text": "Big political story develops", "prov": _prov(3, 50, 2920, 1500, 2790)},
+                {"label": "text", "text": "Political deck line.", "prov": _prov(3, 60, 2700, 1200, 2640)},
+                {"label": "text", "text": "Political body paragraph. " * 35, "prov": _prov(3, 60, 2500, 360, 2100)},
+                {"label": "text", "text": "Second political body paragraph. " * 35, "prov": _prov(3, 420, 2500, 720, 2100)},
+                {"label": "section_header", "text": "SUPREME COURT OF THE STATE OF NEW YORK COUNTY OF NEW YORK", "prov": _prov(3, 1450, 1800, 2100, 1700)},
+                {
+                    "label": "text",
+                    "text": "PLEASE TAKE NOTICE that pursuant to a Final Judgment of Foreclosure and Sale the court-appointed Referee will sell at public auction.",
+                    "prov": _prov(3, 1450, 1650, 2100, 1500),
+                },
+                {
+                    "label": "text",
+                    "text": "Index No. 850126/2022. Plaintiff and Defendants are notified that the Substitute Trustee will offer for sale the premises.",
+                    "prov": _prov(3, 1450, 1480, 2100, 1340),
+                },
+            ],
+        }
+        result = extract_newspaper_articles(structured, pdf_path)
+    finally:
+        newspaper_module._page_sizes = original_page_sizes
+
+    headlines = [article["headline"] for article in result["articles"]]
+    assert "Big political story develops" in headlines
+    assert "SUPREME COURT OF THE STATE OF NEW YORK COUNTY OF NEW YORK" not in headlines
+
+
+def test_extract_newspaper_articles_sanitizes_inline_photo_credit(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "stub.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4 stub")
+
+    from pdf_translator import newspaper as newspaper_module
+
+    original_page_sizes = newspaper_module._page_sizes
+    try:
+        newspaper_module._page_sizes = lambda _: {1: (2200.0, 3200.0), 2: (2200.0, 3200.0), 3: (2200.0, 3200.0)}
+        structured = {
+            "body": {
+                "children": [{"$ref": f"#/texts/{index}"} for index in range(4)]
+            },
+            "texts": [
+                {
+                    "label": "section_header",
+                    "text": "Tariff Clock Is Ticking After BRENDAN MCDERMID/REUTERS The Senate approval is a big win",
+                    "prov": _prov(3, 50, 2920, 1500, 2790),
+                },
+                {"label": "text", "text": "Trade deck line.", "prov": _prov(3, 60, 2700, 1200, 2640)},
+                {"label": "text", "text": "Main trade body paragraph. " * 35, "prov": _prov(3, 60, 2500, 360, 2100)},
+                {"label": "text", "text": "Second trade body paragraph. " * 35, "prov": _prov(3, 420, 2500, 720, 2100)},
+            ],
+        }
+        result = extract_newspaper_articles(structured, pdf_path)
+    finally:
+        newspaper_module._page_sizes = original_page_sizes
+
+    article = next(article for article in result["articles"])
+    assert "REUTERS" not in article["headline"]
+    assert article["headline"].startswith("Tariff Clock Is Ticking After")
