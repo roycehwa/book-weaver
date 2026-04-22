@@ -6,7 +6,9 @@ from pathlib import Path
 
 from pdf_translator.config import RunSettings
 from pdf_translator.guardrails import DEFAULT_INGEST_TIMEOUT_SECONDS, IngestGuardrailError, ingest_pdf_guarded
+from pdf_translator.ingest import ingest_pdf
 from pdf_translator.newspaper import write_newspaper_articles, write_newspaper_reading_markdown
+from pdf_translator.newspaper_illustrate import write_illustrated_outputs
 from pdf_translator.newspaper_rebuild import write_rebuilt_outputs
 from pdf_translator.pipeline import run_translation_pipeline
 from pdf_translator.profile import build_document_profile
@@ -213,6 +215,63 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Optional max number of rebuilt articles included in output.",
+    )
+
+    reading_images_parser = subparsers.add_parser(
+        "reading-images",
+        help="Rebuild and attach matched article images from the source PDF.",
+    )
+    reading_images_parser.add_argument(
+        "articles_json",
+        type=Path,
+        help="Path to an existing articles.json file.",
+    )
+    reading_images_parser.add_argument(
+        "--source-pdf",
+        type=Path,
+        default=None,
+        help="Optional source PDF override when articles.json contains an unavailable absolute path.",
+    )
+    reading_images_parser.add_argument(
+        "--output-path",
+        type=Path,
+        default=None,
+        help="Output path for illustrated markdown. Defaults to <articles-json-dir>/articles.illustrated.md.",
+    )
+    reading_images_parser.add_argument(
+        "--output-json",
+        type=Path,
+        default=None,
+        help="Optional output path for illustrated JSON. Defaults to <articles-json-dir>/articles.illustrated.json.",
+    )
+    reading_images_parser.add_argument(
+        "--images-dir",
+        type=Path,
+        default=None,
+        help="Optional output directory for cropped article images.",
+    )
+    reading_images_parser.add_argument(
+        "--include-all-articles",
+        action="store_true",
+        help="Include all ranked article candidates instead of selected top-half only.",
+    )
+    reading_images_parser.add_argument(
+        "--max-articles",
+        type=int,
+        default=None,
+        help="Optional max number of illustrated articles included in output.",
+    )
+    reading_images_parser.add_argument(
+        "--max-images-per-article",
+        type=int,
+        default=1,
+        help="Maximum number of matched images kept for each article.",
+    )
+    reading_images_parser.add_argument(
+        "--render-scale",
+        type=float,
+        default=2.0,
+        help="Image render scale for crop quality. Higher values create larger PNG files.",
     )
 
     validate_parser = subparsers.add_parser(
@@ -467,6 +526,54 @@ def main() -> None:
                 "Rebuild summary: "
                 f"included={summary['included_articles']}/{summary['total_articles']} "
                 f"dropped_paragraphs={summary['dropped_paragraphs']}"
+            )
+        elif args.command == "reading-images":
+            articles_json = args.articles_json.expanduser().resolve()
+            result = json.loads(articles_json.read_text(encoding="utf-8"))
+            source_pdf_value = (
+                str(args.source_pdf.expanduser()) if args.source_pdf is not None else result.get("source_pdf")
+            )
+            if not isinstance(source_pdf_value, str) or not source_pdf_value.strip():
+                raise SystemExit("Missing source PDF path. Provide --source-pdf or ensure articles.json has source_pdf.")
+
+            source_pdf_raw = Path(source_pdf_value.strip()).expanduser()
+            source_pdf = source_pdf_raw if source_pdf_raw.is_absolute() else (articles_json.parent / source_pdf_raw)
+            source_pdf = source_pdf.resolve()
+            if not source_pdf.exists():
+                raise SystemExit(f"Source PDF does not exist: {source_pdf}. Use --source-pdf to override.")
+
+            normalized = ingest_pdf(source_pdf)
+            output_path = (
+                args.output_path.expanduser().resolve()
+                if args.output_path is not None
+                else articles_json.with_name("articles.illustrated.md")
+            )
+            output_json_path = (
+                args.output_json.expanduser().resolve()
+                if args.output_json is not None
+                else articles_json.with_name("articles.illustrated.json")
+            )
+            images_dir = args.images_dir.expanduser().resolve() if args.images_dir is not None else None
+            illustrated = write_illustrated_outputs(
+                result,
+                normalized.structured,
+                source_pdf,
+                output_markdown_path=output_path,
+                output_json_path=output_json_path,
+                images_dir=images_dir,
+                selected_only=not args.include_all_articles,
+                max_articles=args.max_articles,
+                max_images_per_article=max(1, args.max_images_per_article),
+                render_scale=max(1.0, args.render_scale),
+            )
+            summary = illustrated["summary"]
+            print(f"Illustrated reading edition written to: {illustrated['markdown_path']}")
+            print(f"Illustrated JSON written to: {illustrated['json_path']}")
+            print(f"Cropped image directory: {illustrated['images_dir']}")
+            print(
+                "Illustration summary: "
+                f"included_articles={summary['included_articles']}/{summary['total_articles']} "
+                f"included_images={summary['included_images']}"
             )
         elif args.command == "validate":
             manifest_path = args.manifest.expanduser().resolve()
