@@ -225,12 +225,53 @@ def _match_score(article_region: Region, picture_region: Region) -> float:
     return score
 
 
+def _match_geometry(article_region: Region, picture_region: Region) -> dict[str, float]:
+    x_overlap = _overlap_ratio(article_region.left, article_region.right, picture_region.left, picture_region.right)
+    y_overlap = _overlap_ratio(article_region.bottom, article_region.top, picture_region.bottom, picture_region.top)
+
+    horizontal_gap = 0.0
+    if x_overlap <= 0:
+        horizontal_gap = min(abs(article_region.left - picture_region.right), abs(article_region.right - picture_region.left))
+    vertical_gap = 0.0
+    if y_overlap <= 0:
+        vertical_gap = min(abs(article_region.bottom - picture_region.top), abs(article_region.top - picture_region.bottom))
+
+    return {
+        "x_overlap": x_overlap,
+        "y_overlap": y_overlap,
+        "horizontal_gap": horizontal_gap,
+        "vertical_gap": vertical_gap,
+    }
+
+
+def _is_plausible_picture_match(
+    article_region: Region,
+    picture_region: Region,
+    *,
+    min_primary_overlap: float,
+    max_secondary_gap: float,
+) -> tuple[bool, dict[str, float]]:
+    geometry = _match_geometry(article_region, picture_region)
+    x_overlap = geometry["x_overlap"]
+    y_overlap = geometry["y_overlap"]
+    horizontal_gap = geometry["horizontal_gap"]
+    vertical_gap = geometry["vertical_gap"]
+
+    x_aligned = x_overlap >= min_primary_overlap and (y_overlap > 0.0 or vertical_gap <= max_secondary_gap)
+    y_aligned = y_overlap >= min_primary_overlap and (x_overlap > 0.0 or horizontal_gap <= max_secondary_gap)
+    return (x_aligned or y_aligned), geometry
+
+
 def match_pictures_to_articles(
     payload: dict[str, Any],
     structured: dict[str, Any],
     *,
     max_images_per_article: int = 1,
-    min_match_score: float = 1.55,
+    min_match_score: float = 2.8,
+    min_score_gap: float = 0.75,
+    min_score_ratio: float = 1.18,
+    min_primary_overlap: float = 0.16,
+    max_secondary_gap: float = 70.0,
 ) -> dict[str, Any]:
     matched_payload = copy.deepcopy(payload)
     articles = matched_payload.get("articles")
@@ -274,20 +315,50 @@ def match_pictures_to_articles(
     scores_by_article: dict[int, list[tuple[float, dict[str, Any]]]] = {index: [] for index in article_regions}
 
     for picture_entry, picture_region in picture_regions:
-        best_article_index: int | None = None
-        best_score = 0.0
+        candidates: list[tuple[int, float]] = []
         for article_index, article_region in article_regions.items():
             if article_region.page_no != picture_region.page_no:
                 continue
             score = _match_score(article_region, picture_region)
-            if score > best_score:
-                best_score = score
-                best_article_index = article_index
+            candidates.append((article_index, score))
 
-        if best_article_index is None or best_score < min_match_score:
+        if not candidates:
+            continue
+        candidates.sort(key=lambda item: item[1], reverse=True)
+        best_article_index, best_score = candidates[0]
+        second_score = candidates[1][1] if len(candidates) > 1 else 0.0
+        score_gap = best_score - second_score
+        score_ratio = best_score / max(0.001, second_score) if second_score > 0 else float("inf")
+
+        if best_score < min_match_score:
+            continue
+        if second_score > 0 and score_gap < min_score_gap:
+            continue
+        if second_score > 0 and score_ratio < min_score_ratio:
             continue
 
-        scores_by_article[best_article_index].append((best_score, picture_entry))
+        best_article_region = article_regions.get(best_article_index)
+        if best_article_region is None:
+            continue
+        plausible, geometry = _is_plausible_picture_match(
+            best_article_region,
+            picture_region,
+            min_primary_overlap=min_primary_overlap,
+            max_secondary_gap=max_secondary_gap,
+        )
+        if not plausible:
+            continue
+
+        picture_entry_with_match = dict(picture_entry)
+        picture_entry_with_match["match"] = {
+            "score_gap": round(score_gap, 3),
+            "score_ratio": None if score_ratio == float("inf") else round(score_ratio, 3),
+            "x_overlap": round(geometry["x_overlap"], 3),
+            "y_overlap": round(geometry["y_overlap"], 3),
+            "horizontal_gap": round(geometry["horizontal_gap"], 1),
+            "vertical_gap": round(geometry["vertical_gap"], 1),
+        }
+        scores_by_article[best_article_index].append((best_score, picture_entry_with_match))
 
     for article_index, scored_pictures in scores_by_article.items():
         scored_pictures.sort(key=lambda item: item[0], reverse=True)
@@ -305,6 +376,12 @@ def match_pictures_to_articles(
                 "bottom": entry["bottom"],
                 "caption": entry.get("caption"),
                 "score": round(score, 3),
+                "score_gap": entry.get("match", {}).get("score_gap"),
+                "score_ratio": entry.get("match", {}).get("score_ratio"),
+                "x_overlap": entry.get("match", {}).get("x_overlap"),
+                "y_overlap": entry.get("match", {}).get("y_overlap"),
+                "horizontal_gap": entry.get("match", {}).get("horizontal_gap"),
+                "vertical_gap": entry.get("match", {}).get("vertical_gap"),
             }
             for score, entry in selected
         ]

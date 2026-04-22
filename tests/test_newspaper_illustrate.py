@@ -52,6 +52,48 @@ def test_match_pictures_to_articles_assigns_same_page_picture() -> None:
     assert side_images == []
     assert main_images[0]["picture_index"] == 0
     assert main_images[0]["caption"] == "Photo: Candidate at a campaign stop."
+    assert main_images[0]["score_gap"] is not None
+
+
+def test_match_pictures_to_articles_drops_ambiguous_picture() -> None:
+    payload = {
+        "source_pdf": "/tmp/sample.pdf",
+        "selected_article_indexes": [0, 1],
+        "selected_top_half_count": 2,
+        "articles": [
+            {
+                "headline": "Left story",
+                "page_start": 1,
+                "block_indexes": [0, 1],
+                "body_text": "Left body paragraph. " * 20,
+            },
+            {
+                "headline": "Right story",
+                "page_start": 1,
+                "block_indexes": [2, 3],
+                "body_text": "Right body paragraph. " * 20,
+            },
+        ],
+    }
+    structured = {
+        "body": {"children": [{"$ref": f"#/texts/{index}"} for index in range(4)]},
+        "texts": [
+            {"label": "section_header", "text": "Left story", "prov": _prov(1, 100, 900, 450, 840)},
+            {"label": "text", "text": "Left body paragraph. " * 30, "prov": _prov(1, 100, 820, 450, 500)},
+            {"label": "section_header", "text": "Right story", "prov": _prov(1, 520, 900, 870, 840)},
+            {"label": "text", "text": "Right body paragraph. " * 30, "prov": _prov(1, 520, 820, 870, 500)},
+        ],
+        "pictures": [
+            {
+                "prov": _prov(1, 430, 760, 540, 620),
+            }
+        ],
+    }
+
+    matched = match_pictures_to_articles(payload, structured)
+
+    assert matched["articles"][0]["illustration_images"] == []
+    assert matched["articles"][1]["illustration_images"] == []
 
 
 def test_render_illustrated_reading_markdown_includes_image_and_rebuilt_body() -> None:
