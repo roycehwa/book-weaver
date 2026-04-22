@@ -52,6 +52,8 @@ class PdfPreflight:
     max_page_count: int | None
     warn_file_size_mb: float | None
     max_file_size_mb: float | None
+    ingest_page_count: int | None = None
+    soft_page_limit: int | None = None
     text_layer_chars: int | None = None
     image_marker_count: int | None = None
     warnings: list[str] = field(default_factory=list)
@@ -186,10 +188,11 @@ def _enforce_text_layer(normalized: NormalizedDocument, preflight: PdfPreflight)
     image_marker_count = normalized.raw_markdown.count("<!-- image -->")
     preflight.text_layer_chars = text_layer_chars
     preflight.image_marker_count = image_marker_count
+    effective_page_count = preflight.ingest_page_count or preflight.page_count
 
-    if text_layer_chars >= max(400, preflight.page_count * 30):
+    if text_layer_chars >= max(400, effective_page_count * 30):
         return
-    if image_marker_count < max(12, preflight.page_count):
+    if image_marker_count < max(12, effective_page_count):
         return
 
     preflight.warnings.append(
@@ -246,6 +249,35 @@ def _terminate_process(process: mp.Process) -> None:
         process.join(timeout=5)
 
 
+def _build_pdf_subset(source_pdf: Path, *, page_limit: int) -> tuple[Path, int]:
+    import pypdfium2 as pdfium
+
+    if page_limit <= 0:
+        raise IngestExecutionError(f"Invalid soft page limit {page_limit} for {source_pdf.name}.")
+
+    source_document = pdfium.PdfDocument(str(source_pdf))
+    target_document = pdfium.PdfDocument.new()
+    subset_path = Path(
+        tempfile.NamedTemporaryFile(
+            suffix=".pdf",
+            prefix="pdf-translator-subset-",
+            delete=False,
+        ).name
+    )
+    try:
+        page_count = len(source_document)
+        selected_count = min(page_limit, page_count)
+        target_document.import_pages(source_document, pages=list(range(selected_count)))
+        target_document.save(str(subset_path))
+        return subset_path, selected_count
+    except Exception as exc:
+        subset_path.unlink(missing_ok=True)
+        raise IngestExecutionError(f"Unable to build page-limited PDF for {source_pdf.name}: {exc}") from exc
+    finally:
+        target_document.close()
+        source_document.close()
+
+
 def ingest_pdf_guarded(
     source_pdf: Path,
     *,
@@ -253,22 +285,50 @@ def ingest_pdf_guarded(
     timeout_seconds: int | None = DEFAULT_INGEST_TIMEOUT_SECONDS,
     max_file_size_mb: float | None = None,
     max_page_count: int | None = None,
+    soft_input_gate: bool = False,
+    soft_page_limit: int | None = None,
 ) -> tuple[NormalizedDocument, PdfPreflight]:
-    preflight = enforce_pdf_preflight(
-        inspect_pdf_preflight(
-            source_pdf,
-            profile_name=profile_name,
-            max_file_size_mb=max_file_size_mb,
-            max_page_count=max_page_count,
-        )
+    preflight = inspect_pdf_preflight(
+        source_pdf,
+        profile_name=profile_name,
+        max_file_size_mb=max_file_size_mb,
+        max_page_count=max_page_count,
     )
+    ingest_source = source_pdf
+    ingest_source_is_temp = False
+
+    if soft_page_limit is not None and soft_page_limit > 0 and preflight.page_count > soft_page_limit:
+        subset_path, selected_count = _build_pdf_subset(source_pdf, page_limit=soft_page_limit)
+        ingest_source = subset_path
+        ingest_source_is_temp = True
+        preflight.soft_page_limit = soft_page_limit
+        preflight.ingest_page_count = selected_count
+        preflight.warnings.append(
+            f"Soft gate applied: processing first {selected_count} pages out of {preflight.page_count} total pages."
+        )
+    else:
+        preflight.ingest_page_count = preflight.page_count
+
+    if soft_input_gate:
+        preflight.warnings.append(
+            "Soft input gate enabled: oversize or high-page PDFs are accepted when page-limited ingest is applied."
+        )
+    else:
+        preflight = enforce_pdf_preflight(preflight)
 
     if timeout_seconds is None or timeout_seconds <= 0:
-        return ingest_pdf(source_pdf), preflight
+        try:
+            normalized = ingest_pdf(ingest_source)
+            normalized.source_pdf = source_pdf
+            _enforce_text_layer(normalized, preflight)
+            return normalized, preflight
+        finally:
+            if ingest_source_is_temp:
+                ingest_source.unlink(missing_ok=True)
 
     context = mp.get_context("spawn")
     queue: mp.Queue = context.Queue(maxsize=1)
-    process = context.Process(target=_ingest_worker, args=(str(source_pdf), queue))
+    process = context.Process(target=_ingest_worker, args=(str(ingest_source), queue))
     process.start()
     process.join(timeout_seconds)
 
@@ -292,6 +352,8 @@ def ingest_pdf_guarded(
     finally:
         queue.close()
         process.close()
+        if ingest_source_is_temp:
+            ingest_source.unlink(missing_ok=True)
 
     if not payload.get("ok"):
         message = payload.get("message") or "Unknown ingest failure."
@@ -311,5 +373,6 @@ def ingest_pdf_guarded(
         structured=payload_data["structured"],
         detected_language=payload_data["detected_language"],
     )
+    normalized.source_pdf = source_pdf
     _enforce_text_layer(normalized, preflight)
     return normalized, preflight

@@ -188,6 +188,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override hard input gate for page count.",
     )
     articles_html_parser.add_argument(
+        "--soft-page-limit",
+        type=int,
+        default=150,
+        help="Soft gate page cap: only the first N pages are ingested (default: 150).",
+    )
+    articles_html_parser.add_argument(
+        "--strict-input-gate",
+        action="store_true",
+        help="Disable soft gate behavior and enforce hard input gates for file size/page count.",
+    )
+    articles_html_parser.add_argument(
         "--include-all-articles",
         action="store_true",
         help="Include all ranked article candidates instead of selected top-half only.",
@@ -436,9 +447,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _print_preflight(preflight: dict[str, object]) -> None:
+    processed_page_count = preflight.get("ingest_page_count")
+    page_count = preflight["page_count"]
+    page_part = f"pages={page_count}"
+    if isinstance(processed_page_count, int) and processed_page_count > 0 and processed_page_count != page_count:
+        page_part += f" processed_pages={processed_page_count}"
+
     print(
         "Preflight: "
-        f"pages={preflight['page_count']} "
+        f"{page_part} "
         f"size_mb={preflight['file_size_mb']} "
         f"profile={preflight['profile_name']}"
     )
@@ -534,12 +551,15 @@ def main() -> None:
             )
         elif args.command == "articles-html":
             source_pdf = args.source_pdf.expanduser().resolve()
+            soft_page_limit = max(1, int(args.soft_page_limit)) if not args.strict_input_gate else None
             normalized, preflight = ingest_pdf_guarded(
                 source_pdf,
                 profile_name="newspaper",
                 timeout_seconds=args.ingest_timeout_seconds,
                 max_file_size_mb=args.max_file_size_mb,
                 max_page_count=args.max_page_count,
+                soft_input_gate=not args.strict_input_gate,
+                soft_page_limit=soft_page_limit,
             )
             run_dir = args.output_dir.expanduser().resolve() / source_pdf.stem
             run_dir.mkdir(parents=True, exist_ok=True)
