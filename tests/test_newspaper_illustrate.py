@@ -130,3 +130,44 @@ def test_render_illustrated_reading_markdown_includes_image_and_rebuilt_body() -
     assert len(image_line) < 140
     assert summary["included_articles"] == 1
     assert summary["included_images"] == 1
+
+
+def test_render_illustrated_reading_markdown_keeps_article_without_image() -> None:
+    payload = {
+        "source_pdf": "/tmp/sample.pdf",
+        "selected_article_indexes": [0, 1],
+        "selected_top_half_count": 2,
+        "articles": [
+            {
+                "headline": "Story with image",
+                "page_start": 3,
+                "quality": {"grade": "high", "score": 91.2},
+                "score": 44.6,
+                "rebuilt_body_text": "Image story paragraph.",
+                "illustration_images": [
+                    {
+                        "path": "/tmp/article-001-img-01-p03.png",
+                        "caption": "Lead image",
+                    }
+                ],
+            },
+            {
+                "headline": "Story without image",
+                "page_start": 4,
+                "quality": {"grade": "medium", "score": 77.5},
+                "score": 30.1,
+                "rebuilt_body_text": "No image story paragraph.",
+                "illustration_images": [],
+            },
+        ],
+    }
+
+    markdown_text, summary = render_illustrated_reading_markdown(payload, selected_only=True)
+
+    assert "Story with image" in markdown_text
+    assert "Story without image" in markdown_text
+    assert "No image story paragraph." in markdown_text
+    assert summary["included_articles"] == 2
+    assert summary["included_images"] == 1
+    assert summary["articles_with_images"] == 1
+    assert summary["articles_without_images"] == 1

@@ -573,7 +573,9 @@ def main() -> None:
             print(
                 "Illustration summary: "
                 f"included_articles={summary['included_articles']}/{summary['total_articles']} "
-                f"included_images={summary['included_images']}"
+                f"included_images={summary['included_images']} "
+                f"with_images={summary['articles_with_images']} "
+                f"without_images={summary['articles_without_images']}"
             )
         elif args.command == "validate":
             manifest_path = args.manifest.expanduser().resolve()

@@ -554,6 +554,8 @@ def render_illustrated_reading_markdown(
     ]
 
     image_count = 0
+    with_image_count = 0
+    without_image_count = 0
     for position, article in enumerate(selected_articles, start=1):
         headline = _optional_text(article.get("headline")) or f"Untitled article {position}"
         page_start = article.get("page_start", "?")
@@ -567,6 +569,7 @@ def render_illustrated_reading_markdown(
         lines.append(f"Page: {page_start} | Quality: {quality_grade} ({quality_score}) | Rank score: {rank_score}")
 
         pictures = article.get("illustration_images")
+        article_has_image = False
         if isinstance(pictures, list):
             for image_rank, picture in enumerate(pictures, start=1):
                 if not isinstance(picture, dict):
@@ -577,6 +580,12 @@ def render_illustrated_reading_markdown(
                 alt_text = _safe_image_alt_text(picture.get("caption"), position, image_rank)
                 lines.append(f"![{alt_text}]({_markdown_image_target(path)})")
                 image_count += 1
+                article_has_image = True
+
+        if article_has_image:
+            with_image_count += 1
+        else:
+            without_image_count += 1
 
         deck = _optional_text(article.get("deck"))
         if deck:
@@ -601,6 +610,8 @@ def render_illustrated_reading_markdown(
         "included_articles": len(selected_articles),
         "total_articles": total_count,
         "included_images": image_count,
+        "articles_with_images": with_image_count,
+        "articles_without_images": without_image_count,
     }
     return markdown_text, summary
 
