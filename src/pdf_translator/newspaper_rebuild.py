@@ -54,6 +54,15 @@ class ParagraphProfile:
     terms: set[str]
 
 
+HEADLINE_STOPWORDS = STOPWORDS | {
+    "from",
+    "page",
+    "edition",
+    "story",
+    "continued",
+}
+
+
 def _normalize_paragraph(text: str) -> str:
     normalized = text.replace("\r\n", "\n")
     normalized = re.sub(r"[ \t]+", " ", normalized)
@@ -208,6 +217,36 @@ def _segment_score(segment: list[ParagraphProfile], index: int) -> float:
     )
 
 
+def _segment_terms(segment: list[ParagraphProfile]) -> set[str]:
+    terms: set[str] = set()
+    for profile in segment:
+        terms |= profile.terms
+    return terms
+
+
+def _segment_overlap(left: list[ParagraphProfile], right: list[ParagraphProfile]) -> float:
+    left_terms = _segment_terms(left)
+    right_terms = _segment_terms(right)
+    if not left_terms or not right_terms:
+        return 0.0
+    intersection = len(left_terms & right_terms)
+    baseline = min(len(left_terms), len(right_terms))
+    return intersection / baseline if baseline else 0.0
+
+
+def _can_merge_segment(candidate: list[ParagraphProfile], anchor: list[ParagraphProfile]) -> bool:
+    candidate_words = sum(profile.word_count for profile in candidate)
+    candidate_narrative = sum(1 for profile in candidate if _is_narrative_like(profile))
+    candidate_listing = sum(1 for profile in candidate if _is_listing_like(profile))
+    overlap = _segment_overlap(candidate, anchor)
+
+    if candidate_narrative >= 2 and candidate_listing <= 1 and overlap >= 0.12:
+        return True
+    if candidate_words >= 180 and candidate_narrative >= 3 and candidate_listing == 0 and overlap >= 0.08:
+        return True
+    return False
+
+
 def _merge_soft_breaks(paragraphs: list[str]) -> list[str]:
     merged: list[str] = []
     for paragraph in paragraphs:
@@ -222,6 +261,153 @@ def _merge_soft_breaks(paragraphs: list[str]) -> list[str]:
     return merged
 
 
+def _headline_terms(headline: str) -> set[str]:
+    tokens = re.findall(r"[A-Za-z']+", headline)
+    return {
+        token.lower()
+        for token in tokens
+        if len(token) >= 4 and token.lower() not in HEADLINE_STOPWORDS
+    }
+
+
+def _headline_similarity(left: str, right: str) -> float:
+    left_terms = _headline_terms(left)
+    right_terms = _headline_terms(right)
+    if not left_terms or not right_terms:
+        return 0.0
+    intersection = len(left_terms & right_terms)
+    baseline = min(len(left_terms), len(right_terms))
+    return intersection / baseline if baseline else 0.0
+
+
+def _split_body_paragraphs(body_text: str) -> list[str]:
+    return [_normalize_paragraph(part) for part in body_text.split("\n\n") if _normalize_paragraph(part)]
+
+
+def _paragraph_fingerprint(text: str) -> str:
+    lowered = text.lower()
+    lowered = re.sub(r"[^a-z0-9]+", "", lowered)
+    return lowered
+
+
+def _merge_body_fragments(paragraph_groups: list[list[str]]) -> str:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for group in paragraph_groups:
+        for paragraph in group:
+            fingerprint = _paragraph_fingerprint(paragraph)
+            if not fingerprint or fingerprint in seen:
+                continue
+            seen.add(fingerprint)
+            merged.append(paragraph)
+    return "\n\n".join(merged).strip()
+
+
+def _looks_fragmented_frontmatter(text: str) -> bool:
+    normalized = _normalize_paragraph(text)
+    if not normalized:
+        return True
+    if normalized[:1] in {"-", "—", ",", ";"}:
+        return True
+    if normalized[:1].islower():
+        return True
+    return False
+
+
+def _selected_article_indexes(payload: dict[str, Any], article_count: int) -> set[int]:
+    selected_indexes = payload.get("selected_article_indexes")
+    if isinstance(selected_indexes, list):
+        return {
+            raw_index
+            for raw_index in selected_indexes
+            if isinstance(raw_index, int) and 0 <= raw_index < article_count
+        }
+    top_count = int(payload.get("selected_top_half_count", 0) or 0)
+    return {index for index in range(min(article_count, max(0, top_count)))}
+
+
+def _merge_selected_related_fragments(articles: list[dict[str, Any]], selected_indexes: set[int]) -> None:
+    for article_index in sorted(selected_indexes):
+        article = articles[article_index]
+        if not isinstance(article, dict):
+            continue
+
+        headline = str(article.get("headline", "")).strip()
+        if not headline:
+            continue
+        page_start = int(article.get("page_start", 0) or 0)
+        body_text = str(article.get("body_text", "")).strip()
+        article_score = float(article.get("score", 0.0) or 0.0)
+        if not body_text:
+            continue
+
+        related_indexes: list[int] = []
+        for candidate_index, candidate in enumerate(articles):
+            if candidate_index == article_index:
+                continue
+            if not isinstance(candidate, dict):
+                continue
+            candidate_score = float(candidate.get("score", 0.0) or 0.0)
+            if candidate_index in selected_indexes and candidate_score >= article_score * 0.9:
+                continue
+            candidate_body = str(candidate.get("body_text", "")).strip()
+            if len(candidate_body) < 180:
+                continue
+
+            candidate_headline = str(candidate.get("headline", "")).strip()
+            similarity = _headline_similarity(headline, candidate_headline)
+            if similarity < 0.72:
+                continue
+
+            candidate_page = int(candidate.get("page_start", 0) or 0)
+            if page_start > 0 and candidate_page > 0 and abs(page_start - candidate_page) > 6:
+                continue
+            related_indexes.append(candidate_index)
+
+        if not related_indexes:
+            continue
+
+        related_indexes.sort(
+            key=lambda index: (
+                int(articles[index].get("page_start", 0) or 0),
+                -float(articles[index].get("score", 0.0) or 0.0),
+            )
+        )
+
+        groups: list[list[str]] = []
+        for related_index in related_indexes:
+            related_article = articles[related_index]
+            related_page = int(related_article.get("page_start", 0) or 0)
+            related_body = _split_body_paragraphs(str(related_article.get("body_text", "")))
+            if not related_body:
+                continue
+            if related_page > 0 and page_start > 0 and related_page <= page_start:
+                groups.append(related_body)
+
+        groups.append(_split_body_paragraphs(body_text))
+
+        for related_index in related_indexes:
+            related_article = articles[related_index]
+            related_page = int(related_article.get("page_start", 0) or 0)
+            related_body = _split_body_paragraphs(str(related_article.get("body_text", "")))
+            if not related_body:
+                continue
+            if related_page > 0 and page_start > 0 and related_page > page_start:
+                groups.append(related_body)
+
+        merged_body = _merge_body_fragments(groups)
+        if merged_body:
+            article["body_text"] = merged_body
+            article["merged_fragment_indexes"] = related_indexes
+
+        if _looks_fragmented_frontmatter(str(article.get("deck", ""))):
+            for related_index in related_indexes:
+                candidate_deck = str(articles[related_index].get("deck", "")).strip()
+                if candidate_deck and not _looks_fragmented_frontmatter(candidate_deck):
+                    article["deck"] = candidate_deck
+                    break
+
+
 def rebuild_article_body(body_text: str) -> tuple[str, dict[str, Any]]:
     raw_paragraphs = [part.strip() for part in body_text.split("\n\n") if part.strip()]
     normalized_paragraphs = [_normalize_paragraph(paragraph) for paragraph in raw_paragraphs]
@@ -234,14 +420,32 @@ def rebuild_article_body(body_text: str) -> tuple[str, dict[str, Any]]:
 
     segments = _split_segments(profiles)
     best_index = max(range(len(segments)), key=lambda index: _segment_score(segments[index], index))
+    selected_indexes = [best_index]
     selected_segment = segments[best_index]
+    total_word_count = sum(profile.word_count for profile in profiles)
+
+    # Preserve intro/context when the previous segment is clearly topically connected.
+    if best_index > 0:
+        previous = segments[best_index - 1]
+        if _can_merge_segment(previous, selected_segment):
+            selected_indexes.insert(0, best_index - 1)
+            selected_segment = previous + selected_segment
+
+    # Keep a connected next segment when we still cover too little of the source body.
+    selected_word_total = sum(profile.word_count for profile in selected_segment)
+    if selected_word_total < total_word_count * 0.78 and best_index + 1 < len(segments):
+        next_segment = segments[best_index + 1]
+        if _can_merge_segment(next_segment, segments[selected_indexes[-1]]):
+            selected_indexes.append(best_index + 1)
+            selected_segment = selected_segment + next_segment
 
     # Keep an adjacent segment when the selected segment is too short, to avoid over-truncation.
     selected_word_total = sum(profile.word_count for profile in selected_segment)
-    total_word_count = sum(profile.word_count for profile in profiles)
     if selected_word_total < total_word_count * 0.45 and best_index + 1 < len(segments):
         candidate = segments[best_index + 1]
         if sum(1 for profile in candidate if _is_listing_like(profile)) <= 1:
+            if best_index + 1 not in selected_indexes:
+                selected_indexes.append(best_index + 1)
             selected_segment = selected_segment + candidate
 
     rebuilt_paragraphs = _merge_soft_breaks([profile.text for profile in selected_segment])
@@ -252,6 +456,7 @@ def rebuild_article_body(body_text: str) -> tuple[str, dict[str, Any]]:
         "kept_paragraphs": len(rebuilt_paragraphs),
         "segments": len(segments),
         "selected_segment_index": best_index,
+        "selected_segment_indexes": selected_indexes,
     }
     return rebuilt_text, metadata
 
@@ -261,6 +466,9 @@ def rebuild_articles_payload(payload: dict[str, Any]) -> dict[str, Any]:
     articles = rebuilt_payload.get("articles")
     if not isinstance(articles, list):
         return rebuilt_payload
+
+    selected_indexes = _selected_article_indexes(rebuilt_payload, len(articles))
+    _merge_selected_related_fragments(articles, selected_indexes)
 
     for article in articles:
         if not isinstance(article, dict):
