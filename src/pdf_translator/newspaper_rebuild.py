@@ -63,6 +63,24 @@ HEADLINE_STOPWORDS = STOPWORDS | {
 }
 
 
+PHOTO_CREDIT_PREFIX_PATTERN = re.compile(
+    r"^(?:[A-Z][A-Z'’.\-]+(?:\s+[A-Z][A-Z'’.\-]+)*\s*/\s*"
+    r"(?:THE NEW YORK TIMES|ASSOCIATED PRESS|REUTERS|AFP|GETTY IMAGES)\s*)+",
+)
+PHOTO_CREDIT_ONLY_PATTERN = re.compile(
+    r"^(?:PHOTOGRAPHS?\s+BY\s+.+|[A-Z][A-Z'’.\-]+(?:\s+[A-Z][A-Z'’.\-]+)*\s*/\s*"
+    r"(?:THE NEW YORK TIMES|ASSOCIATED PRESS|REUTERS|AFP|GETTY IMAGES))$"
+)
+CAPTION_LIKE_PATTERN = re.compile(
+    r"^(?:Clockwise from|Left,|Above,|From left|From top|Top left|Top right)",
+    re.IGNORECASE,
+)
+FROM_PAGE_MARKER_PATTERN = re.compile(
+    r"^[A-Z][A-Za-z0-9'’.,\-\s]{0,120}\bFROM PAGE \d+\b",
+    re.IGNORECASE,
+)
+
+
 def _normalize_paragraph(text: str) -> str:
     normalized = text.replace("\r\n", "\n")
     normalized = re.sub(r"[ \t]+", " ", normalized)
@@ -261,6 +279,72 @@ def _merge_soft_breaks(paragraphs: list[str]) -> list[str]:
     return merged
 
 
+def _clean_paragraph_text(paragraph: str) -> str | None:
+    cleaned = _normalize_paragraph(paragraph)
+    if not cleaned:
+        return None
+
+    if FROM_PAGE_MARKER_PATTERN.match(cleaned):
+        return None
+    if CAPTION_LIKE_PATTERN.match(cleaned) and len(cleaned.split()) > 8:
+        return None
+    if PHOTO_CREDIT_ONLY_PATTERN.match(cleaned):
+        return None
+
+    stripped_credit = PHOTO_CREDIT_PREFIX_PATTERN.sub("", cleaned).strip()
+    if stripped_credit:
+        cleaned = stripped_credit
+
+    # Continuation fragments often start with a dash and a lowercase word.
+    cleaned = re.sub(r"^[—-]\s+(?=[a-z])", "", cleaned)
+
+    if not cleaned:
+        return None
+    return cleaned
+
+
+def _ends_with_terminal_punctuation(text: str) -> bool:
+    stripped = text.rstrip(" \t\r\n'\"”)]}")
+    return stripped.endswith((".", "!", "?"))
+
+
+def _looks_truncated_fragment(text: str) -> bool:
+    tokens = re.findall(r"[A-Za-z0-9']+", text)
+    if not tokens:
+        return True
+    profile = _paragraph_profile(text)
+    if _is_heading_like(profile):
+        return False
+    if len(tokens) <= 16 and not _ends_with_terminal_punctuation(text):
+        return True
+    return False
+
+
+def _drop_fragmentary_paragraphs(paragraphs: list[str]) -> list[str]:
+    if not paragraphs:
+        return []
+
+    cleaned: list[str] = []
+    profiles = [_paragraph_profile(paragraph) for paragraph in paragraphs]
+    for index, paragraph in enumerate(paragraphs):
+        profile = profiles[index]
+        previous = cleaned[-1] if cleaned else None
+        previous_profile = _paragraph_profile(previous) if previous else None
+
+        if CAPTION_LIKE_PATTERN.match(paragraph) and len(paragraph.split()) > 8:
+            continue
+        if _looks_truncated_fragment(paragraph):
+            continue
+        if paragraph[:1].islower() and previous and _ends_with_terminal_punctuation(previous):
+            overlap = _term_overlap(previous_profile, profile) if previous_profile else 0.0
+            if overlap < 0.15:
+                continue
+
+        cleaned.append(paragraph)
+
+    return cleaned
+
+
 def _headline_terms(headline: str) -> set[str]:
     tokens = re.findall(r"[A-Za-z']+", headline)
     return {
@@ -281,7 +365,12 @@ def _headline_similarity(left: str, right: str) -> float:
 
 
 def _split_body_paragraphs(body_text: str) -> list[str]:
-    return [_normalize_paragraph(part) for part in body_text.split("\n\n") if _normalize_paragraph(part)]
+    paragraphs: list[str] = []
+    for part in body_text.split("\n\n"):
+        cleaned = _clean_paragraph_text(part)
+        if cleaned:
+            paragraphs.append(cleaned)
+    return paragraphs
 
 
 def _paragraph_fingerprint(text: str) -> str:
@@ -410,7 +499,7 @@ def _merge_selected_related_fragments(articles: list[dict[str, Any]], selected_i
 
 def rebuild_article_body(body_text: str) -> tuple[str, dict[str, Any]]:
     raw_paragraphs = [part.strip() for part in body_text.split("\n\n") if part.strip()]
-    normalized_paragraphs = [_normalize_paragraph(paragraph) for paragraph in raw_paragraphs]
+    normalized_paragraphs = [cleaned for paragraph in raw_paragraphs if (cleaned := _clean_paragraph_text(paragraph))]
     profiles = [_paragraph_profile(paragraph) for paragraph in normalized_paragraphs if paragraph]
     profiles = [profile for profile in profiles if not _is_noise(profile)]
 
@@ -449,6 +538,7 @@ def rebuild_article_body(body_text: str) -> tuple[str, dict[str, Any]]:
             selected_segment = selected_segment + candidate
 
     rebuilt_paragraphs = _merge_soft_breaks([profile.text for profile in selected_segment])
+    rebuilt_paragraphs = _drop_fragmentary_paragraphs(rebuilt_paragraphs)
     rebuilt_text = "\n\n".join(paragraph for paragraph in rebuilt_paragraphs if paragraph).strip()
 
     metadata = {
