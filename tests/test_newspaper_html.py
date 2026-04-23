@@ -81,3 +81,26 @@ def test_write_articles_html_bundle_respects_max_articles(tmp_path: Path) -> Non
     manifest = json.loads(Path(result["manifest_path"]).read_text(encoding="utf-8"))
     assert manifest["included_articles"] == 2
     assert len(manifest["entries"]) == 2
+
+
+def test_write_articles_html_bundle_replaces_stale_article_files(tmp_path: Path) -> None:
+    output_dir = tmp_path / "html"
+    stale_dir = output_dir / "articles"
+    stale_dir.mkdir(parents=True, exist_ok=True)
+    stale_file = stale_dir / "article-999-old.html"
+    stale_file.write_text("stale", encoding="utf-8")
+
+    payload = {
+        "source_pdf": "/tmp/sample.pdf",
+        "selected_article_indexes": [0],
+        "selected_top_half_count": 1,
+        "articles": [
+            {"headline": "Fresh story", "rebuilt_body_text": "fresh"},
+        ],
+    }
+
+    result = write_articles_html_bundle(payload, output_dir=output_dir, selected_only=True)
+    manifest = json.loads(Path(result["manifest_path"]).read_text(encoding="utf-8"))
+
+    assert not stale_file.exists()
+    assert len(manifest["entries"]) == 1

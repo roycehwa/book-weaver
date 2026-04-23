@@ -315,6 +315,8 @@ def _is_headline(block: NewsBlock) -> bool:
         return False
     if len(block.text) < MIN_HEADLINE_CHARS:
         return False
+    if _is_quote_led(block.text) and len(block.text) <= 110:
+        return False
     if (
         _is_utility_header(block.text)
         or _is_non_article_text(block.text)
@@ -398,6 +400,26 @@ def _build_briefing_articles(blocks: list[NewsBlock], page_width: float) -> list
     return briefing_articles
 
 
+def _belongs_to_briefing_rail(
+    block: NewsBlock,
+    briefing_headers: list[NewsBlock],
+    page_width: float,
+) -> bool:
+    if block.label not in {"list_item", "text", "section_header"}:
+        return False
+    for header in briefing_headers:
+        if block.index == header.index:
+            continue
+        if block.left < header.left - 20:
+            continue
+        if block.top >= header.top:
+            continue
+        if block.center_x <= page_width * 0.72:
+            continue
+        return True
+    return False
+
+
 def _headline_distance(anchor: NewsBlock, block: NewsBlock) -> tuple[float, float]:
     return abs(anchor.center_x - block.center_x), anchor.top - block.top
 
@@ -413,14 +435,16 @@ def _is_story_block_candidate(block: NewsBlock, headline: NewsBlock, page_width:
         return False
     if _is_briefing_header(block) or _is_utility_header(block.text):
         return False
-    if block.center_x < headline.left - HEADLINE_BAND_MARGIN:
-        return False
-    if block.center_x > headline.right + HEADLINE_BAND_MARGIN:
-        return False
+    is_wide_headline = headline.width >= page_width * 0.55
+    if not is_wide_headline:
+        if block.center_x < headline.left - HEADLINE_BAND_MARGIN:
+            return False
+        if block.center_x > headline.right + HEADLINE_BAND_MARGIN:
+            return False
     if headline.width < page_width * 0.42 and abs(headline.center_x - block.center_x) > HEADLINE_X_GAP:
         return False
     overlap = _horizontal_overlap_ratio(headline.left, headline.right, block.left, block.right)
-    if overlap <= 0 and abs(headline.center_x - block.center_x) > HEADLINE_X_GAP:
+    if not is_wide_headline and overlap <= 0 and abs(headline.center_x - block.center_x) > HEADLINE_X_GAP:
         return False
     return True
 
@@ -429,19 +453,31 @@ def _assign_blocks_to_headlines(
     page_blocks: list[NewsBlock],
     headlines: list[NewsBlock],
     page_width: float,
+    briefing_headers: list[NewsBlock] | None = None,
 ) -> dict[int, list[NewsBlock]]:
     assignments: dict[int, list[NewsBlock]] = {headline.index: [] for headline in headlines}
     sorted_headlines = sorted(headlines, key=lambda block: (-block.top, block.left))
+    next_headline_top: dict[int, float | None] = {}
+    for position, headline in enumerate(sorted_headlines):
+        next_headline_top[headline.index] = (
+            sorted_headlines[position + 1].top if position + 1 < len(sorted_headlines) else None
+        )
+    briefing_headers = briefing_headers or []
 
     for block in page_blocks:
         if block.index in assignments:
             continue
         if _is_non_article_text(block.text):
             continue
+        if _belongs_to_briefing_rail(block, briefing_headers, page_width):
+            continue
 
         best_headline: NewsBlock | None = None
         best_key: tuple[float, float] | None = None
         for headline in sorted_headlines:
+            cutoff_top = next_headline_top.get(headline.index)
+            if cutoff_top is not None and block.top <= cutoff_top:
+                continue
             if not _is_story_block_candidate(block, headline, page_width):
                 continue
             horizontal_gap, vertical_gap = _headline_distance(headline, block)
@@ -498,27 +534,49 @@ def _group_headlines(headlines: list[NewsBlock], page_width: float) -> tuple[lis
     return primary, dependents
 
 
+def _column_assignment_gap(blocks: list[NewsBlock]) -> float:
+    widths = sorted(block.width for block in blocks if block.width > 0)
+    if not widths:
+        return 60.0
+    median_width = widths[len(widths) // 2]
+    return min(110.0, max(38.0, median_width * 0.45))
+
+
+def _group_blocks_into_columns(blocks: list[NewsBlock]) -> list[dict[str, Any]]:
+    if not blocks:
+        return []
+
+    assignment_gap = _column_assignment_gap(blocks)
+    columns: list[dict[str, Any]] = []
+    for block in sorted(blocks, key=lambda item: (item.left, -item.top)):
+        chosen: dict[str, Any] | None = None
+        best_key: tuple[int, float, float] | None = None
+        for column in columns:
+            overlap = _horizontal_overlap_ratio(column["left"], column["right"], block.left, block.right)
+            left_gap = abs(block.left - column["left"])
+            right_gap = abs(block.right - column["right"])
+            if overlap < 0.35 and (left_gap > assignment_gap or right_gap > assignment_gap * 1.5):
+                continue
+            key = (0 if overlap >= 0.35 else 1, min(left_gap, right_gap), left_gap + right_gap)
+            if best_key is None or key < best_key:
+                chosen = column
+                best_key = key
+        if chosen is None:
+            chosen = {"blocks": [], "left": block.left, "right": block.right}
+            columns.append(chosen)
+        chosen["blocks"].append(block)
+        chosen["left"] = sum(item.left for item in chosen["blocks"]) / len(chosen["blocks"])
+        chosen["right"] = sum(item.right for item in chosen["blocks"]) / len(chosen["blocks"])
+
+    return sorted(columns, key=lambda item: item["left"])
+
+
 def _order_blocks_for_reading(blocks: list[NewsBlock]) -> list[NewsBlock]:
     if not blocks:
         return []
 
-    columns: list[dict[str, Any]] = []
-    for block in sorted(blocks, key=lambda item: (item.center_x, -item.top)):
-        chosen: dict[str, Any] | None = None
-        best_gap: float | None = None
-        for column in columns:
-            gap = abs(block.center_x - column["center_x"])
-            if gap <= COLUMN_CENTER_GAP and (best_gap is None or gap < best_gap):
-                chosen = column
-                best_gap = gap
-        if chosen is None:
-            chosen = {"blocks": [], "center_x": block.center_x}
-            columns.append(chosen)
-        chosen["blocks"].append(block)
-        chosen["center_x"] = sum(item.center_x for item in chosen["blocks"]) / len(chosen["blocks"])
-
     ordered: list[NewsBlock] = []
-    for column in sorted(columns, key=lambda item: item["center_x"]):
+    for column in _group_blocks_into_columns(blocks):
         ordered.extend(sorted(column["blocks"], key=lambda item: (-item.top, item.left)))
     return ordered
 
@@ -527,23 +585,8 @@ def _trim_column_breaks(blocks: list[NewsBlock]) -> list[NewsBlock]:
     if not blocks:
         return []
 
-    columns: list[dict[str, Any]] = []
-    for block in sorted(blocks, key=lambda item: (item.center_x, -item.top)):
-        chosen: dict[str, Any] | None = None
-        best_gap: float | None = None
-        for column in columns:
-            gap = abs(block.center_x - column["center_x"])
-            if gap <= COLUMN_CENTER_GAP and (best_gap is None or gap < best_gap):
-                chosen = column
-                best_gap = gap
-        if chosen is None:
-            chosen = {"blocks": [], "center_x": block.center_x}
-            columns.append(chosen)
-        chosen["blocks"].append(block)
-        chosen["center_x"] = sum(item.center_x for item in chosen["blocks"]) / len(chosen["blocks"])
-
     kept: list[NewsBlock] = []
-    for column in columns:
+    for column in _group_blocks_into_columns(blocks):
         ordered = sorted(column["blocks"], key=lambda item: (-item.top, item.left))
         contiguous: list[NewsBlock] = []
         previous: NewsBlock | None = None
@@ -953,7 +996,13 @@ def extract_newspaper_articles(structured: dict[str, Any], source_pdf: Path) -> 
 
         processed_page_count += 1
         headlines, dependent_headlines = _group_headlines(headline_candidates, page_width)
-        assignments = _assign_blocks_to_headlines(page_blocks, headlines, page_width)
+        briefing_headers = [block for block in page_blocks if _is_briefing_header(block)]
+        assignments = _assign_blocks_to_headlines(
+            page_blocks,
+            headlines,
+            page_width,
+            briefing_headers=briefing_headers,
+        )
 
         for headline in headlines:
             top_ordered_blocks = sorted(

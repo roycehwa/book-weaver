@@ -131,6 +131,44 @@ def test_rebuild_article_body_keeps_short_heading_like_line() -> None:
     assert rebuilt_text.startswith("Migrants deported by U.S. find hope")
 
 
+def test_rebuild_article_body_drops_pullquote_noise_and_rejoins_sentence() -> None:
+    body_text = "\n\n".join(
+        [
+            "Most returned to their home countries. Others sought asylum in Costa Rica. " * 3,
+            '"If I take you to Russia without docu-',
+            '"I\'ve been robbed. I did everything right."',
+            "GERMAN SMIRNOV, a Russian deportee whose asylum hearing in the United States was canceled in January.",
+            "ments, without money — you don't know the language, you don't know this country, you know nothing — and I open the doors and tell you, 'Do whatever you want?'",
+            "Mr. Smirnov, 37, worked as a poll worker in Russia when he filmed what he said were anomalies in the election. " * 2,
+        ]
+    )
+
+    rebuilt_text, _ = rebuild_article_body(body_text)
+
+    assert '"I\'ve been robbed. I did everything right."' not in rebuilt_text
+    assert "GERMAN SMIRNOV, a Russian deportee" not in rebuilt_text
+    assert "without documents, without money" in rebuilt_text
+    assert "Mr. Smirnov, 37, worked as a poll worker in Russia" in rebuilt_text
+
+
+def test_rebuild_article_body_rejoins_capitalized_entity_continuation() -> None:
+    body_text = "\n\n".join(
+        [
+            "Marcia Aguiluz Soto said she could offer the deportees a room and food, but not community. " * 2,
+            "Through her work with the American",
+            "Left, German Smirnov in Monteverde with his family.",
+            "Friends Service Committee — a Philadelphia-based organization founded by Quakers — she realized that community was exactly what was needed.",
+            "So she turned to them. " * 2,
+        ]
+    )
+
+    rebuilt_text, _ = rebuild_article_body(body_text)
+
+    assert "Left, German Smirnov" not in rebuilt_text
+    assert "Through her work with the American Friends Service Committee" in rebuilt_text
+    assert "So she turned to them." in rebuilt_text
+
+
 def test_render_rebuilt_markdown_uses_selected_indexes() -> None:
     payload = {
         "source_pdf": "/tmp/sample.pdf",
@@ -199,6 +237,8 @@ def test_rebuild_articles_payload_merges_related_continuation_fragment() -> None
     assert "A lot of things make Lauren Sánchez Bezos ridiculously happy." in selected_article["body_text"]
     assert "A LONGTIME NETWORKER" in selected_article["body_text"]
     assert selected_article["merged_fragment_indexes"] == [2]
+    assert rebuilt["selected_article_indexes"] == [1]
+    assert rebuilt["articles"][2]["merged_into_article_index"] == 1
     assert selected_article["deck"] == "A lot of things make Lauren Sánchez Bezos ridiculously happy."
 
 
@@ -233,6 +273,8 @@ def test_rebuild_articles_payload_merges_lower_score_selected_fragment() -> None
     assert "A lot of things make Lauren Sánchez Bezos ridiculously happy." in lead_article["body_text"]
     assert "A LONGTIME NETWORKER" in lead_article["body_text"]
     assert lead_article["merged_fragment_indexes"] == [1]
+    assert rebuilt["selected_article_indexes"] == [0]
+    assert rebuilt["articles"][1]["merged_into_article_index"] == 0
     assert lead_article["deck"] == "A lot of things make Lauren Sánchez Bezos ridiculously happy."
 
 

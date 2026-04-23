@@ -165,6 +165,11 @@ def _is_heading_like(profile: ParagraphProfile) -> bool:
     return False
 
 
+def _is_quote_led(text: str) -> bool:
+    normalized = text.strip()
+    return normalized.startswith(("'", '"', "‘", "“"))
+
+
 def _is_noise(profile: ParagraphProfile) -> bool:
     if profile.word_count <= 2:
         return True
@@ -272,11 +277,57 @@ def _merge_soft_breaks(paragraphs: list[str]) -> list[str]:
             merged.append(paragraph)
             continue
         previous = merged[-1]
-        if previous and previous[-1] not in '.!?"”’\'' and paragraph[:1].islower():
-            merged[-1] = f"{previous} {paragraph}"
+        if _should_merge_soft_break(previous, paragraph):
+            spacer = "" if _should_compact_token_boundary(previous, paragraph) else " "
+            merged[-1] = _normalize_paragraph(f"{previous}{spacer}{paragraph}")
         else:
             merged.append(paragraph)
     return merged
+
+
+def _should_merge_soft_break(previous: str, current: str) -> bool:
+    if not previous or _ends_with_terminal_punctuation(previous):
+        return False
+    if current[:1].islower():
+        return True
+
+    previous_profile = _paragraph_profile(previous)
+    if _is_heading_like(previous_profile) and previous_profile.uppercase_ratio >= 0.35:
+        return False
+
+    previous_tokens = re.findall(r"[A-Za-z0-9']+", previous)
+    current_tokens = re.findall(r"[A-Za-z0-9']+", current)
+    if not previous_tokens or not current_tokens:
+        return False
+
+    previous_tail = previous_tokens[-1]
+    current_head = current_tokens[0]
+    if (
+        previous_profile.word_count <= 8
+        and previous_tail[:1].isupper()
+        and current_head[:1].isupper()
+    ):
+        return True
+    return False
+
+
+def _should_compact_token_boundary(previous: str, current: str) -> bool:
+    if not current[:1].islower():
+        return False
+    previous_tokens = re.findall(r"[A-Za-z0-9']+", previous)
+    current_tokens = re.findall(r"[A-Za-z0-9']+", current)
+    if not previous_tokens or not current_tokens:
+        return False
+
+    previous_tail = previous_tokens[-1].lower()
+    current_head = current_tokens[0].lower()
+    if previous_tail in STOPWORDS or current_head in STOPWORDS:
+        return False
+    if len(previous_tail) > 6 or len(current_head) < 4:
+        return False
+    if not previous.rstrip()[-1:].isalpha():
+        return False
+    return True
 
 
 def _clean_paragraph_text(paragraph: str) -> str | None:
@@ -286,7 +337,7 @@ def _clean_paragraph_text(paragraph: str) -> str | None:
 
     if FROM_PAGE_MARKER_PATTERN.match(cleaned):
         return None
-    if CAPTION_LIKE_PATTERN.match(cleaned) and len(cleaned.split()) > 8:
+    if CAPTION_LIKE_PATTERN.match(cleaned) and len(cleaned.split()) >= 5:
         return None
     if PHOTO_CREDIT_ONLY_PATTERN.match(cleaned):
         return None
@@ -320,7 +371,58 @@ def _looks_truncated_fragment(text: str) -> bool:
     return False
 
 
-def _drop_fragmentary_paragraphs(paragraphs: list[str]) -> list[str]:
+def _looks_pullquote_line(profile: ParagraphProfile) -> bool:
+    if not _is_quote_led(profile.text):
+        return False
+    if not _ends_with_terminal_punctuation(profile.text):
+        return False
+    return profile.word_count <= 18
+
+
+def _looks_pullquote_attribution(profile: ParagraphProfile) -> bool:
+    if profile.word_count < 4 or profile.word_count > 22:
+        return False
+    if _is_heading_like(profile):
+        return False
+    lowered = profile.text.lower()
+    if (
+        not re.match(r"^[A-Z][A-Z'’.\-]+(?:\s+[A-Z][A-Z'’.\-]+)+,", profile.text)
+        and profile.uppercase_ratio < 0.3
+    ):
+        return False
+    if "," not in profile.text and " whose " not in f" {lowered} ":
+        return False
+    return any(
+        marker in lowered
+        for marker in [
+            "deportee",
+            "reporter",
+            "editor",
+            "analyst",
+            "photographer",
+            "hearing",
+            "whose",
+        ]
+    )
+
+
+def _looks_reporting_credit(profile: ParagraphProfile) -> bool:
+    lowered = profile.text.lower()
+    return any(
+        marker in lowered
+        for marker in [
+            "contributed reporting",
+            "contributed research",
+            "contributed from",
+        ]
+    )
+
+
+def _drop_fragmentary_paragraphs(
+    paragraphs: list[str],
+    *,
+    drop_truncated: bool = True,
+) -> list[str]:
     if not paragraphs:
         return []
 
@@ -331,11 +433,22 @@ def _drop_fragmentary_paragraphs(paragraphs: list[str]) -> list[str]:
         previous = cleaned[-1] if cleaned else None
         previous_profile = _paragraph_profile(previous) if previous else None
 
-        if CAPTION_LIKE_PATTERN.match(paragraph) and len(paragraph.split()) > 8:
+        if CAPTION_LIKE_PATTERN.match(paragraph) and len(paragraph.split()) >= 5:
             continue
-        if _looks_truncated_fragment(paragraph):
+        if _looks_pullquote_line(profile):
             continue
-        if paragraph[:1].islower() and previous and _ends_with_terminal_punctuation(previous):
+        if _looks_pullquote_attribution(profile):
+            continue
+        if _looks_reporting_credit(profile):
+            continue
+        if drop_truncated and _looks_truncated_fragment(paragraph):
+            continue
+        if (
+            drop_truncated
+            and paragraph[:1].islower()
+            and previous
+            and _ends_with_terminal_punctuation(previous)
+        ):
             overlap = _term_overlap(previous_profile, profile) if previous_profile else 0.0
             if overlap < 0.15:
                 continue
@@ -415,8 +528,11 @@ def _selected_article_indexes(payload: dict[str, Any], article_count: int) -> se
     return {index for index in range(min(article_count, max(0, top_count)))}
 
 
-def _merge_selected_related_fragments(articles: list[dict[str, Any]], selected_indexes: set[int]) -> None:
+def _merge_selected_related_fragments(articles: list[dict[str, Any]], selected_indexes: set[int]) -> set[int]:
+    suppressed_indexes: set[int] = set()
     for article_index in sorted(selected_indexes):
+        if article_index in suppressed_indexes:
+            continue
         article = articles[article_index]
         if not isinstance(article, dict):
             continue
@@ -488,6 +604,11 @@ def _merge_selected_related_fragments(articles: list[dict[str, Any]], selected_i
         if merged_body:
             article["body_text"] = merged_body
             article["merged_fragment_indexes"] = related_indexes
+            for related_index in related_indexes:
+                suppressed_indexes.add(related_index)
+                related_article = articles[related_index]
+                if isinstance(related_article, dict):
+                    related_article["merged_into_article_index"] = article_index
 
         if _looks_fragmented_frontmatter(str(article.get("deck", ""))):
             for related_index in related_indexes:
@@ -495,11 +616,14 @@ def _merge_selected_related_fragments(articles: list[dict[str, Any]], selected_i
                 if candidate_deck and not _looks_fragmented_frontmatter(candidate_deck):
                     article["deck"] = candidate_deck
                     break
+    return suppressed_indexes
 
 
 def rebuild_article_body(body_text: str) -> tuple[str, dict[str, Any]]:
     raw_paragraphs = [part.strip() for part in body_text.split("\n\n") if part.strip()]
     normalized_paragraphs = [cleaned for paragraph in raw_paragraphs if (cleaned := _clean_paragraph_text(paragraph))]
+    normalized_paragraphs = _drop_fragmentary_paragraphs(normalized_paragraphs, drop_truncated=False)
+    normalized_paragraphs = _merge_soft_breaks(normalized_paragraphs)
     profiles = [_paragraph_profile(paragraph) for paragraph in normalized_paragraphs if paragraph]
     profiles = [profile for profile in profiles if not _is_noise(profile)]
 
@@ -537,8 +661,23 @@ def rebuild_article_body(body_text: str) -> tuple[str, dict[str, Any]]:
                 selected_indexes.append(best_index + 1)
             selected_segment = selected_segment + candidate
 
+    # Preserve short clean closers that often carry the final turn of a newspaper story.
+    if best_index + 1 < len(segments):
+        candidate = segments[best_index + 1]
+        candidate_word_total = sum(profile.word_count for profile in candidate)
+        if (
+            candidate_word_total <= 18
+            and all(not _is_listing_like(profile) for profile in candidate)
+            and all(_ends_with_terminal_punctuation(profile.text) for profile in candidate)
+        ):
+            if best_index + 1 not in selected_indexes:
+                selected_indexes.append(best_index + 1)
+            selected_segment = selected_segment + candidate
+
     rebuilt_paragraphs = _merge_soft_breaks([profile.text for profile in selected_segment])
-    rebuilt_paragraphs = _drop_fragmentary_paragraphs(rebuilt_paragraphs)
+    rebuilt_paragraphs = _drop_fragmentary_paragraphs(rebuilt_paragraphs, drop_truncated=False)
+    rebuilt_paragraphs = _merge_soft_breaks(rebuilt_paragraphs)
+    rebuilt_paragraphs = _drop_fragmentary_paragraphs(rebuilt_paragraphs, drop_truncated=True)
     rebuilt_text = "\n\n".join(paragraph for paragraph in rebuilt_paragraphs if paragraph).strip()
 
     metadata = {
@@ -558,7 +697,16 @@ def rebuild_articles_payload(payload: dict[str, Any]) -> dict[str, Any]:
         return rebuilt_payload
 
     selected_indexes = _selected_article_indexes(rebuilt_payload, len(articles))
-    _merge_selected_related_fragments(articles, selected_indexes)
+    suppressed_indexes = _merge_selected_related_fragments(articles, selected_indexes)
+    if suppressed_indexes:
+        ordered_selected_indexes = [
+            raw_index
+            for raw_index in rebuilt_payload.get("selected_article_indexes", [])
+            if isinstance(raw_index, int) and raw_index not in suppressed_indexes
+        ]
+        if ordered_selected_indexes:
+            rebuilt_payload["selected_article_indexes"] = ordered_selected_indexes
+            rebuilt_payload["selected_top_half_count"] = len(ordered_selected_indexes)
 
     for article in articles:
         if not isinstance(article, dict):

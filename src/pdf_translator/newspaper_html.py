@@ -4,6 +4,7 @@ import html
 import json
 import os
 import re
+import shutil
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -354,6 +355,8 @@ def write_articles_html_bundle(
 
     output_dir.mkdir(parents=True, exist_ok=True)
     articles_dir = output_dir / "articles"
+    if articles_dir.exists():
+        shutil.rmtree(articles_dir)
     articles_dir.mkdir(parents=True, exist_ok=True)
 
     entries: list[dict[str, Any]] = []

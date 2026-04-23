@@ -87,6 +87,42 @@ def test_extract_newspaper_articles_filters_banners_and_short_quotes(tmp_path: P
     assert "Real market story develops" in headlines
 
 
+def test_extract_newspaper_articles_ignores_pull_quote_as_headline_anchor(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "stub.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4 stub")
+
+    from pdf_translator import newspaper as newspaper_module
+
+    original_page_sizes = newspaper_module._page_sizes
+    try:
+        newspaper_module._page_sizes = lambda _: {1: (1200.0, 2000.0)}
+        structured = {
+            "body": {
+                "children": [{"$ref": f"#/texts/{index}"} for index in range(8)]
+            },
+            "texts": [
+                {"label": "section_header", "text": "Main migration story continues", "prov": _prov(1, 40, 1900, 920, 1820)},
+                {"label": "text", "text": "Lead deck line.", "prov": _prov(1, 50, 1780, 880, 1720)},
+                {"label": "text", "text": "Main body intro paragraph. " * 20, "prov": _prov(1, 50, 1660, 200, 1520)},
+                {"label": "text", "text": "If I take you to Russia without docu-", "prov": _prov(1, 50, 1500, 200, 1460)},
+                {"label": "section_header", "text": '"I\'ve been robbed. I did everything right."', "prov": _prov(1, 280, 1540, 420, 1490)},
+                {"label": "text", "text": "ments, without money and without support, how would you react?", "prov": _prov(1, 280, 1480, 420, 1420)},
+                {"label": "text", "text": "Mr. Smirnov said he had followed every instruction before the deportation.", "prov": _prov(1, 280, 1400, 420, 1320)},
+                {"label": "text", "text": "The story closes with a final paragraph about the family's future. " * 14, "prov": _prov(1, 50, 1300, 200, 1180)},
+            ],
+        }
+        result = extract_newspaper_articles(structured, pdf_path)
+    finally:
+        newspaper_module._page_sizes = original_page_sizes
+
+    headlines = [article["headline"] for article in result["articles"]]
+    assert '"I\'ve been robbed. I did everything right."' not in headlines
+
+    article = next(article for article in result["articles"] if article["headline"] == "Main migration story continues")
+    assert "ments, without money and without support" in article["body_text"]
+    assert "The story closes with a final paragraph" in article["body_text"]
+
+
 def test_extract_newspaper_articles_uses_column_reading_order(tmp_path: Path) -> None:
     pdf_path = tmp_path / "stub.pdf"
     pdf_path.write_bytes(b"%PDF-1.4 stub")
@@ -122,6 +158,44 @@ def test_extract_newspaper_articles_uses_column_reading_order(tmp_path: Path) ->
         ("LEFT TOP " * 30).strip(),
         ("LEFT BOTTOM " * 30).strip(),
         ("RIGHT TOP " * 30).strip(),
+    ]
+
+
+def test_extract_newspaper_articles_keeps_adjacent_narrow_columns_separate(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "stub.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4 stub")
+
+    from pdf_translator import newspaper as newspaper_module
+
+    original_page_sizes = newspaper_module._page_sizes
+    try:
+        newspaper_module._page_sizes = lambda _: {1: (900.0, 1400.0)}
+        structured = {
+            "body": {
+                "children": [{"$ref": f"#/texts/{index}"} for index in range(7)]
+            },
+            "texts": [
+                {"label": "section_header", "text": "Narrow columns should keep order", "prov": _prov(1, 40, 1320, 760, 1260)},
+                {"label": "text", "text": "Deck text for narrow-column article.", "prov": _prov(1, 40, 1240, 760, 1200)},
+                {"label": "text", "text": "COL1 TOP " * 18, "prov": _prov(1, 40, 1160, 140, 1080)},
+                {"label": "text", "text": "COL1 BOTTOM " * 18, "prov": _prov(1, 40, 1040, 140, 980)},
+                {"label": "text", "text": "COL2 TOP " * 18, "prov": _prov(1, 170, 1150, 270, 1070)},
+                {"label": "text", "text": "COL2 BOTTOM " * 18, "prov": _prov(1, 170, 1030, 270, 970)},
+                {"label": "text", "text": "COL3 TOP " * 18, "prov": _prov(1, 300, 1140, 400, 1060)},
+            ],
+        }
+        result = extract_newspaper_articles(structured, pdf_path)
+    finally:
+        newspaper_module._page_sizes = original_page_sizes
+
+    article = next(article for article in result["articles"] if article["headline"] == "Narrow columns should keep order")
+    body_parts = [part.strip() for part in article["body_text"].split("\n\n")]
+    assert body_parts == [
+        ("COL1 TOP " * 18).strip(),
+        ("COL1 BOTTOM " * 18).strip(),
+        ("COL2 TOP " * 18).strip(),
+        ("COL2 BOTTOM " * 18).strip(),
+        ("COL3 TOP " * 18).strip(),
     ]
 
 
@@ -162,6 +236,39 @@ def test_extract_newspaper_articles_does_not_pull_briefing_into_main_story(tmp_p
 
     article = next(article for article in result["articles"] if article["headline"] == "Main story headline with breadth")
     assert "Briefing item should stay separate" not in article["body_text"]
+
+
+def test_extract_newspaper_articles_keeps_far_right_continuation_for_wide_headline(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "stub.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4 stub")
+
+    from pdf_translator import newspaper as newspaper_module
+
+    original_page_sizes = newspaper_module._page_sizes
+    try:
+        newspaper_module._page_sizes = lambda _: {1: (2200.0, 3200.0)}
+        structured = {
+            "body": {
+                    "children": [{"$ref": f"#/texts/{index}"} for index in range(7)]
+                },
+                "texts": [
+                    {"label": "section_header", "text": "Wide international lead story", "prov": _prov(1, 50, 2920, 1680, 2800)},
+                    {"label": "text", "text": "Lead deck line.", "prov": _prov(1, 60, 2720, 1200, 2640)},
+                    {"label": "text", "text": "Lead story left column. " * 30, "prov": _prov(1, 60, 2520, 360, 2100)},
+                    {"label": "text", "text": "Lead story middle column. " * 30, "prov": _prov(1, 420, 2520, 720, 2100)},
+                    {"label": "text", "text": "Lead story far right continuation. " * 30, "prov": _prov(1, 1760, 2480, 2060, 2140)},
+                    {"label": "section_header", "text": "Later separate story", "prov": _prov(1, 50, 1880, 1500, 1800)},
+                    {"label": "text", "text": "Later far-right obituary continuation. " * 25, "prov": _prov(1, 1760, 1750, 2060, 1450)},
+                ],
+            }
+        result = extract_newspaper_articles(structured, pdf_path)
+    finally:
+        newspaper_module._page_sizes = original_page_sizes
+
+    article = next(article for article in result["articles"] if article["headline"] == "Wide international lead story")
+    assert "Lead story far right continuation." in article["body_text"]
+    assert "Later separate story" not in article["body_text"]
+    assert "Later far-right obituary continuation." not in article["body_text"]
 
 
 def test_extract_newspaper_articles_extracts_front_matter_and_quality(tmp_path: Path) -> None:
