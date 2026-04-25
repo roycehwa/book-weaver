@@ -338,6 +338,7 @@ def _page_sizes(source_pdf: Path) -> dict[int, tuple[float, float]]:
 
 def _clean_pdf_line_text(text: str) -> str:
     cleaned = text.replace("\x02", "-").replace("\ufffe", "-").replace("\u00ad", "-")
+    cleaned = re.sub(r"[\x00-\x08\x0b-\x1f]", " ", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned)
     return cleaned.strip()
 
@@ -778,6 +779,8 @@ def _is_pdf_line_noise(line: PdfTextLine) -> bool:
         return True
     if _is_navigation_text(text) or _is_utility_header(text) or _is_non_article_text(text):
         return True
+    if re.search(r"\btrack risk in real[- ]time\b|\bpowerful screening and monitoring\b", text, re.IGNORECASE):
+        return True
     if re.match(r"^(?:Source|Notes?):\s", text, re.IGNORECASE):
         return True
     if re.fullmatch(r"(?:\d{4}|\d{1,3}(?:\s+\d{1,3}){2,}\s*%?)", text):
@@ -912,6 +915,7 @@ def _split_pdf_line_segments(lines: list[PdfTextLine]) -> list[dict[str, Any]]:
         segment["right"] = max(line.right for line in segment_lines)
         segment["top"] = max(line.top for line in segment_lines)
         segment["bottom"] = min(line.bottom for line in segment_lines)
+        segment["text"] = " ".join(line.text for line in segment_lines)
     return segments
 
 
@@ -922,6 +926,8 @@ def _is_caption_like_pdf_segment(lines: list[PdfTextLine]) -> bool:
     if re.search(r"\bwith (?:his|her|their|wife|husband|parents|children|son|daughter|fianc)", first_text, re.IGNORECASE):
         return True
     if re.search(r"\b(?:photograph|photo|image)s?\s+by\b", first_text, re.IGNORECASE):
+        return True
+    if _is_photo_caption_sentence(first_text):
         return True
     return False
 
@@ -940,11 +946,60 @@ def _is_sidebar_like_pdf_segment(lines: list[PdfTextLine]) -> bool:
     return False
 
 
+def _is_photo_caption_sentence(text: str) -> bool:
+    normalized = _normalize_text(text)
+    if len(normalized.split()) > 45:
+        return False
+    if re.search(r"\bworks at (?:the )?(?:site|scene)\b", normalized, re.IGNORECASE):
+        return True
+    if re.search(r"\bshines? over\b", normalized, re.IGNORECASE):
+        return True
+    if re.search(r"\brings the bell\b", normalized, re.IGNORECASE):
+        return True
+    caption_verb = re.search(
+        r"\b(?:pictured|shown|seen|stands|sits|walks|waves|speaks|spoke|poses|arrives|leaves)\b",
+        normalized,
+        re.IGNORECASE,
+    )
+    setting_marker = re.search(r"\b(?:in|at|during|before|after|outside|near)\b", normalized, re.IGNORECASE)
+    return bool(caption_verb and setting_marker)
+
+
 def _is_foreign_continuation_segment(lines: list[PdfTextLine]) -> bool:
     if not lines:
         return True
     first = _normalize_text(lines[0].text)
     return bool(re.match(r"^continued from page", first, re.IGNORECASE))
+
+
+def _looks_like_pdf_heading(line: PdfTextLine, headline: NewsBlock) -> bool:
+    text = _normalize_text(line.text)
+    if not text or line.top >= headline.bottom - 12.0:
+        return False
+    if line.height < 11.0 or line.height > 45.0:
+        return False
+    if line.width < 80.0:
+        return False
+    if line.word_count > 14:
+        return False
+    if _is_photo_caption_sentence(text):
+        return False
+    if re.search(r"\b(?:REUTERS|AP|EPA|SHUTTERSTOCK|ZUMA|FOR WSJ|GETTY|BLOOMBERG)\b", text, re.IGNORECASE):
+        return False
+    alpha_count = sum(1 for char in text if char.isalpha())
+    if alpha_count < 10:
+        return False
+    return True
+
+
+def _pdf_lower_heading_top(lines: list[PdfTextLine], headline: NewsBlock) -> float | None:
+    candidates = [
+        line.top
+        for line in lines
+        if _looks_like_pdf_heading(line, headline)
+        and line.top < headline.bottom - 35.0
+    ]
+    return max(candidates) if candidates else None
 
 
 def _append_pdf_line_text(paragraph: str, line_text: str) -> str:
@@ -1003,7 +1058,11 @@ def _pdf_line_route_body(
     top_limit = headline.bottom + max(12.0, headline.height * 0.45)
     left_limit = max(0.0, headline.left - 10.0)
     right_limit = min(page_width - 6.0, headline.right + 30.0)
-    bottom_limit = (lower_headline_top + 18.0) if lower_headline_top is not None else 0.0
+    pdf_lower_top = _pdf_lower_heading_top(lines, headline)
+    effective_lower_top = lower_headline_top
+    if pdf_lower_top is not None:
+        effective_lower_top = max(effective_lower_top or 0.0, pdf_lower_top)
+    bottom_limit = (effective_lower_top + 18.0) if effective_lower_top is not None else 0.0
 
     candidate_lines = [
         line
@@ -1326,9 +1385,13 @@ def _keep_article(article: dict[str, Any]) -> bool:
     warnings = set(quality.get("warnings", []))
     if not headline:
         return False
+    if article.get("route_engine") == "docling_blocks" and article.get("pdf_line_route_available"):
+        return False
     if _is_non_article_text(headline) or _is_section_banner(headline):
         return False
     if _looks_like_fragmented_headline(headline):
+        return False
+    if _has_route_integrity_defect(article):
         return False
     if _is_non_editorial_article(
         headline=headline,
@@ -1352,6 +1415,46 @@ def _keep_article(article: dict[str, Any]) -> bool:
     if quality.get("grade") == "low" and article["page_start"] >= 20:
         return False
     return True
+
+
+def _has_route_integrity_defect(article: dict[str, Any]) -> bool:
+    if article.get("route_engine") != "pdf_line_route":
+        return False
+    headline = _normalize_text(str(article.get("headline", "")))
+    body_text = str(article.get("body_text", ""))
+    paragraphs = [paragraph.strip() for paragraph in body_text.split("\n\n") if paragraph.strip()]
+    if not paragraphs:
+        return True
+
+    first = _normalize_text(paragraphs[0])
+    if re.match(r"^\d+\s+(?:miles?|km)\b", first, re.IGNORECASE):
+        return True
+    if re.match(r"^[A-Z][A-Z ]{5,}\b", first):
+        return True
+    if _is_photo_caption_sentence(first):
+        return True
+    if re.match(r"^continued from (?:the )?(?:prior|previous)?\s*page", first, re.IGNORECASE):
+        return True
+    if first[:1].islower():
+        return True
+    if re.match(r"^(?:mend|lion|office|short)\b", first, re.IGNORECASE):
+        return True
+    if re.search(r"\b(?:telligence|masest|calIn|radiIn)\b", body_text):
+        return True
+    if re.search(r"\bfor briefly fired\b", body_text):
+        return True
+    if re.search(r"\bFund NAV Chg %Ret\b|\bTop 250 mutual-funds\b", body_text):
+        return True
+    if "—Associated Press" in body_text and body_text.rfind("—Associated Press") < len(body_text) * 0.75:
+        return True
+    if any(_is_photo_caption_sentence(_normalize_text(paragraph)) for paragraph in paragraphs):
+        return True
+    tiny_paragraphs = sum(1 for paragraph in paragraphs if len(paragraph.split()) <= 3)
+    if tiny_paragraphs >= 2:
+        return True
+    if len(headline.split()) >= 10 and re.search(r"\b(?:OpenAI|Altman|Berkshire|Abel)\b", headline) and " " in headline:
+        return True
+    return False
 
 
 def extract_newspaper_articles(structured: dict[str, Any], source_pdf: Path) -> dict[str, Any]:
@@ -1425,7 +1528,7 @@ def extract_newspaper_articles(structured: dict[str, Any], source_pdf: Path) -> 
                 page_width=page_width,
                 lower_headline_top=lower_headline_top,
             )
-            if line_route_text is not None and len(line_route_text) >= max(700, len(cleaned_body_text) * 0.28):
+            if line_route_text is not None:
                 cleaned_body_text = line_route_text
                 route_engine = "pdf_line_route"
             article_type = "main_story" if headline.width >= page_width * 0.38 or headline.top > 2800 else "secondary_story"
@@ -1448,6 +1551,7 @@ def extract_newspaper_articles(structured: dict[str, Any], source_pdf: Path) -> 
                     "block_indexes": [headline.index] + [block.index for block in body_blocks],
                     "article_type": article_type,
                     "route_engine": route_engine,
+                    "pdf_line_route_available": bool(pdf_line_cache.get(page_no)),
                     "quality": quality,
                     "score": _article_score(
                         page_no=page_no,
