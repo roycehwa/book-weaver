@@ -12,10 +12,11 @@ from pdf_translator.models import NormalizedDocument
 
 
 DEFAULT_INGEST_TIMEOUT_SECONDS = 240
+DEFAULT_NEWSPAPER_SOFT_PAGE_LIMIT = 30
 
 DEFAULT_WARN_PAGE_COUNT = {
     "auto": 160,
-    "newspaper": 96,
+    "newspaper": DEFAULT_NEWSPAPER_SOFT_PAGE_LIMIT,
     "magazine": 140,
     "book": 320,
 }

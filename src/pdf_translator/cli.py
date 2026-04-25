@@ -5,7 +5,12 @@ import json
 from pathlib import Path
 
 from pdf_translator.config import RunSettings
-from pdf_translator.guardrails import DEFAULT_INGEST_TIMEOUT_SECONDS, IngestGuardrailError, ingest_pdf_guarded
+from pdf_translator.guardrails import (
+    DEFAULT_INGEST_TIMEOUT_SECONDS,
+    DEFAULT_NEWSPAPER_SOFT_PAGE_LIMIT,
+    IngestGuardrailError,
+    ingest_pdf_guarded,
+)
 from pdf_translator.ingest import ingest_pdf
 from pdf_translator.newspaper_html import write_articles_html_bundle
 from pdf_translator.newspaper import write_newspaper_articles, write_newspaper_reading_markdown
@@ -190,8 +195,11 @@ def build_parser() -> argparse.ArgumentParser:
     articles_html_parser.add_argument(
         "--soft-page-limit",
         type=int,
-        default=150,
-        help="Soft gate page cap: only the first N pages are ingested (default: 150).",
+        default=DEFAULT_NEWSPAPER_SOFT_PAGE_LIMIT,
+        help=(
+            "Soft gate page cap: only the first N newspaper pages are ingested "
+            f"(default: {DEFAULT_NEWSPAPER_SOFT_PAGE_LIMIT})."
+        ),
     )
     articles_html_parser.add_argument(
         "--strict-input-gate",
@@ -521,6 +529,8 @@ def main() -> None:
                 timeout_seconds=args.ingest_timeout_seconds,
                 max_file_size_mb=args.max_file_size_mb,
                 max_page_count=args.max_page_count,
+                soft_input_gate=True,
+                soft_page_limit=DEFAULT_NEWSPAPER_SOFT_PAGE_LIMIT,
             )
             output_dir = args.output_dir.expanduser().resolve() / source_pdf.stem
             output_dir.mkdir(parents=True, exist_ok=True)

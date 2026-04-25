@@ -7,6 +7,7 @@ from typing import Any
 
 from pdf_translator.guardrails import (
     DEFAULT_INGEST_TIMEOUT_SECONDS,
+    DEFAULT_NEWSPAPER_SOFT_PAGE_LIMIT,
     IngestGuardrailError,
     ingest_pdf_guarded,
 )
@@ -163,6 +164,8 @@ def _run_articles_case(
         timeout_seconds=timeout_seconds,
         max_file_size_mb=max_file_size_mb,
         max_page_count=max_page_count,
+        soft_input_gate=True,
+        soft_page_limit=DEFAULT_NEWSPAPER_SOFT_PAGE_LIMIT,
     )
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
     result = write_newspaper_articles(normalized.structured, source_pdf, artifact_path)
