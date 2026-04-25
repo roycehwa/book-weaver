@@ -159,6 +159,32 @@ class NewsBlock:
         return self.width * self.height
 
 
+@dataclass(slots=True)
+class PdfTextLine:
+    index: int
+    text: str
+    left: float
+    top: float
+    right: float
+    bottom: float
+
+    @property
+    def width(self) -> float:
+        return max(0.0, self.right - self.left)
+
+    @property
+    def height(self) -> float:
+        return max(0.0, self.top - self.bottom)
+
+    @property
+    def center_x(self) -> float:
+        return self.left + self.width / 2
+
+    @property
+    def word_count(self) -> int:
+        return len(self.text.split())
+
+
 def _resolve_ref(structured: dict[str, Any], ref: str) -> tuple[str, dict[str, Any]] | None:
     if not ref.startswith("#/"):
         return None
@@ -308,6 +334,93 @@ def _page_sizes(source_pdf: Path) -> dict[int, tuple[float, float]]:
     for index in range(len(document)):
         sizes[index + 1] = document[index].get_size()
     return sizes
+
+
+def _clean_pdf_line_text(text: str) -> str:
+    cleaned = text.replace("\x02", "-").replace("\ufffe", "-").replace("\u00ad", "-")
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned.strip()
+
+
+def _extract_pdf_text_lines(source_pdf: Path, page_no: int) -> list[PdfTextLine]:
+    import pypdfium2 as pdfium
+
+    try:
+        document = pdfium.PdfDocument(str(source_pdf))
+        page = document[page_no - 1]
+        text_page = page.get_textpage()
+        char_count = text_page.count_chars()
+        rect_count = text_page.count_rects(0, char_count)
+    except Exception:
+        return []
+
+    rects: list[dict[str, float]] = []
+    for rect_index in range(rect_count):
+        try:
+            left, bottom, right, top = text_page.get_rect(rect_index)
+            text = _clean_pdf_line_text(text_page.get_text_bounded(left, bottom, right, top))
+        except Exception:
+            continue
+        if not text:
+            continue
+        if right - left <= 1.0 or top - bottom <= 1.0:
+            continue
+        rects.append({"left": left, "bottom": bottom, "right": right, "top": top})
+
+    # Pdfium exposes text rectangles that are usually line fragments. Merge only
+    # fragments that are almost touching; adjacent newspaper columns can be just
+    # a few points apart, so wider merging corrupts reading order.
+    groups: list[dict[str, float]] = []
+    for rect in sorted(rects, key=lambda item: (-item["top"], item["left"])):
+        chosen: dict[str, float] | None = None
+        rect_center_y = (rect["top"] + rect["bottom"]) / 2
+        rect_height = rect["top"] - rect["bottom"]
+        for group in groups:
+            group_center_y = (group["top"] + group["bottom"]) / 2
+            group_height = group["top"] - group["bottom"]
+            if abs(rect_center_y - group_center_y) > max(3.8, min(rect_height, group_height) * 0.9):
+                continue
+            horizontal_gap = max(rect["left"] - group["right"], group["left"] - rect["right"])
+            if horizontal_gap > 5.0:
+                continue
+            chosen = group
+            break
+
+        if chosen is None:
+            groups.append(dict(rect))
+        else:
+            chosen["left"] = min(chosen["left"], rect["left"])
+            chosen["bottom"] = min(chosen["bottom"], rect["bottom"])
+            chosen["right"] = max(chosen["right"], rect["right"])
+            chosen["top"] = max(chosen["top"], rect["top"])
+
+    lines: list[PdfTextLine] = []
+    for group in groups:
+        try:
+            text = _clean_pdf_line_text(
+                text_page.get_text_bounded(
+                    group["left"] - 0.5,
+                    group["bottom"] - 0.5,
+                    group["right"] + 0.5,
+                    group["top"] + 0.5,
+                )
+            )
+        except Exception:
+            continue
+        if not text:
+            continue
+        lines.append(
+            PdfTextLine(
+                index=len(lines),
+                text=text,
+                left=group["left"],
+                top=group["top"],
+                right=group["right"],
+                bottom=group["bottom"],
+            )
+        )
+
+    return sorted(lines, key=lambda line: (-line.top, line.left))
 
 
 def _is_headline(block: NewsBlock) -> bool:
@@ -659,6 +772,281 @@ def _trim_fragment_edges(blocks: list[NewsBlock]) -> list[NewsBlock]:
     return trimmed
 
 
+def _is_pdf_line_noise(line: PdfTextLine) -> bool:
+    text = _normalize_text(line.text)
+    if not text:
+        return True
+    if _is_navigation_text(text) or _is_utility_header(text) or _is_non_article_text(text):
+        return True
+    if re.match(r"^(?:Source|Notes?):\s", text, re.IGNORECASE):
+        return True
+    if re.fullmatch(r"(?:\d{4}|\d{1,3}(?:\s+\d{1,3}){2,}\s*%?)", text):
+        return True
+    if re.fullmatch(r"(?:Low|Middle|High)(?:\s+income)?", text, re.IGNORECASE):
+        return True
+    if re.search(r"\b(?:percentage of shoppers|income group shopping|discount retailers)\b", text, re.IGNORECASE):
+        return True
+    if re.match(r"^continued from page", text, re.IGNORECASE):
+        return True
+    if re.fullmatch(r"[*•| ]{3,}", text):
+        return True
+    if line.height > 20.0 and line.word_count >= 8:
+        return True
+    return False
+
+
+def _is_pdf_byline_fragment(line: PdfTextLine, headline: NewsBlock) -> bool:
+    text = _normalize_text(line.text)
+    if line.top < headline.bottom - 90:
+        return False
+    if text.upper() == "BY":
+        return True
+    if text.upper().startswith("BY ") and len(text) <= 80:
+        return True
+    if len(text.split()) <= 4 and _uppercase_ratio(text) >= 0.85:
+        return True
+    return False
+
+
+def _group_pdf_lines_into_columns(lines: list[PdfTextLine]) -> list[dict[str, Any]]:
+    columns: list[dict[str, Any]] = []
+    for line in sorted(lines, key=lambda item: item.left):
+        if len(line.text) < 2:
+            continue
+        chosen: dict[str, Any] | None = None
+        best_gap: float | None = None
+        for column in columns:
+            overlap = _horizontal_overlap_ratio(column["left"], column["right"], line.left, line.right)
+            left_gap = abs(line.left - column["left"])
+            if overlap < 0.25 and left_gap >= 22.0:
+                continue
+            if best_gap is None or left_gap < best_gap:
+                chosen = column
+                best_gap = left_gap
+        if chosen is None:
+            chosen = {"lines": [], "left": line.left, "right": line.right}
+            columns.append(chosen)
+        chosen["lines"].append(line)
+        left_values = sorted(item.left for item in chosen["lines"])
+        right_values = sorted(item.right for item in chosen["lines"])
+        middle = len(left_values) // 2
+        chosen["left"] = left_values[middle]
+        chosen["right"] = right_values[middle]
+    return sorted(columns, key=lambda item: item["left"])
+
+
+def _trim_pdf_column_lines(
+    column_lines: list[PdfTextLine],
+    *,
+    headline: NewsBlock,
+) -> list[PdfTextLine]:
+    ordered = sorted(column_lines, key=lambda line: -line.top)
+    cleaned: list[PdfTextLine] = []
+    previous: PdfTextLine | None = None
+    for line in ordered:
+        if _is_pdf_line_noise(line) or _is_pdf_byline_fragment(line, headline):
+            continue
+        if previous is not None:
+            gap = previous.bottom - line.top
+            if gap > 70.0:
+                break
+        cleaned.append(line)
+        previous = line
+    return cleaned
+
+
+def _column_text_profile(lines: list[PdfTextLine]) -> dict[str, Any]:
+    text = " ".join(line.text for line in lines)
+    tokens = re.findall(r"\S+", text)
+    digit_tokens = sum(1 for token in tokens if any(char.isdigit() for char in token))
+    short_lines = sum(1 for line in lines if line.word_count <= 2)
+    return {
+        "text": text,
+        "word_count": len(tokens),
+        "digit_ratio": digit_tokens / len(tokens) if tokens else 0.0,
+        "short_ratio": short_lines / len(lines) if lines else 0.0,
+        "first_lines": [line.text for line in lines[:5]],
+    }
+
+
+def _is_chart_like_pdf_column(lines: list[PdfTextLine]) -> bool:
+    profile = _column_text_profile(lines)
+    first_text = " ".join(profile["first_lines"]).lower()
+    if "percentage of" in first_text or "source:" in profile["text"].lower():
+        return True
+    if profile["digit_ratio"] >= 0.22 and profile["short_ratio"] >= 0.32:
+        return True
+    return False
+
+
+def _is_caption_like_pdf_column(lines: list[PdfTextLine]) -> bool:
+    first_lines = [line.text for line in lines[:4]]
+    if len(first_lines) < 2:
+        return False
+    first_text = " ".join(first_lines)
+    if re.search(r"\b(?:pictured|above|below|left|right|from above)\b", first_text, re.IGNORECASE):
+        return True
+    if re.search(r"\bwith (?:his|her|their|wife|husband|parents|children|son|daughter|fianc)", first_text, re.IGNORECASE):
+        return True
+    return False
+
+
+def _split_pdf_line_segments(lines: list[PdfTextLine]) -> list[dict[str, Any]]:
+    segments: list[dict[str, Any]] = []
+    current: list[PdfTextLine] = []
+    previous: PdfTextLine | None = None
+    for line in sorted(lines, key=lambda item: -item.top):
+        if previous is not None:
+            gap = previous.bottom - line.top
+            if gap > 18.0 and current:
+                segments.append({"lines": current})
+                current = []
+        current.append(line)
+        previous = line
+    if current:
+        segments.append({"lines": current})
+
+    for segment in segments:
+        segment_lines = segment["lines"]
+        segment["left"] = min(line.left for line in segment_lines)
+        segment["right"] = max(line.right for line in segment_lines)
+        segment["top"] = max(line.top for line in segment_lines)
+        segment["bottom"] = min(line.bottom for line in segment_lines)
+    return segments
+
+
+def _is_caption_like_pdf_segment(lines: list[PdfTextLine]) -> bool:
+    first_text = " ".join(line.text for line in lines[:4])
+    if re.search(r"\b(?:pictured|above|below|left|right|from above)\b", first_text, re.IGNORECASE):
+        return True
+    if re.search(r"\bwith (?:his|her|their|wife|husband|parents|children|son|daughter|fianc)", first_text, re.IGNORECASE):
+        return True
+    if re.search(r"\b(?:photograph|photo|image)s?\s+by\b", first_text, re.IGNORECASE):
+        return True
+    return False
+
+
+def _is_sidebar_like_pdf_segment(lines: list[PdfTextLine]) -> bool:
+    if not lines:
+        return False
+    first = _normalize_text(lines[0].text)
+    if len(first.split()) <= 8 and not _is_closed_paragraph(first) and _uppercase_ratio(first) >= 0.18:
+        return True
+    if re.match(r"^[A-Z][A-Za-z&. ]{2,35}, which\b", first):
+        return True
+    profile = _column_text_profile(lines)
+    if profile["digit_ratio"] >= 0.16 and profile["short_ratio"] >= 0.22:
+        return True
+    return False
+
+
+def _is_foreign_continuation_segment(lines: list[PdfTextLine]) -> bool:
+    if not lines:
+        return True
+    first = _normalize_text(lines[0].text)
+    return bool(re.match(r"^continued from page", first, re.IGNORECASE))
+
+
+def _append_pdf_line_text(paragraph: str, line_text: str) -> str:
+    text = _normalize_text(line_text)
+    for pattern in PHOTO_CREDIT_PATTERNS:
+        text = pattern.sub(" ", text)
+    text = re.sub(r"\s+", " ", text).strip(" :|")
+    if not paragraph:
+        return text
+    if paragraph.endswith("-"):
+        if len(paragraph) >= 2 and paragraph[-2].isdigit():
+            return paragraph + text
+        return paragraph[:-1] + text
+    return f"{paragraph} {text}"
+
+
+def _join_pdf_line_columns(columns: list[dict[str, Any]]) -> str:
+    paragraphs: list[str] = []
+    current = ""
+    for column_index, column in enumerate(columns):
+        column_lines = sorted(column["lines"], key=lambda line: -line.top)
+        previous_line: PdfTextLine | None = None
+        column_left = float(column["left"])
+        for line in column_lines:
+            starts_new_paragraph = False
+            if previous_line is not None:
+                vertical_gap = previous_line.bottom - line.top
+                if vertical_gap > 13.0:
+                    starts_new_paragraph = True
+                elif line.left > column_left + 6.0 and _is_closed_paragraph(current):
+                    starts_new_paragraph = True
+            elif column_index > 0 and current and _is_closed_paragraph(current):
+                starts_new_paragraph = True
+
+            if starts_new_paragraph and current:
+                paragraphs.append(current.strip())
+                current = ""
+            current = _append_pdf_line_text(current, line.text)
+            previous_line = line
+
+    if current:
+        paragraphs.append(current.strip())
+    return "\n\n".join(paragraph for paragraph in paragraphs if paragraph)
+
+
+def _pdf_line_route_body(
+    *,
+    lines: list[PdfTextLine],
+    headline: NewsBlock,
+    page_width: float,
+    lower_headline_top: float | None,
+) -> str | None:
+    if not lines:
+        return None
+
+    top_limit = headline.bottom + max(12.0, headline.height * 0.45)
+    left_limit = max(0.0, headline.left - 10.0)
+    right_limit = min(page_width - 6.0, headline.right + 30.0)
+    bottom_limit = (lower_headline_top + 18.0) if lower_headline_top is not None else 0.0
+
+    candidate_lines = [
+        line
+        for line in lines
+        if line.top < top_limit
+        and line.top > bottom_limit
+        and line.left >= left_limit
+        and line.left <= right_limit
+    ]
+    if len(candidate_lines) < 8:
+        return None
+
+    main_columns: list[dict[str, Any]] = []
+    for column in _group_pdf_lines_into_columns(candidate_lines):
+        cleaned_lines = _trim_pdf_column_lines(column["lines"], headline=headline)
+        if len(cleaned_lines) < 4:
+            continue
+        for segment in _split_pdf_line_segments(cleaned_lines):
+            segment_lines = segment["lines"]
+            if len(segment_lines) < 3:
+                continue
+            profile = _column_text_profile(segment_lines)
+            if profile["word_count"] < 35:
+                continue
+            if (
+                _is_chart_like_pdf_column(segment_lines)
+                or _is_caption_like_pdf_column(segment_lines)
+                or _is_caption_like_pdf_segment(segment_lines)
+                or _is_sidebar_like_pdf_segment(segment_lines)
+                or _is_foreign_continuation_segment(segment_lines)
+            ):
+                continue
+            main_columns.append(segment)
+
+    if not main_columns:
+        return None
+
+    body_text = _join_pdf_line_columns(main_columns)
+    if len(body_text) < 700:
+        return None
+    return body_text
+
+
 def _article_quality(
     *,
     headline: str,
@@ -973,6 +1361,7 @@ def extract_newspaper_articles(structured: dict[str, Any], source_pdf: Path) -> 
     articles: list[dict[str, Any]] = []
     skipped_pages: list[dict[str, Any]] = []
     processed_page_count = 0
+    pdf_line_cache: dict[int, list[PdfTextLine]] = {}
 
     for page_no in range(1, total_pages + 1):
         page_width = page_sizes[page_no][0]
@@ -1005,6 +1394,12 @@ def extract_newspaper_articles(structured: dict[str, Any], source_pdf: Path) -> 
         )
 
         for headline in headlines:
+            lower_headline_tops = [
+                other.top
+                for other in headlines
+                if other.index != headline.index and other.top < headline.top - 5.0
+            ]
+            lower_headline_top = max(lower_headline_tops) if lower_headline_tops else None
             top_ordered_blocks = sorted(
                 assignments.get(headline.index, []),
                 key=lambda block: (-block.top, block.left),
@@ -1021,7 +1416,18 @@ def extract_newspaper_articles(structured: dict[str, Any], source_pdf: Path) -> 
             cleaned_headline = _sanitize_inline_credits(headline.text)
             cleaned_deck = _sanitize_inline_credits(deck) if deck else None
             cleaned_body_text = "\n\n".join(_sanitize_inline_credits(block.text) for block in body_blocks if not _is_utility_header(block.text))
-            body_chars = len(body_text)
+            route_engine = "docling_blocks"
+            if page_no not in pdf_line_cache:
+                pdf_line_cache[page_no] = _extract_pdf_text_lines(source_pdf, page_no)
+            line_route_text = _pdf_line_route_body(
+                lines=pdf_line_cache[page_no],
+                headline=headline,
+                page_width=page_width,
+                lower_headline_top=lower_headline_top,
+            )
+            if line_route_text is not None and len(line_route_text) >= max(700, len(cleaned_body_text) * 0.28):
+                cleaned_body_text = line_route_text
+                route_engine = "pdf_line_route"
             article_type = "main_story" if headline.width >= page_width * 0.38 or headline.top > 2800 else "secondary_story"
             quality = _article_quality(
                 headline=cleaned_headline,
@@ -1041,6 +1447,7 @@ def extract_newspaper_articles(structured: dict[str, Any], source_pdf: Path) -> 
                     "body_chars": len(cleaned_body_text),
                     "block_indexes": [headline.index] + [block.index for block in body_blocks],
                     "article_type": article_type,
+                    "route_engine": route_engine,
                     "quality": quality,
                     "score": _article_score(
                         page_no=page_no,
