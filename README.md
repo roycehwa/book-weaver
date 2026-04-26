@@ -58,17 +58,11 @@ Outputs are written to `./runs/<pdf-stem>/` by default:
 
 `normalized.md` is the raw Docling export. `reconstructed.md` is the layout-aware reading edition used for translation.
 
-Use `pdf-translator profile /path/to/file.pdf --profile auto` to classify pages into `accept`, `assist`, `skip_content`, and `reject_structure`. The built-in profiles are `magazine`, `book`, and `newspaper`.
+Use `pdf-translator profile /path/to/file.pdf --profile auto` to classify pages into `accept`, `assist`, `skip_content`, and `reject_structure`. The built-in profiles are `magazine` and `book`.
 
-Use `pdf-translator articles /path/to/newspaper.pdf` to extract and rank article candidates for newspaper-style PDFs. The command writes `articles.json`, includes article-level `deck/byline/dateline/quality`, and prints a quality summary to support a "translate the most important half" workflow.
+The newspaper article extraction branch has been removed from the public CLI because the reading-order quality was not reliable enough for production use. Newspaper-specific code may still exist internally for reference, but it is not a supported product path.
 
-The `articles` command now also writes `articles.md`, a readable edition for direct review. By default it includes the selected top-half articles; use `--reading-all` to include every ranked candidate.
-
-Use `pdf-translator reading /path/to/articles.json` to regenerate a readable `articles.md` from an existing JSON artifact without rerunning ingest.
-
-Use `pdf-translator reading-rebuild /path/to/articles.json` to generate a continuity-focused `articles.rebuilt.md` (plus `articles.rebuilt.json`) from existing extraction output. This post-processes article bodies and trims obvious break fragments without rerunning ingest.
-
-Use `pdf-translator validate /path/to/manifest.json` to run a reusable batch regression suite. Each manifest case must include `source_pdf` and `mode`, where `mode` is `profile` or `articles`. Profile cases can also set `profile`; article cases can set `selected_pass_min_pct`.
+Use `pdf-translator validate /path/to/manifest.json` to run a reusable batch regression suite. Each manifest case must include `source_pdf` and `mode`, where `mode` is usually `profile`.
 
 ## Guardrails
 
@@ -80,7 +74,6 @@ Every command that recomputes ingest now runs a preflight check before Docling s
 
 The defaults are profile-aware:
 
-- `newspaper`: warn above `96` pages or `35MB`; reject above `160` pages or `80MB`
 - `magazine`: warn above `140` pages or `50MB`; reject above `220` pages or `100MB`
 - `book`: warn above `320` pages or `60MB`; reject above `600` pages or `120MB`
 - `auto`: warn above `160` pages or `40MB`; reject above `320` pages or `80MB`

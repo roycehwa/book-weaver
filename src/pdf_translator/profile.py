@@ -171,7 +171,7 @@ def _infer_profile_name(page_profiles: list[dict[str, Any]]) -> str:
         return "book"
 
     if median_columns >= 3 or (median_columns >= 2 and high_fragment_pages / len(text_pages) > 0.35 and avg_picture_ratio < 0.2):
-        return "newspaper"
+        return "magazine"
 
     return "magazine"
 
