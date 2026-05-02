@@ -10,7 +10,7 @@ from reportlab.lib.styles import ParagraphStyle, StyleSheet1, getSampleStyleShee
 from reportlab.lib.units import mm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
-from reportlab.platypus import ListFlowable, ListItem, Paragraph, Preformatted, SimpleDocTemplate, Spacer, Table, TableStyle
+from reportlab.platypus import Image, ListFlowable, ListItem, Paragraph, Preformatted, SimpleDocTemplate, Spacer, Table, TableStyle
 
 
 BASE_FONT = "STSong-Light"
@@ -144,6 +144,25 @@ def _list_from_tag(node: Tag, styles: StyleSheet1) -> ListFlowable:
     return ListFlowable(items, bulletType=bullet_type, start="1", leftIndent=18)
 
 
+def _image_flowable(src: str, max_width_mm: float = 150.0) -> list:
+    path = Path(src.strip("<>"))
+    if not path.is_file():
+        return []
+    try:
+        img = Image(str(path))
+        max_width = max_width_mm * mm
+        if img.imageWidth > max_width:
+            scale = max_width / img.imageWidth
+            img.drawWidth = max_width
+            img.drawHeight = img.imageHeight * scale
+        else:
+            img.drawWidth = img.imageWidth
+            img.drawHeight = img.imageHeight
+        return [img, Spacer(1, 4)]
+    except Exception:
+        return []
+
+
 def _story_from_html(title: str, html: str) -> list:
     styles = _build_styles()
     soup = BeautifulSoup(html, "html.parser")
@@ -170,7 +189,19 @@ def _story_from_html(title: str, html: str) -> list:
         elif node.name in {"h4", "h5", "h6"}:
             story.append(_paragraph_from_tag(node, styles["Heading4"]))
         elif node.name == "p":
-            story.append(_paragraph_from_tag(node, styles["BodyText"]))
+            # A <p> may contain an <img> child (markdown renders ![](path) as <p><img></p>)
+            img_tag = node.find("img")
+            if img_tag and isinstance(img_tag, Tag):
+                src = img_tag.attrs.get("src", "")
+                flowables = _image_flowable(src)
+                if flowables:
+                    story.extend(flowables)
+                    alt = img_tag.attrs.get("alt", "")
+                    if alt:
+                        story.append(Paragraph(f"<i>{alt}</i>", styles["BlockQuote"]))
+                # missing image: skip silently (file not found is not an error worth surfacing)
+            else:
+                story.append(_paragraph_from_tag(node, styles["BodyText"]))
         elif node.name == "blockquote":
             story.append(_paragraph_from_tag(node, styles["BlockQuote"]))
         elif node.name == "pre":
@@ -182,8 +213,13 @@ def _story_from_html(title: str, html: str) -> list:
         elif node.name == "hr":
             story.append(Spacer(1, 8))
         elif node.name == "img":
-            alt = node.attrs.get("alt", "image")
-            story.append(Paragraph(f"[Image] {alt}", styles["BlockQuote"]))
+            src = node.attrs.get("src", "")
+            flowables = _image_flowable(src)
+            if flowables:
+                story.extend(flowables)
+            else:
+                alt = node.attrs.get("alt", "image")
+                story.append(Paragraph(f"[Image] {alt}", styles["BlockQuote"]))
         else:
             text = node.get_text(" ", strip=True)
             if text:
@@ -194,7 +230,12 @@ def _story_from_html(title: str, html: str) -> list:
     return story
 
 
-def render_pdf_from_markdown(title: str, markdown_text: str, output_path: Path) -> None:
+def render_pdf_from_markdown(
+    title: str,
+    markdown_text: str,
+    output_path: Path,
+    images_dir: Path | None = None,
+) -> None:
     html = markdown_to_html(markdown_text)
     story = _story_from_html(title=title, html=html)
     output_path.parent.mkdir(parents=True, exist_ok=True)

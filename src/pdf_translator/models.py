@@ -12,6 +12,7 @@ class NormalizedDocument:
     reconstructed_markdown: str
     structured: dict[str, Any]
     detected_language: str | None = None
+    images_dir: Path | None = None
 
 
 @dataclass(slots=True)

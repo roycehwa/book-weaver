@@ -38,6 +38,7 @@ def run_translation_pipeline(settings: RunSettings) -> PipelineArtifacts:
         timeout_seconds=settings.ingest_timeout_seconds,
         max_file_size_mb=settings.max_file_size_mb,
         max_page_count=settings.max_page_count,
+        output_dir=output_dir,
     )
     if settings.source_language is None:
         settings.source_language = normalized.detected_language
@@ -64,6 +65,7 @@ def run_translation_pipeline(settings: RunSettings) -> PipelineArtifacts:
         title=f"{settings.source_pdf.stem} ({translated.target_language})",
         markdown_text=translated.translated_markdown,
         output_path=artifacts.translated_pdf_path,
+        images_dir=normalized.images_dir,
     )
 
     manifest = {
@@ -80,6 +82,7 @@ def run_translation_pipeline(settings: RunSettings) -> PipelineArtifacts:
             "reconstructed_markdown": str(artifacts.reconstructed_markdown_path),
             "translated_markdown": str(artifacts.translated_markdown_path),
             "translated_pdf": str(artifacts.translated_pdf_path),
+            "images_dir": str(normalized.images_dir) if normalized.images_dir else None,
         },
     }
     artifacts.manifest_path.write_text(

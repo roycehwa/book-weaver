@@ -205,9 +205,10 @@ def _enforce_text_layer(normalized: NormalizedDocument, preflight: PdfPreflight)
     )
 
 
-def _ingest_worker(source_pdf: str, queue: mp.Queue) -> None:
+def _ingest_worker(source_pdf: str, output_dir_str: str | None, profile: str, queue: mp.Queue) -> None:
     try:
-        normalized = ingest_pdf(Path(source_pdf))
+        output_dir = Path(output_dir_str) if output_dir_str else None
+        normalized = ingest_pdf(Path(source_pdf), output_dir=output_dir, profile=profile)
         with tempfile.NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
@@ -222,6 +223,7 @@ def _ingest_worker(source_pdf: str, queue: mp.Queue) -> None:
                     "reconstructed_markdown": normalized.reconstructed_markdown,
                     "structured": normalized.structured,
                     "detected_language": normalized.detected_language,
+                    "images_dir": str(normalized.images_dir) if normalized.images_dir else None,
                 },
                 handle,
                 ensure_ascii=False,
@@ -287,6 +289,7 @@ def ingest_pdf_guarded(
     max_page_count: int | None = None,
     soft_input_gate: bool = False,
     soft_page_limit: int | None = None,
+    output_dir: Path | None = None,
 ) -> tuple[NormalizedDocument, PdfPreflight]:
     preflight = inspect_pdf_preflight(
         source_pdf,
@@ -318,7 +321,7 @@ def ingest_pdf_guarded(
 
     if timeout_seconds is None or timeout_seconds <= 0:
         try:
-            normalized = ingest_pdf(ingest_source)
+            normalized = ingest_pdf(ingest_source, output_dir=output_dir, profile=profile_name)
             normalized.source_pdf = source_pdf
             _enforce_text_layer(normalized, preflight)
             return normalized, preflight
@@ -328,7 +331,10 @@ def ingest_pdf_guarded(
 
     context = mp.get_context("spawn")
     queue: mp.Queue = context.Queue(maxsize=1)
-    process = context.Process(target=_ingest_worker, args=(str(ingest_source), queue))
+    process = context.Process(
+        target=_ingest_worker,
+        args=(str(ingest_source), str(output_dir) if output_dir else None, profile_name, queue),
+    )
     process.start()
     process.join(timeout_seconds)
 
@@ -366,12 +372,14 @@ def ingest_pdf_guarded(
     result_path = Path(payload["result_path"])
     payload_data = json.loads(result_path.read_text(encoding="utf-8"))
     result_path.unlink(missing_ok=True)
+    images_dir_str = payload_data.get("images_dir")
     normalized = NormalizedDocument(
         source_pdf=Path(payload_data["source_pdf"]),
         raw_markdown=payload_data["raw_markdown"],
         reconstructed_markdown=payload_data["reconstructed_markdown"],
         structured=payload_data["structured"],
         detected_language=payload_data["detected_language"],
+        images_dir=Path(images_dir_str) if images_dir_str else None,
     )
     normalized.source_pdf = source_pdf
     _enforce_text_layer(normalized, preflight)

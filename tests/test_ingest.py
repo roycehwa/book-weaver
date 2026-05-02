@@ -21,6 +21,15 @@ def test_build_pdf_converter_uses_fast_native_pdf_settings() -> None:
     assert pdf_option.pipeline_options.force_backend_text is True
 
 
+def test_build_pdf_converter_book_enables_table_structure_and_images() -> None:
+    converter = build_pdf_converter(enable_table_structure=True, generate_picture_images=True)
+    pdf_option = converter.format_to_options[InputFormat.PDF]
+
+    assert pdf_option.pipeline_options.do_table_structure is True
+    assert pdf_option.pipeline_options.generate_picture_images is True
+    assert pdf_option.pipeline_options.images_scale == 2.0
+
+
 def test_enforce_text_layer_rejects_scan_like_document() -> None:
     source_pdf = Path(__file__)
     normalized = NormalizedDocument(
@@ -65,7 +74,7 @@ def test_ingest_pdf_guarded_soft_page_limit_accepts_over_limit_pdf(monkeypatch: 
 
     captured_source: dict[str, Path] = {}
 
-    def fake_ingest(path: Path) -> NormalizedDocument:
+    def fake_ingest(path: Path, *, output_dir: Path | None = None, profile: str = "auto") -> NormalizedDocument:
         captured_source["path"] = path
         return NormalizedDocument(
             source_pdf=path,
@@ -97,7 +106,7 @@ def test_ingest_pdf_guarded_strict_gate_still_rejects(monkeypatch: pytest.Monkey
     source_pdf = tmp_path / "sample.pdf"
     _make_test_pdf(source_pdf, page_count=4)
 
-    def fake_ingest(path: Path) -> NormalizedDocument:
+    def fake_ingest(path: Path, *, output_dir: Path | None = None, profile: str = "auto") -> NormalizedDocument:
         return NormalizedDocument(
             source_pdf=path,
             raw_markdown="Narrative text.\n\n" * 20,
