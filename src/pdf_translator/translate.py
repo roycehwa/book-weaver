@@ -43,8 +43,7 @@ class MockTranslator(BaseTranslator):
         source_language: str | None,
         target_language: str,
     ) -> str:
-        header = f"<!-- mock translation chunk={chunk.index} target={target_language} -->"
-        return f"{header}\n{chunk.markdown}"
+        return chunk.markdown
 
 
 class OpenAITranslator(BaseTranslator):

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import html as html_lib
+import re
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
-from bs4 import BeautifulSoup, NavigableString, Tag
+from bs4 import BeautifulSoup, Comment, NavigableString, Tag
 from markdown import markdown
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
@@ -10,11 +13,30 @@ from reportlab.lib.styles import ParagraphStyle, StyleSheet1, getSampleStyleShee
 from reportlab.lib.units import mm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
-from reportlab.platypus import Image, ListFlowable, ListItem, Paragraph, Preformatted, SimpleDocTemplate, Spacer, Table, TableStyle
+from reportlab.platypus import (
+    BaseDocTemplate,
+    Flowable,
+    Frame,
+    Image,
+    KeepTogether,
+    ListFlowable,
+    ListItem,
+    PageBreak,
+    PageTemplate,
+    Paragraph,
+    Preformatted,
+    Spacer,
+    Table,
+    TableStyle,
+)
 
 
 BASE_FONT = "STSong-Light"
 CODE_FONT = "Courier"
+PAGE_MARGIN = 18 * mm
+FOOTNOTE_AREA_HEIGHT = 34 * mm
+CONTENT_WIDTH = A4[0] - 2 * PAGE_MARGIN
+CONTENT_HEIGHT = A4[1] - 2 * PAGE_MARGIN - FOOTNOTE_AREA_HEIGHT
 
 
 def _register_fonts() -> None:
@@ -77,6 +99,33 @@ def _build_styles() -> StyleSheet1:
             spaceAfter=8,
         )
     )
+    styles.add(
+        ParagraphStyle(
+            name="Caption",
+            parent=styles["BodyText"],
+            fontName=BASE_FONT,
+            fontSize=8.5,
+            leading=11,
+            textColor=colors.HexColor("#6b7280"),
+            alignment=1,
+            spaceBefore=2,
+            spaceAfter=8,
+        )
+    )
+    styles.add(
+        ParagraphStyle(
+            name="Footnote",
+            parent=styles["BodyText"],
+            fontName=BASE_FONT,
+            fontSize=8.5,
+            leading=12,
+            leftIndent=18,
+            rightIndent=8,
+            textColor=colors.HexColor("#4b5563"),
+            spaceBefore=2,
+            spaceAfter=6,
+        )
+    )
     return styles
 
 
@@ -96,28 +145,78 @@ def _paragraph_from_tag(node: Tag, style: ParagraphStyle) -> Paragraph:
     return Paragraph(content, style)
 
 
+def _plain_cell_text(cell: Tag) -> str:
+    return cell.get_text(" ", strip=True)
+
+
+def _estimate_column_widths(rows_text: list[list[str]], total_width: float) -> list[float]:
+    if not rows_text:
+        return [total_width]
+
+    max_columns = max(len(row) for row in rows_text)
+    weights: list[float] = []
+    for column_index in range(max_columns):
+        values = [row[column_index] for row in rows_text if column_index < len(row)]
+        longest_word = max((len(word) for value in values for word in value.split()), default=1)
+        average_len = sum(len(value) for value in values) / max(len(values), 1)
+        weights.append(max(1.0, min(28.0, longest_word * 1.2 + average_len * 0.35)))
+
+    min_width = 18 * mm if max_columns <= 5 else 12 * mm
+    raw_widths = [weight / sum(weights) * total_width for weight in weights]
+    widths = [max(min_width, width) for width in raw_widths]
+
+    if sum(widths) > total_width:
+        scale = total_width / sum(widths)
+        widths = [width * scale for width in widths]
+    return widths
+
+
 def _table_from_tag(node: Tag, styles: StyleSheet1) -> Table:
+    column_count = max((len(row.find_all(["th", "td"])) for row in node.find_all("tr")), default=1)
+    font_size = 8.5 if column_count > 4 else 10.0
+    leading = font_size + 3
+    body_style = ParagraphStyle(
+        "TableCell",
+        parent=styles["BodyText"],
+        fontName=BASE_FONT,
+        fontSize=font_size,
+        leading=leading,
+        wordWrap="CJK",
+    )
+    header_style = ParagraphStyle(
+        "TableHeader",
+        parent=body_style,
+        fontName=BASE_FONT,
+        fontSize=font_size,
+        leading=leading,
+    )
     rows: list[list[Paragraph]] = []
+    rows_text: list[list[str]] = []
     for row in node.find_all("tr"):
         cells: list[Paragraph] = []
+        text_cells: list[str] = []
         for cell in row.find_all(["th", "td"]):
-            cell_style = styles["BodyText"]
-            if cell.name == "th":
-                cell_style = ParagraphStyle(
-                    "TableHeader",
-                    parent=styles["BodyText"],
-                    fontName=BASE_FONT,
-                    fontSize=10.5,
-                    leading=15,
-                )
+            cell_style = header_style if cell.name == "th" else body_style
+            text_cells.append(_plain_cell_text(cell))
             cells.append(Paragraph(_inner_html(cell) or "&nbsp;", cell_style))
         if cells:
             rows.append(cells)
+            rows_text.append(text_cells)
 
     if not rows:
         rows = [[Paragraph("&nbsp;", styles["BodyText"])]]
+        rows_text = [[""]]
 
-    table = Table(rows, repeatRows=1)
+    max_columns = max(len(row) for row in rows)
+    for row in rows:
+        while len(row) < max_columns:
+            row.append(Paragraph("&nbsp;", body_style))
+    for row_text in rows_text:
+        while len(row_text) < max_columns:
+            row_text.append("")
+
+    col_widths = _estimate_column_widths(rows_text, CONTENT_WIDTH)
+    table = Table(rows, colWidths=col_widths, repeatRows=1, hAlign="LEFT")
     table.setStyle(
         TableStyle(
             [
@@ -144,32 +243,167 @@ def _list_from_tag(node: Tag, styles: StyleSheet1) -> ListFlowable:
     return ListFlowable(items, bulletType=bullet_type, start="1", leftIndent=18)
 
 
-def _image_flowable(src: str, max_width_mm: float = 150.0) -> list:
-    path = Path(src.strip("<>"))
-    if not path.is_file():
-        return []
+def _resolve_image_path(src: str, images_dir: Path | None = None, base_dir: Path | None = None) -> Path | None:
+    cleaned = unquote(str(src or "").strip().strip("<>"))
+    if not cleaned:
+        return None
+    parsed = urlparse(cleaned)
+    if parsed.scheme and parsed.scheme != "file":
+        return None
+    if parsed.scheme == "file":
+        cleaned = parsed.path
+
+    path = Path(cleaned).expanduser()
+    candidates = [path]
+    if not path.is_absolute():
+        if base_dir is not None:
+            candidates.append(base_dir / path)
+        if images_dir is not None:
+            candidates.append(images_dir / path)
+            candidates.append(images_dir / path.name)
+
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _image_flowable(src: str, *, styles: StyleSheet1, images_dir: Path | None = None, base_dir: Path | None = None) -> list:
+    path = _resolve_image_path(src, images_dir=images_dir, base_dir=base_dir)
+    if path is None:
+        return [Paragraph("[Image missing]", styles["BlockQuote"])]
     try:
         img = Image(str(path))
-        max_width = max_width_mm * mm
-        if img.imageWidth > max_width:
-            scale = max_width / img.imageWidth
-            img.drawWidth = max_width
-            img.drawHeight = img.imageHeight * scale
-        else:
-            img.drawWidth = img.imageWidth
-            img.drawHeight = img.imageHeight
+        scale = min(CONTENT_WIDTH / img.imageWidth, CONTENT_HEIGHT * 0.72 / img.imageHeight, 1.0)
+        img.drawWidth = img.imageWidth * scale
+        img.drawHeight = img.imageHeight * scale
         return [img, Spacer(1, 4)]
     except Exception:
-        return []
+        return [Paragraph("[Image unavailable]", styles["BlockQuote"])]
 
 
-def _story_from_html(title: str, html: str) -> list:
+def _paragraph_with_inline_image_placeholder(node: Tag, style: ParagraphStyle) -> Paragraph:
+    clone = BeautifulSoup(str(node), "html.parser")
+    for image in clone.find_all("img"):
+        alt = image.attrs.get("alt") or "image"
+        image.replace_with(f"[Image: {alt}]")
+    paragraph = clone.find("p")
+    if isinstance(paragraph, Tag):
+        return _paragraph_from_tag(paragraph, style)
+    text = clone.get_text(" ", strip=True)
+    return Paragraph(text or "&nbsp;", style)
+
+
+def _caption_text(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if text.lower() in {"image", "picture", "figure"}:
+        return ""
+    return text
+
+
+class FootnoteFlowable(Flowable):
+    def __init__(self, text: str) -> None:
+        super().__init__()
+        self.text = text
+
+    def wrap(self, availWidth: float, availHeight: float) -> tuple[int, int]:
+        return 0, 0
+
+    def draw(self) -> None:
+        notes = getattr(self.canv, "_page_footnotes", None)
+        if notes is None:
+            notes = []
+            setattr(self.canv, "_page_footnotes", notes)
+        notes.append(self.text)
+
+
+def _wrap_pdf_text(text: str, width: float, font_name: str, font_size: float) -> list[str]:
+    words = text.split()
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        if current and pdfmetrics.stringWidth(candidate, font_name, font_size) > width:
+            lines.append(current)
+            current = word
+        else:
+            current = candidate
+    if current:
+        lines.append(current)
+    return lines
+
+
+def _draw_page_footnotes(canvas, doc) -> None:
+    notes = getattr(canvas, "_page_footnotes", [])
+    if not notes:
+        return
+
+    canvas.saveState()
+    font_size = 6.8
+    leading = 8.2
+    x = PAGE_MARGIN
+    width = A4[0] - 2 * PAGE_MARGIN
+    top_y = PAGE_MARGIN + FOOTNOTE_AREA_HEIGHT - 6
+    min_y = PAGE_MARGIN
+
+    canvas.setStrokeColor(colors.HexColor("#d1d5db"))
+    canvas.setLineWidth(0.4)
+    canvas.line(x, top_y + 3, x + width, top_y + 3)
+    canvas.setFont(BASE_FONT, font_size)
+    canvas.setFillColor(colors.HexColor("#4b5563"))
+
+    y = top_y
+    for note in notes:
+        for line in _wrap_pdf_text(note, width, BASE_FONT, font_size):
+            if y < min_y:
+                canvas.drawString(x, y, "[additional footnotes overflow this page]")
+                canvas.restoreState()
+                setattr(canvas, "_page_footnotes", [])
+                return
+            canvas.drawString(x, y, line)
+            y -= leading
+        y -= 2
+
+    setattr(canvas, "_page_footnotes", [])
+    canvas.restoreState()
+
+
+def _blockquote_from_tag(node: Tag, styles: StyleSheet1) -> Paragraph | FootnoteFlowable:
+    text = node.get_text(" ", strip=True)
+    if re.match(r"\d{1,3}\s+\S", text):
+        return FootnoteFlowable(text)
+    return Paragraph(html_lib.escape(text) or "&nbsp;", styles["BlockQuote"])
+
+
+def _should_page_break_before_heading(node: Tag, story: list) -> bool:
+    if len(story) <= 2:
+        return False
+    text = node.get_text(" ", strip=True)
+    if node.name == "h1":
+        return True
+    if node.name == "h2":
+        return bool(re.match(r"(?:chapter|part|appendix|\d+[.)]?\s+)", text, re.IGNORECASE))
+    return False
+
+
+def _story_from_html(
+    title: str,
+    html: str,
+    *,
+    images_dir: Path | None = None,
+    base_dir: Path | None = None,
+) -> list:
     styles = _build_styles()
     soup = BeautifulSoup(html, "html.parser")
     root_nodes = soup.contents if soup.contents else []
     story = [Paragraph(title, styles["Heading1"]), Spacer(1, 6)]
 
     for node in root_nodes:
+        if isinstance(node, Comment):
+            continue
+
         if isinstance(node, NavigableString):
             text = str(node).strip()
             if text:
@@ -179,6 +413,9 @@ def _story_from_html(title: str, html: str) -> list:
 
         if not isinstance(node, Tag):
             continue
+
+        if node.name in {"h1", "h2"} and _should_page_break_before_heading(node, story):
+            story.append(PageBreak())
 
         if node.name == "h1":
             story.append(_paragraph_from_tag(node, styles["Heading1"]))
@@ -192,18 +429,20 @@ def _story_from_html(title: str, html: str) -> list:
             # A <p> may contain an <img> child (markdown renders ![](path) as <p><img></p>)
             img_tag = node.find("img")
             if img_tag and isinstance(img_tag, Tag):
-                src = img_tag.attrs.get("src", "")
-                flowables = _image_flowable(src)
-                if flowables:
-                    story.extend(flowables)
-                    alt = img_tag.attrs.get("alt", "")
+                text_without_image = node.get_text(" ", strip=True)
+                if text_without_image:
+                    story.append(_paragraph_with_inline_image_placeholder(node, styles["BodyText"]))
+                else:
+                    src = img_tag.attrs.get("src", "")
+                    flowables = _image_flowable(src, styles=styles, images_dir=images_dir, base_dir=base_dir)
+                    alt = _caption_text(img_tag.attrs.get("alt", ""))
                     if alt:
-                        story.append(Paragraph(f"<i>{alt}</i>", styles["BlockQuote"]))
-                # missing image: skip silently (file not found is not an error worth surfacing)
+                        flowables.append(Paragraph(html_lib.escape(alt), styles["Caption"]))
+                    story.append(KeepTogether(flowables))
             else:
                 story.append(_paragraph_from_tag(node, styles["BodyText"]))
         elif node.name == "blockquote":
-            story.append(_paragraph_from_tag(node, styles["BlockQuote"]))
+            story.append(_blockquote_from_tag(node, styles))
         elif node.name == "pre":
             story.append(Preformatted(node.get_text("\n"), styles["CodeBlock"]))
         elif node.name in {"ul", "ol"}:
@@ -214,12 +453,11 @@ def _story_from_html(title: str, html: str) -> list:
             story.append(Spacer(1, 8))
         elif node.name == "img":
             src = node.attrs.get("src", "")
-            flowables = _image_flowable(src)
-            if flowables:
-                story.extend(flowables)
-            else:
-                alt = node.attrs.get("alt", "image")
-                story.append(Paragraph(f"[Image] {alt}", styles["BlockQuote"]))
+            flowables = _image_flowable(src, styles=styles, images_dir=images_dir, base_dir=base_dir)
+            alt = _caption_text(node.attrs.get("alt", ""))
+            if alt:
+                flowables.append(Paragraph(html_lib.escape(alt), styles["Caption"]))
+            story.append(KeepTogether(flowables))
         else:
             text = node.get_text(" ", strip=True)
             if text:
@@ -237,15 +475,40 @@ def render_pdf_from_markdown(
     images_dir: Path | None = None,
 ) -> None:
     html = markdown_to_html(markdown_text)
-    story = _story_from_html(title=title, html=html)
+    story = _story_from_html(
+        title=title,
+        html=html,
+        images_dir=images_dir,
+        base_dir=output_path.parent,
+    )
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    doc = SimpleDocTemplate(
+    doc = BaseDocTemplate(
         str(output_path),
         pagesize=A4,
-        leftMargin=18 * mm,
-        rightMargin=18 * mm,
-        topMargin=18 * mm,
-        bottomMargin=18 * mm,
+        leftMargin=PAGE_MARGIN,
+        rightMargin=PAGE_MARGIN,
+        topMargin=PAGE_MARGIN,
+        bottomMargin=PAGE_MARGIN,
         title=title,
+    )
+    frame = Frame(
+        PAGE_MARGIN,
+        PAGE_MARGIN + FOOTNOTE_AREA_HEIGHT,
+        CONTENT_WIDTH,
+        CONTENT_HEIGHT,
+        id="body",
+        leftPadding=0,
+        rightPadding=0,
+        topPadding=0,
+        bottomPadding=0,
+    )
+    doc.addPageTemplates(
+        [
+            PageTemplate(
+                id="book",
+                frames=[frame],
+                onPageEnd=_draw_page_footnotes,
+            )
+        ]
     )
     doc.build(story)
