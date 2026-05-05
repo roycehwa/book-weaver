@@ -5,8 +5,9 @@
 Instead of translating directly on PDF coordinates, it runs a three-stage flow:
 
 1. Ingest the PDF into a normalized `Markdown + JSON` representation.
-2. Translate content in block-sized chunks while preserving Markdown structure.
-3. Render a new clean PDF from the translated Markdown.
+2. Rebuild books into a structured `book.json` plus inspectable Markdown views.
+3. Translate book chapters in chapter-aware chunks while preserving Markdown structure.
+4. Render a clean EPUB reading edition by default, with PDF still available as an optional output.
 
 This keeps user intervention low and removes most layout noise from the translation path.
 
@@ -20,17 +21,22 @@ This keeps user intervention low and removes most layout noise from the translat
 ## Stack
 
 - Parsing: `Docling`
-- Translation: pluggable backends (`openai`, `mock`)
-- Rendering: Markdown -> HTML -> PDF via `reportlab`
+- Translation: pluggable backends (`minimax`, `compatible`, `openai`, `mock`)
+- Rendering: Markdown -> EPUB via the Python standard library; optional Markdown -> PDF via `reportlab`
 
 ## Requirements
 
 - macOS / Linux / Windows
 - Python `3.11+`
-- For real translation with `openai` backend:
-  - `OPENAI_API_KEY`
-  - optionally `OPENAI_BASE_URL`
-  - optionally `OPENAI_MODEL`
+- For real translation with the default `minimax` backend:
+  - `MINIMAX_API_KEY`
+  - optionally `MINIMAX_BASE_URL` (defaults to `https://api.minimaxi.com/anthropic/v1/messages`)
+  - optionally `MINIMAX_MODEL` (defaults to `MiniMax-M2.7-highspeed`)
+  - optionally `MINIMAX_MAX_TOKENS` (defaults to `2048`)
+- For other OpenAI-compatible domestic APIs:
+  - `LLM_API_KEY`
+  - `LLM_BASE_URL`
+  - `LLM_MODEL`
 
 ## Quick start
 
@@ -44,7 +50,7 @@ pip install -e .
 Run:
 
 ```bash
-pdf-translator translate /absolute/path/to/file.pdf --target-lang zh-CN
+pdf-translator translate /absolute/path/to/file.pdf --profile book --target-lang zh-CN
 ```
 
 Outputs are written to `./runs/<pdf-stem>/` by default:
@@ -53,16 +59,16 @@ Outputs are written to `./runs/<pdf-stem>/` by default:
 - `normalized.json`
 - `reconstructed.md`
 - `translated.md`
-- `translated.pdf`
+- `translated.epub`
 - `manifest.json`
 
-`normalized.md` is the raw Docling export. `reconstructed.md` is the layout-aware reading edition used for translation.
+`normalized.md` is the raw Docling export. For book profile runs, `book.json` is the source of truth, `book.md` is the cleaned reading view, `translation-input.md` is the chapter-aware translation source, and `translated.epub` is the default reading output.
 
 Use `pdf-translator profile /path/to/file.pdf --profile auto` to classify pages into `accept`, `assist`, `skip_content`, and `reject_structure`. The built-in profiles are `magazine` and `book`.
 
-The newspaper article extraction branch has been removed from the public CLI because the reading-order quality was not reliable enough for production use. Newspaper-specific code may still exist internally for reference, but it is not a supported product path.
+The project scope is **magazine** and **book** workflows (plus `auto` classification). There is no newspaper or generic article-extraction pipeline in this repository.
 
-Use `pdf-translator validate /path/to/manifest.json` to run a reusable batch regression suite. Each manifest case must include `source_pdf` and `mode`, where `mode` is usually `profile`.
+Use `pdf-translator validate /path/to/manifest.json` to run a reusable batch regression suite. Each manifest case must include `source_pdf` and `mode`; only `mode: "profile"` is supported (book/magazine/auto page gating).
 
 ## Guardrails
 
@@ -75,7 +81,7 @@ Every command that recomputes ingest now runs a preflight check before Docling s
 The defaults are profile-aware:
 
 - `magazine`: warn above `140` pages or `50MB`; reject above `220` pages or `100MB`
-- `book`: warn above `320` pages or `60MB`; reject above `600` pages or `120MB`
+- `book`: warn above `800` pages or `60MB`; reject above `1500` pages or `120MB`
 - `auto`: warn above `160` pages or `40MB`; reject above `320` pages or `80MB`
 
 These thresholds are system-protection limits, not content-quality limits. They are meant to stop parser hangs and runaway batch jobs, not to decide whether a page is editorially useful.
@@ -84,7 +90,7 @@ All thresholds can be overridden from the CLI:
 
 ```bash
 pdf-translator profile ./sample.pdf --profile magazine --ingest-timeout-seconds 180
-pdf-translator articles ./paper.pdf --max-file-size-mb 120 --max-page-count 220
+pdf-translator translate ./book.pdf --profile book --max-file-size-mb 120 --max-page-count 1500
 pdf-translator validate ./suite.json --ingest-timeout-seconds 240
 ```
 
@@ -99,14 +105,42 @@ and continues to the next file instead of hanging the entire batch.
 
 ## Translator backends
 
+### `minimax`
+
+Default real translation backend. Uses MiniMax's Anthropic-compatible Messages endpoint.
+
+```bash
+cat > .env <<'EOF'
+MINIMAX_API_KEY=...
+MINIMAX_MODEL=MiniMax-M2.7-highspeed
+# Optional; this is the built-in default.
+MINIMAX_BASE_URL=https://api.minimaxi.com/anthropic/v1/messages
+MINIMAX_MAX_TOKENS=2048
+EOF
+pdf-translator translate ./book.pdf --profile book --target-lang zh-CN --translator minimax --format epub
+```
+
+Put these variables once in a local `.env` file at the project root. `.env` is ignored by git.
+
+### `compatible`
+
+Use this for DeepSeek, Moonshot, Qwen, or any provider exposing an OpenAI-compatible `/chat/completions` endpoint.
+
+```bash
+export LLM_API_KEY=...
+export LLM_BASE_URL=https://provider.example/v1
+export LLM_MODEL=provider-model-name
+pdf-translator translate ./book.pdf --profile book --target-lang zh-CN --translator compatible --format epub
+```
+
 ### `openai`
 
-Uses the OpenAI Python SDK with an OpenAI-compatible endpoint.
+Uses the OpenAI Responses API.
 
 ```bash
 export OPENAI_API_KEY=...
 export OPENAI_MODEL=gpt-4.1-mini
-pdf-translator translate ./paper.pdf --target-lang zh-CN --translator openai
+pdf-translator translate ./book.pdf --profile book --target-lang zh-CN --translator openai
 ```
 
 ### `mock`
@@ -114,11 +148,11 @@ pdf-translator translate ./paper.pdf --target-lang zh-CN --translator openai
 Useful for validating the pipeline without spending tokens.
 
 ```bash
-pdf-translator translate ./paper.pdf --target-lang zh-CN --translator mock
+pdf-translator translate ./book.pdf --profile book --target-lang zh-CN --translator mock
 ```
 
 ## Notes
 
-- The output PDF is intentionally reflowed. It is a translated reading edition, not a coordinate-faithful clone of the source PDF.
+- The output EPUB/PDF is intentionally reflowed. It is a translated reading edition, not a coordinate-faithful clone of the source PDF.
 - Tables and images depend on how well Docling exports them to Markdown.
 - If you need original-layout replacement later, treat that as a separate downstream project.

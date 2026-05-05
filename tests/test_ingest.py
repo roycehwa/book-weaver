@@ -175,13 +175,13 @@ def test_enforce_text_layer_rejects_scan_like_document() -> None:
     )
     preflight = PdfPreflight(
         source_pdf=source_pdf,
-        profile_name="newspaper",
+        profile_name="magazine",
         page_count=24,
         file_size_bytes=1,
-        warn_page_count=96,
-        max_page_count=160,
-        warn_file_size_mb=35.0,
-        max_file_size_mb=80.0,
+        warn_page_count=112,
+        max_page_count=220,
+        warn_file_size_mb=40.0,
+        max_file_size_mb=100.0,
     )
 
     with pytest.raises(InputGateError):
@@ -218,11 +218,11 @@ def test_ingest_pdf_guarded_soft_page_limit_accepts_over_limit_pdf(monkeypatch: 
             detected_language="en",
         )
 
-    monkeypatch.setattr("pdf_translator.guardrails.ingest_pdf", fake_ingest)
+    monkeypatch.setattr("pdf_translator.guardrails.ingest_document", fake_ingest)
 
     normalized, preflight = ingest_pdf_guarded(
         source_pdf,
-        profile_name="newspaper",
+        profile_name="magazine",
         timeout_seconds=0,
         max_page_count=2,
         soft_input_gate=True,
@@ -249,12 +249,12 @@ def test_ingest_pdf_guarded_strict_gate_still_rejects(monkeypatch: pytest.Monkey
             detected_language="en",
         )
 
-    monkeypatch.setattr("pdf_translator.guardrails.ingest_pdf", fake_ingest)
+    monkeypatch.setattr("pdf_translator.guardrails.ingest_document", fake_ingest)
 
     with pytest.raises(InputGateError):
         ingest_pdf_guarded(
             source_pdf,
-            profile_name="newspaper",
+            profile_name="magazine",
             timeout_seconds=0,
             max_page_count=2,
             soft_input_gate=False,

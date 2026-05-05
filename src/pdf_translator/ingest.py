@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import re
-from pathlib import Path
+import tempfile
+import xml.etree.ElementTree as ET
+from pathlib import Path, PurePosixPath
 from typing import Any
+from zipfile import ZipFile
 
+from bs4 import BeautifulSoup, NavigableString
 from langdetect import LangDetectException, detect
 
 from pdf_translator.models import NormalizedDocument
@@ -294,3 +298,289 @@ def ingest_pdf(
         detected_language=detect_language(reconstructed_markdown),
         images_dir=images_dir,
     )
+
+
+def _xml_local_name(tag: str) -> str:
+    if "}" in tag:
+        return tag.rsplit("}", 1)[-1]
+    return tag
+
+
+def _epub_container_opf_path(zipf: ZipFile) -> str:
+    data = zipf.read("META-INF/container.xml")
+    root = ET.fromstring(data)
+    for el in root.iter():
+        if _xml_local_name(el.tag) == "rootfile" and "full-path" in el.attrib:
+            return el.attrib["full-path"].replace("\\", "/")
+    raise ValueError("EPUB container.xml has no rootfile full-path.")
+
+
+def _epub_parse_opf(zipf: ZipFile, opf_path: str) -> tuple[dict[str, tuple[str, str]], list[str]]:
+    raw = zipf.read(opf_path)
+    root = ET.fromstring(raw)
+    manifest: dict[str, tuple[str, str]] = {}
+    spine_ids: list[str] = []
+    for child in root:
+        tag = _xml_local_name(child.tag)
+        if tag == "manifest":
+            for item in child:
+                if _xml_local_name(item.tag) != "item":
+                    continue
+                iid = item.attrib.get("id")
+                href = item.attrib.get("href")
+                if iid and href:
+                    manifest[iid] = (href.replace("\\", "/"), item.attrib.get("media-type", ""))
+        elif tag == "spine":
+            for itemref in child:
+                if _xml_local_name(itemref.tag) != "itemref":
+                    continue
+                rid = itemref.attrib.get("idref")
+                if rid:
+                    spine_ids.append(rid)
+    return manifest, spine_ids
+
+
+def _epub_join(opf_path: str, href: str) -> str:
+    parent = str(PurePosixPath(opf_path).parent)
+    if parent in {"", "."}:
+        joined = PurePosixPath(href)
+    else:
+        joined = PurePosixPath(parent) / href
+    normalized = joined.as_posix()
+    if normalized.startswith("../"):
+        raise ValueError(f"Invalid EPUB path escape: {href!r}")
+    return normalized
+
+
+_XHTML_MEDIA = frozenset(
+    {
+        "application/xhtml+xml",
+        "application/html",
+        "text/html",
+    },
+)
+
+
+def read_epub_spine_length(path: Path) -> int:
+    with ZipFile(path, "r") as zipf:
+        if "META-INF/encryption.xml" in zipf.namelist():
+            raise ValueError("Encrypted EPUB is not supported.")
+        opf_path = _epub_container_opf_path(zipf)
+        manifest, spine_ids = _epub_parse_opf(zipf, opf_path)
+        count = 0
+        for sid in spine_ids:
+            if sid not in manifest:
+                continue
+            href, media = manifest[sid]
+            low = href.lower()
+            if media in _XHTML_MEDIA or low.endswith((".xhtml", ".html", ".htm")):
+                count += 1
+        return max(count, 1)
+
+
+def _extract_epub_body_chapter(
+    zipf: ZipFile,
+    *,
+    opf_path: str,
+    internal_xhtml_path: str,
+    asset_dir: Path,
+    written_assets: dict[str, Path],
+    fallback_title: str,
+) -> tuple[str, str]:
+    html = zipf.read(internal_xhtml_path).decode("utf-8", errors="replace")
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup.find_all(["script", "style"]):
+        tag.decompose()
+    body = soup.find("body") or soup
+    def resolve_media_href(src: str) -> str | None:
+        src = src.split("#", 1)[0].strip()
+        if not src or src.startswith("data:"):
+            return None
+        if src.startswith("/"):
+            return src.lstrip("/").replace("\\", "/")
+        return _epub_join(internal_xhtml_path, src)
+
+    for figure in body.find_all("figure"):
+        img = figure.find("img")
+        if not img:
+            continue
+        alt = (img.get("alt") or img.get("title") or "Figure").strip()
+        raw_src = img.get("src")
+        if not isinstance(raw_src, str):
+            continue
+        resolved = resolve_media_href(raw_src)
+        if not resolved or resolved not in zipf.namelist():
+            continue
+        if resolved not in written_assets:
+            dest = asset_dir / Path(resolved).name
+            base = dest.stem
+            suf = dest.suffix
+            n = 1
+            while dest.exists():
+                dest = asset_dir / f"{base}-{n}{suf}"
+                n += 1
+            dest.write_bytes(zipf.read(resolved))
+            written_assets[resolved] = dest.resolve()
+        path_str = written_assets[resolved].as_posix()
+        cap = figure.find("figcaption")
+        cap_text = cap.get_text(" ", strip=True) if cap else ""
+        if cap_text:
+            figure.replace_with(
+                NavigableString(f"\n\n![{alt}]({path_str})\n\n> {cap_text}\n\n")
+            )
+        else:
+            figure.replace_with(NavigableString(f"\n\n![{alt}]({path_str})\n\n"))
+
+    for img in list(body.find_all("img")):
+        raw_src = img.get("src")
+        if not isinstance(raw_src, str):
+            img.decompose()
+            continue
+        resolved = resolve_media_href(raw_src)
+        if not resolved or resolved not in zipf.namelist():
+            img.decompose()
+            continue
+        if resolved not in written_assets:
+            dest = asset_dir / Path(resolved).name
+            base = dest.stem
+            suf = dest.suffix
+            n = 1
+            while dest.exists():
+                dest = asset_dir / f"{base}-{n}{suf}"
+                n += 1
+            dest.write_bytes(zipf.read(resolved))
+            written_assets[resolved] = dest.resolve()
+        alt = (img.get("alt") or img.get("title") or "").strip() or "Image"
+        img.replace_with(NavigableString(f"![{alt}]({written_assets[resolved].as_posix()})"))
+
+    for sup in body.find_all("sup"):
+        t = sup.get_text("", strip=True)
+        sup.replace_with(t if t else "")
+
+    parts: list[str] = []
+    title_guess = ""
+    first_h1 = body.find("h1")
+    if first_h1:
+        title_guess = first_h1.get_text(" ", strip=True)[:240]
+    if not title_guess:
+        first_h2 = body.find("h2")
+        if first_h2:
+            title_guess = first_h2.get_text(" ", strip=True)[:240]
+    if not title_guess and soup.title and soup.title.string:
+        title_guess = soup.title.string.strip()[:240]
+    if not title_guess:
+        title_guess = fallback_title.strip()[:240] or Path(internal_xhtml_path).stem.replace("_", " ").strip()
+    if not title_guess:
+        title_guess = "Section"
+
+    for el in body.find_all(["h1", "h2", "h3", "h4", "p", "blockquote"], recursive=True):
+        name = el.name
+        text = el.get_text(" ", strip=True)
+        if not text:
+            continue
+        prefix = {"h1": "## ", "h2": "### ", "h3": "#### ", "h4": "##### ", "p": "", "blockquote": "> "}.get(name, "")
+        line = prefix + text
+        parts.append(line)
+
+    body_md = "\n\n".join(parts).strip()
+    return title_guess, body_md
+
+
+def ingest_epub(path: Path) -> NormalizedDocument:
+    asset_dir = Path(tempfile.mkdtemp(prefix="pdf-translator-epub-assets-"))
+    written_assets: dict[str, Path] = {}
+    spine_chapters: list[dict[str, Any]] = []
+    texts: list[dict[str, Any]] = []
+    body_children: list[dict[str, str]] = []
+    text_index = 0
+    raw_parts: list[str] = []
+
+    with ZipFile(path, "r") as zipf:
+        if "META-INF/encryption.xml" in zipf.namelist():
+            raise ValueError("Encrypted EPUB is not supported.")
+        opf_path = _epub_container_opf_path(zipf)
+        manifest, spine_ids = _epub_parse_opf(zipf, opf_path)
+        page_no = 0
+        for sid in spine_ids:
+            if sid not in manifest:
+                continue
+            href, media = manifest[sid]
+            low = href.lower()
+            if media not in _XHTML_MEDIA and not low.endswith((".xhtml", ".html", ".htm")):
+                continue
+            internal = _epub_join(opf_path, href)
+            if internal not in zipf.namelist():
+                continue
+            page_no += 1
+            title, body_md = _extract_epub_body_chapter(
+                zipf,
+                opf_path=opf_path,
+                internal_xhtml_path=internal,
+                asset_dir=asset_dir,
+                written_assets=written_assets,
+                fallback_title=sid.replace("_", " "),
+            )
+            combined = f"## {title}\n\n{body_md}".strip() + "\n"
+            trace = f"[[page: {page_no}]]\n\n{combined}".strip() + "\n"
+            spine_chapters.append(
+                {
+                    "title": title,
+                    "markdown": combined,
+                    "trace_markdown": trace,
+                }
+            )
+            raw_parts.append(combined)
+            texts.append(
+                {
+                    "label": "section_header",
+                    "text": title,
+                    "prov": [{"page_no": page_no, "bbox": {"l": 40.0, "t": 760.0, "r": 400.0, "b": 700.0}}],
+                }
+            )
+            body_children.append({"$ref": f"#/texts/{text_index}"})
+            text_index += 1
+            body_text = body_md if body_md else "(empty)"
+            texts.append(
+                {
+                    "label": "text",
+                    "text": body_text,
+                    "prov": [{"page_no": page_no, "bbox": {"l": 40.0, "t": 600.0, "r": 400.0, "b": 72.0}}],
+                }
+            )
+            body_children.append({"$ref": f"#/texts/{text_index}"})
+            text_index += 1
+
+    if page_no == 0:
+        raise ValueError("EPUB spine contains no readable XHTML documents.")
+
+    structured: dict[str, Any] = {
+        "body": {"children": body_children},
+        "texts": texts,
+        "pictures": [],
+        "tables": [],
+        "_epub_meta": {
+            "schema": "epub_ingest_v1",
+            "synthetic_page_count": max(page_no, 1),
+            "temp_asset_dir": str(asset_dir),
+            "chapters": spine_chapters,
+        },
+    }
+    raw_markdown = "\n\n".join(raw_parts).strip() + "\n"
+    reconstructed_markdown = reconstruct_markdown(structured, raw_markdown)
+
+    return NormalizedDocument(
+        source_pdf=path,
+        raw_markdown=raw_markdown,
+        reconstructed_markdown=reconstructed_markdown,
+        structured=structured,
+        detected_language=detect_language(reconstructed_markdown),
+    )
+
+
+def ingest_document(path: Path) -> NormalizedDocument:
+    suffix = path.suffix.lower()
+    if suffix == ".epub":
+        return ingest_epub(path)
+    if suffix == ".pdf":
+        return ingest_pdf(path)
+    raise ValueError(f"Unsupported document type {suffix!r}. Use .pdf or .epub.")

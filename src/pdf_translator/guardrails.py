@@ -7,37 +7,32 @@ import traceback
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from pdf_translator.ingest import ingest_pdf
+from pdf_translator.ingest import ingest_document, ingest_pdf, read_epub_spine_length
 from pdf_translator.models import NormalizedDocument
 
 
 DEFAULT_INGEST_TIMEOUT_SECONDS = 240
-DEFAULT_NEWSPAPER_SOFT_PAGE_LIMIT = 30
 
 DEFAULT_WARN_PAGE_COUNT = {
     "auto": 160,
-    "newspaper": DEFAULT_NEWSPAPER_SOFT_PAGE_LIMIT,
     "magazine": 140,
-    "book": 320,
+    "book": 800,
 }
 
 DEFAULT_MAX_PAGE_COUNT = {
     "auto": 320,
-    "newspaper": 160,
     "magazine": 220,
-    "book": 600,
+    "book": 1500,
 }
 
 DEFAULT_WARN_FILE_SIZE_MB = {
     "auto": 40.0,
-    "newspaper": 35.0,
     "magazine": 50.0,
     "book": 60.0,
 }
 
 DEFAULT_MAX_FILE_SIZE_MB = {
     "auto": 80.0,
-    "newspaper": 80.0,
     "magazine": 100.0,
     "book": 120.0,
 }
@@ -106,6 +101,8 @@ def _effective_warn_threshold(default_value: float | int | None, max_value: floa
 
 
 def _read_page_count(source_pdf: Path) -> int:
+    if source_pdf.suffix.lower() == ".epub":
+        return read_epub_spine_length(source_pdf)
     import pypdfium2 as pdfium
 
     document = pdfium.PdfDocument(str(source_pdf))
@@ -208,8 +205,12 @@ def _enforce_text_layer(normalized: NormalizedDocument, preflight: PdfPreflight)
 
 def _ingest_worker(source_pdf: str, output_dir_str: str | None, profile: str, queue: mp.Queue) -> None:
     try:
-        output_dir = Path(output_dir_str) if output_dir_str else None
-        normalized = ingest_pdf(Path(source_pdf), output_dir=output_dir, profile=profile)
+        source_path = Path(source_pdf)
+        if source_path.suffix.lower() == ".epub":
+            normalized = ingest_document(source_path)
+        else:
+            output_dir = Path(output_dir_str) if output_dir_str else None
+            normalized = ingest_pdf(source_path, output_dir=output_dir, profile=profile)
         with tempfile.NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
@@ -322,7 +323,10 @@ def ingest_pdf_guarded(
 
     if timeout_seconds is None or timeout_seconds <= 0:
         try:
-            normalized = ingest_pdf(ingest_source, output_dir=output_dir, profile=profile_name)
+            if ingest_source.suffix.lower() == ".epub":
+                normalized = ingest_document(ingest_source)
+            else:
+                normalized = ingest_pdf(ingest_source, output_dir=output_dir, profile=profile_name)
             normalized.source_pdf = source_pdf
             _enforce_text_layer(normalized, preflight)
             return normalized, preflight

@@ -69,20 +69,6 @@ PROFILE_SPECS: dict[str, ProfileSpec] = {
         reject_segments_hard=10,
         weak_flow_ratio=0.24,
     ),
-    "newspaper": ProfileSpec(
-        name="newspaper",
-        document_reject_ratio=0.30,
-        allow_skip_content=True,
-        front_matter_window=6,
-        back_matter_window=6,
-        article_columns_max=5,
-        assist_columns_min=3,
-        assist_segments_min=6,
-        reject_columns_min=6,
-        reject_segments_min=10,
-        reject_segments_hard=12,
-        weak_flow_ratio=0.18,
-    ),
 }
 
 
@@ -92,6 +78,14 @@ def _page_sizes(source_pdf: Path) -> dict[int, tuple[float, float]]:
     for index in range(len(document)):
         sizes[index + 1] = document[index].get_size()
     return sizes
+
+
+def _page_sizes_for_document(source_pdf: Path, structured: dict[str, Any]) -> dict[int, tuple[float, float]]:
+    meta = structured.get("_epub_meta") if isinstance(structured, dict) else None
+    if isinstance(meta, dict) and meta.get("schema") == "epub_ingest_v1":
+        n = max(int(meta.get("synthetic_page_count") or 1), 1)
+        return {page: (612.0, 792.0) for page in range(1, n + 1)}
+    return _page_sizes(source_pdf)
 
 
 def _extract_picture_areas(structured: dict[str, Any], page_sizes: dict[int, tuple[float, float]]) -> dict[int, float]:
@@ -366,7 +360,7 @@ def _build_page_profiles(
 
 
 def build_document_profile(source_pdf: Path, structured: dict[str, Any], profile_name: str = "auto") -> dict[str, Any]:
-    page_sizes = _page_sizes(source_pdf)
+    page_sizes = _page_sizes_for_document(source_pdf, structured)
     provisional_spec = PROFILE_SPECS["magazine"]
     provisional_pages = _build_page_profiles(structured=structured, page_sizes=page_sizes, spec=provisional_spec)
 

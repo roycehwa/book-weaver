@@ -4,7 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
-from pdf_translator.config import RunSettings
+from pdf_translator.config import DEFAULT_TRANSLATION_CONCURRENCY, RunSettings
 from pdf_translator.guardrails import (
     DEFAULT_INGEST_TIMEOUT_SECONDS,
     IngestGuardrailError,
@@ -26,7 +26,11 @@ def build_parser() -> argparse.ArgumentParser:
         "translate",
         help="Ingest, translate, and render a clean translated PDF.",
     )
-    translate_parser.add_argument("source_pdf", type=Path, help="Absolute or relative path to source PDF.")
+    translate_parser.add_argument(
+        "source_pdf",
+        type=Path,
+        help="Path to source document: PDF (Docling) or EPUB (spine XHTML).",
+    )
     translate_parser.add_argument(
         "--output-dir",
         type=Path,
@@ -45,21 +49,33 @@ def build_parser() -> argparse.ArgumentParser:
     )
     translate_parser.add_argument(
         "--translator",
-        default="openai",
-        choices=["openai", "mock"],
-        help="Translation backend.",
+        default="minimax",
+        choices=["openai", "mock", "minimax", "compatible", "openai-compatible"],
+        help="Translation backend. minimax uses MiniMax Anthropic Messages; compatible uses OpenAI-style chat completions.",
     )
     translate_parser.add_argument(
         "--max-chunk-chars",
         type=int,
-        default=2800,
+        default=4200,
         help="Max chunk size for translation requests.",
+    )
+    translate_parser.add_argument(
+        "--translation-concurrency",
+        type=int,
+        default=DEFAULT_TRANSLATION_CONCURRENCY,
+        help="Number of translation chunks to process concurrently.",
     )
     translate_parser.add_argument(
         "--profile",
         default="auto",
         choices=["auto", "magazine", "book"],
         help="Profile used for ingest guardrails.",
+    )
+    translate_parser.add_argument(
+        "--format",
+        default="epub",
+        choices=["pdf", "epub", "both"],
+        help="Rendered output format. EPUB is the default reading output.",
     )
     translate_parser.add_argument(
         "--ingest-timeout-seconds",
@@ -84,7 +100,11 @@ def build_parser() -> argparse.ArgumentParser:
         "profile",
         help="Profile a PDF and classify pages as accept, skip, or reject.",
     )
-    profile_parser.add_argument("source_pdf", type=Path, help="Absolute or relative path to source PDF.")
+    profile_parser.add_argument(
+        "source_pdf",
+        type=Path,
+        help="Path to source document: PDF or EPUB.",
+    )
     profile_parser.add_argument(
         "--output-dir",
         type=Path,
@@ -123,13 +143,13 @@ def build_parser() -> argparse.ArgumentParser:
     validate_parser.add_argument(
         "manifest",
         type=Path,
-        help="Path to a JSON manifest containing profile/articles validation cases.",
+        help="Path to a JSON manifest containing profile validation cases (book/magazine/auto).",
     )
     validate_parser.add_argument(
         "--output-dir",
         type=Path,
         default=Path("runs"),
-        help="Base directory for profile/article artifacts and validation reports.",
+        help="Base directory for profile artifacts and validation reports.",
     )
     validate_parser.add_argument(
         "--report-name",
@@ -194,7 +214,9 @@ def main() -> None:
                 source_language=args.source_lang,
                 translator=args.translator,
                 max_chunk_chars=args.max_chunk_chars,
+                translation_concurrency=args.translation_concurrency,
                 profile_name=args.profile,
+                output_format=args.format,
                 ingest_timeout_seconds=args.ingest_timeout_seconds,
                 max_file_size_mb=args.max_file_size_mb,
                 max_page_count=args.max_page_count,
@@ -203,7 +225,11 @@ def main() -> None:
             manifest = json.loads(artifacts.manifest_path.read_text(encoding="utf-8"))
             _print_preflight(manifest["preflight"])
             print(f"Artifacts written to: {artifacts.output_dir}")
-            print(f"Translated PDF: {artifacts.translated_pdf_path}")
+            files = manifest.get("files", {})
+            if "translated_epub" in files:
+                print(f"Translated EPUB: {files['translated_epub']}")
+            if "translated_pdf" in files:
+                print(f"Translated PDF: {files['translated_pdf']}")
         elif args.command == "profile":
             source_pdf = args.source_pdf.expanduser().resolve()
             normalized, preflight = ingest_pdf_guarded(

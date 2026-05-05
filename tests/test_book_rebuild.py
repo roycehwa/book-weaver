@@ -1,0 +1,383 @@
+import pdf_translator.book_rebuild as book_rebuild
+from pdf_translator.book_rebuild import build_book_reconstruction
+
+
+def _prov(page_no: int, left: float, top: float) -> list[dict]:
+    return [{"page_no": page_no, "bbox": {"l": left, "t": top}}]
+
+
+def test_book_rebuild_preserves_skipped_outline_sections_untranslated(monkeypatch) -> None:
+    structured = {
+        "body": {
+            "children": [{"$ref": f"#/texts/{index}"} for index in range(6)]
+        },
+        "texts": [
+            {"label": "section_header", "text": "Contents", "prov": _prov(1, 40, 760)},
+            {"label": "text", "text": "Chapter 1 ........ 3", "prov": _prov(1, 40, 680)},
+            {"label": "section_header", "text": "Chapter 1", "prov": _prov(3, 40, 760)},
+            {"label": "text", "text": "The translated body should remain in a normal chapter.", "prov": _prov(3, 40, 620)},
+            {"label": "section_header", "text": "Index", "prov": _prov(4, 40, 760)},
+            {"label": "text", "text": "Alpha, 3, 4", "prov": _prov(4, 40, 700)},
+        ],
+        "pictures": [],
+        "tables": [],
+    }
+
+    monkeypatch.setattr(
+        book_rebuild,
+        "_extract_pdf_outline_chapters",
+        lambda source_pdf, total_pages: [
+            {"title": "Contents", "page_no": 1, "depth": 0, "skip": True},
+            {"title": "Chapter 1", "page_no": 3, "depth": 0, "skip": False},
+            {"title": "Index", "page_no": 4, "depth": 0, "skip": True},
+        ],
+    )
+
+    result = build_book_reconstruction(structured)
+
+    assert [chapter["title"] for chapter in result["chapters"]] == ["Contents", "Chapter 1", "Index"]
+    assert result["chapters"][0]["translate"] is False
+    assert result["chapters"][0]["preserve_original"] is True
+    assert "Chapter 1" in result["chapters"][0]["markdown"]
+    assert result["chapters"][1]["translate"] is True
+    assert result["chapters"][2]["translate"] is False
+    assert "Alpha, 3, 4" in result["chapters"][2]["markdown"]
+
+
+def test_book_rebuild_skips_toc_and_splits_chapters() -> None:
+    structured = {
+        "body": {
+            "children": [{"$ref": f"#/texts/{index}"} for index in range(11)]
+        },
+        "texts": [
+            {"label": "section_header", "text": "Contents", "prov": _prov(1, 40, 760)},
+            {"label": "text", "text": "Chapter 1 ........ 3", "prov": _prov(1, 40, 680)},
+            {"label": "text", "text": "Chapter 2 ........ 17", "prov": _prov(1, 40, 640)},
+            {"label": "section_header", "text": "Chapter 1", "prov": _prov(2, 40, 760)},
+            {"label": "section_header", "text": "A Beginning", "prov": _prov(2, 40, 720)},
+            {"label": "text", "text": "This is the opening paragraph of the first chapter with enough text to count as body copy.", "prov": _prov(2, 40, 600)},
+            {"label": "text", "text": "More first chapter body text follows on the same page in a normal readable flow.", "prov": _prov(2, 40, 520)},
+            {"label": "text", "text": "The first chapter continues onto the next page with more narrative detail and continuity.", "prov": _prov(3, 40, 620)},
+            {"label": "section_header", "text": "Chapter 2", "prov": _prov(4, 40, 760)},
+            {"label": "section_header", "text": "Another Start", "prov": _prov(4, 40, 720)},
+            {"label": "text", "text": "The second chapter opens with a fresh body paragraph that should be retained.", "prov": _prov(4, 40, 600)},
+        ],
+        "pictures": [],
+    }
+
+    result = build_book_reconstruction(structured)
+
+    assert result["chapter_count"] == 2
+    assert result["pages"][0]["page_kind"] == "toc"
+    assert result["chapters"][0]["title"] == "Chapter 1: A Beginning"
+    assert result["chapters"][0]["page_start"] == 2
+    assert result["chapters"][0]["page_end"] == 3
+    assert result["chapters"][1]["title"] == "Chapter 2: Another Start"
+    assert "# Chapter 1: A Beginning" in result["full_markdown"]
+    assert "[[page: 2]]" not in result["chapters"][0]["markdown"]
+    assert "[[page: 2]]" in result["chapters"][0]["trace_markdown"]
+
+
+def test_book_rebuild_falls_back_to_single_untitled_section() -> None:
+    structured = {
+        "body": {
+            "children": [{"$ref": f"#/texts/{index}"} for index in range(3)]
+        },
+        "texts": [
+            {"label": "text", "text": "A coherent book page starts here with narrative text and no explicit chapter heading.", "prov": _prov(1, 40, 620)},
+            {"label": "text", "text": "The body continues with a second readable paragraph that should stay in the same section.", "prov": _prov(2, 40, 620)},
+            {"label": "text", "text": "A final paragraph closes the sample body.", "prov": _prov(3, 40, 620)},
+        ],
+        "pictures": [],
+    }
+
+    result = build_book_reconstruction(structured)
+
+    assert result["chapter_count"] == 1
+    assert result["chapters"][0]["title"] == "Untitled Section 1"
+
+
+def test_book_rebuild_uses_first_meaningful_heading_for_section_title() -> None:
+    structured = {
+        "body": {
+            "children": [{"$ref": f"#/texts/{index}"} for index in range(4)]
+        },
+        "texts": [
+            {"label": "section_header", "text": "Tables", "prov": _prov(1, 40, 760)},
+            {"label": "section_header", "text": "Preface", "prov": _prov(1, 40, 700)},
+            {"label": "text", "text": "A normal preface paragraph follows the front list heading.", "prov": _prov(1, 40, 620)},
+            {"label": "text", "text": "More preface text keeps the section readable.", "prov": _prov(1, 40, 560)},
+        ],
+        "pictures": [],
+        "tables": [],
+    }
+
+    result = build_book_reconstruction(structured)
+
+    assert result["chapter_count"] == 1
+    assert result["chapters"][0]["title"] == "Preface"
+
+
+def test_book_rebuild_preserves_trace_page_anchors_figures_and_tables() -> None:
+    structured = {
+        "body": {
+            "children": [{"$ref": "#/texts/0"}, {"$ref": "#/texts/1"}]
+        },
+        "texts": [
+            {"label": "section_header", "text": "Chapter 1", "prov": _prov(1, 40, 760)},
+            {"label": "text", "text": "A readable body paragraph appears near the figure and table.", "prov": _prov(1, 40, 620)},
+        ],
+        "pictures": [
+            {
+                "prov": [{"page_no": 1, "bbox": {"l": 60, "t": 590, "r": 200, "b": 420}}],
+                "captions": [{"text": "A sample figure caption."}],
+            }
+        ],
+        "tables": [
+            {
+                "prov": [{"page_no": 1, "bbox": {"l": 60, "t": 400, "r": 240, "b": 260}}],
+                "data": {
+                    "grid": [
+                        [{"text": "Name"}, {"text": "Value"}],
+                        [{"text": "Alpha"}, {"text": "1"}],
+                    ]
+                },
+            }
+        ],
+    }
+
+    result = build_book_reconstruction(structured)
+    markdown = result["chapters"][0]["markdown"]
+
+    assert "[[page: 1]]" not in markdown
+    assert "[[page: 1]]" in result["chapters"][0]["trace_markdown"]
+    assert "![Figure 1.1: A sample figure caption.](#figure-1-1)" in markdown
+    assert "| Name | Value |" in markdown
+    assert result["pages"][0]["figure_count"] == 1
+    assert result["pages"][0]["table_count"] == 1
+
+
+def test_book_rebuild_resolves_referenced_figure_captions_without_duplication() -> None:
+    structured = {
+        "body": {
+            "children": [
+                {"$ref": "#/texts/0"},
+                {"$ref": "#/texts/1"},
+                {"$ref": "#/texts/2"},
+            ]
+        },
+        "texts": [
+            {"label": "section_header", "text": "Chapter 1", "prov": _prov(1, 40, 760)},
+            {"label": "text", "text": "The paragraph should remain near its image.", "prov": _prov(1, 40, 620)},
+            {"label": "caption", "text": "Referenced figure caption.", "prov": _prov(1, 60, 400)},
+        ],
+        "pictures": [
+            {
+                "prov": [{"page_no": 1, "bbox": {"l": 60, "t": 590, "r": 200, "b": 420}}],
+                "captions": [{"$ref": "#/texts/2"}],
+            }
+        ],
+        "tables": [],
+    }
+
+    result = build_book_reconstruction(structured)
+    markdown = result["chapters"][0]["markdown"]
+
+    assert "![Figure 1.1: Referenced figure caption.](#figure-1-1)" in markdown
+    assert markdown.count("Referenced figure caption.") == 2
+
+
+def test_book_rebuild_skips_unreadable_table_placeholders() -> None:
+    structured = {
+        "body": {
+            "children": [{"$ref": "#/texts/0"}, {"$ref": "#/texts/1"}]
+        },
+        "texts": [
+            {"label": "section_header", "text": "Chapter 1", "prov": _prov(1, 40, 760)},
+            {"label": "text", "text": "A normal paragraph should not be followed by an internal table placeholder.", "prov": _prov(1, 40, 620)},
+        ],
+        "pictures": [],
+        "tables": [
+            {
+                "prov": [{"page_no": 1, "bbox": {"l": 60, "t": 400, "r": 240, "b": 260}}],
+                "data": {
+                    "grid": [[{"text": ""}]],
+                },
+            }
+        ],
+    }
+
+    result = build_book_reconstruction(structured)
+
+    assert "structure preserved" not in result["full_markdown"]
+    assert result["pages"][0]["table_count"] == 0
+
+
+def test_book_rebuild_keeps_image_only_pages() -> None:
+    structured = {
+        "body": {
+            "children": [{"$ref": "#/texts/0"}]
+        },
+        "texts": [
+            {"label": "section_header", "text": "Chapter 1", "prov": _prov(1, 40, 760)},
+        ],
+        "pictures": [
+            {
+                "prov": [{"page_no": 2, "bbox": {"l": 60, "t": 590, "r": 200, "b": 420}}],
+                "captions": [{"text": "A plate that appears on an otherwise image-only page."}],
+            }
+        ],
+        "tables": [],
+    }
+
+    result = build_book_reconstruction(structured)
+
+    assert result["pages"][1]["page_no"] == 2
+    assert result["pages"][1]["page_kind"] == "body"
+    assert "A plate that appears on an otherwise image-only page." in result["full_markdown"]
+
+
+def test_book_rebuild_removes_control_chars_and_formula_fragments() -> None:
+    structured = {
+        "body": {
+            "children": [{"$ref": f"#/texts/{index}"} for index in range(6)]
+        },
+        "texts": [
+            {"label": "section_header", "text": "Chapter 1", "prov": _prov(1, 40, 760)},
+            {"label": "text", "text": "A readable paragraph should remain even in a math-heavy book.", "prov": _prov(1, 40, 620)},
+            {"label": "text", "text": "\x05", "prov": _prov(1, 40, 560)},
+            {"label": "text", "text": "=", "prov": _prov(1, 40, 540)},
+            {"label": "text", "text": "√8", "prov": _prov(1, 40, 520)},
+            {"label": "text", "text": "The next paragraph contains x < y as prose and should remain.", "prov": _prov(1, 40, 500)},
+        ],
+        "pictures": [],
+        "tables": [],
+    }
+
+    result = build_book_reconstruction(structured)
+
+    assert "\x05" not in result["full_markdown"]
+    assert "\n=\n" not in result["full_markdown"]
+    assert "√8" not in result["full_markdown"]
+    assert "x < y" in result["full_markdown"]
+
+
+def test_book_rebuild_skips_references_and_index_pages() -> None:
+    structured = {
+        "body": {
+            "children": [{"$ref": f"#/texts/{index}"} for index in range(14)]
+        },
+        "texts": [
+            {"label": "section_header", "text": "Chapter 1", "prov": _prov(1, 40, 760)},
+            {"label": "text", "text": "The chapter body should remain.", "prov": _prov(1, 40, 620)},
+            {"label": "section_header", "text": "References", "prov": _prov(2, 40, 760)},
+            {"label": "text", "text": "Smith J (2020) A reference title. Publisher.", "prov": _prov(2, 40, 700)},
+            {"label": "text", "text": "Brown A (2021) Another reference title. Journal.", "prov": _prov(2, 40, 660)},
+            {"label": "text", "text": "Jones B (2022) More reference material. Journal.", "prov": _prov(2, 40, 620)},
+            {"label": "text", "text": "Index", "prov": _prov(3, 40, 760)},
+            {"label": "text", "text": "Alpha, 1, 2", "prov": _prov(3, 40, 720)},
+            {"label": "text", "text": "Beta, 3, 4", "prov": _prov(3, 40, 700)},
+            {"label": "text", "text": "Gamma, 5, 6", "prov": _prov(3, 40, 680)},
+            {"label": "text", "text": "Delta, 7, 8", "prov": _prov(3, 40, 660)},
+            {"label": "text", "text": "Epsilon, 9, 10", "prov": _prov(3, 40, 640)},
+            {"label": "text", "text": "Zeta, 11, 12", "prov": _prov(3, 40, 620)},
+            {"label": "text", "text": "Eta, 13, 14", "prov": _prov(3, 40, 600)},
+        ],
+        "pictures": [],
+        "tables": [],
+    }
+
+    result = build_book_reconstruction(structured)
+
+    assert result["chapter_count"] == 1
+    assert "References" not in result["full_markdown"]
+    assert "Alpha, 1, 2" not in result["full_markdown"]
+    assert [page["page_kind"] for page in result["pages"]] == ["body", "references", "index"]
+
+
+def test_book_rebuild_filters_running_page_headers() -> None:
+    structured = {
+        "body": {
+            "children": [{"$ref": f"#/texts/{index}"} for index in range(5)]
+        },
+        "texts": [
+            {"label": "section_header", "text": "Introduction", "prov": _prov(1, 40, 760)},
+            {"label": "text", "text": "The real introduction heading and its opening paragraph should remain.", "prov": _prov(1, 40, 620)},
+            {"label": "page_header", "text": "Introduction", "prov": _prov(2, 80, 612)},
+            {"label": "text", "text": "A continued paragraph on the next page should not be preceded by the running header.", "prov": _prov(2, 40, 560)},
+            {"label": "page_footer", "text": "2", "prov": _prov(2, 300, 30)},
+        ],
+        "pictures": [],
+        "tables": [],
+    }
+
+    result = build_book_reconstruction(structured)
+
+    assert "# Introduction" in result["full_markdown"]
+    assert result["full_markdown"].count("Introduction") == 1
+    assert "running header" in result["full_markdown"]
+
+
+def test_book_rebuild_retains_note_like_page_footer_after_body(monkeypatch) -> None:
+    """Footnote bodies tagged as page_footer should follow main text on the same page."""
+    structured = {
+        "body": {
+            "children": [{"$ref": f"#/texts/{index}"} for index in range(4)]
+        },
+        "texts": [
+            {"label": "section_header", "text": "Chapter 1", "prov": _prov(1, 40, 760)},
+            {"label": "text", "text": "Main body paragraph with a superscript marker in the PDF export.", "prov": _prov(1, 40, 580)},
+            {
+                "label": "page_footer",
+                "text": "1 First footnote line with enough words to qualify as substantive.\n2 Second footnote line also with enough words here.",
+                "prov": _prov(1, 40, 120),
+            },
+            {"label": "page_footer", "text": "12", "prov": _prov(1, 500, 40)},
+        ],
+        "pictures": [],
+        "tables": [],
+    }
+
+    monkeypatch.setattr(book_rebuild, "_extract_pdf_outline_chapters", lambda source_pdf, total_pages: [])
+
+    result = build_book_reconstruction(structured)
+    md = result["chapters"][0]["markdown"]
+
+    assert "Main body paragraph" in md
+    assert "First footnote line" in md
+    assert "Second footnote line" in md
+    assert md.index("Main body paragraph") < md.index("First footnote line")
+    assert "\n\n---\n\n" in md
+    assert "12" not in md
+
+
+def test_book_rebuild_promotes_book_section_starts_to_chapters() -> None:
+    structured = {
+        "body": {
+            "children": [{"$ref": f"#/texts/{index}"} for index in range(8)]
+        },
+        "texts": [
+            {"label": "text", "text": "This page intentionally left blank", "prov": _prov(1, 40, 620)},
+            {"label": "section_header", "text": "Preface", "prov": _prov(2, 60, 510)},
+            {"label": "text", "text": "The preface body should be its own front-matter section.", "prov": _prov(2, 40, 440)},
+            {"label": "section_header", "text": "Introduction", "prov": _prov(3, 60, 510)},
+            {"label": "text", "text": "The introduction body should begin a new section.", "prov": _prov(3, 40, 440)},
+            {"label": "section_header", "text": "Chapter 1", "prov": _prov(4, 60, 510)},
+            {"label": "section_header", "text": "The First Chapter", "prov": _prov(4, 60, 480)},
+            {"label": "text", "text": "Chapter body text should begin after the chapter heading.", "prov": _prov(4, 40, 420)},
+        ],
+        "pictures": [],
+        "tables": [],
+    }
+
+    result = build_book_reconstruction(structured)
+
+    assert [chapter["title"] for chapter in result["chapters"]] == [
+        "Preface",
+        "Introduction",
+        "Chapter 1: The First Chapter",
+    ]
+    assert "This page intentionally left blank" not in result["full_markdown"]
+    assert "# Preface" in result["full_markdown"]
+    assert "# Introduction" in result["full_markdown"]
+    assert "# Chapter 1: The First Chapter" in result["full_markdown"]

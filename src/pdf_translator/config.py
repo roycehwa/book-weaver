@@ -8,6 +8,32 @@ from pdf_translator.guardrails import DEFAULT_INGEST_TIMEOUT_SECONDS
 
 
 DEFAULT_OPENAI_MODEL = "gpt-4.1-mini"
+DEFAULT_MINIMAX_MODEL = "MiniMax-M2.7-highspeed"
+DEFAULT_MINIMAX_BASE_URL = "https://api.minimaxi.com/anthropic/v1/messages"
+DEFAULT_MINIMAX_MAX_TOKENS = 2048
+DEFAULT_TRANSLATION_CONCURRENCY = 4
+
+
+def _load_local_env() -> None:
+    for directory in [Path.cwd(), *Path.cwd().parents]:
+        env_path = directory / ".env"
+        if env_path.exists():
+            _load_env_file(env_path)
+            return
+        if (directory / "pyproject.toml").exists():
+            return
+
+
+def _load_env_file(env_path: Path) -> None:
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
 
 
 @dataclass(slots=True)
@@ -18,6 +44,7 @@ class OpenAISettings:
 
     @classmethod
     def from_env(cls) -> "OpenAISettings":
+        _load_local_env()
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
             raise ValueError("OPENAI_API_KEY is required when translator='openai'.")
@@ -29,6 +56,47 @@ class OpenAISettings:
 
 
 @dataclass(slots=True)
+class CompatibleAPISettings:
+    api_key: str
+    model: str
+    base_url: str
+    max_tokens: int | None = None
+
+    @classmethod
+    def from_env(cls, provider: str = "compatible") -> "CompatibleAPISettings":
+        _load_local_env()
+        normalized = provider.strip().lower()
+        if normalized == "minimax":
+            api_key = os.getenv("MINIMAX_API_KEY") or os.getenv("LLM_API_KEY")
+            if not api_key:
+                raise ValueError("MINIMAX_API_KEY or LLM_API_KEY is required when translator='minimax'.")
+            return cls(
+                api_key=api_key,
+                model=os.getenv("MINIMAX_MODEL") or os.getenv("LLM_MODEL") or DEFAULT_MINIMAX_MODEL,
+                base_url=os.getenv("MINIMAX_BASE_URL") or os.getenv("LLM_BASE_URL") or DEFAULT_MINIMAX_BASE_URL,
+                max_tokens=int(os.getenv("MINIMAX_MAX_TOKENS") or DEFAULT_MINIMAX_MAX_TOKENS),
+            )
+
+        api_key = os.getenv("LLM_API_KEY")
+        base_url = os.getenv("LLM_BASE_URL")
+        model = os.getenv("LLM_MODEL")
+        missing = [
+            name
+            for name, value in [
+                ("LLM_API_KEY", api_key),
+                ("LLM_BASE_URL", base_url),
+                ("LLM_MODEL", model),
+            ]
+            if not value
+        ]
+        if missing:
+            raise ValueError(
+                ", ".join(missing) + " required when translator='compatible'."
+            )
+        return cls(api_key=api_key, base_url=base_url, model=model)
+
+
+@dataclass(slots=True)
 class RunSettings:
     source_pdf: Path
     output_dir: Path
@@ -37,6 +105,8 @@ class RunSettings:
     translator: str
     max_chunk_chars: int
     profile_name: str = "auto"
+    output_format: str = "epub"
+    translation_concurrency: int = DEFAULT_TRANSLATION_CONCURRENCY
     ingest_timeout_seconds: int | None = DEFAULT_INGEST_TIMEOUT_SECONDS
     max_file_size_mb: float | None = None
     max_page_count: int | None = None
