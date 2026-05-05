@@ -526,6 +526,111 @@ def _epub_dc_title(zipf: ZipFile, opf_path: str) -> str | None:
     return None
 
 
+def _epub_element_type(tag: Tag) -> str | None:
+    """Best-effort read of epub:type / XML equivalent on XHTML."""
+    v = tag.get("epub:type")
+    if isinstance(v, str) and v.strip():
+        return v.strip().lower()
+    for key, val in tag.attrs.items():
+        if val is None or not isinstance(val, str):
+            continue
+        kl = key.split("}")[-1].lower()
+        if kl == "type" and val.strip():
+            return val.strip().lower()
+    return None
+
+
+def _epub_toc_block_to_markdown(container: Tag, internal_xhtml_path: str) -> str | None:
+    """Serialize a toc nav/section into one Markdown line per linked entry (fixes multi-column print TOC)."""
+    links = container.find_all("a", href=True)
+    if len(links) < 2:
+        return None
+    lines_out: list[str] = []
+    for a in links:
+        href = a.get("href")
+        if not isinstance(href, str) or not href.strip():
+            continue
+        label = "".join(_epub_phrasing_to_markdown(ch, internal_xhtml_path) for ch in a.children)
+        label = (label or a.get_text(" ", strip=True) or "").strip()
+        if not label:
+            continue
+        resolved = _epub_resolve_link_href(internal_xhtml_path, href)
+        if resolved:
+            lines_out.append(_md_markdown_link(label, resolved))
+        else:
+            lines_out.append(label)
+    return "\n".join(lines_out) if lines_out else None
+
+
+def _epub_replace_toc_nav_regions(body: Tag, internal_xhtml_path: str) -> None:
+    """Replace EPUB3 toc blocks before flow serialization so print-style columns are not one glyph per line."""
+    for tag in list(body.find_all(["nav", "section"])):
+        epub_t = _epub_element_type(tag) or ""
+        role = (tag.get("role") or "").lower()
+        tid = (tag.get("id") or "").lower()
+        classes = " ".join(tag.get("class") or []).lower()
+        links = tag.find_all("a", href=True)
+        is_toc_semantics = (
+            epub_t == "toc"
+            or role in {"doc-toc", "directory"}
+            or "table-of-contents" in classes
+            or any(c in {"toc", "contents", "tableofcontents"} for c in classes.split())
+            or tid in {"toc", "contents", "tableofcontents"}
+        )
+        # Some producers omit epub:type on nav; treat multi-link nav as TOC when clearly labelled.
+        if not is_toc_semantics and tag.name == "nav" and len(links) >= 2:
+            headingish = tag.find(["p", "h1", "h2", "h3", "div"])
+            ht = (headingish.get_text(" ", strip=True) if headingish else "").lower()
+            if any(w in ht for w in ("contents", "table of contents")):
+                is_toc_semantics = True
+        if not is_toc_semantics:
+            continue
+        md = _epub_toc_block_to_markdown(tag, internal_xhtml_path)
+        if md:
+            tag.replace_with(NavigableString("\n\n" + md + "\n\n"))
+
+
+def _epub_maybe_repair_staccato_toc_lines(markdown: str) -> str:
+    """When a print TOC was not in nav@toc, merge runs of 1–2 character lines (broken column flow)."""
+    lines = markdown.split("\n")
+    if len(lines) < 24:
+        return markdown
+    stripped = [ln.strip() for ln in lines]
+    short = sum(1 for s in stripped if len(s) <= 2 and s)
+    if short < len(stripped) * 0.4:
+        return markdown
+    merged: list[str] = []
+    buf: list[str] = []
+    for s in stripped:
+        if len(s) <= 2 and s and not re.match(r"^\d{1,4}$", s):
+            buf.append(s)
+            continue
+        if re.match(r"^\d{1,4}$", s) and buf:
+            merged.append("".join(buf) + " " + s)
+            buf = []
+            continue
+        if buf:
+            merged.append(_epub_merge_short_line_run(buf))
+            buf = []
+        merged.append(s)
+    if buf:
+        merged.append(_epub_merge_short_line_run(buf))
+    return "\n".join(merged)
+
+
+def _epub_merge_short_line_run(parts: list[str]) -> str:
+    if not parts:
+        return ""
+    out = [parts[0]]
+    for nxt in parts[1:]:
+        prev = out[-1]
+        if prev and nxt and prev[-1].isascii() and nxt[0].isascii() and prev[-1].isalnum() and nxt[0].isalnum():
+            out.append(" " + nxt)
+        else:
+            out.append(nxt)
+    return "".join(out)
+
+
 def _html_table_to_markdown(table: Tag) -> str | None:
     rows: list[list[str]] = []
     for tr in table.find_all("tr"):
@@ -638,6 +743,9 @@ def _epub_flow_markdown_lines(body: Tag, *, internal_xhtml_path: str) -> list[st
                 t = str(child).strip()
                 if t.startswith("!["):
                     out.append(t)
+                elif t:
+                    # Injected Markdown (e.g. nav@toc replacement) or other explicit body text nodes
+                    out.append(t)
                 continue
             if not isinstance(child, Tag):
                 continue
@@ -722,6 +830,7 @@ def _extract_epub_body_chapter(
     for tag in soup.find_all(["script", "style"]):
         tag.decompose()
     body = soup.find("body") or soup
+    _epub_replace_toc_nav_regions(body, internal_xhtml_path)
     def resolve_media_href(src: str) -> str | None:
         src = src.split("#", 1)[0].strip()
         if not src or src.startswith("data:"):
@@ -834,6 +943,7 @@ def _extract_epub_body_chapter(
         title_heading.decompose()
 
     body_md = "\n\n".join(_epub_flow_markdown_lines(body, internal_xhtml_path=internal_xhtml_path)).strip()
+    body_md = _epub_maybe_repair_staccato_toc_lines(body_md)
     return title_guess, body_md
 
 

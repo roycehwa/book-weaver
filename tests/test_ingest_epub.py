@@ -7,7 +7,7 @@ import zipfile
 from pathlib import Path
 
 from pdf_translator.book_rebuild import build_book_reconstruction
-from pdf_translator.ingest import ingest_epub
+from pdf_translator.ingest import _epub_maybe_repair_staccato_toc_lines, ingest_epub
 
 
 def _write_epub(
@@ -59,6 +59,34 @@ def _write_epub(
         )
         z.writestr("OEBPS/chapter1.xhtml", chapter_xhtml)
     path.write_bytes(buf.getvalue())
+
+
+def test_ingest_epub_nav_epub_type_toc_becomes_linked_lines(tmp_path: Path) -> None:
+    xhtml = """<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head><body>
+<nav epub:type="toc" id="contents">
+  <p class="toc_title">Contents</p>
+  <a href="chapter1.xhtml#a">First Part</a>
+  <a href="chapter1.xhtml#b">Second Part</a>
+</nav>
+<p>Body after.</p>
+</body></html>"""
+    epub = tmp_path / "toc.epub"
+    _write_epub(epub, chapter_xhtml=xhtml)
+    doc = ingest_epub(epub)
+    md = doc.structured["_epub_meta"]["chapters"][0]["markdown"]
+    assert "[First Part](OEBPS/chapter1.xhtml#a)" in md
+    assert "[Second Part](OEBPS/chapter1.xhtml#b)" in md
+    assert "Body after." in md
+
+
+def test_epub_staccato_line_repair_merges_fragmented_column_flow() -> None:
+    # Simulates two-column TOC where each glyph became its own line (many single-char rows)
+    frag = "\n".join(list("ABCDEFGHIJ") * 3)
+    assert len(frag.split("\n")) >= 24
+    fixed = _epub_maybe_repair_staccato_toc_lines(frag + "\n\nNormal paragraph line here.")
+    assert len(fixed.split("\n")) < len(frag.split("\n"))
+    assert "".join(frag.split()) in "".join(fixed.split())
 
 
 def test_ingest_epub_preserves_external_link_in_paragraph(tmp_path: Path) -> None:

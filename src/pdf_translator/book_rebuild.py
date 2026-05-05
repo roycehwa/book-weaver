@@ -915,7 +915,9 @@ def _chapter_pages_from_outline(
         if entry.get("skip"):
             excluded_page_kinds = {"visual_only"}
         else:
-            excluded_page_kinds = {"toc", "references", "index", "table_heavy", "visual_only"}
+            # Keep table_heavy pages: they are often charts/tables/outline-style grids; excluding them
+            # dropped dense figure/table pages that Docling did not flag with structured table_count.
+            excluded_page_kinds = {"toc", "references", "index", "visual_only"}
         selected_pages = [
             pages_by_no[page_no]
             for page_no in page_numbers
