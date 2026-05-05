@@ -218,7 +218,7 @@ def test_ingest_pdf_guarded_soft_page_limit_accepts_over_limit_pdf(monkeypatch: 
             detected_language="en",
         )
 
-    monkeypatch.setattr("pdf_translator.guardrails.ingest_document", fake_ingest)
+    monkeypatch.setattr("pdf_translator.guardrails.ingest_pdf", fake_ingest)
 
     normalized, preflight = ingest_pdf_guarded(
         source_pdf,
@@ -249,7 +249,7 @@ def test_ingest_pdf_guarded_strict_gate_still_rejects(monkeypatch: pytest.Monkey
             detected_language="en",
         )
 
-    monkeypatch.setattr("pdf_translator.guardrails.ingest_document", fake_ingest)
+    monkeypatch.setattr("pdf_translator.guardrails.ingest_pdf", fake_ingest)
 
     with pytest.raises(InputGateError):
         ingest_pdf_guarded(
