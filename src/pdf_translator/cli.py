@@ -10,6 +10,11 @@ from pdf_translator.guardrails import (
     IngestGuardrailError,
     ingest_pdf_guarded,
 )
+from pdf_translator.knowledge import (
+    emit_mindmap_mermaid_from_book,
+    emit_wiki_outline_from_book,
+    load_book_json,
+)
 from pdf_translator.pipeline import run_translation_pipeline
 from pdf_translator.profile import build_document_profile
 from pdf_translator.validation import run_validation_manifest, write_validation_report
@@ -180,6 +185,44 @@ def build_parser() -> argparse.ArgumentParser:
         help="Default hard input gate for page count when a case is recomputed.",
     )
 
+    knowledge_parser = subparsers.add_parser(
+        "knowledge",
+        help="Branch B stubs: wiki outline and Mermaid mindmap from book.json.",
+    )
+    knowledge_sub = knowledge_parser.add_subparsers(dest="knowledge_command", required=True)
+    wiki_outline = knowledge_sub.add_parser(
+        "wiki-outline",
+        help="Write per-chapter Markdown stubs and index.md under a directory.",
+    )
+    wiki_outline.add_argument(
+        "--book-json",
+        type=Path,
+        required=True,
+        help="Path to book.json from a translate run.",
+    )
+    wiki_outline.add_argument(
+        "--out",
+        type=Path,
+        required=True,
+        help="Output directory for wiki Markdown files.",
+    )
+    mindmap_cmd = knowledge_sub.add_parser(
+        "mindmap",
+        help="Write a Mermaid mindmap file listing chapter titles.",
+    )
+    mindmap_cmd.add_argument(
+        "--book-json",
+        type=Path,
+        required=True,
+        help="Path to book.json from a translate run.",
+    )
+    mindmap_cmd.add_argument(
+        "--out",
+        type=Path,
+        required=True,
+        help="Output path for the .md file containing a fenced mermaid block.",
+    )
+
     return parser
 
 
@@ -284,6 +327,17 @@ def main() -> None:
                     print(f"{status} {case['profile']} {case['name']} :: {case['failure']['type']}")
                 else:
                     print(f"{status} {case['profile']} {case['name']}")
+        elif args.command == "knowledge":
+            book_path = args.book_json.expanduser().resolve()
+            book = load_book_json(book_path)
+            if args.knowledge_command == "wiki-outline":
+                out = args.out.expanduser().resolve()
+                emit_wiki_outline_from_book(book, out)
+                print(f"Wiki outline written under: {out}")
+            elif args.knowledge_command == "mindmap":
+                out = args.out.expanduser().resolve()
+                emit_mindmap_mermaid_from_book(book, out)
+                print(f"Mermaid mindmap written to: {out}")
     except IngestGuardrailError as exc:
         print(str(exc))
         if exc.preflight is not None:

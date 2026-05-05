@@ -22,6 +22,15 @@ from pdf_translator.reconstruct import (
 TOP_TITLE_BAND = 480.0
 MAX_TITLE_LINE_WORDS = 12
 BODY_TEXT_MIN_CHARS = 260
+# Trailing footnote promotion (_promote_trailing_footnote_like_items): conservative per-page
+# heuristic only. It does not solve interleaved footnotes, two-column scholarly layouts, or
+# pages where note markers are dense inside body prose; those need a separate strategy keyed
+# off metadata["footnote_line_ratio"] (or future outline/endnotes detection), not more regex
+# tuned to one sample.
+FOOTNOTE_HEAVY_MIN_CHARS = 40
+FOOTNOTE_HEAVY_MARKER_LINES_MIN = 2
+FOOTNOTE_HEAVY_SINGLE_LINE_MIN_CHARS = 72
+FOOTNOTE_LINE_RATIO_TYPICAL_MAX = 0.18
 CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 MATH_SYMBOL_RE = re.compile(r"[=+\-−·×÷*/^_√∂∑∫∞≈≠≤≥<>|]")
 NON_SECTION_HEADINGS = {
@@ -481,6 +490,63 @@ def _kind_reading_rank(kind: str) -> int:
     return {"text": 0, "figure": 1, "table": 2}.get(kind, 9)
 
 
+def _text_block_footnote_heavy(text: str) -> bool:
+    """True if a *single* text block looks like a footnote cluster (not general prose).
+
+    Intentionally narrow: avoids relabeling numbered lists, statutes, or math-heavy lines.
+    """
+    raw = _clean_book_text(text)
+    if not raw or len(raw) < FOOTNOTE_HEAVY_MIN_CHARS:
+        return False
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return False
+    hits = sum(1 for ln in lines[:32] if NOTE_LINE_RE.match(_normalize_text(ln)))
+    if hits >= FOOTNOTE_HEAVY_MARKER_LINES_MIN:
+        return True
+    if (
+        len(lines) == 1
+        and NOTE_LINE_RE.match(_normalize_text(lines[0]))
+        and len(raw) >= FOOTNOTE_HEAVY_SINGLE_LINE_MIN_CHARS
+    ):
+        return True
+    return False
+
+
+def _promote_trailing_footnote_like_items(items: list[BookItem]) -> list[BookItem]:
+    """Mark a *suffix* of per-page items as footer so they render after ``---``.
+
+    Only runs on the sorted reading order for one page. It cannot reorder interleaved
+    footnote markers in body text; high ``footnote_line_ratio`` books should use a
+    dedicated layout path instead of extending this heuristic.
+    """
+    if len(items) < 2:
+        return items
+    n = len(items)
+    k = n
+    while k > 0:
+        it = items[k - 1]
+        if it.kind != "text" or it.from_page_footer:
+            break
+        if not _text_block_footnote_heavy(it.text):
+            break
+        k -= 1
+    if k == n:
+        return items
+    return [
+        BookItem(
+            kind=it.kind,
+            text=it.text,
+            page_no=it.page_no,
+            left=it.left,
+            top=it.top,
+            path=it.path,
+            from_page_footer=(i >= k) or it.from_page_footer,
+        )
+        for i, it in enumerate(items)
+    ]
+
+
 def _page_content_items(
     blocks: list[LayoutBlock],
     *,
@@ -507,6 +573,7 @@ def _page_content_items(
         items,
         key=lambda item: (-item.top, item.left, _kind_reading_rank(item.kind)),
     )
+    ordered = _promote_trailing_footnote_like_items(ordered)
     out: list[BookItem] = []
     footer_started = False
     for item in ordered:
@@ -526,6 +593,34 @@ def _page_content_items(
             )
         )
     return out
+
+
+def _book_footnote_line_ratio_from_pages(pages: list[dict[str, Any]]) -> float:
+    """Share of non-empty lines (across page content) that look like numbered notes.
+
+    Book-level signal only: no per-title string matching. Downstream may branch on this
+    instead of stacking layout hacks for one imprint.
+    """
+    total = 0
+    note = 0
+    for page in pages:
+        for chunk in page.get("content_lines") or []:
+            if not isinstance(chunk, str):
+                continue
+            for ln in chunk.splitlines():
+                t = ln.strip()
+                if not t:
+                    continue
+                total += 1
+                if NOTE_LINE_RE.match(_normalize_text(t)):
+                    note += 1
+    return note / total if total else 0.0
+
+
+def _footnote_load_label(ratio: float) -> str:
+    if ratio <= FOOTNOTE_LINE_RATIO_TYPICAL_MAX:
+        return "typical"
+    return "footnote_heavy"
 
 
 def _looks_like_toc(lines: list[str], *, page_no: int, total_pages: int) -> bool:
@@ -732,6 +827,8 @@ def _infer_section_title(page_payloads: list[dict[str, Any]], fallback: str) -> 
             heading = _clean_heading_text(line)
             if not heading:
                 continue
+            if len(heading.split()) > MAX_TITLE_LINE_WORDS:
+                continue
             if heading.lower() in NON_SECTION_HEADINGS:
                 continue
             headings.append(heading)
@@ -870,6 +967,7 @@ def _build_book_from_epub_meta(meta: dict[str, Any], source_path: Path | None) -
         tr = str(entry.get("trace_markdown") or md).strip()
         if tr and not tr.endswith("\n"):
             tr += "\n"
+        sip = entry.get("source_internal_path")
         chapters.append(
             {
                 "index": i,
@@ -881,6 +979,7 @@ def _build_book_from_epub_meta(meta: dict[str, Any], source_path: Path | None) -
                 "trace_markdown": tr,
                 "translate": True,
                 "preserve_original": False,
+                "source_internal_path": sip if isinstance(sip, str) else None,
             }
         )
         pages.append(
@@ -911,6 +1010,9 @@ def _build_book_from_epub_meta(meta: dict[str, Any], source_path: Path | None) -
     if trace_markdown:
         trace_markdown += "\n"
 
+    epub_footnote_ratio_pages = [{"content_lines": [ch["markdown"]]} for ch in chapters]
+    epub_fn_ratio = _book_footnote_line_ratio_from_pages(epub_footnote_ratio_pages)
+
     return {
         "metadata": {
             "schema": "book_ir",
@@ -918,6 +1020,8 @@ def _build_book_from_epub_meta(meta: dict[str, Any], source_path: Path | None) -
             "chapter_source": "epub_spine",
             "outline_entry_count": len(chapters),
             "outline_stop_entry_count": len(chapters),
+            "footnote_line_ratio": round(epub_fn_ratio, 5),
+            "footnote_load": _footnote_load_label(epub_fn_ratio),
         },
         "render_policy": {
             "reading_output": "single_language_epub",
@@ -1032,8 +1136,12 @@ def build_book_reconstruction(
             if page["page_kind"] in {"toc", "references", "index"}:
                 flush()
                 continue
-            if page["page_kind"] in {"front_matter", "back_matter", "notes_heavy", "visual_only"}:
-                continue
+            _skippable_misc = {"front_matter", "back_matter", "notes_heavy", "visual_only"}
+            if page["page_kind"] in _skippable_misc:
+                has_assets = (page.get("figure_count", 0) > 0) or (page.get("table_count", 0) > 0)
+                has_text = bool(page.get("content_lines"))
+                if not has_assets and not has_text:
+                    continue
 
             page_title = page["chapter_title"]
             if page_title and current_pages:
@@ -1090,6 +1198,7 @@ def build_book_reconstruction(
         if item.path
     )
 
+    footnote_line_ratio = _book_footnote_line_ratio_from_pages(pages)
     return {
         "metadata": {
             "schema": "book_ir",
@@ -1097,6 +1206,8 @@ def build_book_reconstruction(
             "chapter_source": "pdf_outline" if outline_entries else "layout_heuristic",
             "outline_entry_count": len([entry for entry in outline_entries if not entry.get("skip")]),
             "outline_stop_entry_count": len(outline_entries),
+            "footnote_line_ratio": round(footnote_line_ratio, 5),
+            "footnote_load": _footnote_load_label(footnote_line_ratio),
         },
         "render_policy": {
             "reading_output": "single_language_epub",

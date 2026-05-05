@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import posixpath
 import re
 import tempfile
 import xml.etree.ElementTree as ET
@@ -7,7 +8,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 from zipfile import ZipFile
 
-from bs4 import BeautifulSoup, NavigableString
+from bs4 import BeautifulSoup, NavigableString, Tag
 from langdetect import LangDetectException, detect
 
 from pdf_translator.models import NormalizedDocument
@@ -346,8 +347,8 @@ def _epub_join(opf_path: str, href: str) -> str:
         joined = PurePosixPath(href)
     else:
         joined = PurePosixPath(parent) / href
-    normalized = joined.as_posix()
-    if normalized.startswith("../"):
+    normalized = posixpath.normpath(joined.as_posix())
+    if normalized.startswith("../") or normalized.startswith("/"):
         raise ValueError(f"Invalid EPUB path escape: {href!r}")
     return normalized
 
@@ -361,6 +362,326 @@ _XHTML_MEDIA = frozenset(
 )
 
 
+def _epub_find_cover_internal(
+    zipf: ZipFile, opf_path: str, manifest: dict[str, tuple[str, str]]
+) -> str | None:
+    raw = zipf.read(opf_path)
+    root = ET.fromstring(raw)
+    for child in root:
+        if _xml_local_name(child.tag) != "manifest":
+            continue
+        for item in child:
+            if _xml_local_name(item.tag) != "item":
+                continue
+            props = (item.attrib.get("properties") or "").lower()
+            href = (item.attrib.get("href") or "").replace("\\", "/")
+            if "cover-image" in props.split() and href:
+                internal = _epub_join(opf_path, href)
+                if internal in zipf.namelist():
+                    return internal
+    meta_cover_id: str | None = None
+    for child in root:
+        if _xml_local_name(child.tag) != "metadata":
+            continue
+        for el in child:
+            if _xml_local_name(el.tag) != "meta":
+                continue
+            if el.attrib.get("name") == "cover" and el.attrib.get("content"):
+                meta_cover_id = el.attrib["content"]
+                break
+    if meta_cover_id and meta_cover_id in manifest:
+        href, _mt = manifest[meta_cover_id]
+        internal = _epub_join(opf_path, href.replace("\\", "/"))
+        if internal in zipf.namelist():
+            return internal
+    return None
+
+
+def _epub_spine_xhtml_refs_asset_basename(
+    zipf: ZipFile,
+    opf_path: str,
+    manifest: dict[str, tuple[str, str]],
+    spine_ids: list[str],
+    basename: str,
+) -> bool:
+    if not basename:
+        return False
+    for sid in spine_ids:
+        if sid not in manifest:
+            continue
+        href, media = manifest[sid]
+        low = href.lower()
+        if media not in _XHTML_MEDIA and not low.endswith((".xhtml", ".html", ".htm")):
+            continue
+        internal = _epub_join(opf_path, href.replace("\\", "/"))
+        if internal not in zipf.namelist():
+            continue
+        html = zipf.read(internal).decode("utf-8", errors="replace")
+        if basename in html:
+            return True
+    return False
+
+
+def _epub_copy_binary_to_assets(
+    zipf: ZipFile,
+    internal_path: str,
+    asset_dir: Path,
+    written_assets: dict[str, Path],
+) -> Path:
+    if internal_path in written_assets:
+        return written_assets[internal_path]
+    dest = asset_dir / Path(internal_path).name
+    base = dest.stem
+    suf = dest.suffix
+    n = 1
+    while dest.exists():
+        dest = asset_dir / f"{base}-{n}{suf}"
+        n += 1
+    dest.write_bytes(zipf.read(internal_path))
+    resolved = dest.resolve()
+    written_assets[internal_path] = resolved
+    return resolved
+
+
+def _epub_locate_ncx_internal(zipf: ZipFile, opf_path: str) -> str | None:
+    root = ET.fromstring(zipf.read(opf_path))
+    for child in root:
+        if _xml_local_name(child.tag) != "manifest":
+            continue
+        for item in child:
+            if _xml_local_name(item.tag) != "item":
+                continue
+            mt = (item.attrib.get("media-type") or "").lower()
+            if "ncx" not in mt:
+                continue
+            href = (item.attrib.get("href") or "").replace("\\", "/")
+            if not href:
+                continue
+            internal = _epub_join(opf_path, href)
+            if internal in zipf.namelist():
+                return internal
+    return None
+
+
+def _epub_collect_navpoint_labels(ncx_root: ET.Element, ncx_internal: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    ncx_dir = str(PurePosixPath(ncx_internal).parent)
+
+    def walk_nav_map(parent: ET.Element) -> None:
+        for el in parent:
+            if _xml_local_name(el.tag) != "navPoint":
+                continue
+            label: str | None = None
+            href: str | None = None
+            for child in el:
+                tag = _xml_local_name(child.tag)
+                if tag == "navLabel":
+                    for t in child.iter():
+                        if _xml_local_name(t.tag) == "text":
+                            tx = (t.text or "").strip()
+                            if tx:
+                                label = tx[:500]
+                                break
+                elif tag == "content":
+                    raw = (child.attrib.get("src") or "").split("#", 1)[0].strip()
+                    if raw:
+                        href = raw.replace("\\", "/")
+            if label and href:
+                joined = posixpath.normpath(str(PurePosixPath(ncx_dir) / href))
+                out[joined] = label
+                out[PurePosixPath(joined).name] = label
+            walk_nav_map(el)
+
+    for child in ncx_root:
+        if _xml_local_name(child.tag) == "navMap":
+            walk_nav_map(child)
+    return out
+
+
+def _epub_collect_toc_labels(zipf: ZipFile, opf_path: str) -> dict[str, str]:
+    ncx_internal = _epub_locate_ncx_internal(zipf, opf_path)
+    if not ncx_internal:
+        return {}
+    try:
+        ncx_root = ET.fromstring(zipf.read(ncx_internal))
+    except ET.ParseError:
+        return {}
+    return _epub_collect_navpoint_labels(ncx_root, ncx_internal)
+
+
+def _epub_dc_title(zipf: ZipFile, opf_path: str) -> str | None:
+    try:
+        root = ET.fromstring(zipf.read(opf_path))
+    except ET.ParseError:
+        return None
+    for child in root:
+        if _xml_local_name(child.tag) != "metadata":
+            continue
+        for el in child:
+            if _xml_local_name(el.tag) != "title":
+                continue
+            txt = (el.text or "").strip()
+            if txt:
+                return txt[:500]
+    return None
+
+
+def _html_table_to_markdown(table: Tag) -> str | None:
+    rows: list[list[str]] = []
+    for tr in table.find_all("tr"):
+        cells = tr.find_all(["td", "th"])
+        if not cells:
+            continue
+        rows.append([(c.get_text(" ", strip=True) or "").replace("|", "\\|") for c in cells])
+    if not rows:
+        return None
+    width = max(len(r) for r in rows)
+    padded = [r + [""] * (width - len(r)) for r in rows]
+    header = padded[0]
+    body_rows = padded[1:] if len(padded) > 1 else []
+    lines = ["| " + " | ".join(header) + " |", "| " + " | ".join("---" for _ in range(width)) + " |"]
+    lines.extend("| " + " | ".join(row) + " |" for row in body_rows)
+    return "\n".join(lines)
+
+
+def _md_link_text_escape(text: str) -> str:
+    return text.replace("\\", "\\\\").replace("]", "\\]")
+
+
+def _md_link_dest_format(href: str) -> str:
+    if any(c in href for c in "()\n"):
+        safe = href.replace("<", "%3C").replace(">", "%3E")
+        return f"<{safe}>"
+    return href
+
+
+def _md_markdown_link(label: str, href: str) -> str:
+    if not href:
+        return _md_link_text_escape(label)
+    return f"[{_md_link_text_escape(label)}]({_md_link_dest_format(href)})"
+
+
+def _epub_resolve_link_href(internal_xhtml_path: str, raw_href: str) -> str | None:
+    href = (raw_href or "").strip()
+    if not href:
+        return None
+    scheme = href.split(":", 1)[0].lower() if ":" in href else ""
+    if scheme in ("http", "https", "mailto", "ftp", "tel"):
+        return href
+    if scheme == "javascript":
+        return None
+    if href.startswith("#"):
+        base = internal_xhtml_path.strip().replace("\\", "/")
+        frag = href[1:]
+        return f"{base}#{frag}" if frag else base
+    path_part, sep, frag = href.partition("#")
+    path_part = path_part.strip()
+    try:
+        resolved = _epub_join(internal_xhtml_path, path_part) if path_part else internal_xhtml_path
+    except ValueError:
+        return None
+    if sep:
+        return f"{resolved}#{frag}"
+    return resolved
+
+
+def _epub_phrasing_to_markdown(node: Any, internal_xhtml_path: str) -> str:
+    if isinstance(node, NavigableString):
+        return str(node)
+    if not isinstance(node, Tag):
+        return ""
+    name = (node.name or "").lower()
+    if name == "a":
+        href_raw = node.get("href")
+        if not isinstance(href_raw, str) or not href_raw.strip():
+            return "".join(_epub_phrasing_to_markdown(ch, internal_xhtml_path) for ch in node.children)
+        resolved = _epub_resolve_link_href(internal_xhtml_path, href_raw)
+        inner = "".join(_epub_phrasing_to_markdown(ch, internal_xhtml_path) for ch in node.children)
+        inner_stripped = inner.strip() or (node.get_text(" ", strip=True) or "").strip() or href_raw.strip()
+        if resolved is None:
+            return _md_link_text_escape(inner_stripped)
+        return _md_markdown_link(inner_stripped, resolved)
+    if name in {"b", "strong"}:
+        inner = "".join(_epub_phrasing_to_markdown(ch, internal_xhtml_path) for ch in node.children)
+        t = inner.strip() or node.get_text(" ", strip=True)
+        return f"**{t}**" if t else ""
+    if name in {"i", "em"}:
+        inner = "".join(_epub_phrasing_to_markdown(ch, internal_xhtml_path) for ch in node.children)
+        t = inner.strip() or node.get_text(" ", strip=True)
+        return f"*{t}*" if t else ""
+    if name == "br":
+        return "  \n"
+    if name == "sup":
+        inner = "".join(_epub_phrasing_to_markdown(ch, internal_xhtml_path) for ch in node.children)
+        return inner if inner.strip() else (node.get_text("", strip=True) or "")
+    if name == "sub":
+        return node.get_text("", strip=True)
+    if name == "code":
+        t = node.get_text()
+        if "`" not in t and "\n" not in t and len(t) < 80:
+            return f"`{t}`"
+        return t
+    inner = "".join(_epub_phrasing_to_markdown(ch, internal_xhtml_path) for ch in node.children)
+    if inner:
+        return inner
+    return str(node.get_text("", strip=False) or "")
+
+
+def _epub_flow_markdown_lines(body: Tag, *, internal_xhtml_path: str) -> list[str]:
+    """Serialize body to markdown lines in document order, including standalone images and inline links."""
+    prefix = {"h1": "## ", "h2": "### ", "h3": "#### ", "h4": "##### "}
+    out: list[str] = []
+
+    def walk_children(container: Tag) -> None:
+        for child in list(container.children):
+            if isinstance(child, NavigableString):
+                t = str(child).strip()
+                if t.startswith("!["):
+                    out.append(t)
+                continue
+            if not isinstance(child, Tag):
+                continue
+            name = child.name
+            if name is None:
+                continue
+            if name in prefix:
+                inner = "".join(_epub_phrasing_to_markdown(ch, internal_xhtml_path) for ch in child.children)
+                tx = inner.strip() or child.get_text(" ", strip=True)
+                if tx:
+                    out.append(prefix[name] + tx)
+                continue
+            if name == "p":
+                inner = "".join(_epub_phrasing_to_markdown(ch, internal_xhtml_path) for ch in child.children)
+                tx = inner.strip() or child.get_text(" ", strip=True)
+                if tx:
+                    out.append(tx)
+                continue
+            if name == "blockquote":
+                inner = "".join(_epub_phrasing_to_markdown(ch, internal_xhtml_path) for ch in child.children)
+                tx = inner.strip() or child.get_text(" ", strip=True)
+                if tx:
+                    q = tx.replace("\n", "\n> ")
+                    out.append("> " + q)
+                continue
+            if name == "li":
+                inner = "".join(_epub_phrasing_to_markdown(ch, internal_xhtml_path) for ch in child.children)
+                tx = inner.strip() or child.get_text(" ", strip=True)
+                if tx:
+                    out.append("- " + tx)
+                continue
+            if name == "table":
+                md = _html_table_to_markdown(child)
+                if md:
+                    out.append(md)
+                continue
+            if name in {"br", "hr"}:
+                continue
+            walk_children(child)
+
+    walk_children(body)
+    return out
+
+
 def read_epub_spine_length(path: Path) -> int:
     with ZipFile(path, "r") as zipf:
         if "META-INF/encryption.xml" in zipf.namelist():
@@ -368,6 +689,13 @@ def read_epub_spine_length(path: Path) -> int:
         opf_path = _epub_container_opf_path(zipf)
         manifest, spine_ids = _epub_parse_opf(zipf, opf_path)
         count = 0
+        cover_internal = _epub_find_cover_internal(zipf, opf_path, manifest)
+        if cover_internal and cover_internal in zipf.namelist():
+            low = cover_internal.lower()
+            if any(low.endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg")):
+                bn = Path(cover_internal).name
+                if not _epub_spine_xhtml_refs_asset_basename(zipf, opf_path, manifest, spine_ids, bn):
+                    count += 1
         for sid in spine_ids:
             if sid not in manifest:
                 continue
@@ -386,6 +714,8 @@ def _extract_epub_body_chapter(
     asset_dir: Path,
     written_assets: dict[str, Path],
     fallback_title: str,
+    nav_title: str | None = None,
+    book_title: str | None = None,
 ) -> tuple[str, str]:
     html = zipf.read(internal_xhtml_path).decode("utf-8", errors="replace")
     soup = BeautifulSoup(html, "html.parser")
@@ -454,35 +784,56 @@ def _extract_epub_body_chapter(
         img.replace_with(NavigableString(f"![{alt}]({written_assets[resolved].as_posix()})"))
 
     for sup in body.find_all("sup"):
-        t = sup.get_text("", strip=True)
-        sup.replace_with(t if t else "")
+        md = "".join(_epub_phrasing_to_markdown(ch, internal_xhtml_path) for ch in sup.children)
+        if not md.strip():
+            md = sup.get_text("", strip=True) or ""
+        sup.replace_with(md)
 
-    parts: list[str] = []
-    title_guess = ""
     first_h1 = body.find("h1")
-    if first_h1:
-        title_guess = first_h1.get_text(" ", strip=True)[:240]
-    if not title_guess:
-        first_h2 = body.find("h2")
-        if first_h2:
-            title_guess = first_h2.get_text(" ", strip=True)[:240]
-    if not title_guess and soup.title and soup.title.string:
-        title_guess = soup.title.string.strip()[:240]
+    first_h2 = body.find("h2")
+    title_heading: Tag | None = None
+    title_guess = ""
+
+    if nav_title and nav_title.strip():
+        title_guess = nav_title.strip()[:240]
+        h1t = first_h1.get_text(" ", strip=True) if first_h1 else ""
+        h2t = first_h2.get_text(" ", strip=True) if first_h2 else ""
+        if first_h1 and h1t and h1t.strip() == title_guess.strip():
+            title_heading = first_h1
+        elif first_h2 and h2t and h2t.strip() == title_guess.strip():
+            title_heading = first_h2
+    else:
+        if first_h1:
+            t = first_h1.get_text(" ", strip=True)[:240]
+            if t:
+                title_guess = t
+                title_heading = first_h1
+        if not title_guess and first_h2:
+            t = first_h2.get_text(" ", strip=True)[:240]
+            if t:
+                title_guess = t
+                title_heading = first_h2
+        if not title_guess:
+            ct_el = body.find("p", class_="ct")
+            if ct_el:
+                tct = ct_el.get_text(" ", strip=True)[:240]
+                if tct:
+                    title_guess = tct
+                    title_heading = ct_el
+        if not title_guess and soup.title and soup.title.string:
+            st = soup.title.string.strip()[:240]
+            if book_title and st == book_title.strip()[:240]:
+                pass
+            else:
+                title_guess = st
     if not title_guess:
         title_guess = fallback_title.strip()[:240] or Path(internal_xhtml_path).stem.replace("_", " ").strip()
     if not title_guess:
         title_guess = "Section"
+    if title_heading is not None:
+        title_heading.decompose()
 
-    for el in body.find_all(["h1", "h2", "h3", "h4", "p", "blockquote"], recursive=True):
-        name = el.name
-        text = el.get_text(" ", strip=True)
-        if not text:
-            continue
-        prefix = {"h1": "## ", "h2": "### ", "h3": "#### ", "h4": "##### ", "p": "", "blockquote": "> "}.get(name, "")
-        line = prefix + text
-        parts.append(line)
-
-    body_md = "\n\n".join(parts).strip()
+    body_md = "\n\n".join(_epub_flow_markdown_lines(body, internal_xhtml_path=internal_xhtml_path)).strip()
     return title_guess, body_md
 
 
@@ -500,7 +851,55 @@ def ingest_epub(path: Path) -> NormalizedDocument:
             raise ValueError("Encrypted EPUB is not supported.")
         opf_path = _epub_container_opf_path(zipf)
         manifest, spine_ids = _epub_parse_opf(zipf, opf_path)
+        toc_labels = _epub_collect_toc_labels(zipf, opf_path)
+        book_title = _epub_dc_title(zipf, opf_path)
         page_no = 0
+
+        def emit_spine_chapter(title: str, body_md: str, *, source_internal_path: str | None = None) -> None:
+            nonlocal page_no, text_index
+            page_no += 1
+            pn = page_no
+            raw_body = body_md.strip()
+            combined = (raw_body if raw_body else "(empty)") + "\n"
+            trace = f"[[page: {pn}]]\n\n{combined}".strip() + "\n"
+            entry: dict[str, Any] = {
+                "title": title,
+                "markdown": combined,
+                "trace_markdown": trace,
+            }
+            if source_internal_path:
+                entry["source_internal_path"] = source_internal_path.replace("\\", "/")
+            spine_chapters.append(entry)
+            raw_parts.append(combined)
+            texts.append(
+                {
+                    "label": "section_header",
+                    "text": title,
+                    "prov": [{"page_no": pn, "bbox": {"l": 40.0, "t": 760.0, "r": 400.0, "b": 700.0}}],
+                }
+            )
+            body_children.append({"$ref": f"#/texts/{text_index}"})
+            text_index += 1
+            body_text = raw_body if raw_body else "(empty)"
+            texts.append(
+                {
+                    "label": "text",
+                    "text": body_text,
+                    "prov": [{"page_no": pn, "bbox": {"l": 40.0, "t": 600.0, "r": 400.0, "b": 72.0}}],
+                }
+            )
+            body_children.append({"$ref": f"#/texts/{text_index}"})
+            text_index += 1
+
+        cover_internal = _epub_find_cover_internal(zipf, opf_path, manifest)
+        if cover_internal and cover_internal in zipf.namelist():
+            low = cover_internal.lower()
+            if any(low.endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg")):
+                bn = Path(cover_internal).name
+                if not _epub_spine_xhtml_refs_asset_basename(zipf, opf_path, manifest, spine_ids, bn):
+                    dest = _epub_copy_binary_to_assets(zipf, cover_internal, asset_dir, written_assets)
+                    emit_spine_chapter("Cover", f"![Cover]({dest.as_posix()})\n", source_internal_path=None)
+
         for sid in spine_ids:
             if sid not in manifest:
                 continue
@@ -511,7 +910,7 @@ def ingest_epub(path: Path) -> NormalizedDocument:
             internal = _epub_join(opf_path, href)
             if internal not in zipf.namelist():
                 continue
-            page_no += 1
+            nav_title = toc_labels.get(internal) or toc_labels.get(PurePosixPath(internal).name)
             title, body_md = _extract_epub_body_chapter(
                 zipf,
                 opf_path=opf_path,
@@ -519,36 +918,10 @@ def ingest_epub(path: Path) -> NormalizedDocument:
                 asset_dir=asset_dir,
                 written_assets=written_assets,
                 fallback_title=sid.replace("_", " "),
+                nav_title=nav_title,
+                book_title=book_title,
             )
-            combined = f"## {title}\n\n{body_md}".strip() + "\n"
-            trace = f"[[page: {page_no}]]\n\n{combined}".strip() + "\n"
-            spine_chapters.append(
-                {
-                    "title": title,
-                    "markdown": combined,
-                    "trace_markdown": trace,
-                }
-            )
-            raw_parts.append(combined)
-            texts.append(
-                {
-                    "label": "section_header",
-                    "text": title,
-                    "prov": [{"page_no": page_no, "bbox": {"l": 40.0, "t": 760.0, "r": 400.0, "b": 700.0}}],
-                }
-            )
-            body_children.append({"$ref": f"#/texts/{text_index}"})
-            text_index += 1
-            body_text = body_md if body_md else "(empty)"
-            texts.append(
-                {
-                    "label": "text",
-                    "text": body_text,
-                    "prov": [{"page_no": page_no, "bbox": {"l": 40.0, "t": 600.0, "r": 400.0, "b": 72.0}}],
-                }
-            )
-            body_children.append({"$ref": f"#/texts/{text_index}"})
-            text_index += 1
+            emit_spine_chapter(title, body_md, source_internal_path=internal)
 
     if page_no == 0:
         raise ValueError("EPUB spine contains no readable XHTML documents.")

@@ -46,6 +46,10 @@ def test_render_epub_from_book_writes_epub_structure_and_chapters(tmp_path: Path
         assert "OEBPS/chapters/002-second-chapter.xhtml" in names
         assert "OEBPS/images/figure.png" in names
 
+        opf = archive.read("OEBPS/content.opf").decode("utf-8")
+        assert 'name="cover" content="image-1"' in opf
+        assert 'id="image-1"' in opf and "cover-image" in opf
+
         nav = archive.read("OEBPS/nav.xhtml").decode("utf-8")
         assert nav.index("First Chapter") < nav.index("Second Chapter")
         chapter = archive.read("OEBPS/chapters/001-first-chapter.xhtml").decode("utf-8")

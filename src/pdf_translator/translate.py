@@ -417,6 +417,7 @@ def translate_book_chapters(
             if translated_markdown:
                 translated_markdown += "\n"
                 translated_markdown_parts.append(translated_markdown.strip())
+            sip = chapter.get("source_internal_path")
             translated_chapters.append(
                 TranslatedChapter(
                     index=int(chapter.get("index", len(translated_chapters) + 1)),
@@ -425,6 +426,7 @@ def translate_book_chapters(
                     page_end=chapter.get("page_end"),
                     source_pages=[int(page_no) for page_no in chapter.get("source_pages", [])],
                     markdown=translated_markdown,
+                    source_internal_path=sip if isinstance(sip, str) else None,
                 )
             )
             continue
@@ -458,6 +460,7 @@ def translate_book_chapters(
             translated_markdown += "\n"
             translated_markdown_parts.append(translated_markdown.strip())
 
+        sip = chapter.get("source_internal_path")
         translated_chapters.append(
             TranslatedChapter(
                 index=int(chapter.get("index", len(translated_chapters) + 1)),
@@ -466,6 +469,7 @@ def translate_book_chapters(
                 page_end=chapter.get("page_end"),
                 source_pages=[int(page_no) for page_no in chapter.get("source_pages", [])],
                 markdown=translated_markdown,
+                source_internal_path=sip if isinstance(sip, str) else None,
             )
         )
 

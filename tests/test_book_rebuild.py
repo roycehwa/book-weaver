@@ -44,6 +44,26 @@ def test_book_rebuild_preserves_skipped_outline_sections_untranslated(monkeypatc
     assert "Alpha, 3, 4" in result["chapters"][2]["markdown"]
 
 
+def test_book_rebuild_keeps_front_matter_when_it_has_text(monkeypatch) -> None:
+    monkeypatch.setattr(
+        book_rebuild,
+        "_classify_page_kind",
+        lambda page_no, total_pages, blocks: "front_matter" if page_no == 1 else "body",
+    )
+    structured = {
+        "body": {"children": [{"$ref": "#/texts/0"}, {"$ref": "#/texts/1"}, {"$ref": "#/texts/2"}]},
+        "texts": [
+            {"label": "text", "text": "Cover line only", "prov": _prov(1, 40, 400)},
+            {"label": "section_header", "text": "Chapter A", "prov": _prov(2, 40, 760)},
+            {"label": "text", "text": "x" * 300, "prov": _prov(2, 40, 600)},
+        ],
+        "pictures": [],
+        "tables": [],
+    }
+    result = build_book_reconstruction(structured, source_pdf=None)
+    assert "Cover line only" in result["full_markdown"]
+
+
 def test_book_rebuild_skips_toc_and_splits_chapters() -> None:
     structured = {
         "body": {
@@ -349,6 +369,42 @@ def test_book_rebuild_retains_note_like_page_footer_after_body(monkeypatch) -> N
     assert md.index("Main body paragraph") < md.index("First footnote line")
     assert "\n\n---\n\n" in md
     assert "12" not in md
+
+
+def test_book_rebuild_promotes_inline_footnote_text_to_footer_band(monkeypatch) -> None:
+    """Footnotes emitted as regular text blocks get a separator before the note block."""
+    structured = {
+        "body": {"children": [{"$ref": "#/texts/0"}, {"$ref": "#/texts/1"}, {"$ref": "#/texts/2"}]},
+        "texts": [
+            {"label": "section_header", "text": "Chapter One", "prov": _prov(1, 40, 620)},
+            {
+                "label": "text",
+                "text": "Main body paragraph with adequate length for classification as body copy here.",
+                "prov": _prov(1, 40, 560),
+            },
+            {
+                "label": "text",
+                "text": (
+                    "1 First footnote line with enough words to qualify as substantive endnote material here.\n"
+                    "2 Second footnote line also with enough words to pass the heuristic."
+                ),
+                "prov": _prov(1, 40, 80),
+            },
+        ],
+        "pictures": [],
+        "tables": [],
+    }
+    monkeypatch.setattr(book_rebuild, "_extract_pdf_outline_chapters", lambda source_pdf, total_pages: [])
+
+    result = build_book_reconstruction(structured)
+    md = result["chapters"][0]["markdown"]
+    assert "Main body paragraph" in md
+    assert "First footnote line" in md
+    assert md.index("Main body paragraph") < md.index("---")
+    assert md.index("---") < md.index("First footnote line")
+    assert "footnote_line_ratio" in result["metadata"]
+    assert 0.0 <= result["metadata"]["footnote_line_ratio"] <= 1.0
+    assert result["metadata"]["footnote_load"] in ("typical", "footnote_heavy")
 
 
 def test_book_rebuild_promotes_book_section_starts_to_chapters() -> None:
