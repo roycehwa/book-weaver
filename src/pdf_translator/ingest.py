@@ -569,7 +569,14 @@ def _epub_replace_toc_nav_regions(body: Tag, internal_xhtml_path: str) -> None:
         role = (tag.get("role") or "").lower()
         tid = (tag.get("id") or "").lower()
         classes = " ".join(tag.get("class") or []).lower()
+        hidden = tag.has_attr("hidden") or tag.get("aria-hidden") == "true"
         links = tag.find_all("a", href=True)
+        if epub_t in {"landmarks", "page-list", "pagelist"} or role == "doc-pagelist":
+            tag.decompose()
+            continue
+        if hidden and epub_t != "toc":
+            tag.decompose()
+            continue
         is_toc_semantics = (
             epub_t == "toc"
             or role in {"doc-toc", "directory"}

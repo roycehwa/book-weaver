@@ -80,6 +80,23 @@ def test_ingest_epub_nav_epub_type_toc_becomes_linked_lines(tmp_path: Path) -> N
     assert "Body after." in md
 
 
+def test_ingest_epub_drops_hidden_page_list_and_landmarks(tmp_path: Path) -> None:
+    xhtml = """<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head><body>
+<nav epub:type="toc" id="toc"><ol><li><a href="chapter1.xhtml#a">Main Chapter</a></li></ol></nav>
+<nav epub:type="landmarks" hidden="hidden"><h1>Navigation</h1><ol><li><a href="cover.xhtml">Cover</a></li></ol></nav>
+<nav epub:type="page-list" hidden="hidden" role="doc-pagelist"><h1>Page List</h1><ol><li><a href="chapter1.xhtml#page_1">1</a></li><li><a href="chapter1.xhtml#page_2">2</a></li></ol></nav>
+</body></html>"""
+    epub = tmp_path / "pagelist.epub"
+    _write_epub(epub, chapter_xhtml=xhtml)
+    doc = ingest_epub(epub)
+    md = doc.structured["_epub_meta"]["chapters"][0]["markdown"]
+    assert "Main Chapter" in md
+    assert "Page List" not in md
+    assert "Navigation" not in md
+    assert "page_1" not in md
+
+
 def test_epub_staccato_line_repair_merges_fragmented_column_flow() -> None:
     # Simulates two-column TOC where each glyph became its own line (many single-char rows)
     frag = "\n".join(list("ABCDEFGHIJ") * 3)

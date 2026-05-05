@@ -135,6 +135,47 @@ def test_translate_markdown_retries_empty_chunk(tmp_path: Path, monkeypatch: pyt
     assert result.translated_markdown == "Translated.\n"
 
 
+def test_translate_markdown_retries_untranslated_chinese_output(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    class InitiallyUntranslatedTranslator(BaseTranslator):
+        name = "realish"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            self.calls += 1
+            if self.calls == 1:
+                return "This is still English prose. " * 30
+            return "这是已经翻译成中文的正文。" * 30
+
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
+    settings = RunSettings(
+        source_pdf=tmp_path / "source.pdf",
+        output_dir=tmp_path,
+        target_language="zh-CN",
+        source_language="en",
+        translator="realish",
+        max_chunk_chars=1000,
+    )
+    translator = InitiallyUntranslatedTranslator()
+
+    result = translate_markdown(
+        chunks=[TranslationChunk(index=0, markdown="This source English paragraph needs translation. " * 30)],
+        settings=settings,
+        translator=translator,
+        cache_dir=tmp_path / "cache",
+        retry_count=2,
+    )
+
+    assert translator.calls == 2
+    assert "已经翻译成中文" in result.translated_markdown
+
+
 def test_translate_markdown_parallel_preserves_chunk_order(tmp_path: Path) -> None:
     class EchoIndexTranslator(BaseTranslator):
         name = "echo-index"

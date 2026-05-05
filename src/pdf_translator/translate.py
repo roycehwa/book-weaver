@@ -31,6 +31,7 @@ Rules:
 - Keep headings, lists, tables, links, and code fences intact.
 - Do not translate URLs, code, citation keys, raw numbers, or obvious identifiers.
 - Translate natural language in image alt text if present.
+- When the target language is Chinese, translate English prose into Chinese. Do not return the source prose unchanged.
 - Return only translated Markdown, with no commentary.
 """
 
@@ -50,6 +51,44 @@ def _chunk_cache_path(cache_dir: Path, chunk: TranslationChunk) -> Path:
     return cache_dir / f"chunk-{chunk.index:06d}-{digest}.md"
 
 
+def _ascii_letter_count(text: str) -> int:
+    return sum(1 for char in text if char.isascii() and char.isalpha())
+
+
+def _cjk_count(text: str) -> int:
+    return sum(1 for char in text if "\u4e00" <= char <= "\u9fff")
+
+
+def _looks_untranslated_for_target(source: str, translated: str, target_language: str) -> bool:
+    if not target_language.lower().startswith("zh"):
+        return False
+    source_ascii = _ascii_letter_count(source)
+    if source_ascii < 300:
+        return False
+    translated_ascii = _ascii_letter_count(translated)
+    translated_cjk = _cjk_count(translated)
+    # A valid zh translation may preserve names/citations, but it should not be overwhelmingly ASCII.
+    if translated_cjk < 80 and translated_ascii > 250:
+        return True
+    return translated_ascii / max(translated_ascii + translated_cjk, 1) > 0.72
+
+
+def _assert_translation_quality(
+    *,
+    chunk: TranslationChunk,
+    translated: str,
+    target_language: str,
+    translator_name: str,
+) -> None:
+    if translator_name == "mock":
+        return
+    if _looks_untranslated_for_target(chunk.markdown, translated, target_language):
+        raise ValueError(
+            f"Translation for chunk {chunk.index} looks untranslated "
+            f"(ascii={_ascii_letter_count(translated)}, cjk={_cjk_count(translated)})."
+        )
+
+
 def _translate_chunk_resumable(
     *,
     chunk: TranslationChunk,
@@ -66,7 +105,17 @@ def _translate_chunk_resumable(
         if cache_path.exists():
             cached = cache_path.read_text(encoding="utf-8").strip()
             if cached:
-                return cached
+                try:
+                    _assert_translation_quality(
+                        chunk=chunk,
+                        translated=cached,
+                        target_language=target_language,
+                        translator_name=translator.name,
+                    )
+                except ValueError:
+                    cache_path.unlink(missing_ok=True)
+                else:
+                    return cached
 
     last_error: Exception | None = None
     for attempt in range(max(1, retry_count)):
@@ -78,6 +127,12 @@ def _translate_chunk_resumable(
             ).strip()
             if not translated:
                 raise ValueError(f"Empty translation returned for chunk {chunk.index}.")
+            _assert_translation_quality(
+                chunk=chunk,
+                translated=translated,
+                target_language=target_language,
+                translator_name=translator.name,
+            )
             if cache_path is not None:
                 tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
                 tmp_path.write_text(translated + "\n", encoding="utf-8")
