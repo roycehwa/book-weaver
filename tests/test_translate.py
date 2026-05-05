@@ -307,7 +307,7 @@ def test_minimax_settings_use_default_highspeed_model(monkeypatch: pytest.Monkey
 
     assert settings.model == "MiniMax-M2.7-highspeed"
     assert settings.base_url == "https://api.minimaxi.com/anthropic/v1/messages"
-    assert settings.max_tokens == 2048
+    assert settings.max_tokens == 8192
 
 
 def test_compatible_settings_require_generic_env(monkeypatch: pytest.MonkeyPatch) -> None:

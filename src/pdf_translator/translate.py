@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
 import time
 import urllib.error
 import urllib.request
@@ -12,7 +13,12 @@ from pathlib import Path
 from openai import OpenAI
 
 from pdf_translator.chunking import split_markdown_into_chunks
-from pdf_translator.config import CompatibleAPISettings, OpenAISettings, RunSettings
+from pdf_translator.config import (
+    DEFAULT_MINIMAX_MAX_TOKENS,
+    CompatibleAPISettings,
+    OpenAISettings,
+    RunSettings,
+)
 from pdf_translator.models import BookTranslationResult, TranslatedChapter, TranslationChunk, TranslationResult
 
 
@@ -219,7 +225,9 @@ class MiniMaxAnthropicTranslator(BaseTranslator):
         self.api_key = settings.api_key
         self.endpoint = settings.base_url
         self.model = settings.model
-        self.max_tokens = settings.max_tokens or 2048
+        self.max_tokens = settings.max_tokens or DEFAULT_MINIMAX_MAX_TOKENS
+        # Long-form translation can exceed a 2-minute round-trip; override with MINIMAX_HTTP_TIMEOUT_SECONDS.
+        self.http_timeout = float(os.getenv("MINIMAX_HTTP_TIMEOUT_SECONDS", "600"))
 
     def translate_chunk(
         self,
@@ -249,7 +257,7 @@ class MiniMaxAnthropicTranslator(BaseTranslator):
         )
 
         try:
-            with urllib.request.urlopen(request, timeout=120) as response:
+            with urllib.request.urlopen(request, timeout=self.http_timeout) as response:
                 response_data = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             error_body = exc.read().decode("utf-8", errors="replace")
@@ -272,8 +280,10 @@ class MiniMaxAnthropicTranslator(BaseTranslator):
             raise ValueError(f"Empty MiniMax translation returned for chunk {chunk.index}.")
         if response_data.get("stop_reason") == "max_tokens":
             raise ValueError(
-                f"MiniMax translation was truncated for chunk {chunk.index}; "
-                "reduce --max-chunk-chars or split the chapter more aggressively."
+                f"MiniMax translation was truncated for chunk {chunk.index} "
+                f"(stop_reason=max_tokens, max_tokens={self.max_tokens}). "
+                "Increase MINIMAX_MAX_TOKENS (or MINIMAX_HTTP_TIMEOUT_SECONDS if the request timed out early). "
+                "Only reduce --max-chunk-chars if raising max_tokens is not enough."
             )
         return text
 

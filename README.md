@@ -32,7 +32,8 @@ This keeps user intervention low and removes most layout noise from the translat
   - `MINIMAX_API_KEY`
   - optionally `MINIMAX_BASE_URL` (defaults to `https://api.minimaxi.com/anthropic/v1/messages`)
   - optionally `MINIMAX_MODEL` (defaults to `MiniMax-M2.7-highspeed`)
-  - optionally `MINIMAX_MAX_TOKENS` (defaults to `2048`)
+  - optionally `MINIMAX_MAX_TOKENS` (defaults to `8192`; long zh book chunks often need headroom)
+  - optionally `MINIMAX_HTTP_TIMEOUT_SECONDS` (defaults to `600`; single-request wall clock for slow completions)
 - For other OpenAI-compatible domestic APIs:
   - `LLM_API_KEY`
   - `LLM_BASE_URL`
@@ -115,7 +116,9 @@ MINIMAX_API_KEY=...
 MINIMAX_MODEL=MiniMax-M2.7-highspeed
 # Optional; this is the built-in default.
 MINIMAX_BASE_URL=https://api.minimaxi.com/anthropic/v1/messages
-MINIMAX_MAX_TOKENS=2048
+MINIMAX_MAX_TOKENS=8192
+# Optional; increase if the API is slow to return full completions.
+MINIMAX_HTTP_TIMEOUT_SECONDS=600
 EOF
 pdf-translator translate ./book.pdf --profile book --target-lang zh-CN --translator minimax --format epub
 ```
