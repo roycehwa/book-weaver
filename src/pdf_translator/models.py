@@ -41,6 +41,7 @@ class TranslatedChapter:
     source_pages: list[int] = field(default_factory=list)
     # EPUB spine XHTML path inside the source zip (posix); used to rewrite internal links in output EPUB.
     source_internal_path: str | None = None
+    toc: bool = True
 
 
 @dataclass(slots=True)

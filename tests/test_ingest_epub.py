@@ -149,6 +149,21 @@ def test_ingest_epub_standalone_cover_image_in_flow(tmp_path: Path) -> None:
     assert md.index("![Hero]") < md.index("After image.")
 
 
+def test_ingest_epub_cleans_malformed_html_wrapper_lines(tmp_path: Path) -> None:
+    xhtml = """<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head><body>
+<p>p class="CRTF"&gt;Printed on acid-free paper. &lt;span class="crt-symb"&gt;&amp;#x221E;&lt;/span&gt;&lt;/p</p>
+<p>Body text.</p>
+</body></html>"""
+    epub = tmp_path / "malformed.epub"
+    _write_epub(epub, chapter_xhtml=xhtml)
+    doc = ingest_epub(epub)
+    md = doc.structured["_epub_meta"]["chapters"][0]["markdown"]
+    assert 'p class="CRTF"' not in md
+    assert "Printed on acid-free paper. ∞" in md
+    assert "Body text." in md
+
+
 def test_ingest_epub_opf_cover_prepended_when_not_in_spine(tmp_path: Path) -> None:
     xhtml = """<?xml version="1.0" encoding="utf-8"?>
 <html xmlns="http://www.w3.org/1999/xhtml"><head><title>X</title></head><body>
@@ -167,6 +182,9 @@ def test_ingest_epub_opf_cover_prepended_when_not_in_spine(tmp_path: Path) -> No
     titles = [c["title"] for c in doc.structured["_epub_meta"]["chapters"]]
     assert titles[0] == "Cover"
     assert "![Cover]" in doc.structured["_epub_meta"]["chapters"][0]["markdown"]
+    book = build_book_reconstruction(doc.structured, source_pdf=None)
+    assert book["metadata"]["cover_image_path"]
+    assert any(asset["kind"] == "cover" for asset in book["assets"])
 
 
 def test_ingest_epub_resolves_parent_relative_image_paths(tmp_path: Path) -> None:

@@ -65,6 +65,10 @@ OUTLINE_SKIP_TITLE_RE = re.compile(
     r".*index|index of .*)$",
     re.IGNORECASE,
 )
+OUTLINE_DROP_TITLE_RE = re.compile(
+    r"^(?:title page|half title|start of frontmatter|navigation|page list)$",
+    re.IGNORECASE,
+)
 
 
 @dataclass(slots=True)
@@ -111,6 +115,7 @@ def _extract_pdf_outline_chapters(source_pdf: Path | None, *, total_pages: int) 
                     "page_no": page_no,
                     "depth": depth,
                     "skip": bool(OUTLINE_SKIP_TITLE_RE.match(title)),
+                    "drop": bool(OUTLINE_DROP_TITLE_RE.match(title)),
                 }
             )
 
@@ -324,6 +329,27 @@ def _crop_pdf_regions(
     return exported
 
 
+def _render_pdf_cover_page(source_pdf: Path | None, images_dir: Path | None) -> Path | None:
+    if source_pdf is None or images_dir is None or source_pdf.suffix.lower() != ".pdf":
+        return None
+    try:
+        import pypdfium2 as pdfium
+
+        images_dir.mkdir(parents=True, exist_ok=True)
+        output_path = images_dir / "cover-p0001.png"
+        document = pdfium.PdfDocument(str(source_pdf))
+        try:
+            if len(document) < 1:
+                return None
+            page = document[0]
+            page.render(scale=2.0).to_pil().save(output_path)
+        finally:
+            document.close()
+        return output_path.resolve()
+    except Exception:
+        return None
+
+
 def _caption_texts_from_refs(structured: dict[str, Any], captions: list[Any]) -> list[str]:
     texts: list[str] = []
     for caption in captions:
@@ -459,10 +485,10 @@ def _extract_table_items(
         table_no = per_page_counts[page_no]
         table_markdown = _table_to_markdown(table, page_no=page_no, table_no=table_no)
         image_path = exported_paths.get(page_no, {}).get(table_no)
-        if table_markdown is None:
-            if image_path is None:
-                continue
+        if image_path is not None:
             table_markdown = f"![Table {page_no}.{table_no}]({image_path.as_posix()})"
+        elif table_markdown is None:
+            continue
         items_by_page.setdefault(page_no, []).append(
             BookItem(
                 kind="table",
@@ -789,7 +815,32 @@ def _build_chapter_markdown(page_payloads: list[dict[str, Any]], *, include_page
         parts.extend(content_lines)
     markdown = "\n\n".join(line.strip() for line in parts if line.strip())
     markdown = re.sub(r"\n{3,}", "\n\n", markdown).strip()
+    markdown = _dedupe_adjacent_duplicate_headings(markdown)
     return markdown + "\n" if markdown else ""
+
+
+def _dedupe_adjacent_duplicate_headings(markdown_text: str) -> str:
+    lines = markdown_text.splitlines()
+    out: list[str] = []
+    last_heading_key: str | None = None
+    only_blank_since_heading = False
+    for line in lines:
+        match = re.match(r"^(#{1,6})\s+(.+?)\s*$", line)
+        if match:
+            heading_key = _clean_book_text(match.group(2)).casefold()
+            if heading_key and heading_key == last_heading_key and only_blank_since_heading:
+                continue
+            last_heading_key = heading_key
+            only_blank_since_heading = True
+            out.append(line)
+            continue
+        if line.strip():
+            last_heading_key = None
+            only_blank_since_heading = False
+        elif last_heading_key is not None:
+            only_blank_since_heading = True
+        out.append(line)
+    return "\n".join(out).strip()
 
 
 def _strip_duplicate_leading_heading(markdown_text: str, chapter_title: str) -> str:
@@ -886,9 +937,30 @@ def _build_preserved_resource_chapters(
                 "translate": False,
                 "preserve_original": True,
                 "resource_only": True,
+                "toc": False,
             }
         )
     return preserved
+
+
+def _build_cover_chapter(cover_path: Path | None) -> dict[str, Any] | None:
+    if cover_path is None:
+        return None
+    markdown = f"![Cover]({cover_path.as_posix()})\n"
+    return {
+        "index": 0,
+        "title": "Cover",
+        "page_start": 1,
+        "page_end": 1,
+        "source_pages": [1],
+        "markdown": markdown,
+        "trace_markdown": "[[page: 1]]\n\n" + markdown,
+        "translate": False,
+        "preserve_original": True,
+        "resource_only": True,
+        "cover": True,
+        "toc": False,
+    }
 
 
 def _chapter_pages_from_outline(
@@ -902,6 +974,8 @@ def _chapter_pages_from_outline(
     page_numbers = sorted(pages_by_no)
     chapters: list[dict[str, Any]] = []
     for entry in outline_entries:
+        if entry.get("drop"):
+            continue
         start_page = int(entry["page_no"])
         later_starts = (
             int(candidate["page_no"])
@@ -959,17 +1033,33 @@ def _chapter_pages_from_outline(
 
 def _build_book_from_epub_meta(meta: dict[str, Any], source_path: Path | None) -> dict[str, Any]:
     raw_chapters = meta.get("chapters") or []
+    raw_assets = meta.get("assets") or []
     chapters: list[dict[str, Any]] = []
     pages: list[dict[str, Any]] = []
-    for i, entry in enumerate(raw_chapters, 1):
-        title = str(entry.get("title") or f"Section {i}")
+    for entry in raw_chapters:
+        title = str(entry.get("title") or f"Section {len(chapters) + 1}")
         md = str(entry.get("markdown") or "").strip()
+        title_clean = _clean_book_text(title).lower()
+        md_no_links = re.sub(r"\[[^\]]+\]\([^)]+\)", "", md)
+        md_text_chars = len(re.sub(r"[\W_]+", "", md_no_links, flags=re.UNICODE))
+        has_image = "![" in md
+        if OUTLINE_DROP_TITLE_RE.match(title) and not has_image:
+            continue
+        if title_clean in {"title", "title page", "half title"} and not has_image and md_text_chars < 160:
+            continue
+        if title_clean in {"navigation", "page list"}:
+            continue
+        if "## page list" in md.lower() and md.count("\n- [") > 25:
+            continue
+
+        i = len(chapters) + 1
         if md and not md.endswith("\n"):
             md += "\n"
         tr = str(entry.get("trace_markdown") or md).strip()
         if tr and not tr.endswith("\n"):
             tr += "\n"
         sip = entry.get("source_internal_path")
+        is_cover_title = title_clean in {"cover", "cover page"}
         chapters.append(
             {
                 "index": i,
@@ -979,9 +1069,10 @@ def _build_book_from_epub_meta(meta: dict[str, Any], source_path: Path | None) -
                 "source_pages": [i],
                 "markdown": md,
                 "trace_markdown": tr,
-                "translate": True,
-                "preserve_original": False,
+                "translate": not (is_cover_title or OUTLINE_SKIP_TITLE_RE.match(title)),
+                "preserve_original": bool(is_cover_title or OUTLINE_SKIP_TITLE_RE.match(title)),
                 "source_internal_path": sip if isinstance(sip, str) else None,
+                "toc": not is_cover_title,
             }
         )
         pages.append(
@@ -1014,6 +1105,41 @@ def _build_book_from_epub_meta(meta: dict[str, Any], source_path: Path | None) -
 
     epub_footnote_ratio_pages = [{"content_lines": [ch["markdown"]]} for ch in chapters]
     epub_fn_ratio = _book_footnote_line_ratio_from_pages(epub_footnote_ratio_pages)
+    assets: list[dict[str, Any]] = []
+    for raw_asset in raw_assets:
+        if not isinstance(raw_asset, dict):
+            continue
+        path = raw_asset.get("path")
+        if not isinstance(path, str) or not path.strip():
+            continue
+        kind = str(raw_asset.get("kind") or "picture")
+        assets.append(
+            {
+                "kind": "cover" if kind == "cover" else "picture",
+                "page_no": None,
+                "path": path,
+                "source_internal_path": raw_asset.get("source_internal_path"),
+                "text": f"![{('Cover' if kind == 'cover' else 'Image')}]({path})",
+            }
+        )
+    if not any(asset["kind"] == "cover" for asset in assets):
+        for chapter in chapters:
+            if "![Cover" not in chapter.get("markdown", ""):
+                continue
+            match = re.search(r"!\[[^\]]*]\(([^)]+)\)", chapter["markdown"])
+            if match:
+                assets.insert(
+                    0,
+                    {
+                        "kind": "cover",
+                        "page_no": chapter.get("page_start"),
+                        "path": match.group(1),
+                        "source_internal_path": chapter.get("source_internal_path"),
+                        "text": match.group(0),
+                    },
+                )
+                break
+    cover_image_path = next((asset["path"] for asset in assets if asset["kind"] == "cover"), None)
 
     return {
         "metadata": {
@@ -1024,6 +1150,7 @@ def _build_book_from_epub_meta(meta: dict[str, Any], source_path: Path | None) -
             "outline_stop_entry_count": len(chapters),
             "footnote_line_ratio": round(epub_fn_ratio, 5),
             "footnote_load": _footnote_load_label(epub_fn_ratio),
+            "cover_image_path": cover_image_path,
         },
         "render_policy": {
             "reading_output": "single_language_epub",
@@ -1034,7 +1161,7 @@ def _build_book_from_epub_meta(meta: dict[str, Any], source_path: Path | None) -
         },
         "chapter_count": len(chapters),
         "chapters": chapters,
-        "assets": [],
+        "assets": assets,
         "pages": [
             {
                 "page_no": page["page_no"],
@@ -1060,6 +1187,7 @@ def build_book_reconstruction(
     if isinstance(epub_meta, dict) and epub_meta.get("schema") == "epub_ingest_v1":
         return _build_book_from_epub_meta(epub_meta, source_pdf)
 
+    cover_path = _render_pdf_cover_page(source_pdf, images_dir)
     picture_items, used_caption_texts = _extract_picture_items(
         structured,
         source_pdf=source_pdf,
@@ -1101,6 +1229,9 @@ def build_book_reconstruction(
 
     outline_entries = _extract_pdf_outline_chapters(source_pdf, total_pages=total_pages)
     chapters: list[dict[str, Any]] = _chapter_pages_from_outline(pages, outline_entries)
+    cover_chapter = _build_cover_chapter(cover_path)
+    if cover_chapter is not None:
+        chapters.insert(0, cover_chapter)
     current_pages: list[dict[str, Any]] = []
     current_title: str | None = None
 
@@ -1177,7 +1308,17 @@ def build_book_reconstruction(
     if trace_markdown:
         trace_markdown += "\n"
 
-    assets = [
+    assets = []
+    if cover_path is not None:
+        assets.append(
+            {
+                "kind": "cover",
+                "page_no": 1,
+                "path": str(cover_path),
+                "text": f"![Cover]({cover_path.as_posix()})",
+            }
+        )
+    assets.extend(
         {
             "kind": item.kind,
             "page_no": item.page_no,
@@ -1187,7 +1328,7 @@ def build_book_reconstruction(
         for page_items in picture_items.values()
         for item in page_items
         if item.path
-    ]
+    )
     assets.extend(
         {
             "kind": item.kind,
@@ -1206,10 +1347,13 @@ def build_book_reconstruction(
             "schema": "book_ir",
             "schema_version": 1,
             "chapter_source": "pdf_outline" if outline_entries else "layout_heuristic",
-            "outline_entry_count": len([entry for entry in outline_entries if not entry.get("skip")]),
+            "outline_entry_count": len(
+                [entry for entry in outline_entries if not entry.get("skip") and not entry.get("drop")]
+            ),
             "outline_stop_entry_count": len(outline_entries),
             "footnote_line_ratio": round(footnote_line_ratio, 5),
             "footnote_load": _footnote_load_label(footnote_line_ratio),
+            "cover_image_path": str(cover_path) if cover_path is not None else None,
         },
         "render_policy": {
             "reading_output": "single_language_epub",

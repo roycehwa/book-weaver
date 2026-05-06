@@ -157,5 +157,6 @@ pdf-translator translate ./book.pdf --profile book --target-lang zh-CN --transla
 ## Notes
 
 - The output EPUB/PDF is intentionally reflowed. It is a translated reading edition, not a coordinate-faithful clone of the source PDF.
-- Tables and images depend on how well Docling exports them to Markdown.
+- Book pipeline invariants are documented in [`docs/BOOK_PIPELINE_RULES.md`](docs/BOOK_PIPELINE_RULES.md).
+- For PDF books, tables, charts, figures, and covers are preserved as visual assets whenever crops are available. They should not be converted to Markdown tables by default.
 - If you need original-layout replacement later, treat that as a separate downstream project.

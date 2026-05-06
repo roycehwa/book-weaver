@@ -93,6 +93,7 @@ li {
 }
 """.strip()
 CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+RAW_HTML_TAG_RE = re.compile(r"</?(?:a|img|br)\b[^<>]*?/?>", re.IGNORECASE)
 
 
 def _slug(value: str, fallback: str) -> str:
@@ -108,6 +109,7 @@ def _chapter_payload(chapter) -> dict:
 
 def _markdown_to_body_html(markdown_text: str) -> str:
     markdown_text = CONTROL_CHARS_RE.sub(" ", markdown_text)
+    markdown_text = RAW_HTML_TAG_RE.sub(lambda match: escape(match.group(0)), markdown_text)
     html = markdown(markdown_text, extensions=["tables", "fenced_code", "sane_lists"])
     soup = BeautifulSoup(html, "html.parser")
     return "".join(str(child) for child in soup.contents)
@@ -205,6 +207,7 @@ def _nav_xhtml(title: str, chapters: list[dict], chapter_files: list[str], *, la
     items = "\n".join(
         f'      <li><a href="{escape(chapter_file)}">{escape(str(chapter.get("title") or "Chapter"))}</a></li>'
         for chapter, chapter_file in zip(chapters, chapter_files)
+        if chapter.get("toc", True)
     )
     return f"""<?xml version="1.0" encoding="utf-8"?>
 <html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" xml:lang="{escape(language)}">

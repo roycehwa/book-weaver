@@ -44,6 +44,100 @@ def test_book_rebuild_preserves_skipped_outline_sections_untranslated(monkeypatc
     assert "Alpha, 3, 4" in result["chapters"][2]["markdown"]
 
 
+def test_book_rebuild_filters_epub_title_page_shell() -> None:
+    structured = {
+        "_epub_meta": {
+            "schema": "epub_ingest_v1",
+            "chapters": [
+                {"title": "Cover", "markdown": "![Cover](/tmp/cover.png)\n"},
+                {"title": "Title Page", "markdown": "The Book Title\n"},
+                {"title": "Chapter 1", "markdown": "Real body text."},
+            ],
+        }
+    }
+
+    result = build_book_reconstruction(structured)
+
+    assert [chapter["title"] for chapter in result["chapters"]] == ["Cover", "Chapter 1"]
+    assert result["chapters"][0]["translate"] is False
+    assert result["chapters"][1]["translate"] is True
+
+
+def test_book_rebuild_marks_epub_cover_page_as_non_toc_resource() -> None:
+    structured = {
+        "_epub_meta": {
+            "schema": "epub_ingest_v1",
+            "chapters": [
+                {"title": "Cover Page", "markdown": "![Cover](/tmp/cover.png)\n"},
+                {"title": "Chapter 1", "markdown": "Real body text."},
+            ],
+            "assets": [{"kind": "cover", "path": "/tmp/cover.png"}],
+        }
+    }
+
+    result = build_book_reconstruction(structured)
+
+    assert result["chapters"][0]["title"] == "Cover Page"
+    assert result["chapters"][0]["translate"] is False
+    assert result["chapters"][0]["preserve_original"] is True
+    assert result["chapters"][0]["toc"] is False
+    assert result["metadata"]["cover_image_path"] == "/tmp/cover.png"
+
+
+def test_book_rebuild_adds_pdf_cover_chapter(monkeypatch, tmp_path) -> None:
+    cover = tmp_path / "cover.png"
+    cover.write_bytes(b"png")
+    monkeypatch.setattr(book_rebuild, "_render_pdf_cover_page", lambda source_pdf, images_dir: cover)
+    monkeypatch.setattr(book_rebuild, "_crop_pdf_regions", lambda *args, **kwargs: {})
+    structured = {
+        "body": {"children": [{"$ref": "#/texts/0"}]},
+        "texts": [{"label": "text", "text": "Body text.", "prov": _prov(2, 40, 620)}],
+        "pictures": [],
+        "tables": [],
+    }
+
+    result = build_book_reconstruction(structured, source_pdf=tmp_path / "book.pdf", images_dir=tmp_path)
+
+    assert result["chapters"][0]["title"] == "Cover"
+    assert result["chapters"][0]["translate"] is False
+    assert "![Cover]" in result["chapters"][0]["markdown"]
+    assert result["metadata"]["cover_image_path"] == str(cover)
+    assert any(asset["kind"] == "cover" for asset in result["assets"])
+
+
+def test_book_rebuild_prefers_pdf_table_crop_over_markdown_table(monkeypatch, tmp_path) -> None:
+    table_crop = tmp_path / "table-p0001-01.png"
+    table_crop.write_bytes(b"png")
+    monkeypatch.setattr(book_rebuild, "_render_pdf_cover_page", lambda source_pdf, images_dir: None)
+    monkeypatch.setattr(book_rebuild, "_crop_pdf_regions", lambda *args, **kwargs: {1: {1: table_crop}})
+    structured = {
+        "body": {"children": [{"$ref": "#/texts/0"}, {"$ref": "#/tables/0"}]},
+        "texts": [{"label": "text", "text": "Body text before the table.", "prov": _prov(1, 40, 620)}],
+        "pictures": [],
+        "tables": [
+            {
+                "prov": _prov(1, 100, 300),
+                "data": {
+                    "table_cells": [
+                        {"row_header": True, "text": "A"},
+                        {"row_header": True, "text": "B"},
+                        {"text": "1"},
+                        {"text": "2"},
+                    ]
+                },
+            }
+        ],
+    }
+
+    result = build_book_reconstruction(structured, source_pdf=tmp_path / "book.pdf", images_dir=tmp_path)
+
+    markdown = result["chapters"][0]["markdown"]
+    assert f"![Table 1.1]({table_crop})" in markdown
+    assert "| A | B |" not in markdown
+    assert "**Table 1.1**" not in markdown
+    assert any(asset["kind"] == "table" and asset["path"] == str(table_crop) for asset in result["assets"])
+
+
 def test_book_rebuild_keeps_front_matter_when_it_has_text(monkeypatch) -> None:
     monkeypatch.setattr(
         book_rebuild,
@@ -62,6 +156,24 @@ def test_book_rebuild_keeps_front_matter_when_it_has_text(monkeypatch) -> None:
     }
     result = build_book_reconstruction(structured, source_pdf=None)
     assert "Cover line only" in result["full_markdown"]
+
+
+def test_book_rebuild_dedupes_adjacent_duplicate_headings() -> None:
+    structured = {
+        "body": {"children": [{"$ref": "#/texts/0"}, {"$ref": "#/texts/1"}, {"$ref": "#/texts/2"}]},
+        "texts": [
+            {"label": "section_header", "text": "Senses of Mourning", "prov": _prov(1, 40, 760)},
+            {"label": "section_header", "text": "Senses of Mourning", "prov": _prov(1, 40, 700)},
+            {"label": "text", "text": "Subtitle body.", "prov": _prov(1, 40, 620)},
+        ],
+        "pictures": [],
+        "tables": [],
+    }
+
+    result = build_book_reconstruction(structured)
+
+    assert result["full_markdown"].count("Senses of Mourning") == 1
+    assert "Subtitle body." in result["full_markdown"]
 
 
 def test_book_rebuild_skips_toc_and_splits_chapters() -> None:

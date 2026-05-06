@@ -424,3 +424,4 @@ def test_minimax_translator_uses_anthropic_messages_api(monkeypatch: pytest.Monk
             "content": "Source language: en\nTarget language: zh-CN\nMarkdown chunk index: 3\n\n# Title\n\nBody.",
         }
     ]
+

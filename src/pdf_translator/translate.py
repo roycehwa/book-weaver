@@ -32,6 +32,7 @@ Rules:
 - Do not translate URLs, code, citation keys, raw numbers, or obvious identifiers.
 - Translate natural language in image alt text if present.
 - When the target language is Chinese, translate English prose into Chinese. Do not return the source prose unchanged.
+- Translate completely. Do not summarize, shorten, skip paragraphs, or replace content with an overview.
 - Return only translated Markdown, with no commentary.
 """
 
@@ -73,6 +74,17 @@ def _looks_untranslated_for_target(source: str, translated: str, target_language
     return translated_ascii / max(translated_ascii + translated_cjk, 1) > 0.72
 
 
+def _looks_incomplete_for_target(source: str, translated: str, target_language: str) -> bool:
+    if not target_language.lower().startswith("zh"):
+        return False
+    source_alpha = _ascii_letter_count(source)
+    if source_alpha < 1200:
+        return False
+    translated_signal = _cjk_count(translated) + int(_ascii_letter_count(translated) * 0.35)
+    # English-to-Chinese usually compresses, but not by an order of magnitude.
+    return translated_signal < source_alpha * 0.18
+
+
 def _assert_translation_quality(
     *,
     chunk: TranslationChunk,
@@ -86,6 +98,12 @@ def _assert_translation_quality(
         raise ValueError(
             f"Translation for chunk {chunk.index} looks untranslated "
             f"(ascii={_ascii_letter_count(translated)}, cjk={_cjk_count(translated)})."
+        )
+    if _looks_incomplete_for_target(chunk.markdown, translated, target_language):
+        raise ValueError(
+            f"Translation for chunk {chunk.index} looks incomplete "
+            f"(source_ascii={_ascii_letter_count(chunk.markdown)}, "
+            f"translated_ascii={_ascii_letter_count(translated)}, cjk={_cjk_count(translated)})."
         )
 
 
@@ -462,6 +480,15 @@ def _split_markdown_media_segments(markdown_text: str) -> list[tuple[str, str]]:
     return segments
 
 
+def estimate_translation_chunk_count(markdown_text: str, max_chunk_chars: int) -> int:
+    count = 0
+    for segment_kind, segment_markdown in _split_markdown_media_segments(markdown_text):
+        if segment_kind == "media":
+            continue
+        count += len(split_markdown_into_chunks(segment_markdown, max_chunk_chars))
+    return count
+
+
 def translate_book_chapters(
     *,
     book: dict,
@@ -492,6 +519,7 @@ def translate_book_chapters(
                     source_pages=[int(page_no) for page_no in chapter.get("source_pages", [])],
                     markdown=translated_markdown,
                     source_internal_path=sip if isinstance(sip, str) else None,
+                    toc=bool(chapter.get("toc", True)),
                 )
             )
             continue
@@ -535,6 +563,7 @@ def translate_book_chapters(
                 source_pages=[int(page_no) for page_no in chapter.get("source_pages", [])],
                 markdown=translated_markdown,
                 source_internal_path=sip if isinstance(sip, str) else None,
+                toc=bool(chapter.get("toc", True)),
             )
         )
 

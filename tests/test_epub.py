@@ -80,3 +80,60 @@ def test_render_epub_from_book_handles_control_chars(tmp_path: Path) -> None:
         chapter = archive.read("OEBPS/chapters/001-unsafe.xhtml").decode("utf-8")
         assert "A map" in chapter
         assert "\x05" not in chapter
+
+
+def test_render_epub_from_book_hides_non_toc_chapters_from_nav(tmp_path: Path) -> None:
+    cover_path = tmp_path / "cover.png"
+    cover_path.write_bytes(b"fake-png")
+    output_path = tmp_path / "book.epub"
+
+    render_epub_from_book(
+        book={"chapters": []},
+        translated_chapters=[
+            {
+                "index": 1,
+                "title": "Cover",
+                "markdown": f"![Cover]({cover_path})",
+                "toc": False,
+            },
+            {
+                "index": 2,
+                "title": "Chapter 1",
+                "markdown": "# Chapter 1\n\nBody text.",
+            },
+        ],
+        output_path=output_path,
+        title="Book With Cover",
+    )
+
+    with ZipFile(output_path) as archive:
+        names = archive.namelist()
+        assert "OEBPS/chapters/001-cover.xhtml" in names
+        assert "OEBPS/chapters/002-chapter-1.xhtml" in names
+        nav = archive.read("OEBPS/nav.xhtml").decode("utf-8")
+        assert 'href="chapters/001-cover.xhtml"' not in nav
+        assert ">Cover</a>" not in nav
+        assert "Chapter 1" in nav
+
+
+def test_render_epub_from_book_escapes_raw_html_examples(tmp_path: Path) -> None:
+    output_path = tmp_path / "book.epub"
+
+    render_epub_from_book(
+        book={"chapters": []},
+        translated_chapters=[
+            {
+                "index": 1,
+                "title": "Notes",
+                "markdown": 'Example code: <a href="https://example.test"><img src="https://example.test/x.png" /></a><br />Done.',
+            }
+        ],
+        output_path=output_path,
+        title="Raw HTML",
+    )
+
+    with ZipFile(output_path) as archive:
+        chapter = archive.read("OEBPS/chapters/001-notes.xhtml").decode("utf-8")
+        assert "<img" not in chapter
+        assert "&lt;img" in chapter
+        assert "Done." in chapter

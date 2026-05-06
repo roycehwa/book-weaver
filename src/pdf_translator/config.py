@@ -12,7 +12,7 @@ DEFAULT_MINIMAX_MODEL = "MiniMax-M2.7-highspeed"
 DEFAULT_MINIMAX_BASE_URL = "https://api.minimaxi.com/anthropic/v1/messages"
 # Book chunks are sized for ingest quality; zh outputs often need more completion budget than 2048.
 DEFAULT_MINIMAX_MAX_TOKENS = 8192
-DEFAULT_TRANSLATION_CONCURRENCY = 4
+DEFAULT_TRANSLATION_CONCURRENCY = 12
 
 
 def _load_local_env() -> None:

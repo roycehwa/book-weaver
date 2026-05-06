@@ -61,7 +61,7 @@ def build_parser() -> argparse.ArgumentParser:
     translate_parser.add_argument(
         "--max-chunk-chars",
         type=int,
-        default=4200,
+        default=9000,
         help="Max chunk size for translation requests.",
     )
     translate_parser.add_argument(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import posixpath
 import re
 import tempfile
@@ -625,6 +626,27 @@ def _epub_maybe_repair_staccato_toc_lines(markdown: str) -> str:
     return "\n".join(merged)
 
 
+MALFORMED_HTML_WRAPPER_RE = re.compile(
+    r'^\s*<?(?P<tag>p|div|span)\b(?P<attrs>[^<>]*)>(?P<body>.*?)(?:</(?P=tag)>?|</(?P=tag)\s*)?\s*$',
+    re.IGNORECASE,
+)
+
+
+def _epub_clean_malformed_html_wrapper_lines(markdown: str) -> str:
+    cleaned: list[str] = []
+    for line in markdown.splitlines():
+        match = MALFORMED_HTML_WRAPPER_RE.match(line)
+        if not match:
+            cleaned.append(line)
+            continue
+        body = match.group("body").strip()
+        if not body:
+            continue
+        text = BeautifulSoup(body, "html.parser").get_text(" ", strip=True)
+        cleaned.append(html.unescape(text))
+    return "\n".join(cleaned).strip()
+
+
 def _epub_merge_short_line_run(parts: list[str]) -> str:
     if not parts:
         return ""
@@ -951,6 +973,7 @@ def _extract_epub_body_chapter(
 
     body_md = "\n\n".join(_epub_flow_markdown_lines(body, internal_xhtml_path=internal_xhtml_path)).strip()
     body_md = _epub_maybe_repair_staccato_toc_lines(body_md)
+    body_md = _epub_clean_malformed_html_wrapper_lines(body_md)
     return title_guess, body_md
 
 
@@ -1053,6 +1076,14 @@ def ingest_epub(path: Path) -> NormalizedDocument:
             "synthetic_page_count": max(page_no, 1),
             "temp_asset_dir": str(asset_dir),
             "chapters": spine_chapters,
+            "assets": [
+                {
+                    "kind": "cover" if internal == cover_internal else "picture",
+                    "source_internal_path": internal,
+                    "path": path.as_posix(),
+                }
+                for internal, path in sorted(written_assets.items())
+            ],
         },
     }
     raw_markdown = "\n\n".join(raw_parts).strip() + "\n"

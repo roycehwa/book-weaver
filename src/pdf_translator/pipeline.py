@@ -12,7 +12,12 @@ from pdf_translator.guardrails import ingest_pdf_guarded
 from pdf_translator.models import PipelineArtifacts
 from pdf_translator.profile import build_document_profile
 from pdf_translator.render import render_pdf_from_markdown
-from pdf_translator.translate import build_translator, translate_book_chapters, translate_markdown
+from pdf_translator.translate import (
+    build_translator,
+    estimate_translation_chunk_count,
+    translate_book_chapters,
+    translate_markdown,
+)
 
 
 def build_output_dir(base_output_dir: Path, source_pdf: Path) -> Path:
@@ -42,6 +47,7 @@ def _build_chapter_report(book: dict, *, max_chunk_chars: int) -> dict:
     for chapter in book.get("chapters", []):
         markdown = str(chapter.get("markdown") or "")
         chunks = split_markdown_into_chunks(markdown, max_chunk_chars)
+        translation_chunks = estimate_translation_chunk_count(markdown, max_chunk_chars)
         source_pages = [int(page_no) for page_no in chapter.get("source_pages", [])]
         chapters.append(
             {
@@ -53,6 +59,7 @@ def _build_chapter_report(book: dict, *, max_chunk_chars: int) -> dict:
                 "source_pages": source_pages,
                 "char_count": len(markdown),
                 "estimated_chunk_count": len(chunks),
+                "estimated_translation_chunk_count": translation_chunks,
                 "placeholder_title": str(chapter.get("title") or "").startswith("Untitled Section"),
                 "translate": bool(chapter.get("translate", True)),
                 "preserve_original": bool(chapter.get("preserve_original", False)),
@@ -65,7 +72,7 @@ def _build_chapter_report(book: dict, *, max_chunk_chars: int) -> dict:
         "placeholder_title_count": sum(1 for chapter in chapters if chapter["placeholder_title"]),
         "preserved_original_count": sum(1 for chapter in chapters if chapter["preserve_original"]),
         "estimated_chunk_count": sum(
-            chapter["estimated_chunk_count"] for chapter in chapters if chapter["translate"]
+            chapter["estimated_translation_chunk_count"] for chapter in chapters if chapter["translate"]
         ),
         "chapters": chapters,
     }
