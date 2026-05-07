@@ -8,7 +8,7 @@ from pathlib import Path
 from zipfile import ZipFile
 
 from pdf_translator.book_rebuild import build_book_reconstruction
-from pdf_translator.epub import render_epub_from_book
+from pdf_translator.epub import render_epub_from_book, validate_epub_internal_hrefs
 from pdf_translator.ingest import ingest_epub
 
 
@@ -105,4 +105,10 @@ def test_render_epub_rewrites_internal_href_to_output_chapter_basename(tmp_path:
         assert len(names) == 2
         c1 = zf.read(sorted(names)[0]).decode("utf-8")
         assert "OEBPS/chapter2.xhtml" not in c1
-        assert "002-chapter-two.xhtml#note" in c1 or "chapter-two.xhtml#note" in c1
+        assert "002-chapter-two.xhtml" in c1
+        assert "#note" not in c1
+
+    validation = validate_epub_internal_hrefs(out)
+    assert validation["total_internal_hrefs"] >= 1
+    assert validation["unresolved_internal_hrefs"] == 0
+    assert validation["resolved_ratio"] == 1.0

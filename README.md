@@ -60,10 +60,10 @@ Outputs are written to `./runs/<pdf-stem>/` by default:
 - `normalized.json`
 - `reconstructed.md`
 - `translated.md`
-- `translated.epub`
+- `<source-stem> (zh-CN).epub`
 - `manifest.json`
 
-`normalized.md` is the raw Docling export. For book profile runs, `book.json` is the source of truth, `book.md` is the cleaned reading view, `translation-input.md` is the chapter-aware translation source, and `translated.epub` is the default reading output.
+`normalized.md` is the raw Docling export. For book profile runs, `book.json` is the source of truth, `book.md` is the cleaned reading view, `translation-input.md` is the chapter-aware translation source, and the named EPUB is the default reading output. `translated.md` remains a stable internal intermediate for cache reuse, polish, and diffing.
 
 Use `pdf-translator profile /path/to/file.pdf --profile auto` to classify pages into `accept`, `assist`, `skip_content`, and `reject_structure`. The built-in profiles are `magazine` and `book`.
 

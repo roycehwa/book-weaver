@@ -91,9 +91,53 @@ td, th {
 li {
   margin: 0.25rem 0 0.55rem;
 }
+.chapter-notes {
+  margin-top: 2.4rem;
+  padding-top: 1rem;
+  border-top: 1px solid #d8d2c4;
+  color: #4b5563;
+  font-size: 0.86rem;
+  line-height: 1.55;
+}
+.chapter-notes h2 {
+  margin: 0 0 0.85rem;
+  font-size: 1rem;
+  letter-spacing: 0.04em;
+}
+.chapter-notes p {
+  margin: 0 0 0.55em;
+}
+.preserved-apparatus {
+  margin-top: 1.2rem;
+  padding: 1rem 1.05rem;
+  border: 1px solid #e3ded2;
+  background: #fbf7ec;
+  color: #3f4652;
+  font-size: 0.88rem;
+  line-height: 1.5;
+}
+.preserved-apparatus h1,
+.preserved-apparatus h2,
+.preserved-apparatus h3 {
+  page-break-before: auto;
+  break-before: auto;
+  margin-top: 0.6rem;
+}
+.preserved-apparatus p,
+.preserved-apparatus li {
+  margin-bottom: 0.5rem;
+}
 """.strip()
 CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 RAW_HTML_TAG_RE = re.compile(r"</?(?:a|img|br)\b[^<>]*?/?>", re.IGNORECASE)
+NOTE_MARKER_RE = re.compile(r"^(?:\d{1,3}|[¹²³⁴⁵⁶⁷⁸⁹⁰]{1,4})$")
+APPARATUS_TITLE_RE = re.compile(
+    r"^(?:front\s*matter|frontmatter|copyright|dedication|contents|table of contents|"
+    r"list of (?:figures|tables|illustrations)(?: and (?:figures|tables|illustrations))?|"
+    r"tables|figures|text boxes?|glossary|abbreviations|notes|endnotes|bibliography|references|works cited|"
+    r".*index|index of .*)$",
+    re.IGNORECASE,
+)
 
 
 def _slug(value: str, fallback: str) -> str:
@@ -112,7 +156,53 @@ def _markdown_to_body_html(markdown_text: str) -> str:
     markdown_text = RAW_HTML_TAG_RE.sub(lambda match: escape(match.group(0)), markdown_text)
     html = markdown(markdown_text, extensions=["tables", "fenced_code", "sane_lists"])
     soup = BeautifulSoup(html, "html.parser")
+    _compact_trailing_note_cluster(soup)
     return "".join(str(child) for child in soup.contents)
+
+
+def _is_note_marker_node(node) -> bool:
+    if getattr(node, "name", None) != "p":
+        return False
+    text = node.get_text(" ", strip=True)
+    return bool(NOTE_MARKER_RE.match(text))
+
+
+def _compact_trailing_note_cluster(soup: BeautifulSoup) -> None:
+    """Wrap EPUB chapter-end note dumps without touching PDF page footnotes.
+
+    EPUBs often store notes as a numbered cluster at the end of each chapter.
+    PDF page footnotes are embedded near their source page and are not long
+    trailing marker clusters, so this deliberately requires multiple marker
+    paragraphs in the latter half of the generated chapter HTML.
+    """
+
+    children = [child for child in soup.contents if getattr(child, "name", None)]
+    if len(children) < 12:
+        return
+
+    min_start = max(4, int(len(children) * 0.45))
+    start_index: int | None = None
+    for index in range(min_start, len(children)):
+        if not _is_note_marker_node(children[index]):
+            continue
+        marker_count = sum(1 for child in children[index:] if _is_note_marker_node(child))
+        if marker_count >= 3:
+            start_index = index
+            break
+    if start_index is None:
+        return
+
+    section = soup.new_tag("section")
+    section["class"] = "chapter-notes"
+    section["epub:type"] = "footnotes"
+    heading = soup.new_tag("h2")
+    heading.string = "本章注释"
+    section.append(heading)
+
+    for child in children[start_index:]:
+        child.extract()
+        section.append(child)
+    soup.append(section)
 
 
 def _media_type(path: Path) -> str:
@@ -135,7 +225,12 @@ def build_epub_internal_href_map(chapters: list[dict], chapter_files: list[str])
 
 
 def rewrite_epub_internal_hrefs(body_html: str, *, href_map: dict[str, str]) -> str:
-    """Rewrite same-publication <a href> targets that point at mapped spine files to sibling chapter filenames."""
+    """Rewrite same-publication links to output chapter files.
+
+    Current contract is L2 chapter-level remapping. Source XHTML fragments are
+    intentionally dropped unless a future L3 fragment/id map exists; preserving
+    unknown fragments would create broken EPUB links.
+    """
     soup = BeautifulSoup(body_html, "html.parser")
     for anchor in soup.find_all("a"):
         href = anchor.get("href")
@@ -157,7 +252,7 @@ def rewrite_epub_internal_hrefs(body_html: str, *, href_map: dict[str, str]) -> 
         if not target:
             continue
         base = PurePosixPath(target).name
-        anchor["href"] = f"{base}#{frag}" if sep and frag else base
+        anchor["href"] = base
     return "".join(str(child) for child in soup.contents)
 
 
@@ -188,7 +283,8 @@ def _rewrite_images(body_html: str, image_map: dict[Path, str], image_items: lis
     return "".join(str(child) for child in soup.contents)
 
 
-def _chapter_xhtml(*, title: str, body_html: str, language: str) -> str:
+def _chapter_xhtml(*, title: str, body_html: str, language: str, body_id: str | None = None) -> str:
+    id_attr = f' id="{escape(body_id)}"' if body_id else ""
     return f"""<?xml version="1.0" encoding="utf-8"?>
 <html xmlns="http://www.w3.org/1999/xhtml" xml:lang="{escape(language)}">
 <head>
@@ -196,11 +292,17 @@ def _chapter_xhtml(*, title: str, body_html: str, language: str) -> str:
   <title>{escape(title)}</title>
   <link rel="stylesheet" type="text/css" href="styles/book.css" />
 </head>
-<body>
+<body{id_attr}>
 {body_html}
 </body>
 </html>
 """
+
+
+def _wrap_preserved_apparatus(body_html: str) -> str:
+    if not body_html.strip():
+        return body_html
+    return f'<section class="preserved-apparatus">\n{body_html}\n</section>'
 
 
 def _nav_xhtml(title: str, chapters: list[dict], chapter_files: list[str], *, language: str) -> str:
@@ -322,12 +424,18 @@ def render_epub_from_book(
     for chapter, chapter_file in zip(chapters, chapter_files):
         index = int(chapter.get("index") or 1)
         chapter_title = str(chapter.get("title") or f"Chapter {index}")
+        chapter_id = str(chapter.get("chapter_id") or "").strip() or None
         markdown_text = str(chapter.get("markdown") or "")
         body_html = _markdown_to_body_html(markdown_text)
         body_html = rewrite_epub_internal_hrefs(body_html, href_map=href_map)
         body_html = _rewrite_images(body_html, image_map, image_items)
+        if chapter.get("preserve_original") or chapter.get("resource_only") or APPARATUS_TITLE_RE.match(chapter_title):
+            body_html = _wrap_preserved_apparatus(body_html)
         chapter_documents.append(
-            (chapter_file, _chapter_xhtml(title=chapter_title, body_html=body_html, language=language))
+            (
+                chapter_file,
+                _chapter_xhtml(title=chapter_title, body_html=body_html, language=language, body_id=chapter_id),
+            )
         )
 
     cover_manifest_id = "image-1" if image_items else None
@@ -359,3 +467,60 @@ def render_epub_from_book(
             archive.writestr(f"OEBPS/{chapter_file}", chapter_document, compress_type=ZIP_DEFLATED)
         for epub_path, source_path in image_items:
             archive.write(source_path, f"OEBPS/{epub_path}", compress_type=ZIP_DEFLATED)
+
+
+def validate_epub_internal_hrefs(epub_path: Path) -> dict[str, object]:
+    """Return internal href resolution stats for a rendered EPUB.
+
+    External links are ignored. Relative links are resolved against the XHTML
+    file containing the link. A fragment is counted only when the target file
+    contains the referenced id.
+    """
+
+    total = 0
+    resolved = 0
+    unresolved: list[dict[str, str]] = []
+    with ZipFile(epub_path) as archive:
+        names = set(archive.namelist())
+        xhtml_names = [name for name in names if name.startswith("OEBPS/") and name.endswith((".xhtml", ".html"))]
+        ids_by_name: dict[str, set[str]] = {}
+        html_by_name: dict[str, str] = {}
+        for name in xhtml_names:
+            html = archive.read(name).decode("utf-8", errors="ignore")
+            html_by_name[name] = html
+            soup = BeautifulSoup(html, "html.parser")
+            ids_by_name[name] = {str(tag.get("id")) for tag in soup.find_all(attrs={"id": True})}
+
+        for source_name, html in html_by_name.items():
+            soup = BeautifulSoup(html, "html.parser")
+            source_dir = PurePosixPath(source_name).parent
+            for anchor in soup.find_all("a"):
+                href = anchor.get("href")
+                if not isinstance(href, str) or not href.strip():
+                    continue
+                href = href.strip()
+                low = href.lower()
+                if low.startswith(("http://", "https://", "mailto:")):
+                    continue
+                total += 1
+                path_part, _sep, frag = href.partition("#")
+                if path_part:
+                    target_name = posixpath.normpath(str(source_dir / path_part))
+                else:
+                    target_name = source_name
+                ok = target_name in names
+                if ok and frag:
+                    ok = frag in ids_by_name.get(target_name, set())
+                if ok:
+                    resolved += 1
+                else:
+                    unresolved.append({"source": source_name, "href": href, "target": target_name})
+
+    return {
+        "schema": "epub_href_validation_v1",
+        "total_internal_hrefs": total,
+        "resolved_internal_hrefs": resolved,
+        "unresolved_internal_hrefs": len(unresolved),
+        "resolved_ratio": round(resolved / total, 5) if total else 1.0,
+        "unresolved": unresolved[:50],
+    }

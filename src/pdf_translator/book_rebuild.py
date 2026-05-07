@@ -61,6 +61,7 @@ BOOK_SECTION_START_RE = re.compile(
 )
 OUTLINE_SKIP_TITLE_RE = re.compile(
     r"^(?:front\s*matter|frontmatter|copyright|dedication|contents|table of contents|"
+    r"list of (?:figures|tables|illustrations)(?: and (?:figures|tables|illustrations))?|"
     r"tables|figures|text boxes?|glossary|abbreviations|notes|endnotes|bibliography|references|works cited|"
     r".*index|index of .*)$",
     re.IGNORECASE,
@@ -80,6 +81,22 @@ class BookItem:
     top: float
     path: str | None = None
     from_page_footer: bool = False
+
+
+def stable_chapter_slug(title: str, index: int) -> str:
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", title).strip("-").lower()
+    return slug[:56] or f"chapter-{index}"
+
+
+def stable_chapter_id(title: str, index: int) -> str:
+    return f"ch-{index:03d}-{stable_chapter_slug(title, index)}"
+
+
+def _assign_chapter_ids(chapters: list[dict[str, Any]]) -> None:
+    for fallback_index, chapter in enumerate(chapters, 1):
+        index = int(chapter.get("index") or fallback_index)
+        title = str(chapter.get("title") or f"Chapter {index}")
+        chapter["chapter_id"] = stable_chapter_id(title, index)
 
 
 def _extract_pdf_outline_chapters(source_pdf: Path | None, *, total_pages: int) -> list[dict[str, Any]]:
@@ -348,6 +365,59 @@ def _render_pdf_cover_page(source_pdf: Path | None, images_dir: Path | None) -> 
         return output_path.resolve()
     except Exception:
         return None
+
+
+def _render_pdf_page_image(source_pdf: Path | None, images_dir: Path | None, page_no: int) -> Path | None:
+    if source_pdf is None or images_dir is None or source_pdf.suffix.lower() != ".pdf" or page_no <= 0:
+        return None
+    try:
+        import pypdfium2 as pdfium
+
+        images_dir.mkdir(parents=True, exist_ok=True)
+        output_path = images_dir / f"original-page-p{page_no:04d}.png"
+        if output_path.exists():
+            return output_path.resolve()
+        document = pdfium.PdfDocument(str(source_pdf))
+        try:
+            if page_no > len(document):
+                return None
+            page = document[page_no - 1]
+            page.render(scale=1.7).to_pil().save(output_path)
+        finally:
+            document.close()
+        return output_path.resolve()
+    except Exception:
+        return None
+
+
+def _replace_preserved_apparatus_with_page_images(
+    chapters: list[dict[str, Any]],
+    *,
+    source_pdf: Path | None,
+    images_dir: Path | None,
+) -> None:
+    for chapter in chapters:
+        title = str(chapter.get("title") or "")
+        if not bool(chapter.get("preserve_original")):
+            continue
+        if not OUTLINE_SKIP_TITLE_RE.match(title):
+            continue
+        page_markdown: list[str] = []
+        for page_no in chapter.get("source_pages", []):
+            try:
+                page_number = int(page_no)
+            except (TypeError, ValueError):
+                continue
+            page_image = _render_pdf_page_image(source_pdf, images_dir, page_number)
+            if page_image is not None:
+                page_markdown.append(f"![Original page {page_number}]({page_image.as_posix()})")
+        if not page_markdown:
+            continue
+        markdown = "\n\n".join(page_markdown).strip() + "\n"
+        chapter["markdown"] = markdown
+        chapter["trace_markdown"] = markdown
+        chapter["resource_only"] = True
+        chapter["toc"] = False
 
 
 def _caption_texts_from_refs(structured: dict[str, Any], captions: list[Any]) -> list[str]:
@@ -1060,6 +1130,7 @@ def _build_book_from_epub_meta(meta: dict[str, Any], source_path: Path | None) -
             tr += "\n"
         sip = entry.get("source_internal_path")
         is_cover_title = title_clean in {"cover", "cover page"}
+        is_preserved_resource = bool(is_cover_title or OUTLINE_SKIP_TITLE_RE.match(title))
         chapters.append(
             {
                 "index": i,
@@ -1069,10 +1140,11 @@ def _build_book_from_epub_meta(meta: dict[str, Any], source_path: Path | None) -
                 "source_pages": [i],
                 "markdown": md,
                 "trace_markdown": tr,
-                "translate": not (is_cover_title or OUTLINE_SKIP_TITLE_RE.match(title)),
-                "preserve_original": bool(is_cover_title or OUTLINE_SKIP_TITLE_RE.match(title)),
+                "translate": not is_preserved_resource,
+                "preserve_original": is_preserved_resource,
+                "resource_only": is_preserved_resource,
                 "source_internal_path": sip if isinstance(sip, str) else None,
-                "toc": not is_cover_title,
+                "toc": not is_preserved_resource,
             }
         )
         pages.append(
@@ -1103,6 +1175,7 @@ def _build_book_from_epub_meta(meta: dict[str, Any], source_path: Path | None) -
     if trace_markdown:
         trace_markdown += "\n"
 
+    _assign_chapter_ids(chapters)
     epub_footnote_ratio_pages = [{"content_lines": [ch["markdown"]]} for ch in chapters]
     epub_fn_ratio = _book_footnote_line_ratio_from_pages(epub_footnote_ratio_pages)
     assets: list[dict[str, Any]] = []
@@ -1287,8 +1360,10 @@ def build_book_reconstruction(
 
     chapters.extend(_build_preserved_resource_chapters(pages, chapters))
     chapters.sort(key=lambda chapter: (int(chapter.get("page_start") or 0), int(chapter.get("index") or 0)))
+    _replace_preserved_apparatus_with_page_images(chapters, source_pdf=source_pdf, images_dir=images_dir)
     for index, chapter in enumerate(chapters, 1):
         chapter["index"] = index
+    _assign_chapter_ids(chapters)
 
     full_markdown_parts: list[str] = []
     trace_markdown_parts: list[str] = []

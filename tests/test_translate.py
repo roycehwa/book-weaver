@@ -176,6 +176,101 @@ def test_translate_markdown_retries_untranslated_chinese_output(tmp_path: Path, 
     assert "已经翻译成中文" in result.translated_markdown
 
 
+def test_translate_markdown_retries_mixed_english_chinese_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class InitiallyMixedTranslator(BaseTranslator):
+        name = "realish"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            self.calls += 1
+            if self.calls == 1:
+                return (
+                    "AI系统可以 analyze complex trade scenarios 并 simulate proposed agreements 的效果，"
+                    "同时 highlight potential opportunities for mutual benefit。"
+                    "官员还可以 monitor currency fluctuations 并 detect early warning signs。"
+                )
+            return "AI系统可以分析复杂贸易情境并模拟拟议协议的效果，同时识别潜在互利机会。"
+
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
+    settings = RunSettings(
+        source_pdf=tmp_path / "source.pdf",
+        output_dir=tmp_path,
+        target_language="zh-CN",
+        source_language="en",
+        translator="realish",
+        max_chunk_chars=1000,
+    )
+    translator = InitiallyMixedTranslator()
+
+    result = translate_markdown(
+        chunks=[TranslationChunk(index=0, markdown="AI systems can analyze complex trade scenarios.")],
+        settings=settings,
+        translator=translator,
+        cache_dir=tmp_path / "cache",
+        retry_count=2,
+    )
+
+    assert translator.calls == 2
+    assert "highlight potential" not in result.translated_markdown
+    assert "识别潜在互利机会" in result.translated_markdown
+
+
+def test_translate_markdown_strips_generated_english_chinese_glosses_before_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class InitiallyGlossyTranslator(BaseTranslator):
+        name = "realish"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            self.calls += 1
+            return (
+                "这种 perspective（视角）形成 identity（身份），并将 visual culture（视觉文化）"
+                "作为 assumption（假设）来处理。"
+            )
+
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
+    settings = RunSettings(
+        source_pdf=tmp_path / "source.pdf",
+        output_dir=tmp_path,
+        target_language="zh-CN",
+        source_language="en",
+        translator="realish",
+        max_chunk_chars=1000,
+    )
+    translator = InitiallyGlossyTranslator()
+
+    result = translate_markdown(
+        chunks=[TranslationChunk(index=0, markdown="This perspective forms identity and visual culture.")],
+        settings=settings,
+        translator=translator,
+        cache_dir=tmp_path / "cache",
+        retry_count=2,
+    )
+
+    assert translator.calls == 1
+    assert "perspective（视角）" not in result.translated_markdown
+    assert "视觉文化" in result.translated_markdown
+
+
 def test_translate_markdown_parallel_preserves_chunk_order(tmp_path: Path) -> None:
     class EchoIndexTranslator(BaseTranslator):
         name = "echo-index"
@@ -225,6 +320,7 @@ def test_translate_book_chapters_preserves_chapter_boundaries(tmp_path: Path) ->
         "chapters": [
             {
                 "index": 1,
+                "chapter_id": "ch-001-chapter-1",
                 "title": "Chapter 1",
                 "page_start": 1,
                 "page_end": 2,
@@ -233,6 +329,7 @@ def test_translate_book_chapters_preserves_chapter_boundaries(tmp_path: Path) ->
             },
             {
                 "index": 2,
+                "chapter_id": "ch-002-chapter-2",
                 "title": "Chapter 2",
                 "page_start": 3,
                 "page_end": 4,
@@ -247,6 +344,7 @@ def test_translate_book_chapters_preserves_chapter_boundaries(tmp_path: Path) ->
     assert result.chunk_count == 2
     assert len(result.translated_chapters) == 2
     assert result.translated_chapters[0].title == "Chapter 1"
+    assert result.translated_chapters[0].chapter_id == "ch-001-chapter-1"
     assert result.translated_chapters[0].source_pages == [1, 2]
     assert "# Chapter 1" in result.translated_markdown
     assert result.translated_markdown.index("# Chapter 1") < result.translated_markdown.index("# Chapter 2")
@@ -327,6 +425,33 @@ def test_translate_book_chapters_restores_media_blocks_after_translation(tmp_pat
     assert "PRESERVE_ORIGINAL_BLOCK" not in result.translated_markdown
 
 
+def test_translate_book_chapters_preserves_link_heavy_lists_without_model_call(tmp_path: Path) -> None:
+    settings = RunSettings(
+        source_pdf=tmp_path / "source.epub",
+        output_dir=tmp_path,
+        target_language="zh-CN",
+        source_language="en",
+        translator="failing",
+        max_chunk_chars=1000,
+    )
+    links = "".join(f"[Figure {index}](OEBPS/part.xhtml#fig-{index})" for index in range(20))
+    book = {
+        "chapters": [
+            {
+                "index": 1,
+                "title": "List of Illustrations",
+                "markdown": links,
+                "translate": True,
+            }
+        ]
+    }
+
+    result = translate_book_chapters(book=book, settings=settings, translator=FailingTranslator())
+
+    assert "Figure 19" in result.translated_markdown
+    assert "OEBPS/part.xhtml#fig-19" in result.translated_markdown
+
+
 def test_minimax_settings_use_provider_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MINIMAX_API_KEY", "key")
     monkeypatch.setenv("MINIMAX_MODEL", "MiniMax-Test")
@@ -375,28 +500,32 @@ def test_minimax_translator_uses_anthropic_messages_api(monkeypatch: pytest.Monk
     captured: dict[str, object] = {}
 
     class FakeResponse:
-        def __enter__(self) -> "FakeResponse":
-            return self
+        def __init__(self) -> None:
+            self.status_code = 200
 
-        def __exit__(self, *args: object) -> None:
+        def raise_for_status(self) -> None:
             return None
 
-        def read(self) -> bytes:
-            return json.dumps(
-                {
-                    "content": [{"type": "text", "text": "# 标题\n\n正文。"}],
-                    "stop_reason": "end_turn",
-                }
-            ).encode("utf-8")
+        def json(self) -> dict[str, object]:
+            return {
+                "content": [{"type": "text", "text": "# 标题\n\n正文。"}],
+                "stop_reason": "end_turn",
+            }
 
-    def fake_urlopen(request: object, timeout: int) -> FakeResponse:
+    def fake_post(
+        url: str,
+        *,
+        json: dict[str, object],
+        headers: dict[str, str],
+        timeout: tuple[int, float],
+    ) -> FakeResponse:
         captured["timeout"] = timeout
-        captured["url"] = request.full_url
-        captured["headers"] = dict(request.header_items())
-        captured["body"] = json.loads(request.data.decode("utf-8"))
+        captured["url"] = url
+        captured["headers"] = headers
+        captured["body"] = json
         return FakeResponse()
 
-    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("requests.post", fake_post)
     translator = MiniMaxAnthropicTranslator(
         CompatibleAPISettings(
             api_key="test-key",
@@ -418,10 +547,10 @@ def test_minimax_translator_uses_anthropic_messages_api(monkeypatch: pytest.Monk
     body = captured["body"]
     assert body["model"] == "MiniMax-M2.7-highspeed"
     assert body["max_tokens"] == 2048
+    assert captured["headers"].get("anthropic-version") == "2023-06-01"
     assert body["messages"] == [
         {
             "role": "user",
             "content": "Source language: en\nTarget language: zh-CN\nMarkdown chunk index: 3\n\n# Title\n\nBody.",
         }
     ]
-

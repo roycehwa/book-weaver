@@ -16,6 +16,7 @@ from pdf_translator.knowledge import (
     load_book_json,
 )
 from pdf_translator.pipeline import run_translation_pipeline
+from pdf_translator.polish import run_polish
 from pdf_translator.profile import build_document_profile
 from pdf_translator.validation import run_validation_manifest, write_validation_report
 
@@ -185,6 +186,45 @@ def build_parser() -> argparse.ArgumentParser:
         help="Default hard input gate for page count when a case is recomputed.",
     )
 
+    polish_parser = subparsers.add_parser(
+        "polish",
+        help="Post-edit an existing book translation run without retranslating the whole book.",
+    )
+    polish_parser.add_argument(
+        "run_dir",
+        type=Path,
+        help="Path to a completed translate run containing book.json and translated.md.",
+    )
+    polish_parser.add_argument(
+        "--target-lang",
+        default="zh-CN",
+        help="Target language, for example zh-CN.",
+    )
+    polish_parser.add_argument(
+        "--translator",
+        default="minimax",
+        choices=["openai", "mock", "minimax", "compatible", "openai-compatible"],
+        help="Translation backend used for polish requests.",
+    )
+    polish_parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=8,
+        help="Number of candidate lines per polish request.",
+    )
+    polish_parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=6,
+        help="Number of polish batches to run concurrently.",
+    )
+    polish_parser.add_argument(
+        "--request-timeout-seconds",
+        type=float,
+        default=None,
+        help="Per-request polish timeout. Defaults to the translator timeout, e.g. MINIMAX_HTTP_TIMEOUT_SECONDS.",
+    )
+
     knowledge_parser = subparsers.add_parser(
         "knowledge",
         help="Branch B stubs: wiki outline and Mermaid mindmap from book.json.",
@@ -327,6 +367,24 @@ def main() -> None:
                     print(f"{status} {case['profile']} {case['name']} :: {case['failure']['type']}")
                 else:
                     print(f"{status} {case['profile']} {case['name']}")
+        elif args.command == "polish":
+            result = run_polish(
+                run_dir=args.run_dir,
+                target_language=args.target_lang,
+                translator_name=args.translator,
+                batch_size=args.batch_size,
+                concurrency=args.concurrency,
+                request_timeout_seconds=args.request_timeout_seconds,
+            )
+            print(f"Polish report: {result.report_path}")
+            print(f"Polished Markdown: {result.polished_markdown_path}")
+            print(f"Polished EPUB: {result.polished_epub_path}")
+            print(
+                "Polish summary: "
+                f"candidates={result.candidate_count} "
+                f"accepted={result.accepted_count} "
+                f"rejected={result.rejected_count}"
+            )
         elif args.command == "knowledge":
             book_path = args.book_json.expanduser().resolve()
             book = load_book_json(book_path)

@@ -4,13 +4,13 @@ import json
 import hashlib
 import os
 import time
-import urllib.error
-import urllib.request
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import re
 from pathlib import Path
 
 from openai import OpenAI
+import requests
 
 from pdf_translator.chunking import split_markdown_into_chunks
 from pdf_translator.config import (
@@ -20,6 +20,9 @@ from pdf_translator.config import (
     RunSettings,
 )
 from pdf_translator.models import BookTranslationResult, TranslatedChapter, TranslationChunk, TranslationResult
+
+
+TRANSLATION_PROMPT_VERSION = "v2-no-source-gloss"
 
 
 SYSTEM_PROMPT = """You are a professional document translator.
@@ -32,9 +35,33 @@ Rules:
 - Do not translate URLs, code, citation keys, raw numbers, or obvious identifiers.
 - Translate natural language in image alt text if present.
 - When the target language is Chinese, translate English prose into Chinese. Do not return the source prose unchanged.
+- When the target language is Chinese, do not invent bilingual glosses like "perspective（视角）" or "visual culture（视觉文化）".
+- If a source English term should be translated, write only the Chinese translation. If the original text did not contain parentheses, do not add parentheses just to show the source English.
+- Keep source English only for names, titles, citations, identifiers, or terms that genuinely should remain untranslated.
 - Translate completely. Do not summarize, shorten, skip paragraphs, or replace content with an overview.
 - Return only translated Markdown, with no commentary.
 """
+
+
+ENGLISH_THEN_CHINESE_GLOSS_RE = re.compile(
+    r"[A-Za-z][A-Za-z'’\-/]*(?:\s+[A-Za-z][A-Za-z'’\-/]*){0,6}\s*[（(][\u4e00-\u9fff][^（）()A-Za-z]{0,80}[）)]"
+)
+CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+LATIN_WORD_RE = re.compile(r"\b[A-Za-z][A-Za-z'’-]{3,}\b")
+URL_OR_EMAIL_RE = re.compile(r"(?:https?://|www\.)\S+|\S+@\S+")
+MARKDOWN_LINK_DEST_RE = re.compile(r"\]\([^)]+\)")
+ALLOWED_MIXED_LATIN_WORDS = {
+    "press",
+    "copyright",
+    "license",
+    "email",
+    "figure",
+    "table",
+    "chapter",
+    "appendix",
+    "notes",
+    "index",
+}
 
 
 def _translation_prompt(chunk: TranslationChunk, source_language: str | None, target_language: str) -> str:
@@ -48,7 +75,8 @@ def _translation_prompt(chunk: TranslationChunk, source_language: str | None, ta
 
 
 def _chunk_cache_path(cache_dir: Path, chunk: TranslationChunk) -> Path:
-    digest = hashlib.sha256(chunk.markdown.encode("utf-8")).hexdigest()[:16]
+    digest_input = f"{TRANSLATION_PROMPT_VERSION}\n{chunk.markdown}"
+    digest = hashlib.sha256(digest_input.encode("utf-8")).hexdigest()[:16]
     return cache_dir / f"chunk-{chunk.index:06d}-{digest}.md"
 
 
@@ -85,6 +113,74 @@ def _looks_incomplete_for_target(source: str, translated: str, target_language: 
     return translated_signal < source_alpha * 0.18
 
 
+def _english_then_chinese_gloss_count(text: str) -> int:
+    return len(ENGLISH_THEN_CHINESE_GLOSS_RE.findall(text))
+
+
+def _mixed_untranslated_english_signal(text: str) -> tuple[int, int, int]:
+    """Return (suspect_word_count, mixed_line_count, max_line_suspects).
+
+    This targets the failure mode where a model returns mostly Chinese but
+    leaves natural-language English phrases inside Chinese sentences. It
+    deliberately ignores structural/image lines, URLs, emails, Markdown link
+    destinations, all-caps acronyms, and likely names.
+    """
+
+    suspect_word_count = 0
+    mixed_line_count = 0
+    max_line_suspects = 0
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith(("#", "![", "|", ">", "```")):
+            continue
+        if not CJK_RE.search(line):
+            continue
+        cleaned = URL_OR_EMAIL_RE.sub(" ", line)
+        cleaned = MARKDOWN_LINK_DEST_RE.sub("]", cleaned)
+        line_suspects = 0
+        for match in LATIN_WORD_RE.finditer(cleaned):
+            word = match.group(0).strip("'’”-").lower()
+            if not word or word in ALLOWED_MIXED_LATIN_WORDS:
+                continue
+            original = match.group(0)
+            if original.isupper() and len(original) <= 8:
+                continue
+            if original[:1].isupper() and original[1:].islower():
+                # Most remaining title-case words in mixed CJK lines are names.
+                continue
+            if not any(char.islower() for char in original):
+                continue
+            line_suspects += 1
+        if line_suspects:
+            mixed_line_count += 1
+            suspect_word_count += line_suspects
+            max_line_suspects = max(max_line_suspects, line_suspects)
+    return suspect_word_count, mixed_line_count, max_line_suspects
+
+
+def _strip_generated_english_chinese_glosses(source: str, translated: str, target_language: str) -> str:
+    if not target_language.lower().startswith("zh"):
+        return translated
+    source_count = _english_then_chinese_gloss_count(source)
+    translated_count = _english_then_chinese_gloss_count(translated)
+    if translated_count == 0 or translated_count <= source_count:
+        return translated
+    return ENGLISH_THEN_CHINESE_GLOSS_RE.sub(lambda match: re.search(r"[（(](.*)[）)]", match.group(0)).group(1), translated)
+
+
+def _looks_polluted_by_generated_glosses(source: str, translated: str, target_language: str) -> bool:
+    if not target_language.lower().startswith("zh"):
+        return False
+    translated_count = _english_then_chinese_gloss_count(translated)
+    if translated_count < 2:
+        return False
+    source_count = _english_then_chinese_gloss_count(source)
+    if translated_count <= 5 and source_count == 0:
+        return False
+    # A small number can exist in source notes/tables. The failure mode here is generated repeatedly in output.
+    return translated_count > source_count + 1
+
+
 def _assert_translation_quality(
     *,
     chunk: TranslationChunk,
@@ -105,6 +201,23 @@ def _assert_translation_quality(
             f"(source_ascii={_ascii_letter_count(chunk.markdown)}, "
             f"translated_ascii={_ascii_letter_count(translated)}, cjk={_cjk_count(translated)})."
         )
+    if _looks_polluted_by_generated_glosses(chunk.markdown, translated, target_language):
+        raise ValueError(
+            f"Translation for chunk {chunk.index} contains generated English-Chinese glosses "
+            f"(source_glosses={_english_then_chinese_gloss_count(chunk.markdown)}, "
+            f"translated_glosses={_english_then_chinese_gloss_count(translated)})."
+        )
+    suspect_words, mixed_lines, max_line_suspects = _mixed_untranslated_english_signal(translated)
+    if suspect_words >= 18 and mixed_lines >= 2:
+        raise ValueError(
+            f"Translation for chunk {chunk.index} contains mixed untranslated English "
+            f"(suspect_words={suspect_words}, mixed_lines={mixed_lines}, max_line={max_line_suspects})."
+        )
+    if max_line_suspects >= 10:
+        raise ValueError(
+            f"Translation for chunk {chunk.index} contains a heavily mixed English line "
+            f"(suspect_words={suspect_words}, mixed_lines={mixed_lines}, max_line={max_line_suspects})."
+        )
 
 
 def _translate_chunk_resumable(
@@ -123,6 +236,7 @@ def _translate_chunk_resumable(
         if cache_path.exists():
             cached = cache_path.read_text(encoding="utf-8").strip()
             if cached:
+                cached = _strip_generated_english_chinese_glosses(chunk.markdown, cached, target_language)
                 try:
                     _assert_translation_quality(
                         chunk=chunk,
@@ -145,6 +259,7 @@ def _translate_chunk_resumable(
             ).strip()
             if not translated:
                 raise ValueError(f"Empty translation returned for chunk {chunk.index}.")
+            translated = _strip_generated_english_chinese_glosses(chunk.markdown, translated, target_language)
             _assert_translation_quality(
                 chunk=chunk,
                 translated=translated,
@@ -319,27 +434,30 @@ class MiniMaxAnthropicTranslator(BaseTranslator):
                 }
             ],
         }
-        request = urllib.request.Request(
-            self.endpoint,
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
 
         try:
-            with urllib.request.urlopen(request, timeout=self.http_timeout) as response:
-                response_data = json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            error_body = exc.read().decode("utf-8", errors="replace")
+            response = requests.post(
+                self.endpoint,
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                    "anthropic-version": "2023-06-01",
+                    "Connection": "close",
+                },
+                timeout=(10, self.http_timeout),
+            )
+            response.raise_for_status()
+            response_data = response.json()
+        except requests.HTTPError as exc:
+            error_body = exc.response.text if exc.response is not None else ""
+            status_code = exc.response.status_code if exc.response else "?"
             raise ValueError(
                 f"MiniMax translation failed for chunk {chunk.index}: "
-                f"HTTP {exc.code}: {error_body[:500]}"
+                f"HTTP {status_code}: {error_body[:500]}"
             ) from exc
-        except urllib.error.URLError as exc:
-            raise ValueError(f"MiniMax translation failed for chunk {chunk.index}: {exc.reason}") from exc
+        except requests.RequestException as exc:
+            raise ValueError(f"MiniMax translation failed for chunk {chunk.index}: {exc}") from exc
 
         text_parts: list[str] = []
         for item in response_data.get("content", []):
@@ -424,12 +542,27 @@ def _is_preserved_media_block(block: str) -> bool:
     return stripped.startswith("![") or _is_markdown_table_block(block)
 
 
+def _is_preserved_apparatus_block(block: str) -> bool:
+    stripped = block.strip()
+    if not stripped:
+        return False
+    first_line = stripped.splitlines()[0].strip().lower()
+    if first_line in {"# list of illustrations", "# list of tables", "# list of figures"}:
+        return True
+    link_count = stripped.count("](")
+    if link_count < 8:
+        return False
+    ascii_count = _ascii_letter_count(stripped)
+    # Link-heavy figure/table lists are navigation apparatus, not reading prose.
+    return link_count / max(len(stripped), 1) > 0.006 and ascii_count > 500
+
+
 def _protect_media_blocks(markdown_text: str) -> tuple[str, dict[str, str]]:
     blocks = markdown_text.split("\n\n")
     replacements: dict[str, str] = {}
     protected_blocks: list[str] = []
     for block in blocks:
-        if _is_preserved_media_block(block):
+        if _is_preserved_media_block(block) or _is_preserved_apparatus_block(block):
             token = f"[[PRESERVE_ORIGINAL_BLOCK_{len(replacements):04d}]]"
             replacements[token] = block
             protected_blocks.append(token)
@@ -469,7 +602,7 @@ def _split_markdown_media_segments(markdown_text: str) -> list[tuple[str, str]]:
             segments.append(("media", f"{stripped}\n\n{next_block.strip()}"))
             index += 2
             continue
-        if _is_preserved_media_block(block):
+        if _is_preserved_media_block(block) or _is_preserved_apparatus_block(block):
             flush_text()
             segments.append(("media", block.strip()))
         else:
@@ -513,6 +646,7 @@ def translate_book_chapters(
             translated_chapters.append(
                 TranslatedChapter(
                     index=int(chapter.get("index", len(translated_chapters) + 1)),
+                    chapter_id=str(chapter.get("chapter_id") or "") or None,
                     title=str(chapter.get("title") or f"Chapter {len(translated_chapters) + 1}"),
                     page_start=chapter.get("page_start"),
                     page_end=chapter.get("page_end"),
@@ -525,7 +659,8 @@ def translate_book_chapters(
             continue
 
         translated_parts: list[str] = []
-        for segment_kind, segment_markdown in _split_markdown_media_segments(chapter_source_markdown):
+        media_segments = [("media", chapter_source_markdown.strip())] if _is_preserved_apparatus_block(chapter_source_markdown) else _split_markdown_media_segments(chapter_source_markdown)
+        for segment_kind, segment_markdown in media_segments:
             if segment_kind == "media":
                 translated_parts.append(segment_markdown)
                 continue
@@ -557,6 +692,7 @@ def translate_book_chapters(
         translated_chapters.append(
             TranslatedChapter(
                 index=int(chapter.get("index", len(translated_chapters) + 1)),
+                chapter_id=str(chapter.get("chapter_id") or "") or None,
                 title=str(chapter.get("title") or f"Chapter {len(translated_chapters) + 1}"),
                 page_start=chapter.get("page_start"),
                 page_end=chapter.get("page_end"),

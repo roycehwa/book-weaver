@@ -84,6 +84,34 @@ def test_book_rebuild_marks_epub_cover_page_as_non_toc_resource() -> None:
     assert result["metadata"]["cover_image_path"] == "/tmp/cover.png"
 
 
+def test_book_rebuild_marks_epub_apparatus_chapters_as_non_toc_resources() -> None:
+    structured = {
+        "_epub_meta": {
+            "schema": "epub_ingest_v1",
+            "chapters": [
+                {"title": "Contents", "markdown": "[Chapter 1](chapter.xhtml)\n"},
+                {"title": "List of Figures and Tables", "markdown": "- Figure 1.1 Sample\n"},
+                {"title": "Chapter 1", "markdown": "Real body text."},
+                {"title": "Notes", "markdown": "- 1. A note.\n"},
+                {"title": "Index", "markdown": "- Alpha, 1\n"},
+            ],
+        }
+    }
+
+    result = build_book_reconstruction(structured)
+
+    by_title = {chapter["title"]: chapter for chapter in result["chapters"]}
+    assert by_title["Contents"]["translate"] is False
+    assert by_title["Contents"]["toc"] is False
+    assert by_title["List of Figures and Tables"]["translate"] is False
+    assert by_title["List of Figures and Tables"]["toc"] is False
+    assert by_title["Chapter 1"]["translate"] is True
+    assert by_title["Chapter 1"]["toc"] is True
+    assert by_title["Notes"]["translate"] is False
+    assert by_title["Index"]["toc"] is False
+    assert by_title["Chapter 1"]["chapter_id"] == "ch-003-chapter-1"
+
+
 def test_book_rebuild_adds_pdf_cover_chapter(monkeypatch, tmp_path) -> None:
     cover = tmp_path / "cover.png"
     cover.write_bytes(b"png")
@@ -136,6 +164,43 @@ def test_book_rebuild_prefers_pdf_table_crop_over_markdown_table(monkeypatch, tm
     assert "| A | B |" not in markdown
     assert "**Table 1.1**" not in markdown
     assert any(asset["kind"] == "table" and asset["path"] == str(table_crop) for asset in result["assets"])
+
+
+def test_book_rebuild_preserves_pdf_back_matter_as_original_page_images(monkeypatch, tmp_path) -> None:
+    page_image = tmp_path / "original-page-p0003.png"
+    page_image.write_bytes(b"png")
+    monkeypatch.setattr(book_rebuild, "_render_pdf_cover_page", lambda source_pdf, images_dir: None)
+    monkeypatch.setattr(book_rebuild, "_crop_pdf_regions", lambda *args, **kwargs: {})
+    monkeypatch.setattr(book_rebuild, "_render_pdf_page_image", lambda source_pdf, images_dir, page_no: page_image)
+    monkeypatch.setattr(
+        book_rebuild,
+        "_extract_pdf_outline_chapters",
+        lambda source_pdf, total_pages: [
+            {"title": "Chapter 1", "page_no": 1, "depth": 0, "skip": False},
+            {"title": "Notes", "page_no": 3, "depth": 0, "skip": True},
+        ],
+    )
+    structured = {
+        "body": {"children": [{"$ref": f"#/texts/{index}"} for index in range(4)]},
+        "texts": [
+            {"label": "section_header", "text": "Chapter 1", "prov": _prov(1, 40, 760)},
+            {"label": "text", "text": "Body text.", "prov": _prov(1, 40, 620)},
+            {"label": "section_header", "text": "Notes", "prov": _prov(3, 40, 760)},
+            {"label": "text", "text": "1. A densely formatted note that should remain visually faithful.", "prov": _prov(3, 40, 700)},
+        ],
+        "pictures": [],
+        "tables": [],
+    }
+
+    result = build_book_reconstruction(structured, source_pdf=tmp_path / "book.pdf", images_dir=tmp_path)
+    notes = result["chapters"][1]
+
+    assert notes["title"] == "Notes"
+    assert notes["translate"] is False
+    assert notes["resource_only"] is True
+    assert notes["toc"] is False
+    assert f"![Original page 3]({page_image.as_posix()})" in notes["markdown"]
+    assert "densely formatted note" not in notes["markdown"]
 
 
 def test_book_rebuild_keeps_front_matter_when_it_has_text(monkeypatch) -> None:
@@ -202,6 +267,7 @@ def test_book_rebuild_skips_toc_and_splits_chapters() -> None:
     assert result["chapter_count"] == 2
     assert result["pages"][0]["page_kind"] == "toc"
     assert result["chapters"][0]["title"] == "Chapter 1: A Beginning"
+    assert result["chapters"][0]["chapter_id"] == "ch-001-chapter-1-a-beginning"
     assert result["chapters"][0]["page_start"] == 2
     assert result["chapters"][0]["page_end"] == 3
     assert result["chapters"][1]["title"] == "Chapter 2: Another Start"

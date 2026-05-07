@@ -34,6 +34,7 @@ class TranslationResult:
 @dataclass(slots=True)
 class TranslatedChapter:
     index: int
+    chapter_id: str | None
     title: str
     page_start: int | None
     page_end: int | None

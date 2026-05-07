@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import re
 
 from pdf_translator.book_rebuild import build_book_reconstruction
 from pdf_translator.book_views import render_book_markdown, render_translation_input_markdown
 from pdf_translator.chunking import split_markdown_into_chunks
 from pdf_translator.config import RunSettings
-from pdf_translator.epub import render_epub_from_book
+from pdf_translator.epub import render_epub_from_book, validate_epub_internal_hrefs
 from pdf_translator.guardrails import ingest_pdf_guarded
 from pdf_translator.models import PipelineArtifacts
 from pdf_translator.profile import build_document_profile
@@ -24,7 +25,19 @@ def build_output_dir(base_output_dir: Path, source_pdf: Path) -> Path:
     return base_output_dir / source_pdf.stem
 
 
-def build_artifacts(output_dir: Path) -> PipelineArtifacts:
+def safe_delivery_file_stem(source_path: Path, target_language: str) -> str:
+    source_stem = source_path.stem.strip() or "book"
+    source_stem = re.sub(r"[\\/:*?\"<>|]+", " ", source_stem)
+    source_stem = re.sub(r"\s+", " ", source_stem).strip(" .")
+    if len(source_stem) > 140:
+        source_stem = source_stem[:140].rstrip(" .")
+    target = re.sub(r"[\\/:*?\"<>|]+", " ", target_language.strip() or "translated")
+    target = re.sub(r"\s+", " ", target).strip(" .")
+    return f"{source_stem} ({target})"
+
+
+def build_artifacts(output_dir: Path, source_pdf: Path, target_language: str) -> PipelineArtifacts:
+    delivery_stem = safe_delivery_file_stem(source_pdf, target_language)
     return PipelineArtifacts(
         output_dir=output_dir,
         normalized_markdown_path=output_dir / "normalized.md",
@@ -33,8 +46,8 @@ def build_artifacts(output_dir: Path) -> PipelineArtifacts:
         reconstructed_markdown_path=output_dir / "reconstructed.md",
         translation_input_markdown_path=output_dir / "translation-input.md",
         translated_markdown_path=output_dir / "translated.md",
-        translated_pdf_path=output_dir / "translated.pdf",
-        translated_epub_path=output_dir / "translated.epub",
+        translated_pdf_path=output_dir / f"{delivery_stem}.pdf",
+        translated_epub_path=output_dir / f"{delivery_stem}.epub",
         manifest_path=output_dir / "manifest.json",
         book_json_path=output_dir / "book.json",
         book_markdown_path=output_dir / "book.md",
@@ -52,6 +65,7 @@ def _build_chapter_report(book: dict, *, max_chunk_chars: int) -> dict:
         chapters.append(
             {
                 "index": chapter.get("index"),
+                "chapter_id": chapter.get("chapter_id"),
                 "title": chapter.get("title"),
                 "page_start": chapter.get("page_start"),
                 "page_end": chapter.get("page_end"),
@@ -81,7 +95,7 @@ def _build_chapter_report(book: dict, *, max_chunk_chars: int) -> dict:
 def run_translation_pipeline(settings: RunSettings) -> PipelineArtifacts:
     output_dir = build_output_dir(settings.output_dir, settings.source_pdf)
     output_dir.mkdir(parents=True, exist_ok=True)
-    artifacts = build_artifacts(output_dir)
+    artifacts = build_artifacts(output_dir, settings.source_pdf, settings.target_language)
 
     normalized, preflight = ingest_pdf_guarded(
         settings.source_pdf,
@@ -214,6 +228,7 @@ def run_translation_pipeline(settings: RunSettings) -> PipelineArtifacts:
             language=translated.target_language,
         )
         rendered_files["translated_epub"] = str(artifacts.translated_epub_path)
+        rendered_files["epub_href_validation"] = validate_epub_internal_hrefs(artifacts.translated_epub_path)
 
     manifest = {
         "source_pdf": str(settings.source_pdf),

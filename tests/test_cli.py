@@ -18,3 +18,23 @@ def test_public_cli_book_and_magazine_profiles_only() -> None:
 
     with pytest.raises(SystemExit):
         parser.parse_args(["articles-html", "sample.pdf"])
+
+
+def test_public_cli_accepts_polish_command() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "polish",
+            "runs/sample",
+            "--target-lang",
+            "zh-CN",
+            "--translator",
+            "minimax",
+            "--request-timeout-seconds",
+            "600",
+        ]
+    )
+
+    assert args.command == "polish"
+    assert str(args.run_dir) == "runs/sample"
+    assert args.request_timeout_seconds == 600

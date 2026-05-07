@@ -1,41 +1,79 @@
-# 路线图：高分章节、分支 A / B 与内部链接
+# 路线图：书籍输入、翻译阅读与知识网络化
 
-本文档与仓库代码一并维护，描述产品阶段划分与分支 A（翻译 + 译后跳转）的技术分层。历史讨论见仓库 Issue / PR 时可引用本文件路径：`docs/ROADMAP.md`。
+本文档与仓库代码一并维护，描述从 PDF / EPUB 书籍输入到阅读交付与知识网络化的产品路线。历史讨论见仓库 Issue / PR 时可引用本文件路径：`docs/ROADMAP.md`。
+
+具体分阶段实施计划见 [`docs/IMPLEMENTATION_PLAN.md`](./IMPLEMENTATION_PLAN.md)。Phase A 的执行方法见 [`docs/PHASE_A_METHOD.md`](./PHASE_A_METHOD.md)。分支 A 的链接、章节 id、脚注和定点修正契约见 [`docs/BRANCH_A_CONTRACT.md`](./BRANCH_A_CONTRACT.md)。知识分支的 profile 分类与方法论见 [`docs/KNOWLEDGE_PROFILES.md`](./KNOWLEDGE_PROFILES.md)。
 
 ## 总览
 
-工程从「能跑通 ingest → 书稿 → EPUB」进入 **更高要求的分章节**：章节既是 **翻译与阅读导航** 的单元，也是 **知识提炼** 的单元。两条分支 **共用同一套章节边界与章节 id 契约**，避免两套分章逻辑漂移。
+系统输入是一本文档：PDF 或 EPUB。核心流程不是“先翻译再结束”，而是先把书籍变成稳定 BookIR，再根据语言和用户目标选择路径：
+
+- 如果输入是英文或其他外文，翻译是 **语言归一化前置能力**，产出译文 EPUB，同时将 **原文 + 译文** 一起作为知识分支输入。
+- 如果输入已经是中文，可以跳过翻译，直接进入知识分支。
+- 用户可以选择只做阅读交付，不进入知识分支。
+
+因此当前路线分为两个产品分支：
+
+- **分支 A：阅读交付**。目标是把书翻译成可读 EPUB/PDF，并支持看样后的局部修正。
+- **分支 B：知识拆分与网络化管理**。目标是基于 BookIR、原文、译文生成章节化知识资产、Wiki、脑图、索引和后续知识图谱。
+
+两条分支 **共用同一套章节边界、章节 id、页码、图表和来源追溯契约**，避免翻译阅读和知识提炼各自重建结构。
+
+### 主流程
+
+```mermaid
+flowchart TB
+  IN[PDF_or_EPUB_book] --> INGEST[ingest_and_normalize]
+  INGEST --> IR[BookIR_book_json]
+  IR --> LANG{source_language}
+  LANG -->|Chinese| BINPUT[knowledge_input_original_only]
+  LANG -->|Non_Chinese| TR[translate_to_target_language]
+  TR --> AOUT[Branch_A_reading_EPUB_PDF]
+  TR --> BILINGUAL[knowledge_input_original_plus_translation]
+  IR --> ACHOICE{user_goal}
+  ACHOICE -->|reading_only| AOUT
+  ACHOICE -->|knowledge| BINPUT
+  BINPUT --> B[Branch_B_knowledge_pipeline]
+  BILINGUAL --> B
+  B --> KOUT[wiki_mindmap_indexes_graphs]
+```
 
 ### 分章原则（已确认）
 
 - **按内容分章**：边界反映 **原文/原书的逻辑结构**（目录、卷、篇、章标题层级等），**不以 PDF 页码或物理页** 做主切片。
 - **工程信号**：优先 **EPUB spine / NCX / 标题块**（及 PDF 管线中等价结构节点）；页级启发式仅兜底，不主导主叙事章界。
+- **双语对齐**：外文书进入知识分支时，知识单元需要同时保留原文和译文引用；中文书只保留单语来源。
 
 ```mermaid
 flowchart TB
-  subgraph shared [Shared_chapter_IR]
-    IR[chapter_IR_book_ir_extensions]
+  subgraph shared [Shared_BookIR]
+    IR[BookIR_chapter_ids_pages_assets]
   end
-  subgraph branchA [Branch_A_reading]
-    T[translate_per_chapter]
+  subgraph branchA [Branch_A_reading_delivery]
+    T[optional_translation]
     NAV[internal_links_and_toc]
-    EPUB[render_epub]
-    IR --> T --> NAV --> EPUB
+    EPUB[render_named_epub_pdf]
+    PATCH[future_targeted_corrections]
+    IR --> T --> NAV --> EPUB --> PATCH
   end
-  subgraph branchB [Branch_B_knowledge]
-    EX[extract_knowledge_per_chapter]
+  subgraph branchB [Branch_B_knowledge_management]
+    SU[semantic_units]
+    PROF[suitability_profile]
+    EX[profile_specific_extraction]
     W[wiki_emit]
     M[mindmap_emit]
-    IR --> EX --> W
+    G[knowledge_graph_json]
+    IR --> SU --> PROF --> EX --> W
     EX --> M
+    EX --> G
   end
 ```
 
 ---
 
-## 分支 A：翻译 + 译后章节跳转（当前优先）
+## 分支 A：阅读交付（翻译 EPUB/PDF）
 
-**目标**：译稿 EPUB 中 **按章阅读**，且 **章内/章间跳转**（脚注、参见、目录锚点等）在可接受准确度内可用。
+**目标**：当用户需要阅读译本时，产出可读 EPUB/PDF。外文书默认翻译；中文书通常跳过。分支 A 可以作为最终交付，也可以作为分支 B 的前置语言归一化步骤。
 
 ### 代码落点
 
@@ -44,12 +82,14 @@ flowchart TB
 | EPUB ingest | [`src/pdf_translator/ingest.py`](../src/pdf_translator/ingest.py) | 行内 `<a href>` → Markdown；`source_internal_path` 写入 `_epub_meta["chapters"]` |
 | 书稿 IR | [`src/pdf_translator/book_rebuild.py`](../src/pdf_translator/book_rebuild.py) | EPUB 章节透传 `source_internal_path` |
 | 翻译 | [`src/pdf_translator/translate.py`](../src/pdf_translator/translate.py) | `TranslatedChapter.source_internal_path` |
-| 输出 EPUB | [`src/pdf_translator/epub.py`](../src/pdf_translator/epub.py) | `build_epub_internal_href_map` + `rewrite_epub_internal_hrefs`（L2） |
+| 输出 EPUB | [`src/pdf_translator/epub.py`](../src/pdf_translator/epub.py) | 命名 EPUB、内部链接重写、保留图表/附属内容 |
 
 ### 已实现（L1 + L2 基线）
 
+- 交付 EPUB/PDF 使用源书名和目标语言命名，不再固定为 `translated.epub`。
 - **L1**：正文/列表/引用/标题中的链接与 `<sup>` 内链接进入 Markdown；包内 href 规范为 zip 内 posix 路径 + 可选 fragment。
 - **L2**：渲染前将仍指向源 spine 文件的 `<a href>` 重写为输出包内 **同目录章节文件名 + fragment**。
+- 翻译缓存、并发和 polish 已形成可复用基础。
 
 ### 待办（分支 A）
 
@@ -58,12 +98,41 @@ flowchart TB
 3. **L3（可选）**：脚注/尾注双向；与 `metadata["footnote_line_ratio"]` / `footnote_load` 专轨协同，避免单书过拟合正则。
 4. **验收**：合成 EPUB 上自动统计 **可解析 href 比例**（回归指标，不绑单本样书）。
 5. **L4**：PDF 内链依赖 Docling（或替代管线）链接导出，单独评估上限。
+6. **看样后定点修正（TODO）**：用户初步阅读 EPUB 后，可指定章节 / 段落 / 句子位置提交修正要求；系统只重跑对应 `chapter_id` / 文本片段，更新 `translated.md`、EPUB 章节 XHTML 与修正记录，不重新翻译整本书。
 
 ---
 
-## 分支 B：分章 → 提炼 → Wiki / 脑图（后续）
+## 分支 B：知识拆分与网络化管理（下一阶段）
 
-在 **同一章节 IR** 上做按章知识点提炼，产出 Wiki 与脑图。工程上与分支 A 渲染可分离；占位 CLI：`pdf-translator knowledge wiki-outline` / `mindmap`（见 [`src/pdf_translator/knowledge.py`](../src/pdf_translator/knowledge.py)）。
+**目标**：从 BookIR、原文和可选译文出发，把一本书拆解成可管理、可追溯、可进一步加工的知识资产。
+
+分支 B 的输入分两种：
+
+- 中文书：`book.json + book.md`。
+- 外文书：`book.json + book.md + translated.md + translated_chapters`，知识单元保留原文和译文双引用。
+
+### 分支 B 的阶段
+
+1. **确定性结构层**：生成 `knowledge/chapters.json` 和 `knowledge/semantic-units.json`，不调用模型。
+2. **适用性判断**：生成 `knowledge/suitability-report.json`，判断书类 profile、可行输出、风险和是否值得网络化。
+3. **profile-specific extraction**：按 [`docs/KNOWLEDGE_PROFILES.md`](./KNOWLEDGE_PROFILES.md) 选择抽取 schema。
+4. **归一化与合并**：概念、人物、术语、别名、译名、重复 claim 合并。
+5. **输出层**：Wiki、索引、Mermaid 脑图、JSON graph，后续再接 Notion / Obsidian / Neo4j。
+
+### 分支 B 的第一批命令建议
+
+```bash
+pdf-translator knowledge build RUN_DIR
+pdf-translator knowledge suitability RUN_DIR
+pdf-translator knowledge extract RUN_DIR --profile argumentative
+```
+
+### 分支 B 的关键约束
+
+- 不同书类不能共用同一套知识 schema。
+- 知识点必须带 provenance；没有来源的模型总结不能进入正式网络。
+- 自动抽取是候选层，后续需要支持人工修正和回写。
+- 外文书的知识化应同时利用原文和译文：译文提高可读性，原文保留术语和证据精度。
 
 ---
 
@@ -83,9 +152,13 @@ flowchart TB
 
 ## 跟踪项（可与 Issue 对齐）
 
+- [ ] 主流程：语言判断 + 用户目标选择（只翻译 / 翻译后知识化 / 中文直接知识化）  
+- [ ] 主流程：双语 BookIR / knowledge input contract  
 - [ ] 分支 A：链接契约 + 译后 id 策略定稿  
 - [ ] 分支 A：章节 IR 与 `book_ir` 单一事实源整理  
 - [ ] 分支 A：合成 EPUB href 可解析比例自动化校验  
 - [ ] 分支 A（可选）：L3 脚注与 `footnote_load` 协同  
-- [ ] 分支 B：内容分章与章节 IR 共用确认  
-- [ ] 分支 B：按章提炼 schema + Wiki / 脑图正式管线  
+- [ ] 分支 A（TODO）：看样后定点修正 schema、定位方式与最小重渲染流程  
+- [ ] 分支 B：`knowledge/chapters.json` 与 `knowledge/semantic-units.json`  
+- [ ] 分支 B：`suitability-report.json` + profile override  
+- [ ] 分支 B：按 profile 的抽取 schema + Wiki / 脑图正式管线  

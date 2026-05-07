@@ -15,6 +15,7 @@ def test_render_epub_from_book_writes_epub_structure_and_chapters(tmp_path: Path
         translated_chapters=[
             TranslatedChapter(
                 index=1,
+                chapter_id="ch-001-first-chapter",
                 title="First Chapter",
                 page_start=1,
                 page_end=2,
@@ -23,6 +24,7 @@ def test_render_epub_from_book_writes_epub_structure_and_chapters(tmp_path: Path
             ),
             TranslatedChapter(
                 index=2,
+                chapter_id="ch-002-second-chapter",
                 title="Second Chapter",
                 page_start=3,
                 page_end=4,
@@ -137,3 +139,69 @@ def test_render_epub_from_book_escapes_raw_html_examples(tmp_path: Path) -> None
         assert "<img" not in chapter
         assert "&lt;img" in chapter
         assert "Done." in chapter
+
+
+def test_render_epub_from_book_compacts_trailing_chapter_notes(tmp_path: Path) -> None:
+    output_path = tmp_path / "book.epub"
+    body = "\n\n".join(f"Paragraph {index} with normal body text." for index in range(1, 9))
+    notes = "\n\n".join(
+        [
+            "1",
+            "First chapter-end note.",
+            "2",
+            "Second chapter-end note.",
+            "3",
+            "Third chapter-end note.",
+        ]
+    )
+
+    render_epub_from_book(
+        book={"chapters": []},
+        translated_chapters=[
+            {
+                "index": 1,
+                "title": "Chapter With Notes",
+                "markdown": f"# Chapter With Notes\n\n{body}\n\n{notes}",
+            }
+        ],
+        output_path=output_path,
+        title="Notes Book",
+    )
+
+    with ZipFile(output_path) as archive:
+        chapter = archive.read("OEBPS/chapters/001-chapter-with-notes.xhtml").decode("utf-8")
+        css = archive.read("OEBPS/styles/book.css").decode("utf-8")
+        assert 'class="chapter-notes"' in chapter
+        assert "本章注释" in chapter
+        assert chapter.index("Paragraph 8") < chapter.index('class="chapter-notes"')
+        assert "First chapter-end note." in chapter
+        assert ".chapter-notes" in css
+
+
+def test_render_epub_from_book_wraps_preserved_back_matter(tmp_path: Path) -> None:
+    output_path = tmp_path / "book.epub"
+
+    render_epub_from_book(
+        book={"chapters": []},
+        translated_chapters=[
+            {
+                "index": 1,
+                "title": "Notes",
+                "markdown": "# Notes\n\n- 1. A preserved note.",
+                "translate": False,
+                "preserve_original": True,
+                "toc": False,
+            }
+        ],
+        output_path=output_path,
+        title="Back Matter",
+    )
+
+    with ZipFile(output_path) as archive:
+        chapter = archive.read("OEBPS/chapters/001-notes.xhtml").decode("utf-8")
+        nav = archive.read("OEBPS/nav.xhtml").decode("utf-8")
+        css = archive.read("OEBPS/styles/book.css").decode("utf-8")
+        assert 'class="preserved-apparatus"' in chapter
+        assert "A preserved note." in chapter
+        assert ">Notes</a>" not in nav
+        assert ".preserved-apparatus" in css
