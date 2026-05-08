@@ -1,15 +1,18 @@
-# PDF Translator
+# BookWeaver
 
-`pdf-translator` is a pragmatic PDF translation pipeline designed to avoid the hardest part of PDF localization: reusing the original layout.
+`book-weaver` is a book ingestion, translation, reconstruction, and knowledge-weaving pipeline.
 
-Instead of translating directly on PDF coordinates, it runs a three-stage flow:
+The project started as a PDF translation pipeline, but its current scope is broader: turn PDF / EPUB books into stable reading artifacts and structured knowledge inputs. Translation is now one branch of the system, not the product boundary.
+
+Instead of translating directly on PDF coordinates, it runs a staged flow:
 
 1. Ingest the PDF into a normalized `Markdown + JSON` representation.
 2. Rebuild books into a structured `book.json` plus inspectable Markdown views.
-3. Translate book chapters in chapter-aware chunks while preserving Markdown structure.
+3. Translate book chapters when the source language requires it.
 4. Render a clean EPUB reading edition by default, with PDF still available as an optional output.
+5. Prepare stable chapter, page, asset, and provenance structures for downstream knowledge extraction.
 
-This keeps user intervention low and removes most layout noise from the translation path.
+This keeps user intervention low, removes most layout noise from the reading path, and keeps the intermediate structure reusable for later wiki, graph, mindmap, and knowledge-base workflows.
 
 ## Why this architecture
 
@@ -17,6 +20,7 @@ This keeps user intervention low and removes most layout noise from the translat
 - Works for native PDFs and OCR-backed scanned PDFs.
 - Easier to debug because every stage has an inspectable intermediate artifact.
 - Easy to swap translator backends without touching parsing.
+- Knowledge extraction can reuse the same BookIR instead of rebuilding structure again.
 
 ## Stack
 
@@ -51,8 +55,10 @@ pip install -e .
 Run:
 
 ```bash
-pdf-translator translate /absolute/path/to/file.pdf --profile book --target-lang zh-CN
+book-weaver translate /absolute/path/to/file.pdf --profile book --target-lang zh-CN
 ```
+
+The previous `pdf-translator` command remains available as a compatibility alias during the transition.
 
 Outputs are written to `./runs/<pdf-stem>/` by default:
 
@@ -65,11 +71,11 @@ Outputs are written to `./runs/<pdf-stem>/` by default:
 
 `normalized.md` is the raw Docling export. For book profile runs, `book.json` is the source of truth, `book.md` is the cleaned reading view, `translation-input.md` is the chapter-aware translation source, and the named EPUB is the default reading output. `translated.md` remains a stable internal intermediate for cache reuse, polish, and diffing.
 
-Use `pdf-translator profile /path/to/file.pdf --profile auto` to classify pages into `accept`, `assist`, `skip_content`, and `reject_structure`. The built-in profiles are `magazine` and `book`.
+Use `book-weaver profile /path/to/file.pdf --profile auto` to classify pages into `accept`, `assist`, `skip_content`, and `reject_structure`. The built-in profiles are `magazine` and `book`.
 
 The project scope is **magazine** and **book** workflows (plus `auto` classification). There is no newspaper or generic article-extraction pipeline in this repository.
 
-Use `pdf-translator validate /path/to/manifest.json` to run a reusable batch regression suite. Each manifest case must include `source_pdf` and `mode`; only `mode: "profile"` is supported (book/magazine/auto page gating).
+Use `book-weaver validate /path/to/manifest.json` to run a reusable batch regression suite. Each manifest case must include `source_pdf` and `mode`; only `mode: "profile"` is supported (book/magazine/auto page gating).
 
 ## Guardrails
 
@@ -90,9 +96,9 @@ These thresholds are system-protection limits, not content-quality limits. They 
 All thresholds can be overridden from the CLI:
 
 ```bash
-pdf-translator profile ./sample.pdf --profile magazine --ingest-timeout-seconds 180
-pdf-translator translate ./book.pdf --profile book --max-file-size-mb 120 --max-page-count 1500
-pdf-translator validate ./suite.json --ingest-timeout-seconds 240
+book-weaver profile ./sample.pdf --profile magazine --ingest-timeout-seconds 180
+book-weaver translate ./book.pdf --profile book --max-file-size-mb 120 --max-page-count 1500
+book-weaver validate ./suite.json --ingest-timeout-seconds 240
 ```
 
 When batch validation hits a protected failure, it now records the branch as one of:
@@ -120,7 +126,7 @@ MINIMAX_MAX_TOKENS=8192
 # Optional; increase if the API is slow to return full completions.
 MINIMAX_HTTP_TIMEOUT_SECONDS=600
 EOF
-pdf-translator translate ./book.pdf --profile book --target-lang zh-CN --translator minimax --format epub
+book-weaver translate ./book.pdf --profile book --target-lang zh-CN --translator minimax --format epub
 ```
 
 Put these variables once in a local `.env` file at the project root. `.env` is ignored by git.
@@ -133,7 +139,7 @@ Use this for DeepSeek, Moonshot, Qwen, or any provider exposing an OpenAI-compat
 export LLM_API_KEY=...
 export LLM_BASE_URL=https://provider.example/v1
 export LLM_MODEL=provider-model-name
-pdf-translator translate ./book.pdf --profile book --target-lang zh-CN --translator compatible --format epub
+book-weaver translate ./book.pdf --profile book --target-lang zh-CN --translator compatible --format epub
 ```
 
 ### `openai`
@@ -143,7 +149,7 @@ Uses the OpenAI Responses API.
 ```bash
 export OPENAI_API_KEY=...
 export OPENAI_MODEL=gpt-4.1-mini
-pdf-translator translate ./book.pdf --profile book --target-lang zh-CN --translator openai
+book-weaver translate ./book.pdf --profile book --target-lang zh-CN --translator openai
 ```
 
 ### `mock`
@@ -151,12 +157,13 @@ pdf-translator translate ./book.pdf --profile book --target-lang zh-CN --transla
 Useful for validating the pipeline without spending tokens.
 
 ```bash
-pdf-translator translate ./book.pdf --profile book --target-lang zh-CN --translator mock
+book-weaver translate ./book.pdf --profile book --target-lang zh-CN --translator mock
 ```
 
 ## Notes
 
 - The output EPUB/PDF is intentionally reflowed. It is a translated reading edition, not a coordinate-faithful clone of the source PDF.
+- Project identity and rename rules are documented in [`docs/PROJECT_IDENTITY.md`](docs/PROJECT_IDENTITY.md).
 - Book pipeline invariants are documented in [`docs/BOOK_PIPELINE_RULES.md`](docs/BOOK_PIPELINE_RULES.md).
 - For PDF books, tables, charts, figures, and covers are preserved as visual assets whenever crops are available. They should not be converted to Markdown tables by default.
 - If you need original-layout replacement later, treat that as a separate downstream project.

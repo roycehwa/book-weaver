@@ -1,8 +1,10 @@
-# 路线图：书籍输入、翻译阅读与知识网络化
+# BookWeaver 路线图：书籍输入、翻译阅读与知识网络化
 
-本文档与仓库代码一并维护，描述从 PDF / EPUB 书籍输入到阅读交付与知识网络化的产品路线。历史讨论见仓库 Issue / PR 时可引用本文件路径：`docs/ROADMAP.md`。
+本文档与仓库代码一并维护，描述 BookWeaver 从 PDF / EPUB 书籍输入到阅读交付与知识网络化的产品路线。历史讨论见仓库 Issue / PR 时可引用本文件路径：`docs/ROADMAP.md`。
 
-具体分阶段实施计划见 [`docs/IMPLEMENTATION_PLAN.md`](./IMPLEMENTATION_PLAN.md)。Phase A 的执行方法见 [`docs/PHASE_A_METHOD.md`](./PHASE_A_METHOD.md)。分支 A 的链接、章节 id、脚注和定点修正契约见 [`docs/BRANCH_A_CONTRACT.md`](./BRANCH_A_CONTRACT.md)。知识分支的 profile 分类与方法论见 [`docs/KNOWLEDGE_PROFILES.md`](./KNOWLEDGE_PROFILES.md)。
+BookWeaver 已从单一“PDF 翻译器”分叉为书籍处理与知识化项目。翻译仍是分支 A 的核心能力，但项目边界已经扩展为：书籍结构归一化、阅读交付、知识拆分、知识网络和后续平台输出。
+
+项目定位见 [`docs/PROJECT_IDENTITY.md`](./PROJECT_IDENTITY.md)。具体分阶段实施计划见 [`docs/IMPLEMENTATION_PLAN.md`](./IMPLEMENTATION_PLAN.md)。Phase A 的执行方法见 [`docs/PHASE_A_METHOD.md`](./PHASE_A_METHOD.md)。分支 A 的链接、章节 id、脚注和定点修正契约见 [`docs/BRANCH_A_CONTRACT.md`](./BRANCH_A_CONTRACT.md)。知识分支的 profile 分类与方法论见 [`docs/KNOWLEDGE_PROFILES.md`](./KNOWLEDGE_PROFILES.md)。
 
 ## 总览
 
@@ -122,9 +124,9 @@ flowchart TB
 ### 分支 B 的第一批命令建议
 
 ```bash
-pdf-translator knowledge build RUN_DIR
-pdf-translator knowledge suitability RUN_DIR
-pdf-translator knowledge extract RUN_DIR --profile argumentative
+book-weaver knowledge build RUN_DIR
+book-weaver knowledge suitability RUN_DIR
+book-weaver knowledge extract RUN_DIR --profile argumentative
 ```
 
 ### 分支 B 的关键约束

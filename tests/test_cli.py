@@ -7,6 +7,7 @@ def test_public_cli_book_and_magazine_profiles_only() -> None:
     parser = build_parser()
     help_text = parser.format_help()
 
+    assert parser.prog == "book-weaver"
     assert "articles-html" not in help_text
     assert "newspaper-batch" not in help_text
 

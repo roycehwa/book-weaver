@@ -3,9 +3,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "pdf-translator"
+name = "book-weaver"
 version = "0.1.0"
-description = "Zero-intervention PDF translator built on a normalized Markdown/JSON pipeline."
+description = "Book ingestion, translation, reconstruction, and knowledge-weaving pipeline."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -29,6 +29,7 @@ dev = [
 ]
 
 [project.scripts]
+book-weaver = "pdf_translator.cli:main"
 pdf-translator = "pdf_translator.cli:main"
 
 [tool.setuptools]

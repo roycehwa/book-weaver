@@ -98,16 +98,16 @@ and target_language startswith "zh"
 Current foreign-language command:
 
 ```bash
-pdf-translator translate SOURCE --profile book --target-lang zh-CN --format epub --translator minimax
-pdf-translator polish RUN_DIR --target-lang zh-CN --translator minimax
+book-weaver translate SOURCE --profile book --target-lang zh-CN --format epub --translator minimax
+book-weaver polish RUN_DIR --target-lang zh-CN --translator minimax
 ```
 
 Future fixed command shape:
 
 ```bash
-pdf-translator translate SOURCE --profile book --target-lang zh-CN --format epub
-pdf-translator polish RUN_DIR --target-lang zh-CN
-pdf-translator finalize RUN_DIR
+book-weaver translate SOURCE --profile book --target-lang zh-CN --format epub
+book-weaver polish RUN_DIR --target-lang zh-CN
+book-weaver finalize RUN_DIR
 ```
 
 `finalize` is not yet implemented. Until then, use the retention rules below manually or in an Agent script.
@@ -216,8 +216,8 @@ Recommended logic:
 
 1. Scan input directory for `.pdf` and `.epub`.
 2. Skip files with an existing accepted run.
-3. Run `pdf-translator translate`.
-4. If source is non-Chinese, run `pdf-translator polish`.
+3. Run `book-weaver translate`.
+4. If source is non-Chinese, run `book-weaver polish`.
 5. Run Phase A QA:
    - check `manifest.json`;
    - check final EPUB exists;
@@ -280,12 +280,12 @@ For Chinese books, `book.md` is both source and final text.
 ## Open Implementation Items
 
 - Add a formal `--skip-translation-if-same-language` behavior to `translate`.
-- Add `pdf-translator finalize RUN_DIR`.
+- Add `book-weaver finalize RUN_DIR`.
 - Add `phase_a_status.json`.
 - Add an Agent batch runner or documented cron/automation template.
 - Add cleanup command with dry-run mode:
 
 ```bash
-pdf-translator cleanup RUN_DIR --phase-a --dry-run
-pdf-translator cleanup RUN_DIR --phase-a
+book-weaver cleanup RUN_DIR --phase-a --dry-run
+book-weaver cleanup RUN_DIR --phase-a
 ```

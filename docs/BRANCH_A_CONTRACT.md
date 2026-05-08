@@ -88,7 +88,7 @@ PDF 内链属于 L4，当前只做评估，不承诺实现。
 未来命令形态建议：
 
 ```bash
-pdf-translator patch RUN_DIR --chapter-id ch-004-introduction --selector paragraph:12 --instruction "..."
+book-weaver patch RUN_DIR --chapter-id ch-004-introduction --selector paragraph:12 --instruction "..."
 ```
 
 修正记录必须保存：

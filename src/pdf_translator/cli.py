@@ -23,14 +23,14 @@ from pdf_translator.validation import run_validation_manifest, write_validation_
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="pdf-translator",
-        description="Translate PDFs through a normalized Markdown/JSON pipeline.",
+        prog="book-weaver",
+        description="Ingest books, translate when needed, and prepare reading and knowledge artifacts.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     translate_parser = subparsers.add_parser(
         "translate",
-        help="Ingest, translate, and render a clean translated PDF.",
+        help="Ingest, optionally translate, and render a clean reading edition.",
     )
     translate_parser.add_argument(
         "source_pdf",

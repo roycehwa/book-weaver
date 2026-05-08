@@ -31,7 +31,7 @@ Goal: Turn the successful `Mourning` experiment into a repeatable command.
 Command:
 
 ```bash
-pdf-translator polish RUN_DIR --target-lang zh-CN
+book-weaver polish RUN_DIR --target-lang zh-CN
 ```
 
 Inputs:
@@ -75,9 +75,9 @@ Goal: Make long book translation controllable and restartable.
 Commands:
 
 ```bash
-pdf-translator translate SOURCE --profile book --target-lang zh-CN --format epub
-pdf-translator translate SOURCE --profile book --pages 1-120 --resume
-pdf-translator translate SOURCE --profile book --ignore-cache
+book-weaver translate SOURCE --profile book --target-lang zh-CN --format epub
+book-weaver translate SOURCE --profile book --pages 1-120 --resume
+book-weaver translate SOURCE --profile book --ignore-cache
 ```
 
 Implementation steps:
@@ -145,7 +145,7 @@ Goal: Add a second branch from the same BookIR for knowledge processing.
 Command:
 
 ```bash
-pdf-translator knowledge-export RUN_DIR --format json
+book-weaver knowledge-export RUN_DIR --format json
 ```
 
 Outputs:
@@ -200,7 +200,7 @@ Goal: Use Notion as a knowledge workspace, not as the primary translation engine
 Command:
 
 ```bash
-pdf-translator notion-export RUN_DIR --database-id DATABASE_ID
+book-weaver notion-export RUN_DIR --database-id DATABASE_ID
 ```
 
 Notion databases:
@@ -239,7 +239,7 @@ Goal: Make the project usable across a directory of books.
 Command:
 
 ```bash
-pdf-translator batch /path/to/books --profile book --format epub --polish --knowledge-export
+book-weaver batch /path/to/books --profile book --format epub --polish --knowledge-export
 ```
 
 Implementation steps:
