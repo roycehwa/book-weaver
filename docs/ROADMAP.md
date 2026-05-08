@@ -129,6 +129,16 @@ book-weaver knowledge suitability RUN_DIR
 book-weaver knowledge extract RUN_DIR --profile argumentative
 ```
 
+`book-weaver knowledge build RUN_DIR` 已实现为 Phase B Core 的确定性起点。它不调用模型，默认写入 `RUN_DIR/knowledge/`：
+
+- `manifest.json`
+- `chapters.json`
+- `semantic-units.json`
+- `assets.json`
+- `source-map.json`
+
+译文只有在可安全按章节和段落对齐时才进入 `semantic-units.json`；无法对齐时保留原文单元和译文路径，不强行错配。
+
 ### 分支 B 的关键约束
 
 - 不同书类不能共用同一套知识 schema。

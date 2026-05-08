@@ -39,3 +39,12 @@ def test_public_cli_accepts_polish_command() -> None:
     assert args.command == "polish"
     assert str(args.run_dir) == "runs/sample"
     assert args.request_timeout_seconds == 600
+
+
+def test_public_cli_accepts_knowledge_build_command() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["knowledge", "build", "runs/sample"])
+
+    assert args.command == "knowledge"
+    assert args.knowledge_command == "build"
+    assert str(args.run_dir) == "runs/sample"

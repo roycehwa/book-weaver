@@ -11,6 +11,7 @@ from pdf_translator.guardrails import (
     ingest_pdf_guarded,
 )
 from pdf_translator.knowledge import (
+    build_knowledge_package,
     emit_mindmap_mermaid_from_book,
     emit_wiki_outline_from_book,
     load_book_json,
@@ -227,9 +228,24 @@ def build_parser() -> argparse.ArgumentParser:
 
     knowledge_parser = subparsers.add_parser(
         "knowledge",
-        help="Branch B stubs: wiki outline and Mermaid mindmap from book.json.",
+        help="Build and export Phase B knowledge artifacts.",
     )
     knowledge_sub = knowledge_parser.add_subparsers(dest="knowledge_command", required=True)
+    knowledge_build = knowledge_sub.add_parser(
+        "build",
+        help="Build deterministic chapters, semantic units, assets, and source map from a Phase A run.",
+    )
+    knowledge_build.add_argument(
+        "run_dir",
+        type=Path,
+        help="Path to a completed Phase A run containing book.json.",
+    )
+    knowledge_build.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help="Optional output directory. Defaults to RUN_DIR/knowledge.",
+    )
     wiki_outline = knowledge_sub.add_parser(
         "wiki-outline",
         help="Write per-chapter Markdown stubs and index.md under a directory.",
@@ -386,13 +402,22 @@ def main() -> None:
                 f"rejected={result.rejected_count}"
             )
         elif args.command == "knowledge":
-            book_path = args.book_json.expanduser().resolve()
-            book = load_book_json(book_path)
-            if args.knowledge_command == "wiki-outline":
+            if args.knowledge_command == "build":
+                paths = build_knowledge_package(args.run_dir, out_dir=args.out)
+                print(f"Knowledge manifest: {paths['manifest']}")
+                print(f"Chapters: {paths['chapters']}")
+                print(f"Semantic units: {paths['semantic_units']}")
+                print(f"Assets: {paths['assets']}")
+                print(f"Source map: {paths['source_map']}")
+            elif args.knowledge_command == "wiki-outline":
+                book_path = args.book_json.expanduser().resolve()
+                book = load_book_json(book_path)
                 out = args.out.expanduser().resolve()
                 emit_wiki_outline_from_book(book, out)
                 print(f"Wiki outline written under: {out}")
             elif args.knowledge_command == "mindmap":
+                book_path = args.book_json.expanduser().resolve()
+                book = load_book_json(book_path)
                 out = args.out.expanduser().resolve()
                 emit_mindmap_mermaid_from_book(book, out)
                 print(f"Mermaid mindmap written to: {out}")
