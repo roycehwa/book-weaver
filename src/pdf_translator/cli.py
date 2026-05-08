@@ -12,6 +12,7 @@ from pdf_translator.guardrails import (
 )
 from pdf_translator.knowledge import (
     build_knowledge_package,
+    build_suitability_report,
     emit_mindmap_mermaid_from_book,
     emit_wiki_outline_from_book,
     load_book_json,
@@ -246,6 +247,21 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional output directory. Defaults to RUN_DIR/knowledge.",
     )
+    knowledge_suitability = knowledge_sub.add_parser(
+        "suitability",
+        help="Generate a rule-based profile, risk, and chapter plan before model extraction.",
+    )
+    knowledge_suitability.add_argument(
+        "run_dir",
+        type=Path,
+        help="Path to a completed Phase A run containing book.json.",
+    )
+    knowledge_suitability.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help="Optional output directory. Defaults to RUN_DIR/knowledge.",
+    )
     wiki_outline = knowledge_sub.add_parser(
         "wiki-outline",
         help="Write per-chapter Markdown stubs and index.md under a directory.",
@@ -409,6 +425,10 @@ def main() -> None:
                 print(f"Semantic units: {paths['semantic_units']}")
                 print(f"Assets: {paths['assets']}")
                 print(f"Source map: {paths['source_map']}")
+            elif args.knowledge_command == "suitability":
+                paths = build_suitability_report(args.run_dir, out_dir=args.out)
+                print(f"Suitability report: {paths['report']}")
+                print(f"Suitability Markdown: {paths['markdown']}")
             elif args.knowledge_command == "wiki-outline":
                 book_path = args.book_json.expanduser().resolve()
                 book = load_book_json(book_path)

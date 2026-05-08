@@ -139,6 +139,13 @@ book-weaver knowledge extract RUN_DIR --profile argumentative
 
 译文只有在可安全按章节和段落对齐时才进入 `semantic-units.json`；无法对齐时保留原文单元和译文路径，不强行错配。
 
+`book-weaver knowledge suitability RUN_DIR` 已实现为 Phase B 入口判断器。当前版本是规则版，不调用模型，默认写入：
+
+- `knowledge/suitability-report.json`
+- `knowledge/suitability.md`
+
+它会判断 profile、网络化适用性、推荐输出、可抽取对象、风险和逐章处理动作。后续可在这个基础上加入低成本模型判断，但用户验收优先看 `suitability.md`。
+
 ### 分支 B 的关键约束
 
 - 不同书类不能共用同一套知识 schema。

@@ -3,7 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 import json
 
-from pdf_translator.knowledge import build_knowledge_package, emit_mindmap_mermaid_from_book, emit_wiki_outline_from_book
+from pdf_translator.knowledge import (
+    build_knowledge_package,
+    build_suitability_report,
+    emit_mindmap_mermaid_from_book,
+    emit_wiki_outline_from_book,
+)
 
 
 def test_emit_wiki_outline_writes_index_and_chapter_stubs(tmp_path: Path) -> None:
@@ -101,3 +106,108 @@ def test_build_knowledge_package_does_not_force_unsafe_translation_alignment(tmp
 
     assert all(unit["text_translated"] is None for unit in units)
     assert all(unit["translation_alignment"] == "unavailable" for unit in units)
+
+
+def test_build_suitability_report_detects_argumentative_book(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "book.json").write_text(
+        json.dumps(
+            {
+                "chapters": [
+                    {
+                        "index": 1,
+                        "chapter_id": "ch-001-introduction",
+                        "title": "Introduction",
+                        "markdown": (
+                            "# Introduction\n\n"
+                            "This book argues that political theory requires a new concept of evidence.\n\n"
+                            "The argument contrasts earlier theory with new interpretation.\n\n"
+                            "However, the author critiques this framework because it hides the central claim.\n\n"
+                            "Therefore the chapter develops a theory of institutional evidence.\n"
+                        ),
+                    }
+                ],
+                "assets": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    paths = build_suitability_report(run_dir)
+    report = json.loads(paths["report"].read_text(encoding="utf-8"))
+    md = paths["markdown"].read_text(encoding="utf-8")
+
+    assert report["profile"] == "argumentative"
+    assert report["network_suitability"] in {"high", "medium"}
+    assert "claim" in report["extractable_objects"]
+    assert report["chapters"][0]["action"] == "extract"
+    assert "Knowledge Suitability Report" in md
+    assert "argument_map" in md
+
+
+def test_build_suitability_report_detects_practical_book(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "book.json").write_text(
+        json.dumps(
+            {
+                "chapters": [
+                    {
+                        "index": 1,
+                        "title": "A Practical Strategy Guide",
+                        "markdown": (
+                            "# A Practical Strategy Guide\n\n"
+                            "This guide provides a method and a checklist for teams.\n\n"
+                            "- Step one: define the problem.\n\n"
+                            "- Step two: choose the tool.\n\n"
+                            "A case study illustrates when the principle applies.\n"
+                        ),
+                    }
+                ],
+                "assets": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    paths = build_suitability_report(run_dir)
+    report = json.loads(paths["report"].read_text(encoding="utf-8"))
+
+    assert report["profile"] == "practical"
+    assert "playbook" in report["recommended_outputs"]
+    assert "action" in report["extractable_objects"]
+
+
+def test_build_suitability_report_flags_technical_visual_risk(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "book.json").write_text(
+        json.dumps(
+            {
+                "chapters": [
+                    {
+                        "index": 1,
+                        "title": "Formula and Data Appendix",
+                        "markdown": (
+                            "# Formula and Data Appendix\n\n"
+                            "The theorem follows from the equation and proof.\n\n"
+                            "![Figure](fig1.png)\n\n"
+                            "| A | B |\n| --- | --- |\n| 1 | 2 |\n\n"
+                            "![Figure](fig2.png)\n\n"
+                            "| C | D |\n| --- | --- |\n| 3 | 4 |\n"
+                        ),
+                    }
+                ],
+                "assets": [{"kind": "figure", "path": "fig1.png"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    paths = build_suitability_report(run_dir)
+    report = json.loads(paths["report"].read_text(encoding="utf-8"))
+
+    assert report["profile"] == "technical_lite"
+    assert any(risk["risk"] == "visual_or_table_heavy" for risk in report["risks"])
+    assert "automatic_formula_semantics" in report["do_not_extract"]
