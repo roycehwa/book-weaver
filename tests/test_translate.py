@@ -176,6 +176,215 @@ def test_translate_markdown_retries_untranslated_chinese_output(tmp_path: Path, 
     assert "已经翻译成中文" in result.translated_markdown
 
 
+def test_translate_markdown_uses_quality_retry_prompt_after_bad_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class QualityRetryAwareTranslator(BaseTranslator):
+        name = "realish"
+
+        def __init__(self) -> None:
+            self.prompts: list[str] = []
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            self.prompts.append(chunk.markdown)
+            if len(self.prompts) == 1:
+                return "This is still English prose. " * 30
+            assert "QUALITY RETRY" in chunk.markdown
+            return "这是质量重试后得到的完整中文译文。" * 30
+
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
+    settings = RunSettings(
+        source_pdf=tmp_path / "source.pdf",
+        output_dir=tmp_path,
+        target_language="zh-CN",
+        source_language="en",
+        translator="realish",
+        max_chunk_chars=1000,
+    )
+    translator = QualityRetryAwareTranslator()
+
+    result = translate_markdown(
+        chunks=[TranslationChunk(index=0, markdown="This source English paragraph needs translation. " * 30)],
+        settings=settings,
+        translator=translator,
+        cache_dir=tmp_path / "cache",
+        retry_count=2,
+    )
+
+    assert len(translator.prompts) == 2
+    assert "质量重试后" in result.translated_markdown
+
+
+def test_translate_markdown_accepts_short_note_with_preserved_citations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CitationHeavyTranslator(BaseTranslator):
+        name = "realish"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            self.calls += 1
+            return (
+                "大学采取的行动并非仅仅基于课堂中使用 n-word。"
+                "该情境涉及一系列保密问题。"
+                "Stein (2019) quoting Augsburg spokesperson Rebecca John. "
+                "Chronicle of Higher Education, New York Times, https://example.com. "
+                * 8
+            )
+
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
+    settings = RunSettings(
+        source_pdf=tmp_path / "source.pdf",
+        output_dir=tmp_path,
+        target_language="zh-CN",
+        source_language="en",
+        translator="realish",
+        max_chunk_chars=1000,
+    )
+    translator = CitationHeavyTranslator()
+
+    result = translate_markdown(
+        chunks=[
+            TranslationChunk(
+                index=99,
+                markdown=(
+                    "The actions the university took were not solely based on the use of the n-word "
+                    "in the classroom. Stein (2019) quoting Augsburg spokesperson Rebecca John."
+                ),
+            )
+        ],
+        settings=settings,
+        translator=translator,
+        cache_dir=tmp_path / "cache",
+        retry_count=2,
+    )
+
+    assert translator.calls == 1
+    assert "大学采取的行动" in result.translated_markdown
+
+
+def test_translate_markdown_accepts_scholarly_terms_when_body_is_translated(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class TermKeepingTranslator(BaseTranslator):
+        name = "realish"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            self.calls += 1
+            return (
+                "我使用 wrong、wronging、rights、claims、trumps、side-constraints、exclusionary、"
+                "entitlement、authority、ex ante、ex post 这些术语来保持论证的一致性。"
+                "除此之外，本段已经说明：道德关系既包括行动之前他人如何约束我们，也包括伤害发生之后"
+                "投诉、问责、补偿、道歉与宽恕等实践如何形成关系。" * 10
+            )
+
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
+    settings = RunSettings(
+        source_pdf=tmp_path / "source.pdf",
+        output_dir=tmp_path,
+        target_language="zh-CN",
+        source_language="en",
+        translator="realish",
+        max_chunk_chars=9000,
+    )
+    translator = TermKeepingTranslator()
+
+    result = translate_markdown(
+        chunks=[
+            TranslationChunk(
+                index=2,
+                markdown=(
+                    "Wrongs, rights, claims, trumps, side-constraints, exclusionary duties, "
+                    "entitlements, and ex ante and ex post relations are technical terms in this chapter. "
+                    * 30
+                ),
+            )
+        ],
+        settings=settings,
+        translator=translator,
+        cache_dir=tmp_path / "cache",
+        retry_count=2,
+    )
+
+    assert translator.calls == 1
+    assert "道德关系" in result.translated_markdown
+
+
+def test_translate_markdown_accepts_short_bibliography_entries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BibliographyTranslator(BaseTranslator):
+        name = "realish"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            self.calls += 1
+            return chunk.markdown
+
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
+    settings = RunSettings(
+        source_pdf=tmp_path / "source.pdf",
+        output_dir=tmp_path,
+        target_language="zh-CN",
+        source_language="en",
+        translator="realish",
+        max_chunk_chars=1000,
+    )
+    translator = BibliographyTranslator()
+
+    result = translate_markdown(
+        chunks=[
+            TranslationChunk(
+                index=28,
+                markdown=(
+                    "# SelectiveBibliography\n\n"
+                    "Frigo, Daniela, Politica, esperienza e politesse (Milano, 2009), 25-55.\n\n"
+                    "Mattingly, Garrett, Renaissance Diplomacy (Boston et al., 1955).\n\n"
+                    "Queller, Donald E., The Office of Ambassador in the Middle Ages (Princeton, 1967)."
+                ),
+            )
+        ],
+        settings=settings,
+        translator=translator,
+        cache_dir=tmp_path / "cache",
+        retry_count=2,
+    )
+
+    assert translator.calls == 1
+    assert "SelectiveBibliography" in result.translated_markdown
+
+
 def test_translate_markdown_retries_mixed_english_chinese_output(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

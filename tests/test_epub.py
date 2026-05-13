@@ -84,6 +84,34 @@ def test_render_epub_from_book_handles_control_chars(tmp_path: Path) -> None:
         assert "\x05" not in chapter
 
 
+def test_render_epub_from_book_recovers_moved_absolute_image_paths(tmp_path: Path) -> None:
+    output_dir = tmp_path / "OK" / "book"
+    image_dir = output_dir / "book-images"
+    image_dir.mkdir(parents=True)
+    (image_dir / "figure-p0001-01.png").write_bytes(b"fake-png")
+    stale_path = tmp_path / "NG" / "book" / "book-images" / "figure-p0001-01.png"
+    output_path = output_dir / "book.epub"
+
+    render_epub_from_book(
+        book={"chapters": []},
+        translated_chapters=[
+            {
+                "index": 1,
+                "title": "Chapter",
+                "markdown": f"# Chapter\n\n![Figure]({stale_path})\n\nBody.",
+            }
+        ],
+        output_path=output_path,
+        title="Moved Book",
+    )
+
+    with ZipFile(output_path) as archive:
+        names = archive.namelist()
+        assert "OEBPS/images/figure-p0001-01.png" in names
+        chapter = archive.read("OEBPS/chapters/001-chapter.xhtml").decode("utf-8")
+        assert "../images/figure-p0001-01.png" in chapter
+
+
 def test_render_epub_from_book_hides_non_toc_chapters_from_nav(tmp_path: Path) -> None:
     cover_path = tmp_path / "cover.png"
     cover_path.write_bytes(b"fake-png")

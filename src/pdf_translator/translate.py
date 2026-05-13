@@ -22,7 +22,7 @@ from pdf_translator.config import (
 from pdf_translator.models import BookTranslationResult, TranslatedChapter, TranslationChunk, TranslationResult
 
 
-TRANSLATION_PROMPT_VERSION = "v2-no-source-gloss"
+TRANSLATION_PROMPT_VERSION = "v3-quality-retry"
 
 
 SYSTEM_PROMPT = """You are a professional document translator.
@@ -64,12 +64,26 @@ ALLOWED_MIXED_LATIN_WORDS = {
 }
 
 
-def _translation_prompt(chunk: TranslationChunk, source_language: str | None, target_language: str) -> str:
+def _translation_prompt(
+    chunk: TranslationChunk,
+    source_language: str | None,
+    target_language: str,
+    *,
+    quality_retry: str | None = None,
+) -> str:
     source = source_language or "auto-detect"
+    retry_note = (
+        "\nQuality retry: the previous output failed validation because it was not fully translated. "
+        "Translate every natural-language sentence completely into the target language now. "
+        "Do not return the source text unchanged.\n"
+        if quality_retry
+        else ""
+    )
     return (
         f"Source language: {source}\n"
         f"Target language: {target_language}\n"
-        f"Markdown chunk index: {chunk.index}\n\n"
+        f"Markdown chunk index: {chunk.index}\n"
+        f"{retry_note}\n"
         f"{chunk.markdown}"
     )
 
@@ -99,6 +113,13 @@ def _looks_untranslated_for_target(source: str, translated: str, target_language
     # A valid zh translation may preserve names/citations, but it should not be overwhelmingly ASCII.
     if translated_cjk < 80 and translated_ascii > 250:
         return True
+    if source_ascii < 1000 and translated_cjk >= 160:
+        return False
+    if _looks_reference_or_note_heavy(source) and (translated_cjk >= 220 or source_ascii < 1200):
+        return False
+    # For data-heavy content (tables, appendices), high CJK count indicates valid translation
+    if translated_cjk >= 1000:
+        return False
     return translated_ascii / max(translated_ascii + translated_cjk, 1) > 0.72
 
 
@@ -158,6 +179,34 @@ def _mixed_untranslated_english_signal(text: str) -> tuple[int, int, int]:
     return suspect_word_count, mixed_line_count, max_line_suspects
 
 
+def _looks_reference_or_note_heavy(source: str) -> bool:
+    lower = source.lower()
+    if re.search(r"^#{1,3}\s+(?:notes?|references|bibliography|selective\s*bibliography|works cited|secondary sources|case law)\b", source, re.MULTILINE | re.IGNORECASE):
+        return True
+    citation_markers = len(re.findall(r"\b(?:vol\.|no\.|pp\.|doi:|https?://|www\.|press|university|journal|review|chronicle|proceedings)\b", lower))
+    year_markers = len(re.findall(r"\((?:1[5-9]\d{2}|20\d{2})\)|\b(?:1[5-9]\d{2}|20\d{2})\b", source))
+    note_markers = len(re.findall(r"^\s*(?:\d+|[*†‡])\s+", source, re.MULTILINE))
+    return citation_markers + year_markers + note_markers >= 8
+
+
+def _allow_mixed_english_for_target(source: str, translated: str, target_language: str) -> bool:
+    if not target_language.lower().startswith("zh"):
+        return False
+    translated_cjk = _cjk_count(translated)
+    if translated_cjk < 160:
+        return False
+    source_ascii = _ascii_letter_count(source)
+    if source_ascii < 1000:
+        return True
+    if _looks_reference_or_note_heavy(source) and translated_cjk >= 220:
+        return True
+    translated_ascii = _ascii_letter_count(translated)
+    # Dense scholarly prose often preserves technical terms, quoted terms, names, and citations.
+    # The gross untranslated / incomplete checks above catch the real failure modes; this gate
+    # should not reject otherwise substantial Chinese output for retained terminology.
+    return translated_cjk >= max(300, int(source_ascii * 0.12)) and translated_ascii <= translated_cjk * 3.5
+
+
 def _strip_generated_english_chinese_glosses(source: str, translated: str, target_language: str) -> str:
     if not target_language.lower().startswith("zh"):
         return translated
@@ -207,13 +256,15 @@ def _assert_translation_quality(
             f"(source_glosses={_english_then_chinese_gloss_count(chunk.markdown)}, "
             f"translated_glosses={_english_then_chinese_gloss_count(translated)})."
         )
+    if target_language.lower().startswith("zh") and _ascii_letter_count(chunk.markdown) < 1000 and _cjk_count(translated) >= 160:
+        return
     suspect_words, mixed_lines, max_line_suspects = _mixed_untranslated_english_signal(translated)
-    if suspect_words >= 18 and mixed_lines >= 2:
+    if suspect_words >= 18 and mixed_lines >= 2 and not _allow_mixed_english_for_target(chunk.markdown, translated, target_language):
         raise ValueError(
             f"Translation for chunk {chunk.index} contains mixed untranslated English "
             f"(suspect_words={suspect_words}, mixed_lines={mixed_lines}, max_line={max_line_suspects})."
         )
-    if max_line_suspects >= 10:
+    if max_line_suspects >= 10 and not _allow_mixed_english_for_target(chunk.markdown, translated, target_language):
         raise ValueError(
             f"Translation for chunk {chunk.index} contains a heavily mixed English line "
             f"(suspect_words={suspect_words}, mixed_lines={mixed_lines}, max_line={max_line_suspects})."
@@ -252,10 +303,12 @@ def _translate_chunk_resumable(
     last_error: Exception | None = None
     for attempt in range(max(1, retry_count)):
         try:
-            translated = translator.translate_chunk(
+            translated = _complete_translation_attempt(
+                translator=translator,
                 chunk=chunk,
                 source_language=source_language,
                 target_language=target_language,
+                quality_retry=str(last_error) if isinstance(last_error, ValueError) else None,
             ).strip()
             if not translated:
                 raise ValueError(f"Empty translation returned for chunk {chunk.index}.")
@@ -479,6 +532,110 @@ class MiniMaxAnthropicTranslator(BaseTranslator):
         return text
 
 
+def _complete_translation_attempt(
+    *,
+    translator: BaseTranslator,
+    chunk: TranslationChunk,
+    source_language: str | None,
+    target_language: str,
+    quality_retry: str | None = None,
+) -> str:
+    if quality_retry is None:
+        return translator.translate_chunk(
+            chunk=chunk,
+            source_language=source_language,
+            target_language=target_language,
+        )
+
+    prompt = _translation_prompt(
+        chunk,
+        source_language,
+        target_language,
+        quality_retry=quality_retry,
+    )
+    if isinstance(translator, MiniMaxAnthropicTranslator):
+        payload = {
+            "model": translator.model,
+            "max_tokens": translator.max_tokens,
+            "system": SYSTEM_PROMPT,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        try:
+            response = requests.post(
+                translator.endpoint,
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {translator.api_key}",
+                    "Content-Type": "application/json",
+                    "anthropic-version": "2023-06-01",
+                    "Connection": "close",
+                },
+                timeout=(10, translator.http_timeout),
+            )
+            response.raise_for_status()
+            response_data = response.json()
+        except requests.HTTPError as exc:
+            error_body = exc.response.text if exc.response is not None else ""
+            status_code = exc.response.status_code if exc.response else "?"
+            raise ValueError(
+                f"MiniMax translation failed for chunk {chunk.index}: "
+                f"HTTP {status_code}: {error_body[:500]}"
+            ) from exc
+        except requests.RequestException as exc:
+            raise ValueError(f"MiniMax translation failed for chunk {chunk.index}: {exc}") from exc
+        text_parts = [
+            str(item.get("text") or "")
+            for item in response_data.get("content", [])
+            if isinstance(item, dict) and item.get("type") == "text"
+        ]
+        text = "\n".join(part.strip() for part in text_parts if part.strip()).strip()
+        if not text:
+            raise ValueError(f"Empty MiniMax translation returned for chunk {chunk.index}.")
+        if response_data.get("stop_reason") == "max_tokens":
+            raise ValueError(
+                f"MiniMax translation was truncated for chunk {chunk.index} "
+                f"(stop_reason=max_tokens, max_tokens={translator.max_tokens}). "
+                "Increase MINIMAX_MAX_TOKENS (or MINIMAX_HTTP_TIMEOUT_SECONDS if the request timed out early). "
+                "Only reduce --max-chunk-chars if raising max_tokens is not enough."
+            )
+        return text
+
+    if isinstance(translator, OpenAITranslator):
+        response = translator.client.responses.create(
+            model=translator.model,
+            input=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        return response.output_text.strip()
+
+    if isinstance(translator, OpenAICompatibleTranslator):
+        response = translator.client.chat.completions.create(
+            model=translator.model,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        return (response.choices[0].message.content or "").strip()
+
+    retry_chunk = TranslationChunk(
+        index=chunk.index,
+        markdown=(
+            "QUALITY RETRY: translate the SOURCE_MARKDOWN completely. "
+            "Return only the translated Markdown.\n\n"
+            "SOURCE_MARKDOWN:\n"
+            f"{chunk.markdown}"
+        ),
+    )
+    return translator.translate_chunk(
+        chunk=retry_chunk,
+        source_language=source_language,
+        target_language=target_language,
+    )
+
+
 def build_translator(name: str) -> BaseTranslator:
     normalized = name.strip().lower()
     if normalized == "mock":
@@ -498,7 +655,7 @@ def translate_markdown(
     settings: RunSettings,
     translator: BaseTranslator,
     cache_dir: Path | None = None,
-    retry_count: int = 3,
+    retry_count: int = 6,
     concurrency: int = 1,
 ) -> TranslationResult:
     translated_chunks = _translate_chunks_ordered(
@@ -628,7 +785,7 @@ def translate_book_chapters(
     settings: RunSettings,
     translator: BaseTranslator,
     cache_dir: Path | None = None,
-    retry_count: int = 3,
+    retry_count: int = 6,
     concurrency: int = 1,
 ) -> BookTranslationResult:
     translated_chapters: list[TranslatedChapter] = []

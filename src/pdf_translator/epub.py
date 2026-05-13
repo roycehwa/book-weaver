@@ -256,17 +256,40 @@ def rewrite_epub_internal_hrefs(body_html: str, *, href_map: dict[str, str]) -> 
     return "".join(str(child) for child in soup.contents)
 
 
-def _rewrite_images(body_html: str, image_map: dict[Path, str], image_items: list[tuple[str, Path]]) -> str:
+def _resolve_image_source_path(raw_src: str, image_roots: list[Path]) -> Path | None:
+    source_path = Path(unquote(raw_src)).expanduser()
+    candidates = [source_path]
+    if not source_path.is_absolute():
+        candidates.extend(root / source_path for root in image_roots)
+    if source_path.parent.name:
+        candidates.extend(root / source_path.parent.name / source_path.name for root in image_roots)
+    candidates.extend(root / source_path.name for root in image_roots)
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if candidate.exists():
+            return candidate.resolve()
+    return None
+
+
+def _rewrite_images(
+    body_html: str,
+    image_map: dict[Path, str],
+    image_items: list[tuple[str, Path]],
+    image_roots: list[Path],
+) -> str:
     soup = BeautifulSoup(body_html, "html.parser")
     used_names: set[str] = set(image_map.values())
     for image in soup.find_all("img"):
         raw_src = image.get("src")
         if not raw_src or str(raw_src).startswith("#"):
             continue
-        source_path = Path(unquote(str(raw_src))).expanduser()
-        if not source_path.exists():
+        resolved = _resolve_image_source_path(str(raw_src), image_roots)
+        if resolved is None:
             continue
-        resolved = source_path.resolve()
         if resolved not in image_map:
             base_name = resolved.name
             candidate = base_name
@@ -420,6 +443,7 @@ def render_epub_from_book(
     chapter_documents: list[tuple[str, str]] = []
     image_map: dict[Path, str] = {}
     image_items: list[tuple[str, Path]] = []
+    image_roots = [output_path.parent.resolve()]
 
     for chapter, chapter_file in zip(chapters, chapter_files):
         index = int(chapter.get("index") or 1)
@@ -428,7 +452,7 @@ def render_epub_from_book(
         markdown_text = str(chapter.get("markdown") or "")
         body_html = _markdown_to_body_html(markdown_text)
         body_html = rewrite_epub_internal_hrefs(body_html, href_map=href_map)
-        body_html = _rewrite_images(body_html, image_map, image_items)
+        body_html = _rewrite_images(body_html, image_map, image_items, image_roots)
         if chapter.get("preserve_original") or chapter.get("resource_only") or APPARATUS_TITLE_RE.match(chapter_title):
             body_html = _wrap_preserved_apparatus(body_html)
         chapter_documents.append(

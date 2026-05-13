@@ -657,7 +657,7 @@ def _page_content_items(
             page_no=block.page_no,
             left=block.left,
             top=block.top,
-            from_page_footer=block.label == "page_footer",
+            from_page_footer=block.label in {"footnote", "page_footer"},
         )
         for block in blocks
         if _format_book_block(block)
@@ -665,9 +665,16 @@ def _page_content_items(
     ]
     items.extend(figures)
     items.extend(tables)
+    columns = _cluster_columns(items)  # type: ignore[arg-type]
     ordered = sorted(
         items,
-        key=lambda item: (-item.top, item.left, _kind_reading_rank(item.kind)),
+        key=lambda item: (
+            item.from_page_footer,
+            _column_index(item, columns),  # type: ignore[arg-type]
+            -item.top,
+            item.left,
+            _kind_reading_rank(item.kind),
+        ),
     )
     ordered = _promote_trailing_footnote_like_items(ordered)
     out: list[BookItem] = []
@@ -995,10 +1002,11 @@ def _build_preserved_resource_chapters(
         markdown = _build_chapter_markdown([page], include_page_markers=False)
         if not markdown.strip():
             continue
+        title = _preserved_resource_title(page)
         preserved.append(
             {
                 "index": -1,
-                "title": f"Original Visual Page {page_no}",
+                "title": title,
                 "page_start": page_no,
                 "page_end": page_no,
                 "source_pages": [page_no],
@@ -1011,6 +1019,21 @@ def _build_preserved_resource_chapters(
             }
         )
     return preserved
+
+
+def _preserved_resource_title(page: dict[str, Any]) -> str:
+    page_no = int(page["page_no"])
+    page_kind = str(page.get("page_kind") or "")
+    if page_kind == "toc":
+        return "Contents"
+    if page_kind == "references":
+        return "References"
+    if page_kind == "index":
+        return "Index"
+    title = _infer_section_title([page], f"Visual Material Page {page_no}")
+    if _is_placeholder_title(title):
+        return f"Visual Material Page {page_no}"
+    return title
 
 
 def _build_cover_chapter(cover_path: Path | None) -> dict[str, Any] | None:
@@ -1106,6 +1129,7 @@ def _build_book_from_epub_meta(meta: dict[str, Any], source_path: Path | None) -
     raw_assets = meta.get("assets") or []
     chapters: list[dict[str, Any]] = []
     pages: list[dict[str, Any]] = []
+    in_outline_index = False
     for entry in raw_chapters:
         title = str(entry.get("title") or f"Section {len(chapters) + 1}")
         md = str(entry.get("markdown") or "").strip()
@@ -1130,7 +1154,17 @@ def _build_book_from_epub_meta(meta: dict[str, Any], source_path: Path | None) -
             tr += "\n"
         sip = entry.get("source_internal_path")
         is_cover_title = title_clean in {"cover", "cover page"}
-        is_preserved_resource = bool(is_cover_title or OUTLINE_SKIP_TITLE_RE.match(title))
+        is_index_continuation = bool(
+            in_outline_index
+            and re.fullmatch(r"[A-Z]", title.strip(), flags=re.IGNORECASE)
+        )
+        is_preserved_resource = bool(
+            is_cover_title
+            or OUTLINE_SKIP_TITLE_RE.match(title)
+            or is_index_continuation
+        )
+        if INDEX_TITLE_RE.match(title):
+            in_outline_index = True
         chapters.append(
             {
                 "index": i,
@@ -1337,7 +1371,8 @@ def build_book_reconstruction(
         current_pages = []
         current_title = None
 
-    if not chapters:
+    has_content_chapters = any(not bool(chapter.get("resource_only")) for chapter in chapters)
+    if not has_content_chapters:
         for page in pages:
             if page["page_kind"] in {"toc", "references", "index"}:
                 flush()

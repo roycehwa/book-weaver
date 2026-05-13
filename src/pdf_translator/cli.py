@@ -4,6 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
+from pdf_translator.agent_runner import DEFAULT_AGENT_SOURCE_ROOT, AgentLockError, run_agent_once
 from pdf_translator.config import DEFAULT_TRANSLATION_CONCURRENCY, RunSettings
 from pdf_translator.guardrails import (
     DEFAULT_INGEST_TIMEOUT_SECONDS,
@@ -225,6 +226,82 @@ def build_parser() -> argparse.ArgumentParser:
         help="Per-request polish timeout. Defaults to the translator timeout, e.g. MINIMAX_HTTP_TIMEOUT_SECONDS.",
     )
 
+    agent_parser = subparsers.add_parser(
+        "agent-once",
+        help="Hermes Agent entry point: process one book from EN/CN and archive it to OK/NG.",
+    )
+    agent_parser.add_argument(
+        "--source-root",
+        type=Path,
+        default=DEFAULT_AGENT_SOURCE_ROOT,
+        help="Root containing EN, CN, OK, and NG directories.",
+    )
+    agent_parser.add_argument(
+        "--target-lang",
+        default="zh-CN",
+        help="Target language, for example zh-CN.",
+    )
+    agent_parser.add_argument(
+        "--translator",
+        default="minimax",
+        choices=["openai", "mock", "minimax", "compatible", "openai-compatible"],
+        help="Translation backend for EN books.",
+    )
+    agent_parser.add_argument(
+        "--format",
+        default="epub",
+        choices=["pdf", "epub", "both"],
+        help="Rendered output format. EPUB is the default reading output.",
+    )
+    agent_parser.add_argument(
+        "--max-chunk-chars",
+        type=int,
+        default=9000,
+        help="Max chunk size for translation requests.",
+    )
+    agent_parser.add_argument(
+        "--translation-concurrency",
+        type=int,
+        default=DEFAULT_TRANSLATION_CONCURRENCY,
+        help="Number of translation chunks to process concurrently.",
+    )
+    agent_parser.add_argument(
+        "--ingest-timeout-seconds",
+        type=int,
+        default=DEFAULT_INGEST_TIMEOUT_SECONDS,
+        help="Hard timeout for the ingest stage. Use 0 to disable.",
+    )
+    agent_parser.add_argument(
+        "--max-file-size-mb",
+        type=float,
+        default=None,
+        help="Override the hard input gate for file size in MB.",
+    )
+    agent_parser.add_argument(
+        "--max-page-count",
+        type=int,
+        default=None,
+        help="Override the hard input gate for page count.",
+    )
+    agent_parser.add_argument(
+        "--no-polish",
+        action="store_true",
+        help="Skip the polish pass for EN books.",
+    )
+    agent_parser.add_argument(
+        "--polish-translator",
+        default=None,
+        choices=["openai", "mock", "minimax", "compatible", "openai-compatible"],
+        help="Optional translator backend for the EN polish pass.",
+    )
+    agent_parser.add_argument(
+        "--source-lane",
+        dest="source_lanes",
+        action="append",
+        choices=["EN", "CN"],
+        help="Restrict source lanes for this run. Repeat for multiple lanes. Defaults to EN and CN.",
+    )
+
     knowledge_parser = subparsers.add_parser(
         "knowledge",
         help="Branch B stubs: wiki outline and Mermaid mindmap from book.json.",
@@ -385,6 +462,33 @@ def main() -> None:
                 f"accepted={result.accepted_count} "
                 f"rejected={result.rejected_count}"
             )
+        elif args.command == "agent-once":
+            try:
+                result = run_agent_once(
+                    source_root=args.source_root,
+                    target_language=args.target_lang,
+                    translator=args.translator,
+                    output_format=args.format,
+                    max_chunk_chars=args.max_chunk_chars,
+                    translation_concurrency=args.translation_concurrency,
+                    ingest_timeout_seconds=args.ingest_timeout_seconds,
+                    max_file_size_mb=args.max_file_size_mb,
+                    max_page_count=args.max_page_count,
+                    polish_english=not args.no_polish,
+                    polish_translator=args.polish_translator,
+                    source_lanes=tuple(args.source_lanes or ("EN", "CN")),
+                )
+            except AgentLockError as exc:
+                print(str(exc))
+                raise SystemExit(3) from exc
+            if result.status == "no_work":
+                print(result.message or "No work.")
+            else:
+                print(f"Agent status: {result.status}")
+                print(f"Source: {result.source_path}")
+                print(f"Destination: {result.destination_dir}")
+            if result.status == "ng":
+                raise SystemExit(1)
         elif args.command == "knowledge":
             book_path = args.book_json.expanduser().resolve()
             book = load_book_json(book_path)

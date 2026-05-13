@@ -38,3 +38,25 @@ def test_public_cli_accepts_polish_command() -> None:
     assert args.command == "polish"
     assert str(args.run_dir) == "runs/sample"
     assert args.request_timeout_seconds == 600
+
+
+def test_public_cli_accepts_agent_once_command() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "agent-once",
+            "--source-root",
+            "/tmp/books",
+            "--translator",
+            "mock",
+            "--no-polish",
+            "--source-lane",
+            "CN",
+        ]
+    )
+
+    assert args.command == "agent-once"
+    assert str(args.source_root) == "/tmp/books"
+    assert args.translator == "mock"
+    assert args.no_polish is True
+    assert args.source_lanes == ["CN"]

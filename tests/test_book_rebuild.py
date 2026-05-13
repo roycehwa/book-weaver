@@ -94,6 +94,8 @@ def test_book_rebuild_marks_epub_apparatus_chapters_as_non_toc_resources() -> No
                 {"title": "Chapter 1", "markdown": "Real body text."},
                 {"title": "Notes", "markdown": "- 1. A note.\n"},
                 {"title": "Index", "markdown": "- Alpha, 1\n"},
+                {"title": "V", "markdown": "- Veblen, Thorsten, [161](text/page.xhtml#p161)\n- Venice, 32, 35, 37, 40\n"},
+                {"title": "W", "markdown": "- Wallace, Henry, 187-188\n- Walmart, 196, 197, 199, 200, 201\n"},
             ],
         }
     }
@@ -109,6 +111,9 @@ def test_book_rebuild_marks_epub_apparatus_chapters_as_non_toc_resources() -> No
     assert by_title["Chapter 1"]["toc"] is True
     assert by_title["Notes"]["translate"] is False
     assert by_title["Index"]["toc"] is False
+    assert by_title["V"]["translate"] is False
+    assert by_title["V"]["toc"] is False
+    assert by_title["W"]["translate"] is False
     assert by_title["Chapter 1"]["chapter_id"] == "ch-003-chapter-1"
 
 
@@ -131,6 +136,64 @@ def test_book_rebuild_adds_pdf_cover_chapter(monkeypatch, tmp_path) -> None:
     assert "![Cover]" in result["chapters"][0]["markdown"]
     assert result["metadata"]["cover_image_path"] == str(cover)
     assert any(asset["kind"] == "cover" for asset in result["assets"])
+
+
+def test_book_rebuild_runs_layout_fallback_when_only_cover_exists(monkeypatch, tmp_path) -> None:
+    cover = tmp_path / "cover.png"
+    table = tmp_path / "table-p0002-01.png"
+    cover.write_bytes(b"png")
+    table.write_bytes(b"png")
+    monkeypatch.setattr(book_rebuild, "_render_pdf_cover_page", lambda source_pdf, images_dir: cover)
+    monkeypatch.setattr(book_rebuild, "_crop_pdf_regions", lambda *args, **kwargs: {2: {1: table}})
+    monkeypatch.setattr(book_rebuild, "_extract_pdf_outline_chapters", lambda source_pdf, total_pages: [])
+    structured = {
+        "body": {"children": [{"$ref": f"#/texts/{index}"} for index in range(8)]},
+        "texts": [
+            {"label": "section_header", "text": "Title Page", "prov": _prov(1, 40, 760)},
+            {"label": "text", "text": "A short title-page line.", "prov": _prov(1, 40, 700)},
+            {"label": "section_header", "text": "Contents", "prov": _prov(2, 40, 760)},
+            {"label": "text", "text": "1 Introduction ........ 3", "prov": _prov(2, 40, 700)},
+            {"label": "section_header", "text": "Introduction", "prov": _prov(3, 40, 760)},
+            {
+                "label": "text",
+                "text": "The real body starts here and must not be dropped merely because a cover chapter already exists.",
+                "prov": _prov(3, 40, 620),
+            },
+            {
+                "label": "text",
+                "text": "The introduction continues with enough normal prose to form a readable chapter.",
+                "prov": _prov(4, 40, 620),
+            },
+            {
+                "label": "text",
+                "text": "Another body paragraph confirms the layout fallback keeps pages after the table of contents.",
+                "prov": _prov(5, 40, 620),
+            },
+        ],
+        "pictures": [],
+        "tables": [
+            {
+                "prov": [{"page_no": 2, "bbox": {"l": 40, "t": 700, "r": 300, "b": 500}}],
+                "data": {"grid": [[{"text": "1 Introduction"}, {"text": "3"}]]},
+            }
+        ],
+    }
+
+    result = build_book_reconstruction(structured, source_pdf=tmp_path / "book.pdf", images_dir=tmp_path)
+
+    assert result["chapters"][0]["title"] == "Cover"
+    assert any(chapter["title"] == "Introduction" for chapter in result["chapters"])
+    assert any(chapter["title"] == "Contents" for chapter in result["chapters"])
+    assert all(not chapter["title"].startswith("Original Visual Page") for chapter in result["chapters"])
+    introduction = next(chapter for chapter in result["chapters"] if chapter["title"] == "Introduction")
+    contents = next(chapter for chapter in result["chapters"] if chapter["title"] == "Contents")
+    assert contents["translate"] is False
+    assert contents["toc"] is False
+    assert introduction["translate"] is True
+    assert introduction["preserve_original"] is False
+    assert "The real body starts here" in introduction["markdown"]
+    assert "The introduction continues" in introduction["markdown"]
+    assert "Contents" not in introduction["markdown"]
 
 
 def test_book_rebuild_prefers_pdf_table_crop_over_markdown_table(monkeypatch, tmp_path) -> None:
@@ -274,6 +337,29 @@ def test_book_rebuild_skips_toc_and_splits_chapters() -> None:
     assert "# Chapter 1: A Beginning" in result["full_markdown"]
     assert "[[page: 2]]" not in result["chapters"][0]["markdown"]
     assert "[[page: 2]]" in result["chapters"][0]["trace_markdown"]
+
+
+def test_book_rebuild_places_docling_footnotes_after_page_body() -> None:
+    structured = {
+        "body": {
+            "children": [{"$ref": f"#/texts/{index}"} for index in range(4)]
+        },
+        "texts": [
+            {"label": "section_header", "text": "Chapter 1", "prov": _prov(1, 40, 760)},
+            {"label": "text", "text": "Left column body.", "prov": _prov(1, 40, 650)},
+            {"label": "footnote", "text": "1 Left column note.", "prov": _prov(1, 40, 180)},
+            {"label": "text", "text": "Right column body.", "prov": _prov(1, 320, 650)},
+        ],
+        "pictures": [],
+        "tables": [],
+    }
+
+    result = build_book_reconstruction(structured)
+    markdown = result["chapters"][0]["markdown"]
+
+    assert markdown.index("Left column body.") < markdown.index("Right column body.")
+    assert markdown.index("Right column body.") < markdown.index("1 Left column note.")
+    assert "---" in markdown
 
 
 def test_book_rebuild_falls_back_to_single_untitled_section() -> None:
