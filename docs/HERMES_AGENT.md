@@ -24,7 +24,8 @@ The command creates missing directories automatically.
 
 ## Processing rules
 
-- Failed `NG` books are retried before new `EN`/`CN` sources, using the existing failed book directory so translation cache files are reused.
+- Failed `NG` books are retried before new `EN`/`CN` sources while their retry budget remains, using the existing failed book directory so translation cache files are reused.
+- After the retry budget is exhausted, the book remains in `NG` for inspection but no longer blocks newer `EN`/`CN` sources.
 - The oldest PDF/EPUB under `EN` or `CN` is selected.
 - Active work uses a stable directory under `.hermes-working/<book-title>/`; if Hermes times out or the process is killed before NG archiving, the next run reuses that directory and continues from cached chunks.
 - `EN` books run the book pipeline with translation to `zh-CN`, then run the polish pass by default.
@@ -58,7 +59,7 @@ NG/<book-title>/
   phase-a-status.json
 ```
 
-`phase-a-status.json` is the agent-facing status record. It includes source lane, destination, timestamps, and error details for NG runs.
+`phase-a-status.json` is the agent-facing status record. It includes source lane, destination, timestamps, retry counters, and error details for NG runs.
 
 On retry success, the recovered book is moved from `NG/<book-title>/` to `OK/<book-title>/`.
 

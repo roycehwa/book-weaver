@@ -173,6 +173,45 @@ def test_agent_once_resumes_failed_ng_before_new_sources(
     assert status["resume_from_ng"] is True
 
 
+def test_agent_once_skips_exhausted_ng_retries_for_new_sources(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root = tmp_path / "文档"
+    failed_dir = source_root / "NG" / "Failed Book"
+    failed_dir.mkdir(parents=True)
+    failed_source = failed_dir / "Failed Book.pdf"
+    failed_source.write_bytes(b"%PDF")
+    (failed_dir / "phase-a-status.json").write_text(
+        json.dumps({"status": "ng", "source_lane": "EN", "attempt_count": 2}),
+        encoding="utf-8",
+    )
+
+    new_dir = source_root / "EN"
+    new_dir.mkdir(parents=True)
+    new_source = new_dir / "New Book.pdf"
+    new_source.write_bytes(b"%PDF")
+    processed_sources: list[Path] = []
+
+    def fake_pipeline(settings):
+        processed_sources.append(settings.source_pdf)
+        output_dir = settings.output_dir / settings.source_pdf.stem
+        output_dir.mkdir(parents=True, exist_ok=True)
+        artifacts = build_artifacts(output_dir, settings.source_pdf, settings.target_language)
+        artifacts.manifest_path.write_text(json.dumps({"ok": True}), encoding="utf-8")
+        return artifacts
+
+    monkeypatch.setattr("pdf_translator.agent_runner.run_translation_pipeline", fake_pipeline)
+
+    result = run_agent_once(source_root=source_root, translator="mock", polish_english=False)
+
+    assert result.status == "ok"
+    assert processed_sources == [new_source]
+    assert failed_source.exists()
+    assert result.destination_dir is not None
+    assert (result.destination_dir / "New Book.pdf").exists()
+
+
 def test_agent_once_reuses_stable_working_dir_after_timeout_like_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

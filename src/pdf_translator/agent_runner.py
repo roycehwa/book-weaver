@@ -38,6 +38,7 @@ class AgentWorkItem:
     lane: str
     output_parent: Path
     failed_dir: Path | None = None
+    previous_attempt_count: int = 0
 
 
 def run_agent_once(
@@ -54,6 +55,7 @@ def run_agent_once(
     polish_english: bool = True,
     polish_translator: str | None = None,
     source_lanes: tuple[str, ...] = ("EN", "CN"),
+    max_ng_retries: int = 2,
 ) -> AgentRunResult:
     source_root = source_root.expanduser().resolve()
     source_root.mkdir(parents=True, exist_ok=True)
@@ -62,7 +64,11 @@ def run_agent_once(
 
     lock_path = source_root / ".pdf-translator-agent.lock"
     with _agent_lock(lock_path):
-        candidate = _pick_resume_book(source_root, source_lanes=source_lanes) or _pick_next_book(
+        candidate = _pick_resume_book(
+            source_root,
+            source_lanes=source_lanes,
+            max_ng_retries=max_ng_retries,
+        ) or _pick_next_book(
             source_root,
             source_lanes=source_lanes,
         )
@@ -85,6 +91,8 @@ def run_agent_once(
             "polish_english": polish_english,
             "work_base": str(output_parent),
             "resume_from_ng": candidate.failed_dir is not None,
+            "attempt_count": candidate.previous_attempt_count + 1,
+            "max_ng_retries": max_ng_retries,
         }
 
         try:
@@ -203,9 +211,14 @@ class _agent_lock:
             return
 
 
-def _pick_resume_book(source_root: Path, *, source_lanes: tuple[str, ...] = ("EN", "CN")) -> AgentWorkItem | None:
+def _pick_resume_book(
+    source_root: Path,
+    *,
+    source_lanes: tuple[str, ...] = ("EN", "CN"),
+    max_ng_retries: int = 2,
+) -> AgentWorkItem | None:
     allowed_lanes = tuple(lane for lane in source_lanes if lane in {"EN", "CN"})
-    candidates: list[tuple[float, Path, Path, str]] = []
+    candidates: list[tuple[float, Path, Path, str, int]] = []
     ng_dir = source_root / "NG"
     if not ng_dir.exists():
         return None
@@ -221,22 +234,35 @@ def _pick_resume_book(source_root: Path, *, source_lanes: tuple[str, ...] = ("EN
             continue
         if status.get("status") != "ng":
             continue
+        attempt_count = _status_attempt_count(status)
+        if max_ng_retries >= 0 and attempt_count >= max_ng_retries:
+            continue
         lane = str(status.get("source_lane") or "")
         if lane not in allowed_lanes:
             continue
         source_path = _find_source_book(failed_dir)
         if source_path is None:
             continue
-        candidates.append((status_path.stat().st_mtime, failed_dir, source_path, lane))
+        candidates.append((status_path.stat().st_mtime, failed_dir, source_path, lane, attempt_count))
     if not candidates:
         return None
-    _, failed_dir, source_path, lane = sorted(candidates, key=lambda item: (item[0], str(item[1])))[0]
+    _, failed_dir, source_path, lane, attempt_count = sorted(candidates, key=lambda item: (item[0], str(item[1])))[0]
     return AgentWorkItem(
         source_path=source_path,
         lane=lane,
         output_parent=failed_dir,
         failed_dir=failed_dir,
+        previous_attempt_count=attempt_count,
     )
+
+
+def _status_attempt_count(status: dict[str, Any]) -> int:
+    raw = status.get("attempt_count")
+    if isinstance(raw, int):
+        return max(raw, 0)
+    if isinstance(raw, str) and raw.isdigit():
+        return int(raw)
+    return 1 if status.get("resume_from_ng") else 0
 
 
 def _pick_next_book(source_root: Path, *, source_lanes: tuple[str, ...] = ("EN", "CN")) -> AgentWorkItem | None:

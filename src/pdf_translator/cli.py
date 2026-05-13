@@ -301,6 +301,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["EN", "CN"],
         help="Restrict source lanes for this run. Repeat for multiple lanes. Defaults to EN and CN.",
     )
+    agent_parser.add_argument(
+        "--max-ng-retries",
+        type=int,
+        default=2,
+        help="Maximum automatic retries for one NG book before newer EN/CN sources are allowed to run.",
+    )
 
     knowledge_parser = subparsers.add_parser(
         "knowledge",
@@ -477,6 +483,7 @@ def main() -> None:
                     polish_english=not args.no_polish,
                     polish_translator=args.polish_translator,
                     source_lanes=tuple(args.source_lanes or ("EN", "CN")),
+                    max_ng_retries=args.max_ng_retries,
                 )
             except AgentLockError as exc:
                 print(str(exc))
