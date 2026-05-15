@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from pdf_translator.agent_runner import run_agent_once
+from pdf_translator.guardrails import IngestExecutionError
 from pdf_translator.pipeline import build_artifacts
 
 
@@ -210,6 +211,31 @@ def test_agent_once_skips_exhausted_ng_retries_for_new_sources(
     assert failed_source.exists()
     assert result.destination_dir is not None
     assert (result.destination_dir / "New Book.pdf").exists()
+
+
+def test_agent_once_marks_ingest_failures_non_retryable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root = tmp_path / "文档"
+    source_dir = source_root / "EN"
+    source_dir.mkdir(parents=True)
+    source = source_dir / "Broken.epub"
+    source.write_bytes(b"Too many downloads at the same time")
+
+    def fake_pipeline(settings):
+        raise IngestExecutionError("Unable to inspect page count for Broken.epub: File is not a zip file")
+
+    monkeypatch.setattr("pdf_translator.agent_runner.run_translation_pipeline", fake_pipeline)
+
+    result = run_agent_once(source_root=source_root, translator="mock", polish_english=False, max_ng_retries=2)
+
+    assert result.status == "ng"
+    assert result.destination_dir is not None
+    status = json.loads((result.destination_dir / "phase-a-status.json").read_text(encoding="utf-8"))
+    assert status["attempt_count"] == 2
+    assert status["retry_exhausted"] is True
+    assert status["non_retryable"] is True
 
 
 def test_agent_once_reuses_stable_working_dir_after_timeout_like_failure(

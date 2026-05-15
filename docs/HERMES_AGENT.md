@@ -26,6 +26,7 @@ The command creates missing directories automatically.
 
 - Failed `NG` books are retried before new `EN`/`CN` sources while their retry budget remains, using the existing failed book directory so translation cache files are reused.
 - After the retry budget is exhausted, the book remains in `NG` for inspection but no longer blocks newer `EN`/`CN` sources.
+- Source inspection failures, such as corrupt EPUB/ZIP files or input-gate rejections, are marked non-retryable immediately because rerunning cannot repair the source file.
 - The oldest PDF/EPUB under `EN` or `CN` is selected.
 - Active work uses a stable directory under `.hermes-working/<book-title>/`; if Hermes times out or the process is killed before NG archiving, the next run reuses that directory and continues from cached chunks.
 - `EN` books run the book pipeline with translation to `zh-CN`, then run the polish pass by default.

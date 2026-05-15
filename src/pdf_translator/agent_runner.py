@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from pdf_translator.config import DEFAULT_TRANSLATION_CONCURRENCY, RunSettings
-from pdf_translator.guardrails import DEFAULT_INGEST_TIMEOUT_SECONDS
+from pdf_translator.guardrails import DEFAULT_INGEST_TIMEOUT_SECONDS, IngestExecutionError, InputGateError
 from pdf_translator.pipeline import run_translation_pipeline
 from pdf_translator.polish import run_polish
 
@@ -152,11 +152,16 @@ def run_agent_once(
                     run_dir=expected_run_dir,
                     destination_parent=source_root / "NG",
                 )
+            non_retryable = _is_non_retryable_failure(exc)
+            attempt_count = max_ng_retries if non_retryable and max_ng_retries >= 0 else candidate.previous_attempt_count + 1
             status_payload.update(
                 {
                     "status": "ng",
                     "completed_at": datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
                     "destination_dir": str(destination_dir),
+                    "attempt_count": attempt_count,
+                    "retry_exhausted": max_ng_retries >= 0 and attempt_count >= max_ng_retries,
+                    "non_retryable": non_retryable,
                     "error_type": type(exc).__name__,
                     "error": str(exc),
                     "traceback": traceback.format_exc(),
@@ -263,6 +268,10 @@ def _status_attempt_count(status: dict[str, Any]) -> int:
     if isinstance(raw, str) and raw.isdigit():
         return int(raw)
     return 1 if status.get("resume_from_ng") else 0
+
+
+def _is_non_retryable_failure(exc: Exception) -> bool:
+    return isinstance(exc, (InputGateError, IngestExecutionError))
 
 
 def _pick_next_book(source_root: Path, *, source_lanes: tuple[str, ...] = ("EN", "CN")) -> AgentWorkItem | None:
