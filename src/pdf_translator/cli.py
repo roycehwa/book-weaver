@@ -13,6 +13,7 @@ from pdf_translator.guardrails import (
 from pdf_translator.knowledge import (
     build_knowledge_package,
     build_knowledge_plan,
+    build_metadata_prior,
     build_suitability_report,
     emit_mindmap_mermaid_from_book,
     emit_wiki_outline_from_book,
@@ -263,6 +264,32 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional output directory. Defaults to RUN_DIR/knowledge.",
     )
+    knowledge_metadata = knowledge_sub.add_parser(
+        "metadata",
+        help="Search public book metadata and generate a weak network-model prior.",
+    )
+    knowledge_metadata.add_argument(
+        "run_dir",
+        type=Path,
+        help="Path to a completed Phase A run containing manifest.json.",
+    )
+    knowledge_metadata.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help="Optional output directory. Defaults to RUN_DIR/knowledge.",
+    )
+    knowledge_metadata.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Refresh metadata lookup even if metadata-prior.json already exists.",
+    )
+    knowledge_metadata.add_argument(
+        "--timeout-seconds",
+        type=float,
+        default=8.0,
+        help="Per-provider metadata lookup timeout.",
+    )
     knowledge_plan = knowledge_sub.add_parser(
         "plan",
         help="Generate a network-oriented processing plan before knowledge extraction.",
@@ -283,6 +310,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="rule",
         choices=["rule"],
         help="Planning backend. rule is deterministic; model adjudication will be added behind the same schema.",
+    )
+    knowledge_plan.add_argument(
+        "--metadata-prior",
+        default="none",
+        choices=["none", "auto"],
+        help="Use cached or freshly searched book metadata as a weak planning prior.",
     )
     wiki_outline = knowledge_sub.add_parser(
         "wiki-outline",
@@ -451,8 +484,22 @@ def main() -> None:
                 paths = build_suitability_report(args.run_dir, out_dir=args.out)
                 print(f"Suitability report: {paths['report']}")
                 print(f"Suitability Markdown: {paths['markdown']}")
+            elif args.knowledge_command == "metadata":
+                paths = build_metadata_prior(
+                    args.run_dir,
+                    out_dir=args.out,
+                    refresh=args.refresh,
+                    timeout_seconds=args.timeout_seconds,
+                )
+                print(f"Metadata prior: {paths['prior']}")
+                print(f"Metadata Markdown: {paths['markdown']}")
             elif args.knowledge_command == "plan":
-                paths = build_knowledge_plan(args.run_dir, out_dir=args.out, planner=args.planner)
+                paths = build_knowledge_plan(
+                    args.run_dir,
+                    out_dir=args.out,
+                    planner=args.planner,
+                    metadata_prior=args.metadata_prior,
+                )
                 print(f"Plan candidates: {paths['candidates']}")
                 print(f"Plan JSON: {paths['plan']}")
                 print(f"Plan Markdown: {paths['markdown']}")

@@ -126,6 +126,7 @@ flowchart TB
 ```bash
 book-weaver knowledge build RUN_DIR
 book-weaver knowledge suitability RUN_DIR
+book-weaver knowledge metadata RUN_DIR
 book-weaver knowledge plan RUN_DIR
 book-weaver knowledge extract RUN_DIR --profile argumentative
 ```
@@ -163,6 +164,13 @@ book-weaver knowledge extract RUN_DIR --profile argumentative
 - `faceted_index_network`
 
 `plan.md` 是主要人工验收物。它必须说明主网络模型、二级分支模板、候选顶层节点、逐章角色、抽取对象和质量门槛。模型仲裁层预留在 `plan.json.planner` 中，后续可加入 MiniMax 等低成本模型，但模型不能绕过 schema 或直接成为最终图谱。
+
+`book-weaver knowledge metadata RUN_DIR` 已实现为外部 metadata prior。它会搜索公开书籍元数据，并生成：
+
+- `knowledge/metadata-prior.json`
+- `knowledge/metadata-prior.md`
+
+`book-weaver knowledge plan RUN_DIR --metadata-prior auto` 会读取或自动生成该先验，并将其作为弱信号加入网络模型评分。策略是 **metadata 只加权，不覆盖本地结构证据**。如果外部 API 失败，系统仍会用书名/文件名生成低权重先验，并继续本地 plan。
 
 ### 分支 B 的关键约束
 

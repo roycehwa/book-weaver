@@ -6,6 +6,7 @@ import json
 from pdf_translator.knowledge import (
     build_knowledge_package,
     build_knowledge_plan,
+    build_metadata_prior,
     build_suitability_report,
     emit_mindmap_mermaid_from_book,
     emit_wiki_outline_from_book,
@@ -346,3 +347,90 @@ def test_build_knowledge_plan_selects_event_timeline_network(tmp_path: Path) -> 
 
     assert plan["final_plan"]["primary_network_model"] == "event_timeline_network"
     assert "event" in plan["final_plan"]["recommended_extractors"]
+
+
+def test_build_metadata_prior_uses_external_records_as_weak_prior(tmp_path: Path) -> None:
+    run_dir = tmp_path / "AI Use Cases for Diplomats -- Donald Kilburg"
+    run_dir.mkdir()
+    (run_dir / "manifest.json").write_text(
+        json.dumps({"source_pdf": "/books/AI Use Cases for Diplomats -- Donald Kilburg.epub"}),
+        encoding="utf-8",
+    )
+
+    def fake_fetcher(query: str, timeout_seconds: float) -> list[dict]:
+        assert "AI Use Cases for Diplomats" in query
+        return [
+            {
+                "source": "test",
+                "title": "AI Use Cases for Diplomats",
+                "authors": ["Donald Kilburg"],
+                "publisher": "Taylor & Francis",
+                "description": "A practical guide with real-world examples, use cases, tools, and strategy.",
+                "categories": ["Artificial Intelligence", "Diplomacy", "Technology"],
+                "url": "https://example.test/book",
+            }
+        ]
+
+    paths = build_metadata_prior(run_dir, fetcher=fake_fetcher)
+    prior = json.loads(paths["prior"].read_text(encoding="utf-8"))
+    md = paths["markdown"].read_text(encoding="utf-8")
+
+    assert prior["primary_network_model"] == "playbook_network"
+    assert prior["network_scores"]["playbook_network"] > prior["network_scores"]["event_timeline_network"]
+    assert "AI Use Cases for Diplomats" in md
+
+
+def test_build_knowledge_plan_can_use_cached_metadata_prior(tmp_path: Path) -> None:
+    run_dir = tmp_path / "Ambiguous Book"
+    run_dir.mkdir()
+    (run_dir / "book.json").write_text(
+        json.dumps(
+            {
+                "chapters": [
+                    {
+                        "index": 1,
+                        "title": "A Framework for Action",
+                        "markdown": (
+                            "# A Framework for Action\n\n"
+                            "This chapter discusses a framework.\n\n"
+                            "The text uses examples and a guide for practice.\n\n"
+                            "The method applies to teams.\n\n"
+                            "The strategy becomes an action plan.\n"
+                        ),
+                    }
+                ],
+                "assets": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    knowledge_dir = run_dir / "knowledge"
+    knowledge_dir.mkdir()
+    (knowledge_dir / "metadata-prior.json").write_text(
+        json.dumps(
+            {
+                "schema": "book_weaver_metadata_prior_v1",
+                "query": {"query": "Ambiguous Book", "title_hint": "Ambiguous Book"},
+                "primary_network_model": "playbook_network",
+                "secondary_network_models": [],
+                "confidence": 0.8,
+                "network_scores": {
+                    "argument_network": 0,
+                    "concept_network": 0,
+                    "event_timeline_network": 0,
+                    "playbook_network": 120,
+                    "narrative_network": 0,
+                    "faceted_index_network": 0,
+                },
+                "records": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    paths = build_knowledge_plan(run_dir, metadata_prior="auto")
+    plan = json.loads(paths["plan"].read_text(encoding="utf-8"))
+
+    assert plan["metadata_prior"]["primary_network_model"] == "playbook_network"
+    assert plan["algorithm_candidate"]["metadata_prior_mode"] == "auto"
+    assert plan["algorithm_candidate"]["network_scores"]["playbook_network"] > 0

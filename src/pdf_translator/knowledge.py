@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+import requests
 
 
 def _slug_title(title: str, index: int) -> str:
@@ -481,6 +483,112 @@ NETWORK_TO_PROFILE: dict[str, str] = {
 }
 
 
+METADATA_PRIOR_KEYWORDS: dict[str, list[str]] = {
+    "argument_network": [
+        "philosophy",
+        "political science",
+        "law",
+        "ethics",
+        "theory",
+        "argument",
+        "conservatism",
+        "liberalism",
+        "humanism",
+        "critique",
+        "思想",
+        "哲学",
+        "政治理论",
+    ],
+    "concept_network": [
+        "concept",
+        "decision",
+        "framework",
+        "heritage studies",
+        "critical heritage",
+        "identity",
+        "culture",
+        "religion",
+        "sociology",
+        "anthropology",
+        "知识",
+        "概念",
+        "文化",
+        "宗教",
+        "社会学",
+        "人类学",
+    ],
+    "event_timeline_network": [
+        "history",
+        "historical",
+        "archaeology",
+        "biography",
+        "war",
+        "military",
+        "empire",
+        "ancestor",
+        "dynasty",
+        "chronology",
+        "历史",
+        "考古",
+        "传记",
+        "战争",
+        "祖先",
+    ],
+    "playbook_network": [
+        "guardrails",
+        "human decisions",
+        "decision",
+        "age of ai",
+        "business",
+        "management",
+        "self-help",
+        "personal finance",
+        "guide",
+        "strategy",
+        "how to",
+        "use cases",
+        "artificial intelligence",
+        "technology",
+        "diplomacy",
+        "practice",
+        "管理",
+        "商业",
+        "指南",
+        "策略",
+        "人工智能",
+        "实践",
+    ],
+    "narrative_network": [
+        "fiction",
+        "novel",
+        "literary",
+        "memoir",
+        "story",
+        "narrative",
+        "小说",
+        "文学",
+        "回忆录",
+        "叙事",
+    ],
+    "faceted_index_network": [
+        "reference",
+        "handbook",
+        "encyclopedia",
+        "dictionary",
+        "catalog",
+        "glossary",
+        "collection",
+        "参考",
+        "手册",
+        "百科",
+        "词典",
+    ],
+}
+
+
+MetadataFetcher = Callable[[str, float], list[dict[str, Any]]]
+
+
 APPARATUS_TITLE_RE = re.compile(
     r"\b("
     r"contents|copyright|dedication|acknowledg|preface|notes?|references|bibliography|index|glossary|appendix|"
@@ -493,6 +601,222 @@ APPARATUS_TITLE_RE = re.compile(
 def _count_keyword_hits(text: str, keywords: list[str]) -> int:
     lowered = text.lower()
     return sum(lowered.count(keyword.lower()) for keyword in keywords)
+
+
+def _compact_space(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _source_name_from_run(run_dir: Path) -> str:
+    manifest = _read_json(run_dir / "manifest.json")
+    source = str(manifest.get("source_pdf") or "")
+    if source:
+        return Path(source).stem
+    return run_dir.name
+
+
+def _metadata_query_from_run(run_dir: Path) -> dict[str, Any]:
+    stem = _source_name_from_run(run_dir)
+    cleaned = re.sub(r"\.(pdf|epub)$", "", stem, flags=re.IGNORECASE)
+    cleaned = cleaned.replace("_", " ")
+    chunks = [_compact_space(chunk) for chunk in re.split(r"\s+--\s+", cleaned) if _compact_space(chunk)]
+    title = chunks[0] if chunks else _compact_space(cleaned)
+    author = chunks[1] if len(chunks) > 1 else None
+    title = re.sub(r"\s+-\s+Wei Zhi$", "", title).strip()
+    query = f"{title} {author or ''}".strip()
+    return {
+        "source_name": stem,
+        "title_hint": title,
+        "author_hint": author,
+        "query": query,
+    }
+
+
+def _google_books_records(query: str, timeout_seconds: float) -> list[dict[str, Any]]:
+    response = requests.get(
+        "https://www.googleapis.com/books/v1/volumes",
+        params={"q": query, "maxResults": 5, "printType": "books"},
+        timeout=timeout_seconds,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    records: list[dict[str, Any]] = []
+    for item in payload.get("items") or []:
+        info = item.get("volumeInfo") or {}
+        records.append(
+            {
+                "source": "google_books",
+                "title": info.get("title"),
+                "subtitle": info.get("subtitle"),
+                "authors": info.get("authors") or [],
+                "publisher": info.get("publisher"),
+                "published_date": info.get("publishedDate"),
+                "description": info.get("description"),
+                "categories": info.get("categories") or [],
+                "page_count": info.get("pageCount"),
+                "language": info.get("language"),
+                "url": info.get("infoLink"),
+            }
+        )
+    return records
+
+
+def _open_library_records(query: str, timeout_seconds: float) -> list[dict[str, Any]]:
+    response = requests.get(
+        "https://openlibrary.org/search.json",
+        params={"q": query, "limit": 5},
+        timeout=timeout_seconds,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    records: list[dict[str, Any]] = []
+    for doc in payload.get("docs") or []:
+        records.append(
+            {
+                "source": "open_library",
+                "title": doc.get("title"),
+                "subtitle": doc.get("subtitle"),
+                "authors": doc.get("author_name") or [],
+                "publisher": (doc.get("publisher") or [None])[0],
+                "published_date": str(doc.get("first_publish_year") or "") or None,
+                "description": None,
+                "categories": doc.get("subject") or [],
+                "page_count": None,
+                "language": doc.get("language") or [],
+                "url": f"https://openlibrary.org{doc.get('key')}" if doc.get("key") else None,
+            }
+        )
+    return records
+
+
+def _fetch_metadata_records(query: str, timeout_seconds: float) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
+    for provider, fetcher in (("google_books", _google_books_records), ("open_library", _open_library_records)):
+        try:
+            records.extend(fetcher(query, timeout_seconds))
+        except Exception as exc:  # Network metadata is helpful but not required for planning.
+            errors.append({"provider": provider, "error": str(exc)})
+    if errors and not records:
+        return [{"source": "metadata_error", "errors": errors}]
+    return records
+
+
+def _metadata_record_text(record: dict[str, Any]) -> str:
+    fields: list[str] = []
+    for key in ("title", "subtitle", "publisher", "description"):
+        value = record.get(key)
+        if value:
+            fields.append(str(value))
+    for key in ("authors", "categories", "language"):
+        value = record.get(key)
+        if isinstance(value, list):
+            fields.extend(str(item) for item in value[:40])
+        elif value:
+            fields.append(str(value))
+    return "\n".join(fields)
+
+
+def _metadata_network_scores(records: list[dict[str, Any]], query_info: dict[str, Any]) -> dict[str, int]:
+    text = "\n".join([query_info.get("source_name", ""), query_info.get("title_hint", ""), query_info.get("author_hint") or ""])
+    text += "\n" + "\n".join(_metadata_record_text(record) for record in records if record.get("source") != "metadata_error")
+    scores = {model: 0 for model in NETWORK_MODELS}
+    for model, keywords in METADATA_PRIOR_KEYWORDS.items():
+        scores[model] += _count_keyword_hits(text, keywords) * 12
+    title_hint = str(query_info.get("title_hint") or "").lower()
+    if "use case" in title_hint:
+        scores["playbook_network"] += 55
+    if "conservatism" in title_hint or "liberal political economy" in title_hint:
+        scores["argument_network"] += 45
+    if "ancestor" in title_hint or "heritage" in title_hint:
+        scores["event_timeline_network"] += 28
+        scores["concept_network"] += 26
+    if "war" in title_hint or "underground" in title_hint:
+        scores["event_timeline_network"] += 45
+    if "wealth" in title_hint or "strategies" in title_hint:
+        scores["playbook_network"] += 45
+    return scores
+
+
+def _metadata_confidence(scores: dict[str, int], records: list[dict[str, Any]]) -> float:
+    valid_records = [record for record in records if record.get("source") != "metadata_error"]
+    top_score = max(scores.values()) if scores else 0
+    if not valid_records:
+        return 0.25 if top_score > 0 else 0.0
+    ordered = sorted(scores.values(), reverse=True)
+    if not ordered or ordered[0] <= 0:
+        return 0.35
+    top = ordered[0]
+    second = ordered[1] if len(ordered) > 1 else 0
+    return round(min(0.88, 0.38 + ((top - second) / max(top, 1)) * 0.30 + min(len(valid_records), 5) * 0.04), 2)
+
+
+def _render_metadata_markdown(prior: dict[str, Any]) -> str:
+    lines = [
+        "# Metadata Prior",
+        "",
+        f"- Query: `{prior['query']['query']}`",
+        f"- Title hint: {prior['query']['title_hint']}",
+        f"- Author hint: {prior['query'].get('author_hint') or 'unknown'}",
+        f"- Primary network prior: `{prior['primary_network_model']}`",
+        f"- Confidence: `{prior['confidence']}`",
+        "",
+        "## Network Prior Scores",
+        "",
+    ]
+    for name, score in sorted(prior["network_scores"].items(), key=lambda item: item[1], reverse=True):
+        lines.append(f"- `{name}`: {score}")
+    lines.extend(["", "## Sources", ""])
+    for record in prior["records"][:8]:
+        if record.get("source") == "metadata_error":
+            lines.append(f"- metadata lookup failed: {record.get('errors')}")
+            continue
+        title = record.get("title") or "Untitled"
+        authors = ", ".join(record.get("authors") or [])
+        categories = ", ".join(str(item) for item in (record.get("categories") or [])[:6])
+        url = record.get("url") or ""
+        lines.append(f"- `{record.get('source')}` {title} | {authors} | {categories} | {url}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def build_metadata_prior(
+    run_dir: Path,
+    out_dir: Path | None = None,
+    *,
+    refresh: bool = False,
+    timeout_seconds: float = 8.0,
+    fetcher: MetadataFetcher | None = None,
+) -> dict[str, Path]:
+    """Search public book metadata and convert it into a weak network-model prior."""
+    run_dir = run_dir.expanduser().resolve()
+    knowledge_dir = (out_dir.expanduser().resolve() if out_dir else run_dir / "knowledge")
+    knowledge_dir.mkdir(parents=True, exist_ok=True)
+    prior_path = knowledge_dir / "metadata-prior.json"
+    markdown_path = knowledge_dir / "metadata-prior.md"
+    if prior_path.exists() and not refresh:
+        return {"prior": prior_path, "markdown": markdown_path}
+
+    query_info = _metadata_query_from_run(run_dir)
+    records = (fetcher or _fetch_metadata_records)(str(query_info["query"]), timeout_seconds)
+    scores = _metadata_network_scores(records, query_info)
+    ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    primary = ranked[0][0] if ranked and ranked[0][1] > 0 else "faceted_index_network"
+    confidence = _metadata_confidence(scores, records)
+    prior = {
+        "schema": "book_weaver_metadata_prior_v1",
+        "run_dir": str(run_dir),
+        "query": query_info,
+        "primary_network_model": primary,
+        "secondary_network_models": [name for name, score in ranked[1:3] if score > 0],
+        "confidence": confidence,
+        "network_scores": scores,
+        "records": records,
+        "policy": "metadata prior is a weak external signal; it may add weight to local plan scores but must not override local structural evidence by itself",
+    }
+    prior_path.write_text(json.dumps(prior, ensure_ascii=False, indent=2), encoding="utf-8")
+    markdown_path.write_text(_render_metadata_markdown(prior), encoding="utf-8")
+    return {"prior": prior_path, "markdown": markdown_path}
 
 
 def _score_profiles(chapters: list[dict[str, Any]], units: list[dict[str, Any]]) -> dict[str, int]:
@@ -542,7 +866,12 @@ def _global_text(chapters: list[dict[str, Any]], units: list[dict[str, Any]], ma
     return f"{title_text}\n{body_text}"
 
 
-def _score_network_models(chapters: list[dict[str, Any]], units: list[dict[str, Any]], run_dir: Path) -> dict[str, int]:
+def _score_network_models(
+    chapters: list[dict[str, Any]],
+    units: list[dict[str, Any]],
+    run_dir: Path,
+    metadata_prior: dict[str, Any] | None = None,
+) -> dict[str, int]:
     text = _global_text(chapters, units)
     lowered = f"{run_dir.name}\n{text}".lower()
     scores = {model: 0 for model in NETWORK_MODELS}
@@ -689,6 +1018,14 @@ def _score_network_models(chapters: list[dict[str, Any]], units: list[dict[str, 
         scores["concept_network"] += 6
     if table_image_count / total_units > 0.15:
         scores["faceted_index_network"] += 10
+
+    if metadata_prior:
+        prior_scores = metadata_prior.get("network_scores") or {}
+        prior_confidence = float(metadata_prior.get("confidence") or 0.0)
+        for model in NETWORK_MODELS:
+            prior_score = int(prior_scores.get(model) or 0)
+            if prior_score > 0:
+                scores[model] += int(prior_score * min(max(prior_confidence, 0.0), 0.9) * 0.55)
 
     return scores
 
@@ -1083,11 +1420,30 @@ def _render_plan_markdown(plan: dict[str, Any]) -> str:
         f"- Top-level node kinds: {', '.join(f'`{item}`' for item in model['top_level_node_kinds'])}",
         f"- Second-level branch kinds: {', '.join(f'`{item}`' for item in model['second_level_branch_kinds'])}",
         "",
+    ]
+    metadata_prior = plan.get("metadata_prior")
+    if metadata_prior:
+        lines.extend(
+            [
+                "## Metadata Prior",
+                "",
+                f"- Primary prior: `{metadata_prior.get('primary_network_model')}`",
+                f"- Confidence: `{metadata_prior.get('confidence')}`",
+                f"- Query: `{(metadata_prior.get('query') or {}).get('query')}`",
+                "",
+            ]
+        )
+        for name, score in sorted((metadata_prior.get("network_scores") or {}).items(), key=lambda item: item[1], reverse=True):
+            lines.append(f"- `{name}`: {score}")
+        lines.append("")
+    lines.extend(
+        [
         "## Candidate Top-Level Nodes",
         "",
         "| Node | Kind | Source Chapters | Branch Template |",
         "| --- | --- | --- | --- |",
-    ]
+        ]
+    )
     for node in final["top_level_nodes"]:
         chapters = ", ".join(str(ch) for ch in node.get("source_chapters", []))
         branches = ", ".join(str(branch) for branch in node.get("second_level_branch_template", []))
@@ -1132,7 +1488,12 @@ def _render_plan_markdown(plan: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def build_knowledge_plan(run_dir: Path, out_dir: Path | None = None, planner: str = "rule") -> dict[str, Path]:
+def build_knowledge_plan(
+    run_dir: Path,
+    out_dir: Path | None = None,
+    planner: str = "rule",
+    metadata_prior: str = "none",
+) -> dict[str, Path]:
     """Build a network-oriented Phase B processing plan.
 
     The current planner is algorithmic. The output shape reserves an LLM adjudication layer so
@@ -1154,7 +1515,15 @@ def build_knowledge_plan(run_dir: Path, out_dir: Path | None = None, planner: st
         build_suitability_report(run_dir, out_dir=knowledge_dir)
     suitability = _read_json(knowledge_dir / "suitability-report.json")
 
-    network_scores = _score_network_models(chapters, units, run_dir)
+    prior: dict[str, Any] | None = None
+    if metadata_prior == "auto":
+        prior_paths = build_metadata_prior(run_dir, out_dir=knowledge_dir)
+        prior = _read_json(prior_paths["prior"])
+    elif metadata_prior != "none":
+        raise ValueError("metadata_prior must be 'none' or 'auto'")
+
+    local_network_scores = _score_network_models(chapters, units, run_dir)
+    network_scores = _score_network_models(chapters, units, run_dir, metadata_prior=prior)
     ranked_models = sorted(network_scores.items(), key=lambda item: item[1], reverse=True)
     primary_network_model = ranked_models[0][0] if ranked_models and ranked_models[0][1] > 0 else "faceted_index_network"
     confidence = _confidence_from_network_scores(network_scores)
@@ -1185,6 +1554,9 @@ def build_knowledge_plan(run_dir: Path, out_dir: Path | None = None, planner: st
     candidate = {
         "schema": "book_weaver_plan_candidate_v1",
         "planner": "rule",
+        "metadata_prior_mode": metadata_prior,
+        "metadata_prior_path": str(knowledge_dir / "metadata-prior.json") if prior else None,
+        "local_network_scores": local_network_scores,
         "network_scores": network_scores,
         "ranked_network_models": [{"model": name, "score": score} for name, score in ranked_models],
         "primary_network_model": primary_network_model,
@@ -1218,6 +1590,7 @@ def build_knowledge_plan(run_dir: Path, out_dir: Path | None = None, planner: st
             "policy": "algorithm controls structure and validation; model adjudication may later propose changes but cannot bypass schema",
         },
         "algorithm_candidate": candidate,
+        "metadata_prior": prior,
         "final_plan": final_plan,
         "quality_gates": [
             {
