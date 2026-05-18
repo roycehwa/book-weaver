@@ -1436,6 +1436,20 @@ def _render_plan_markdown(plan: dict[str, Any]) -> str:
         for name, score in sorted((metadata_prior.get("network_scores") or {}).items(), key=lambda item: item[1], reverse=True):
             lines.append(f"- `{name}`: {score}")
         lines.append("")
+    user_review = plan.get("user_review")
+    if user_review:
+        lines.extend(
+            [
+                "## User Review",
+                "",
+                f"- Applied: `{user_review.get('applied', False)}`",
+                f"- Network override: `{user_review.get('network_override') or 'none'}`",
+                f"- Preserve content types: {', '.join(f'`{item}`' for item in user_review.get('preserve_content_types', [])) or 'none'}",
+                f"- Skip content types: {', '.join(f'`{item}`' for item in user_review.get('skip_content_types', [])) or 'none'}",
+                f"- References supplied: `{len(user_review.get('references', []))}`",
+                "",
+            ]
+        )
     lines.extend(
         [
         "## Candidate Top-Level Nodes",
@@ -1486,6 +1500,170 @@ def _render_plan_markdown(plan: dict[str, Any]) -> str:
 
     lines.extend(["", "## Next Command", "", f"```bash\n{final['next_command']}\n```", ""])
     return "\n".join(lines)
+
+
+def _parse_network_override(text: str) -> tuple[str | None, list[str]]:
+    lowered = text.lower()
+    explicit_hits = sorted(
+        [model for model in NETWORK_MODELS if model in lowered],
+        key=lambda model: lowered.find(model),
+    )
+    if explicit_hits:
+        return explicit_hits[0], explicit_hits[1:]
+    aliases = {
+        "argument_network": ["argument_network", "argument", "argumentative", "论证"],
+        "concept_network": ["concept_network", "concept", "概念"],
+        "event_timeline_network": ["event_timeline_network", "timeline", "historical", "history", "event", "时间", "事件", "历史"],
+        "playbook_network": ["playbook_network", "playbook", "practical", "operation", "guide", "操作", "实践", "手册"],
+        "narrative_network": ["narrative_network", "narrative", "story", "fiction", "叙事", "小说"],
+        "faceted_index_network": ["faceted_index_network", "faceted", "index", "reference", "多维", "索引"],
+    }
+    hits: list[str] = []
+    for model, terms in aliases.items():
+        if any(term in lowered for term in terms):
+            hits.append(model)
+    if "hybrid" in lowered or "mixed" in lowered or "混合" in lowered:
+        return hits[0] if hits else None, hits[1:]
+    return hits[0] if hits else None, hits[1:]
+
+
+def _extract_answer_section(text: str, labels: list[str]) -> str:
+    pattern = "|".join(re.escape(label) for label in labels)
+    match = re.search(rf"(?im)^\s*(?:{pattern})\s*[:：]\s*(.*)$", text)
+    if not match:
+        return ""
+    start = match.end(1)
+    first_line = match.group(1).strip()
+    rest = text[start:]
+    known_headers = [
+        "organization",
+        "组织方式",
+        "network",
+        "网络",
+        "preserve",
+        "必须保留",
+        "保留",
+        "skip",
+        "可以跳过",
+        "跳过",
+        "references",
+        "reference",
+        "参考材料",
+        "参考",
+    ]
+    next_header = re.search(
+        rf"(?im)^[ \t]*(?:{'|'.join(re.escape(label) for label in known_headers)})\s*[:：]\s*",
+        rest,
+    )
+    if next_header:
+        rest = rest[: next_header.start()]
+    return _compact_space(f"{first_line}\n{rest}")
+
+
+def _parse_content_types(section: str) -> list[str]:
+    allowed = {
+        "appendix": ["appendix", "appendices", "附录"],
+        "glossary": ["glossary", "术语"],
+        "chronology": ["chronology", "timeline", "年表", "时间表"],
+        "case_list": ["case list", "use case", "use cases", "案例", "用例"],
+        "illustrations": ["illustration", "illustrations", "figure", "figures", "image", "images", "插图", "图片"],
+        "tables": ["table", "tables", "表格"],
+        "references": ["reference", "references", "bibliography", "参考文献", "书目"],
+        "notes": ["note", "notes", "endnote", "footnote", "注释"],
+        "index": ["index", "索引"],
+        "copyright": ["copyright", "版权"],
+        "publisher_pages": ["publisher", "imprint", "title page", "出版社", "扉页"],
+        "blank_pages": ["blank", "空白"],
+        "contents": ["contents", "table of contents", "目录"],
+    }
+    lowered = section.lower()
+    found: list[str] = []
+    for canonical, aliases in allowed.items():
+        if any(alias in lowered for alias in aliases):
+            found.append(canonical)
+    return found
+
+
+def _parse_references(section: str) -> list[dict[str, Any]]:
+    if not section.strip():
+        return []
+    urls = re.findall(r"https?://\S+", section)
+    cleaned = section
+    for url in urls:
+        cleaned = cleaned.replace(url, "")
+    references = [{"type": "url", "source": "user_supplied_reference", "content": url.strip()} for url in urls]
+    text = cleaned.strip()
+    if text:
+        references.append({"type": "text", "source": "user_supplied_reference", "content": text[:4000]})
+    return references
+
+
+def parse_user_review_answers(text: str) -> dict[str, Any]:
+    network_section = _extract_answer_section(text, ["organization", "组织方式", "network", "网络"])
+    preserve_section = _extract_answer_section(text, ["preserve", "必须保留", "保留"])
+    skip_section = _extract_answer_section(text, ["skip", "可以跳过", "跳过"])
+    reference_section = _extract_answer_section(text, ["references", "reference", "参考材料", "参考"])
+    network_override, secondary = _parse_network_override(network_section)
+    return {
+        "schema": "book_weaver_user_review_v1",
+        "network_override": network_override,
+        "secondary_network_models": secondary,
+        "preserve_content_types": _parse_content_types(preserve_section),
+        "skip_content_types": _parse_content_types(skip_section),
+        "references": _parse_references(reference_section),
+        "raw_answers": text,
+        "policy": "user review may adjust structure and boundaries once; it must not create accepted knowledge without source evidence",
+    }
+
+
+def _chapter_matches_content_type(chapter: dict[str, Any], content_type: str) -> bool:
+    title = str(chapter.get("title") or "").lower()
+    mapping = {
+        "appendix": ["appendix"],
+        "glossary": ["glossary"],
+        "chronology": ["chronology", "timeline"],
+        "case_list": ["use case", "case list"],
+        "illustrations": ["illustration", "list of illustrations", "figures"],
+        "tables": ["table", "tables"],
+        "references": ["references", "bibliography"],
+        "notes": ["notes", "endnotes", "footnotes"],
+        "index": ["index"],
+        "copyright": ["copyright"],
+        "publisher_pages": ["publisher", "imprint", "title page"],
+        "blank_pages": ["blank"],
+        "contents": ["contents", "table of contents"],
+    }
+    return any(term in title for term in mapping.get(content_type, []))
+
+
+def _apply_review_to_plan(plan: dict[str, Any], review: dict[str, Any]) -> dict[str, Any]:
+    final = plan["final_plan"]
+    if review.get("network_override") in NETWORK_MODELS:
+        final["primary_network_model"] = review["network_override"]
+        final["secondary_network_models"] = review.get("secondary_network_models") or final.get("secondary_network_models", [])
+        final["recommended_extractors"] = NETWORK_MODELS[review["network_override"]]["recommended_extractors"]
+        final["rationale"] += f" User review set primary network model to `{review['network_override']}`."
+    for chapter in final["chapter_roles"]:
+        for content_type in review.get("preserve_content_types", []):
+            if _chapter_matches_content_type(chapter, content_type):
+                chapter["role"] = "preserve"
+                chapter["reasons"] = sorted(set(chapter.get("reasons", []) + [f"user_preserve_{content_type}"]))
+        for content_type in review.get("skip_content_types", []):
+            if _chapter_matches_content_type(chapter, content_type):
+                chapter["role"] = "skip"
+                chapter["reasons"] = sorted(set(chapter.get("reasons", []) + [f"user_skip_{content_type}"]))
+    plan["user_review"] = {
+        **review,
+        "applied": True,
+    }
+    if review.get("references"):
+        plan["reference_prior"] = {
+            "schema": "book_weaver_reference_prior_v1",
+            "source": "user_supplied_reference",
+            "references": review["references"],
+            "policy": "reference material can influence planning and later candidate extraction prompts, but accepted knowledge must still cite the source book",
+        }
+    return plan
 
 
 def build_knowledge_plan(
@@ -1621,3 +1799,36 @@ def build_knowledge_plan(
     paths["plan"].write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
     paths["markdown"].write_text(_render_plan_markdown(plan), encoding="utf-8")
     return paths
+
+
+def apply_user_review(run_dir: Path, answers_path: Path, out_dir: Path | None = None) -> dict[str, Path]:
+    """Apply one user-supplied structural review to an existing knowledge plan."""
+    run_dir = run_dir.expanduser().resolve()
+    answers_path = answers_path.expanduser().resolve()
+    knowledge_dir = (out_dir.expanduser().resolve() if out_dir else run_dir / "knowledge")
+    if not answers_path.exists():
+        raise FileNotFoundError(f"Missing answers file: {answers_path}")
+    plan_path = knowledge_dir / "plan.json"
+    if not plan_path.exists():
+        build_knowledge_plan(run_dir, out_dir=knowledge_dir, metadata_prior="auto")
+    plan = _read_json(plan_path)
+    answers = answers_path.read_text(encoding="utf-8")
+    review = parse_user_review_answers(answers)
+    reviewed_plan = _apply_review_to_plan(plan, review)
+    review_path = knowledge_dir / "user-review.json"
+    reference_prior_path = knowledge_dir / "reference-prior.json"
+    review_path.write_text(json.dumps(reviewed_plan["user_review"], ensure_ascii=False, indent=2), encoding="utf-8")
+    if reviewed_plan.get("reference_prior"):
+        reference_prior_path.write_text(
+            json.dumps(reviewed_plan["reference_prior"], ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    plan_path.write_text(json.dumps(reviewed_plan, ensure_ascii=False, indent=2), encoding="utf-8")
+    markdown_path = knowledge_dir / "plan.md"
+    markdown_path.write_text(_render_plan_markdown(reviewed_plan), encoding="utf-8")
+    return {
+        "review": review_path,
+        "reference_prior": reference_prior_path,
+        "plan": plan_path,
+        "markdown": markdown_path,
+    }

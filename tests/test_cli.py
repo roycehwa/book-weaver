@@ -78,3 +78,13 @@ def test_public_cli_accepts_knowledge_metadata_command() -> None:
     assert args.knowledge_command == "metadata"
     assert str(args.run_dir) == "runs/sample"
     assert args.refresh is True
+
+
+def test_public_cli_accepts_knowledge_review_command() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["knowledge", "review", "runs/sample", "--answers", "answers.txt"])
+
+    assert args.command == "knowledge"
+    assert args.knowledge_command == "review"
+    assert str(args.run_dir) == "runs/sample"
+    assert str(args.answers) == "answers.txt"

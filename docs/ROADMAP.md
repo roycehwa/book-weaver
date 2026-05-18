@@ -128,6 +128,7 @@ book-weaver knowledge build RUN_DIR
 book-weaver knowledge suitability RUN_DIR
 book-weaver knowledge metadata RUN_DIR
 book-weaver knowledge plan RUN_DIR
+book-weaver knowledge review RUN_DIR --answers answers.txt
 book-weaver knowledge extract RUN_DIR --profile argumentative
 ```
 
@@ -171,6 +172,22 @@ book-weaver knowledge extract RUN_DIR --profile argumentative
 - `knowledge/metadata-prior.md`
 
 `book-weaver knowledge plan RUN_DIR --metadata-prior auto` 会读取或自动生成该先验，并将其作为弱信号加入网络模型评分。策略是 **metadata 只加权，不覆盖本地结构证据**。如果外部 API 失败，系统仍会用书名/文件名生成低权重先验，并继续本地 plan。
+
+`book-weaver knowledge review RUN_DIR --answers answers.txt` 已实现为一次性用户结构确认层。用户不编辑 JSON 或 Markdown，只提供一份自然语言答案文件，内容可包括：
+
+- 组织方式确认：如 `event_timeline_network + concept_network`。
+- 必须保留的内容类型：如 `appendix`、`glossary`、`chronology`、`illustrations`、`tables`。
+- 可以跳过的内容类型：如 `copyright`、`index`、`publisher pages`。
+- 用户提供的参考材料：书评、推荐语、出版社简介、课程 reading note、URL 或粘贴文本。
+
+输出：
+
+- `knowledge/user-review.json`
+- `knowledge/reference-prior.json`（如果用户提供参考材料）
+- 更新后的 `knowledge/plan.json`
+- 更新后的 `knowledge/plan.md`
+
+用户参考材料只作为 `reference_prior`，不能直接生成 accepted knowledge。后续抽取仍必须回到 `semantic-units.json` 找原书出处。
 
 ### 分支 B 的关键约束
 

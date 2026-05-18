@@ -11,6 +11,7 @@ from pdf_translator.guardrails import (
     ingest_pdf_guarded,
 )
 from pdf_translator.knowledge import (
+    apply_user_review,
     build_knowledge_package,
     build_knowledge_plan,
     build_metadata_prior,
@@ -317,6 +318,27 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["none", "auto"],
         help="Use cached or freshly searched book metadata as a weak planning prior.",
     )
+    knowledge_review = knowledge_sub.add_parser(
+        "review",
+        help="Apply one user-supplied structural review answer file to the knowledge plan.",
+    )
+    knowledge_review.add_argument(
+        "run_dir",
+        type=Path,
+        help="Path to a completed Phase A run containing book.json.",
+    )
+    knowledge_review.add_argument(
+        "--answers",
+        type=Path,
+        required=True,
+        help="Plain-text user answers covering organization, preserve/skip content types, and optional references.",
+    )
+    knowledge_review.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help="Optional output directory. Defaults to RUN_DIR/knowledge.",
+    )
     wiki_outline = knowledge_sub.add_parser(
         "wiki-outline",
         help="Write per-chapter Markdown stubs and index.md under a directory.",
@@ -501,6 +523,12 @@ def main() -> None:
                     metadata_prior=args.metadata_prior,
                 )
                 print(f"Plan candidates: {paths['candidates']}")
+                print(f"Plan JSON: {paths['plan']}")
+                print(f"Plan Markdown: {paths['markdown']}")
+            elif args.knowledge_command == "review":
+                paths = apply_user_review(args.run_dir, args.answers, out_dir=args.out)
+                print(f"User review: {paths['review']}")
+                print(f"Reference prior: {paths['reference_prior']}")
                 print(f"Plan JSON: {paths['plan']}")
                 print(f"Plan Markdown: {paths['markdown']}")
             elif args.knowledge_command == "wiki-outline":

@@ -4,12 +4,14 @@ from pathlib import Path
 import json
 
 from pdf_translator.knowledge import (
+    apply_user_review,
     build_knowledge_package,
     build_knowledge_plan,
     build_metadata_prior,
     build_suitability_report,
     emit_mindmap_mermaid_from_book,
     emit_wiki_outline_from_book,
+    parse_user_review_answers,
 )
 
 
@@ -434,3 +436,75 @@ def test_build_knowledge_plan_can_use_cached_metadata_prior(tmp_path: Path) -> N
     assert plan["metadata_prior"]["primary_network_model"] == "playbook_network"
     assert plan["algorithm_candidate"]["metadata_prior_mode"] == "auto"
     assert plan["algorithm_candidate"]["network_scores"]["playbook_network"] > 0
+
+
+def test_parse_user_review_answers_extracts_structural_inputs() -> None:
+    answers = """
+    组织方式：混合，偏 event_timeline_network + concept_network
+    必须保留：chronology, glossary, appendix, illustrations, tables
+    可以跳过：copyright, index, publisher pages
+    参考材料：
+    这本书的一篇书评认为它讨论民族祖先、文化遗产建构和地方竞争。
+    https://example.test/review
+    """
+
+    review = parse_user_review_answers(answers)
+
+    assert review["network_override"] == "event_timeline_network"
+    assert "concept_network" in review["secondary_network_models"]
+    assert {"chronology", "glossary", "appendix", "illustrations", "tables"}.issubset(
+        set(review["preserve_content_types"])
+    )
+    assert {"copyright", "index", "publisher_pages"}.issubset(set(review["skip_content_types"]))
+    assert len(review["references"]) == 2
+
+
+def test_apply_user_review_updates_plan_without_user_editing_json(tmp_path: Path) -> None:
+    run_dir = tmp_path / "Review Book"
+    run_dir.mkdir()
+    (run_dir / "book.json").write_text(
+        json.dumps(
+            {
+                "chapters": [
+                    {
+                        "index": 1,
+                        "title": "Chapter 1 Practical Guide",
+                        "markdown": "# Chapter 1 Practical Guide\n\nA guide with a tool.\n\nA practice.\n\nA case.\n\nAn action.\n",
+                    },
+                    {
+                        "index": 2,
+                        "title": "Appendix: Chronology",
+                        "markdown": "# Appendix: Chronology\n\n1900 event.\n\n1910 event.\n",
+                    },
+                    {"index": 3, "title": "Index", "markdown": "# Index\n\nA 1\n"},
+                ],
+                "assets": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    build_knowledge_plan(run_dir)
+    answers = tmp_path / "answers.txt"
+    answers.write_text(
+        """
+        organization: event_timeline_network
+        preserve: appendix, chronology
+        skip: index
+        references:
+        External review says the chronology is central context, not a throwaway appendix.
+        """,
+        encoding="utf-8",
+    )
+
+    paths = apply_user_review(run_dir, answers)
+    plan = json.loads(paths["plan"].read_text(encoding="utf-8"))
+    review = json.loads(paths["review"].read_text(encoding="utf-8"))
+    roles = {chapter["title"]: chapter["role"] for chapter in plan["final_plan"]["chapter_roles"]}
+    md = paths["markdown"].read_text(encoding="utf-8")
+
+    assert review["network_override"] == "event_timeline_network"
+    assert plan["final_plan"]["primary_network_model"] == "event_timeline_network"
+    assert roles["Appendix: Chronology"] == "preserve"
+    assert roles["Index"] == "skip"
+    assert (run_dir / "knowledge" / "reference-prior.json").exists()
+    assert "User Review" in md
