@@ -5,6 +5,7 @@ import json
 
 from pdf_translator.knowledge import (
     build_knowledge_package,
+    build_knowledge_plan,
     build_suitability_report,
     emit_mindmap_mermaid_from_book,
     emit_wiki_outline_from_book,
@@ -211,3 +212,137 @@ def test_build_suitability_report_flags_technical_visual_risk(tmp_path: Path) ->
     assert report["profile"] == "technical_lite"
     assert any(risk["risk"] == "visual_or_table_heavy" for risk in report["risks"])
     assert "automatic_formula_semantics" in report["do_not_extract"]
+
+
+def test_build_knowledge_plan_selects_argument_network(tmp_path: Path) -> None:
+    run_dir = tmp_path / "True Conservatism"
+    run_dir.mkdir()
+    (run_dir / "book.json").write_text(
+        json.dumps(
+            {
+                "chapters": [
+                    {"index": 1, "title": "Copyright Page", "markdown": "# Copyright Page\n\nCopyright.\n"},
+                    {
+                        "index": 2,
+                        "title": "1. Our Prejudices",
+                        "markdown": (
+                            "# 1. Our Prejudices\n\n"
+                            "This book argues that reason, theory, and humanity require a concept of judgment.\n\n"
+                            "The claim is developed through critique and evidence.\n\n"
+                            "However, the author contrasts this framework with liberal assumptions.\n\n"
+                            "Therefore the argument is about political philosophy and conservative thought.\n"
+                        ),
+                    },
+                    {
+                        "index": 3,
+                        "title": "2. The Sufficiency of Reason",
+                        "markdown": (
+                            "# 2. The Sufficiency of Reason\n\n"
+                            "The chapter develops a major claim about reason.\n\n"
+                            "It provides evidence and responds to objections.\n\n"
+                            "The concept of excellence is revised.\n\n"
+                            "The argument contrasts rival theories.\n"
+                        ),
+                    },
+                ],
+                "assets": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    paths = build_knowledge_plan(run_dir)
+    plan = json.loads(paths["plan"].read_text(encoding="utf-8"))
+    md = paths["markdown"].read_text(encoding="utf-8")
+
+    assert plan["final_plan"]["primary_network_model"] == "argument_network"
+    assert plan["final_plan"]["chapter_roles"][0]["role"] == "skip"
+    assert plan["final_plan"]["chapter_roles"][1]["role"] == "extract"
+    assert "claims" in md
+
+
+def test_build_knowledge_plan_selects_playbook_network_and_preserves_use_case_appendix(tmp_path: Path) -> None:
+    run_dir = tmp_path / "AI Use Cases for Diplomats"
+    run_dir.mkdir()
+    (run_dir / "book.json").write_text(
+        json.dumps(
+            {
+                "chapters": [
+                    {
+                        "index": 1,
+                        "title": "Chapter 1 AI and Consular Affairs: Optimizing Visa Services",
+                        "markdown": (
+                            "# Chapter 1 AI and Consular Affairs: Optimizing Visa Services\n\n"
+                            "This guide provides a practical AI use case for diplomats.\n\n"
+                            "- Step one: define the use case.\n\n"
+                            "- Step two: choose the tool.\n\n"
+                            "A case study explains the management practice.\n"
+                        ),
+                    },
+                    {
+                        "index": 2,
+                        "title": "Appendix A: 100 AI Use Cases for Diplomats",
+                        "markdown": (
+                            "# Appendix A: 100 AI Use Cases for Diplomats\n\n"
+                            "Use case 1 applies AI to consular operations.\n\n"
+                            "Use case 2 applies AI to economic affairs.\n\n"
+                            "Use case 3 applies AI to public affairs.\n"
+                        ),
+                    },
+                ],
+                "assets": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    paths = build_knowledge_plan(run_dir)
+    plan = json.loads(paths["plan"].read_text(encoding="utf-8"))
+    roles = {chapter["title"]: chapter["role"] for chapter in plan["final_plan"]["chapter_roles"]}
+
+    assert plan["final_plan"]["primary_network_model"] == "playbook_network"
+    assert roles["Appendix A: 100 AI Use Cases for Diplomats"] == "preserve"
+    assert "action" in plan["final_plan"]["recommended_extractors"]
+
+
+def test_build_knowledge_plan_selects_event_timeline_network(tmp_path: Path) -> None:
+    run_dir = tmp_path / "In Search of National Ancestors"
+    run_dir.mkdir()
+    (run_dir / "book.json").write_text(
+        json.dumps(
+            {
+                "chapters": [
+                    {
+                        "index": 1,
+                        "title": "2 Locating Religious Revivals in China",
+                        "markdown": (
+                            "# 2 Locating Religious Revivals in China\n\n"
+                            "The historical revival of ceremonies changed the place of heritage.\n\n"
+                            "The event involved local actors and a ceremony around ancestors.\n\n"
+                            "This chapter explains time, place, and cultural identity.\n\n"
+                            "The historical narrative links the revival to later practices.\n"
+                        ),
+                    },
+                    {
+                        "index": 2,
+                        "title": "3 The Search for a Common Ancestor",
+                        "markdown": (
+                            "# 3 The Search for a Common Ancestor\n\n"
+                            "The chapter follows a historical search for ancestor ceremonies.\n\n"
+                            "Actors used heritage branding in different places.\n\n"
+                            "The event sequence creates a timeline of cultural revival.\n\n"
+                            "The interpretation connects national identity and place.\n"
+                        ),
+                    },
+                ],
+                "assets": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    paths = build_knowledge_plan(run_dir)
+    plan = json.loads(paths["plan"].read_text(encoding="utf-8"))
+
+    assert plan["final_plan"]["primary_network_model"] == "event_timeline_network"
+    assert "event" in plan["final_plan"]["recommended_extractors"]

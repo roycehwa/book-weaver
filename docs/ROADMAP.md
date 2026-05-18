@@ -126,6 +126,7 @@ flowchart TB
 ```bash
 book-weaver knowledge build RUN_DIR
 book-weaver knowledge suitability RUN_DIR
+book-weaver knowledge plan RUN_DIR
 book-weaver knowledge extract RUN_DIR --profile argumentative
 ```
 
@@ -145,6 +146,23 @@ book-weaver knowledge extract RUN_DIR --profile argumentative
 - `knowledge/suitability.md`
 
 它会判断 profile、网络化适用性、推荐输出、可抽取对象、风险和逐章处理动作。后续可在这个基础上加入低成本模型判断，但用户验收优先看 `suitability.md`。
+
+`book-weaver knowledge plan RUN_DIR` 已实现为真正的网络组织计划器。当前版本是规则版，不调用模型，默认写入：
+
+- `knowledge/plan-candidates.json`
+- `knowledge/plan.json`
+- `knowledge/plan.md`
+
+它不会只判断“书籍类型”，而是选择知识网络组织模型：
+
+- `argument_network`
+- `concept_network`
+- `event_timeline_network`
+- `playbook_network`
+- `narrative_network`
+- `faceted_index_network`
+
+`plan.md` 是主要人工验收物。它必须说明主网络模型、二级分支模板、候选顶层节点、逐章角色、抽取对象和质量门槛。模型仲裁层预留在 `plan.json.planner` 中，后续可加入 MiniMax 等低成本模型，但模型不能绕过 schema 或直接成为最终图谱。
 
 ### 分支 B 的关键约束
 

@@ -57,3 +57,13 @@ def test_public_cli_accepts_knowledge_suitability_command() -> None:
     assert args.command == "knowledge"
     assert args.knowledge_command == "suitability"
     assert str(args.run_dir) == "runs/sample"
+
+
+def test_public_cli_accepts_knowledge_plan_command() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["knowledge", "plan", "runs/sample"])
+
+    assert args.command == "knowledge"
+    assert args.knowledge_command == "plan"
+    assert str(args.run_dir) == "runs/sample"
+    assert args.planner == "rule"

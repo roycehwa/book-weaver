@@ -12,6 +12,7 @@ from pdf_translator.guardrails import (
 )
 from pdf_translator.knowledge import (
     build_knowledge_package,
+    build_knowledge_plan,
     build_suitability_report,
     emit_mindmap_mermaid_from_book,
     emit_wiki_outline_from_book,
@@ -262,6 +263,27 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional output directory. Defaults to RUN_DIR/knowledge.",
     )
+    knowledge_plan = knowledge_sub.add_parser(
+        "plan",
+        help="Generate a network-oriented processing plan before knowledge extraction.",
+    )
+    knowledge_plan.add_argument(
+        "run_dir",
+        type=Path,
+        help="Path to a completed Phase A run containing book.json.",
+    )
+    knowledge_plan.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help="Optional output directory. Defaults to RUN_DIR/knowledge.",
+    )
+    knowledge_plan.add_argument(
+        "--planner",
+        default="rule",
+        choices=["rule"],
+        help="Planning backend. rule is deterministic; model adjudication will be added behind the same schema.",
+    )
     wiki_outline = knowledge_sub.add_parser(
         "wiki-outline",
         help="Write per-chapter Markdown stubs and index.md under a directory.",
@@ -429,6 +451,11 @@ def main() -> None:
                 paths = build_suitability_report(args.run_dir, out_dir=args.out)
                 print(f"Suitability report: {paths['report']}")
                 print(f"Suitability Markdown: {paths['markdown']}")
+            elif args.knowledge_command == "plan":
+                paths = build_knowledge_plan(args.run_dir, out_dir=args.out, planner=args.planner)
+                print(f"Plan candidates: {paths['candidates']}")
+                print(f"Plan JSON: {paths['plan']}")
+                print(f"Plan Markdown: {paths['markdown']}")
             elif args.knowledge_command == "wiki-outline":
                 book_path = args.book_json.expanduser().resolve()
                 book = load_book_json(book_path)

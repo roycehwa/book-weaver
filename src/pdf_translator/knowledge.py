@@ -425,6 +425,62 @@ PROFILE_DEFINITIONS: dict[str, dict[str, list[str]]] = {
 }
 
 
+NETWORK_MODELS: dict[str, dict[str, Any]] = {
+    "argument_network": {
+        "label": "Argument Network",
+        "description": "organize the book around questions, positions, claims, evidence, objections, and responses",
+        "top_level_node_kinds": ["question", "position", "major_claim"],
+        "second_level_branch_kinds": ["evidence", "counterclaim", "response", "concept"],
+        "recommended_extractors": ["concept", "claim", "evidence", "counterclaim", "theory_relation"],
+    },
+    "concept_network": {
+        "label": "Concept Network",
+        "description": "organize the book around focus questions, core concepts, sub-concepts, and typed propositions",
+        "top_level_node_kinds": ["focus_question", "core_concept"],
+        "second_level_branch_kinds": ["definition", "sub_concept", "contrast", "application"],
+        "recommended_extractors": ["concept", "term", "definition", "proposition", "concept_relation"],
+    },
+    "event_timeline_network": {
+        "label": "Event Timeline Network",
+        "description": "organize the book around events, time, actors, places, and causal or temporal links",
+        "top_level_node_kinds": ["period", "event_cluster", "actor"],
+        "second_level_branch_kinds": ["event", "cause", "effect", "place", "interpretation"],
+        "recommended_extractors": ["actor", "event", "time", "place", "causal_link", "temporal_link"],
+    },
+    "playbook_network": {
+        "label": "Playbook Network",
+        "description": "organize the book around goals, principles, frameworks, steps, cases, and actions",
+        "top_level_node_kinds": ["goal", "framework", "domain_area"],
+        "second_level_branch_kinds": ["principle", "step", "case", "action", "warning"],
+        "recommended_extractors": ["framework", "principle", "step", "rule", "case", "action", "anti_pattern"],
+    },
+    "narrative_network": {
+        "label": "Narrative Network",
+        "description": "organize the book around characters, scenes, events, relationship changes, conflicts, and themes",
+        "top_level_node_kinds": ["character", "plot_arc", "theme"],
+        "second_level_branch_kinds": ["scene", "event", "relationship_change", "conflict", "motif"],
+        "recommended_extractors": ["character", "scene", "event", "relationship_state", "conflict", "theme", "motif"],
+    },
+    "faceted_index_network": {
+        "label": "Faceted Index Network",
+        "description": "organize the book through multiple entry dimensions such as topic, person, place, time, method, and case",
+        "top_level_node_kinds": ["topic", "person", "place", "time", "method", "case"],
+        "second_level_branch_kinds": ["chapter_reference", "definition", "example", "related_topic"],
+        "recommended_extractors": ["topic", "entity", "term", "case", "cross_reference", "source_pointer"],
+    },
+}
+
+
+NETWORK_TO_PROFILE: dict[str, str] = {
+    "argument_network": "argumentative",
+    "concept_network": "textbook",
+    "event_timeline_network": "historical",
+    "playbook_network": "practical",
+    "narrative_network": "narrative",
+    "faceted_index_network": "technical_lite",
+}
+
+
 APPARATUS_TITLE_RE = re.compile(
     r"\b("
     r"contents|copyright|dedication|acknowledg|preface|notes?|references|bibliography|index|glossary|appendix|"
@@ -463,6 +519,333 @@ def _score_profiles(chapters: list[dict[str, Any]], units: list[dict[str, Any]])
     if re.search(r"\bI\s+argue\b|\bthis book argues\b|\bwe argue\b", combined, re.IGNORECASE):
         scores["argumentative"] += 8
     return scores
+
+
+def _chapter_text_sample(chapter_id: str, units: list[dict[str, Any]], max_units: int = 8) -> str:
+    blocks: list[str] = []
+    for unit in units:
+        if unit.get("chapter_id") != chapter_id:
+            continue
+        text = str(unit.get("text_translated") or unit.get("text_original") or "").strip()
+        if text:
+            blocks.append(text)
+        if len(blocks) >= max_units:
+            break
+    return "\n".join(blocks)
+
+
+def _global_text(chapters: list[dict[str, Any]], units: list[dict[str, Any]], max_units: int = 360) -> str:
+    title_text = "\n".join(str(chapter.get("title") or "") for chapter in chapters)
+    body_text = "\n".join(
+        str(unit.get("text_translated") or unit.get("text_original") or "") for unit in units[:max_units]
+    )
+    return f"{title_text}\n{body_text}"
+
+
+def _score_network_models(chapters: list[dict[str, Any]], units: list[dict[str, Any]], run_dir: Path) -> dict[str, int]:
+    text = _global_text(chapters, units)
+    lowered = f"{run_dir.name}\n{text}".lower()
+    scores = {model: 0 for model in NETWORK_MODELS}
+
+    argument_terms = [
+        "argue",
+        "argument",
+        "claim",
+        "conservative",
+        "liberal",
+        "theory",
+        "critique",
+        "reason",
+        "humanity",
+        "justice",
+        "democracy",
+        "freedom",
+        "ethics",
+        "philosophy",
+        "concept",
+        "论证",
+        "主张",
+        "概念",
+        "理论",
+        "批判",
+        "民主",
+        "自由",
+    ]
+    concept_terms = [
+        "concept",
+        "definition",
+        "framework",
+        "taxonomy",
+        "model",
+        "knowledge",
+        "heritage",
+        "identity",
+        "culture",
+        "religious",
+        "discourse",
+        "术语",
+        "定义",
+        "框架",
+        "模型",
+        "身份",
+        "文化",
+    ]
+    event_terms = [
+        "history",
+        "historical",
+        "war",
+        "empire",
+        "revolution",
+        "century",
+        "dynasty",
+        "ceremony",
+        "revival",
+        "ancestor",
+        "place",
+        "migration",
+        "timeline",
+        "历史",
+        "战争",
+        "世纪",
+        "仪式",
+        "祖先",
+    ]
+    playbook_terms = [
+        "use case",
+        "case study",
+        "how to",
+        "guide",
+        "applying",
+        "tool",
+        "platform",
+        "strategy",
+        "step",
+        "checklist",
+        "practice",
+        "capacity",
+        "leadership",
+        "management",
+        "operations",
+        "ai use cases",
+        "用例",
+        "指南",
+        "步骤",
+        "工具",
+        "实践",
+    ]
+    narrative_terms = [
+        "novel",
+        "story",
+        "character",
+        "scene",
+        "plot",
+        "fiction",
+        "narrator",
+        "dialogue",
+        "memoir",
+        "小说",
+        "人物",
+        "场景",
+        "情节",
+    ]
+    faceted_terms = [
+        "glossary",
+        "appendix",
+        "index",
+        "reference",
+        "handbook",
+        "encyclopedia",
+        "dictionary",
+        "catalog",
+        "术语表",
+        "附录",
+        "索引",
+    ]
+
+    scores["argument_network"] += _count_keyword_hits(lowered, argument_terms)
+    scores["concept_network"] += _count_keyword_hits(lowered, concept_terms)
+    scores["event_timeline_network"] += _count_keyword_hits(lowered, event_terms)
+    scores["playbook_network"] += _count_keyword_hits(lowered, playbook_terms)
+    scores["narrative_network"] += _count_keyword_hits(lowered, narrative_terms)
+    scores["faceted_index_network"] += _count_keyword_hits(lowered, faceted_terms)
+
+    chapter_titles = "\n".join(str(ch.get("title") or "") for ch in chapters).lower()
+    if re.search(r"\bchapter\s+\d+.*\b(ai|tool|use|case|management|operations|security|capacity)\b", chapter_titles):
+        scores["playbook_network"] += 35
+    if re.search(r"\b(our|the)\s+(prejudices|sovereignty|sufficiency|reason|excellence)\b", chapter_titles):
+        scores["argument_network"] += 35
+    if re.search(r"\b(ceremon|ancestor|heritage|historical narratives|revivals?)\b", chapter_titles):
+        scores["event_timeline_network"] += 28
+        scores["concept_network"] += 12
+    if "100 ai use cases" in chapter_titles:
+        scores["playbook_network"] += 40
+        scores["faceted_index_network"] += 15
+
+    list_count = sum(1 for unit in units if unit.get("kind") == "list")
+    table_image_count = sum(1 for unit in units if unit.get("kind") in {"table", "image"})
+    total_units = max(len(units), 1)
+    if list_count / total_units > 0.10:
+        scores["playbook_network"] += 12
+        scores["concept_network"] += 6
+    if table_image_count / total_units > 0.15:
+        scores["faceted_index_network"] += 10
+
+    return scores
+
+
+def _confidence_from_network_scores(scores: dict[str, int]) -> float:
+    ordered = sorted(scores.values(), reverse=True)
+    if not ordered or ordered[0] <= 0:
+        return 0.35
+    top = ordered[0]
+    second = ordered[1] if len(ordered) > 1 else 0
+    return round(min(0.94, 0.46 + ((top - second) / max(top, 1)) * 0.34 + min(top, 60) / 300), 2)
+
+
+def _network_action_for_chapter(chapter: dict[str, Any], units: list[dict[str, Any]]) -> tuple[str, list[str]]:
+    action, reasons = _chapter_action(chapter, units)
+    title = str(chapter.get("title") or "")
+    lower_title = title.lower()
+    chapter_units = [unit for unit in units if unit.get("chapter_id") == chapter.get("chapter_id")]
+    paragraph_count = sum(1 for unit in chapter_units if unit.get("kind") == "paragraph")
+    unit_count = len(chapter_units)
+
+    hard_skip = re.search(
+        r"\b(cover|copyright|dedication|contents|table of contents|title page|imprints? page|index|references|bibliography)\b",
+        lower_title,
+    )
+    if hard_skip:
+        return "skip", ["front_back_matter_or_navigation"]
+    if re.search(r"\b(notes?|acknowledg(e)?ments?)\b", lower_title):
+        return "preserve", ["apparatus_preserve_for_reference"]
+    if re.search(r"\b(glossary|appendix)\b", lower_title):
+        if paragraph_count >= 3 or "use case" in lower_title or "terms" in lower_title:
+            return "preserve", ["structured_reference_material"]
+        return "summarize", ["appendix_short_or_low_body_text"]
+    if paragraph_count >= 4:
+        return "extract", ["main_body_chapter"]
+    if paragraph_count >= 2:
+        return "summarize", ["short_body_section"]
+    if unit_count and action != "skip":
+        return "summarize", ["limited_text_section"]
+    return action, reasons
+
+
+def _planned_chapters(chapters: list[dict[str, Any]], units: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    planned: list[dict[str, Any]] = []
+    for chapter in chapters:
+        action, reasons = _network_action_for_chapter(chapter, units)
+        chapter_units = [unit for unit in units if unit.get("chapter_id") == chapter.get("chapter_id")]
+        planned.append(
+            {
+                "chapter_id": chapter.get("chapter_id"),
+                "index": chapter.get("index"),
+                "title": chapter.get("title"),
+                "role": action,
+                "reasons": reasons,
+                "unit_count": len(chapter_units),
+                "paragraph_count": sum(1 for unit in chapter_units if unit.get("kind") == "paragraph"),
+                "visual_or_table_count": sum(1 for unit in chapter_units if unit.get("kind") in {"image", "table"}),
+                "page_start": chapter.get("page_start"),
+                "page_end": chapter.get("page_end"),
+            }
+        )
+    return planned
+
+
+def _candidate_top_level_nodes(
+    primary_network_model: str,
+    chapters: list[dict[str, Any]],
+    units: list[dict[str, Any]],
+    planned_chapters: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    eligible = [chapter for chapter in planned_chapters if chapter["role"] == "extract"]
+    nodes: list[dict[str, Any]] = []
+    model = primary_network_model
+
+    if model == "playbook_network":
+        for chapter in eligible[:12]:
+            title = str(chapter["title"])
+            label = re.sub(r"^chapter\s+\d+\s*", "", title, flags=re.IGNORECASE)
+            nodes.append(
+                {
+                    "node_id": f"n-{int(chapter['index']):03d}",
+                    "label": label,
+                    "kind": "domain_area",
+                    "source_chapters": [chapter["chapter_id"]],
+                    "second_level_branch_template": ["principles", "steps", "cases", "actions", "risks"],
+                }
+            )
+    elif model == "event_timeline_network":
+        for chapter in eligible[:12]:
+            title = str(chapter["title"])
+            nodes.append(
+                {
+                    "node_id": f"n-{int(chapter['index']):03d}",
+                    "label": title,
+                    "kind": "event_cluster",
+                    "source_chapters": [chapter["chapter_id"]],
+                    "second_level_branch_template": ["events", "actors", "places", "causes", "interpretations"],
+                }
+            )
+    elif model == "argument_network":
+        for chapter in eligible[:12]:
+            title = str(chapter["title"])
+            sample = _chapter_text_sample(str(chapter["chapter_id"]), units, max_units=4)
+            kind = "question" if "?" in title else "major_claim"
+            label = title if title else sample[:80]
+            nodes.append(
+                {
+                    "node_id": f"n-{int(chapter['index']):03d}",
+                    "label": label,
+                    "kind": kind,
+                    "source_chapters": [chapter["chapter_id"]],
+                    "second_level_branch_template": ["claims", "evidence", "objections", "responses", "concepts"],
+                }
+            )
+    elif model == "concept_network":
+        concept_titles = [chapter for chapter in eligible if len(str(chapter["title"])) <= 90] or eligible
+        for chapter in concept_titles[:12]:
+            nodes.append(
+                {
+                    "node_id": f"n-{int(chapter['index']):03d}",
+                    "label": str(chapter["title"]),
+                    "kind": "core_concept",
+                    "source_chapters": [chapter["chapter_id"]],
+                    "second_level_branch_template": ["definitions", "sub_concepts", "contrasts", "applications"],
+                }
+            )
+    elif model == "narrative_network":
+        for chapter in eligible[:12]:
+            nodes.append(
+                {
+                    "node_id": f"n-{int(chapter['index']):03d}",
+                    "label": str(chapter["title"]),
+                    "kind": "plot_arc",
+                    "source_chapters": [chapter["chapter_id"]],
+                    "second_level_branch_template": ["scenes", "events", "characters", "relationship_changes", "themes"],
+                }
+            )
+    else:
+        facets = [
+            ("topic", "Topic Index"),
+            ("person", "People / Organizations"),
+            ("place", "Places"),
+            ("time", "Time / Periods"),
+            ("method", "Methods / Frameworks"),
+            ("case", "Cases / Examples"),
+        ]
+        for idx, (kind, label) in enumerate(facets, start=1):
+            nodes.append(
+                {
+                    "node_id": f"n-{idx:03d}",
+                    "label": label,
+                    "kind": kind,
+                    "source_chapters": [chapter["chapter_id"] for chapter in eligible],
+                    "second_level_branch_template": ["entries", "aliases", "source_chapters", "related_entries"],
+                }
+            )
+    return nodes
 
 
 def _confidence_from_scores(scores: dict[str, int]) -> float:
@@ -672,4 +1055,196 @@ def build_suitability_report(run_dir: Path, out_dir: Path | None = None) -> dict
     }
     paths["report"].write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     paths["markdown"].write_text(_render_suitability_markdown(report), encoding="utf-8")
+    return paths
+
+
+def _render_plan_markdown(plan: dict[str, Any]) -> str:
+    candidate = plan["algorithm_candidate"]
+    final = plan["final_plan"]
+    model = NETWORK_MODELS[final["primary_network_model"]]
+    lines = [
+        "# Knowledge Plan",
+        "",
+        "## Decision",
+        "",
+        f"- Primary network model: `{final['primary_network_model']}`",
+        f"- Model label: {model['label']}",
+        f"- Confidence: `{final['confidence']}`",
+        f"- Secondary network models: {', '.join(f'`{m}`' for m in final['secondary_network_models']) or 'none'}",
+        f"- Planner mode: `{plan['planner']['mode']}`",
+        "",
+        "## Why This Network",
+        "",
+        final["rationale"],
+        "",
+        "## Network Shape",
+        "",
+        f"- Description: {model['description']}",
+        f"- Top-level node kinds: {', '.join(f'`{item}`' for item in model['top_level_node_kinds'])}",
+        f"- Second-level branch kinds: {', '.join(f'`{item}`' for item in model['second_level_branch_kinds'])}",
+        "",
+        "## Candidate Top-Level Nodes",
+        "",
+        "| Node | Kind | Source Chapters | Branch Template |",
+        "| --- | --- | --- | --- |",
+    ]
+    for node in final["top_level_nodes"]:
+        chapters = ", ".join(str(ch) for ch in node.get("source_chapters", []))
+        branches = ", ".join(str(branch) for branch in node.get("second_level_branch_template", []))
+        label = str(node["label"]).replace("|", "\\|")
+        lines.append(f"| {label} | `{node['kind']}` | {chapters} | {branches} |")
+
+    lines.extend(
+        [
+            "",
+            "## Chapter Roles",
+            "",
+            "| # | Title | Role | Reason | Units | Pages |",
+            "| --- | --- | --- | --- | --- | --- |",
+        ]
+    )
+    for chapter in final["chapter_roles"]:
+        title = str(chapter["title"]).replace("|", "\\|")
+        pages = ""
+        if chapter.get("page_start") is not None:
+            pages = str(chapter["page_start"])
+            if chapter.get("page_end") and chapter["page_end"] != chapter["page_start"]:
+                pages += f"-{chapter['page_end']}"
+        lines.append(
+            "| "
+            f"{chapter['index']} | {title} | `{chapter['role']}` | "
+            f"{', '.join(chapter['reasons'])} | {chapter['unit_count']} | {pages} |"
+        )
+
+    lines.extend(["", "## Extraction Objects", ""])
+    for item in final["recommended_extractors"]:
+        lines.append(f"- `{item}`")
+
+    lines.extend(["", "## Quality Gates", ""])
+    for gate in plan["quality_gates"]:
+        lines.append(f"- `{gate['gate']}`: {gate['expectation']}")
+
+    lines.extend(["", "## Algorithm Scores", ""])
+    for name, score in sorted(candidate["network_scores"].items(), key=lambda item: item[1], reverse=True):
+        lines.append(f"- `{name}`: {score}")
+
+    lines.extend(["", "## Next Command", "", f"```bash\n{final['next_command']}\n```", ""])
+    return "\n".join(lines)
+
+
+def build_knowledge_plan(run_dir: Path, out_dir: Path | None = None, planner: str = "rule") -> dict[str, Path]:
+    """Build a network-oriented Phase B processing plan.
+
+    The current planner is algorithmic. The output shape reserves an LLM adjudication layer so
+    future model-backed planning can be added without changing downstream consumers.
+    """
+    run_dir = run_dir.expanduser().resolve()
+    knowledge_dir = (out_dir.expanduser().resolve() if out_dir else run_dir / "knowledge")
+    if planner != "rule":
+        raise ValueError("Only planner='rule' is implemented. Model adjudication will be added behind this schema.")
+    if not (knowledge_dir / "semantic-units.json").exists() or not (knowledge_dir / "chapters.json").exists():
+        build_knowledge_package(run_dir, out_dir=knowledge_dir)
+
+    chapters = _read_json_list(knowledge_dir / "chapters.json")
+    units = _read_json_list(knowledge_dir / "semantic-units.json")
+    if not chapters:
+        raise ValueError(f"No chapters found in {knowledge_dir / 'chapters.json'}")
+
+    if not (knowledge_dir / "suitability-report.json").exists():
+        build_suitability_report(run_dir, out_dir=knowledge_dir)
+    suitability = _read_json(knowledge_dir / "suitability-report.json")
+
+    network_scores = _score_network_models(chapters, units, run_dir)
+    ranked_models = sorted(network_scores.items(), key=lambda item: item[1], reverse=True)
+    primary_network_model = ranked_models[0][0] if ranked_models and ranked_models[0][1] > 0 else "faceted_index_network"
+    confidence = _confidence_from_network_scores(network_scores)
+    secondary_models = [name for name, score in ranked_models[1:3] if score > 0]
+    chapter_roles = _planned_chapters(chapters, units)
+    top_level_nodes = _candidate_top_level_nodes(primary_network_model, chapters, units, chapter_roles)
+    network_definition = NETWORK_MODELS[primary_network_model]
+    extract_count = sum(1 for chapter in chapter_roles if chapter["role"] == "extract")
+    preserve_count = sum(1 for chapter in chapter_roles if chapter["role"] == "preserve")
+    skip_count = sum(1 for chapter in chapter_roles if chapter["role"] == "skip")
+    rationale = (
+        f"The algorithm selected `{primary_network_model}` because it has the highest network score "
+        f"({network_scores[primary_network_model]}). The plan uses this as the organizing skeleton, "
+        f"then assigns chapter roles from structure and content signals rather than profile alone. "
+        f"Current role counts: extract={extract_count}, preserve={preserve_count}, skip={skip_count}."
+    )
+    if primary_network_model == "playbook_network":
+        rationale += " The book appears organized around domains, use cases, tools, steps, or practical application."
+    elif primary_network_model == "argument_network":
+        rationale += " The book appears organized around claims, concepts, positions, and argumentative development."
+    elif primary_network_model == "event_timeline_network":
+        rationale += " The book appears organized around historical development, events, actors, places, or temporal change."
+    elif primary_network_model == "concept_network":
+        rationale += " The book appears organized around concepts, definitions, frameworks, and explanatory relations."
+    elif primary_network_model == "faceted_index_network":
+        rationale += " The book appears better served by multiple entry facets than by a single linear skeleton."
+
+    candidate = {
+        "schema": "book_weaver_plan_candidate_v1",
+        "planner": "rule",
+        "network_scores": network_scores,
+        "ranked_network_models": [{"model": name, "score": score} for name, score in ranked_models],
+        "primary_network_model": primary_network_model,
+        "secondary_network_models": secondary_models,
+        "confidence": confidence,
+        "profile_hint": suitability.get("profile"),
+        "chapter_roles": chapter_roles,
+        "top_level_nodes": top_level_nodes,
+        "rationale": rationale,
+    }
+    final_plan = {
+        "primary_network_model": primary_network_model,
+        "secondary_network_models": secondary_models,
+        "confidence": confidence,
+        "rationale": rationale,
+        "top_level_nodes": top_level_nodes,
+        "chapter_roles": chapter_roles,
+        "recommended_extractors": network_definition["recommended_extractors"],
+        "next_command": f"book-weaver knowledge extract {run_dir} --network-model {primary_network_model}",
+    }
+    plan = {
+        "schema": "book_weaver_knowledge_plan_v1",
+        "run_dir": str(run_dir),
+        "source": {
+            "knowledge_manifest": str(knowledge_dir / "manifest.json"),
+            "suitability_report": str(knowledge_dir / "suitability-report.json"),
+        },
+        "planner": {
+            "mode": planner,
+            "llm_adjudication": None,
+            "policy": "algorithm controls structure and validation; model adjudication may later propose changes but cannot bypass schema",
+        },
+        "algorithm_candidate": candidate,
+        "final_plan": final_plan,
+        "quality_gates": [
+            {
+                "gate": "network_model_human_check",
+                "expectation": "the selected network model must match the book's organizing logic, not just its subject words",
+            },
+            {
+                "gate": "chapter_role_human_check",
+                "expectation": "main body chapters should not be skipped; front/back matter should not be deep-extracted",
+            },
+            {
+                "gate": "top_level_node_check",
+                "expectation": "top-level nodes should form a two-to-three-level usable network skeleton",
+            },
+            {
+                "gate": "provenance_check",
+                "expectation": "all future extracted nodes must cite chapter_id and semantic unit evidence",
+            },
+        ],
+    }
+
+    paths = {
+        "candidates": knowledge_dir / "plan-candidates.json",
+        "plan": knowledge_dir / "plan.json",
+        "markdown": knowledge_dir / "plan.md",
+    }
+    paths["candidates"].write_text(json.dumps(candidate, ensure_ascii=False, indent=2), encoding="utf-8")
+    paths["plan"].write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
+    paths["markdown"].write_text(_render_plan_markdown(plan), encoding="utf-8")
     return paths
