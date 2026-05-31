@@ -85,4 +85,10 @@ def test_pipeline_skips_translation_for_chinese_source(
     assert manifest["translation_mode"] == "skipped_same_language"
     assert manifest["translator"] == "skipped"
     assert manifest["chunk_count"] == 0
+    assert "segments" in manifest["files"]
+    assert "translated_segments" in manifest["files"]
+    assert "review_items" in manifest["files"]
+    assert "review_state" in manifest["files"]
+    review_items = __import__("json").loads(Path(manifest["files"]["review_items"]).read_text(encoding="utf-8"))
+    assert review_items["schema"] == "translation_review_items_v1"
     assert artifacts.translated_markdown_path.read_text(encoding="utf-8") == "# 第一章\n\n正文。\n"

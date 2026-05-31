@@ -60,3 +60,27 @@ def test_public_cli_accepts_agent_once_command() -> None:
     assert args.translator == "mock"
     assert args.no_polish is True
     assert args.source_lanes == ["CN"]
+
+
+def test_public_cli_accepts_review_export_command() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "review-export",
+            "runs/sample",
+            "--version",
+            "v2",
+            "--target-lang",
+            "zh-CN",
+            "--format",
+            "both",
+            "--parent-version",
+            "v1",
+        ]
+    )
+
+    assert args.command == "review-export"
+    assert str(args.run_dir) == "runs/sample"
+    assert args.version == "v2"
+    assert args.format == "both"
+    assert args.parent_version == "v1"
