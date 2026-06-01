@@ -94,6 +94,17 @@ def _chunk_cache_path(cache_dir: Path, chunk: TranslationChunk) -> Path:
     return cache_dir / f"chunk-{chunk.index:06d}-{digest}.md"
 
 
+def _read_chunk_cache(cache_dir: Path, chunk: TranslationChunk) -> str:
+    """Return cached translation for a chunk, falling back to index-only filenames."""
+    cache_path = _chunk_cache_path(cache_dir, chunk)
+    if cache_path.exists():
+        return cache_path.read_text(encoding="utf-8").strip()
+    matches = sorted(cache_dir.glob(f"chunk-{chunk.index:06d}-*.md"))
+    if len(matches) == 1:
+        return matches[0].read_text(encoding="utf-8").strip()
+    return ""
+
+
 def _ascii_letter_count(text: str) -> int:
     return sum(1 for char in text if char.isascii() and char.isalpha())
 

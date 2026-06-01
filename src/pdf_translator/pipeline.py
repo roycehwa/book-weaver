@@ -314,6 +314,8 @@ def run_translation_pipeline(settings: RunSettings) -> PipelineArtifacts:
             translated_markdown=translated.translated_markdown,
             translated_chapters=translated_chapters,
         ),
+        cache_dir=translation_cache_dir if translation_cache_dir.exists() else None,
+        max_chunk_chars=settings.max_chunk_chars,
     )
     extra_files.update(write_review_artifacts(output_dir, review_artifacts))
     rendered_files: dict[str, str] = {}

@@ -84,3 +84,24 @@ def test_public_cli_accepts_review_export_command() -> None:
     assert args.version == "v2"
     assert args.format == "both"
     assert args.parent_version == "v1"
+
+
+def test_public_cli_accepts_review_rewrite_command() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "review-rewrite",
+            "runs/sample",
+            "--target-lang",
+            "zh-CN",
+            "--source-lang",
+            "en",
+            "--translator",
+            "mock",
+        ]
+    )
+
+    assert args.command == "review-rewrite"
+    assert str(args.run_dir) == "runs/sample"
+    assert args.source_lang == "en"
+    assert args.translator == "mock"

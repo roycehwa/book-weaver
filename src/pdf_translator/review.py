@@ -7,6 +7,16 @@ import re
 from pathlib import Path
 from typing import Any
 
+from pdf_translator.models import TranslationChunk
+from pdf_translator.chunking import split_markdown_into_chunks
+from pdf_translator.translate import (
+    _chapter_markdown_for_translation,
+    _chunk_cache_path,
+    _is_preserved_apparatus_block,
+    _read_chunk_cache,
+    _split_markdown_media_segments,
+)
+
 
 SCHEMA_SEGMENTS = "translation_review_segments_v1"
 SCHEMA_TRANSLATED_SEGMENTS = "translation_review_translated_segments_v1"
@@ -29,6 +39,12 @@ ALLOWED_MIXED_LATIN_WORDS = {
     "press",
     "table",
 }
+MODEL_REFUSAL_PATTERNS = (
+    re.compile(r"未在消息中提供"),
+    re.compile(r"请提供.*(?:Markdown|markdown|文档)"),
+    re.compile(r"please provide.*markdown", re.I),
+    re.compile(r"no markdown (?:content|document)", re.I),
+)
 
 
 def utc_now() -> str:
@@ -134,6 +150,169 @@ def build_translated_segments(
             }
         )
     return translated_segments
+
+
+def build_aligned_review_segments(
+    book: dict[str, Any],
+    *,
+    source_path: Path,
+    target_language: str,
+    cache_dir: Path,
+    max_chunk_chars: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Pair source/translation segments using the same chunk boundaries as translate_book_chapters."""
+    source_segments: list[dict[str, Any]] = []
+    translated_segments: list[dict[str, Any]] = []
+    global_chunk_index = 0
+
+    for fallback_index, chapter in enumerate(book.get("chapters") or [], 1):
+        key = _chapter_key(chapter, fallback_index)
+        chapter_index = int(chapter.get("index") or fallback_index)
+        title = _chapter_title(chapter, fallback_index)
+        location = _segment_location(chapter)
+        chapter_source_markdown = _chapter_markdown_for_translation(chapter)
+        block_index = 0
+
+        def append_segment(source_text: str, translated_text: str) -> None:
+            nonlocal block_index
+            block_index += 1
+            segment_id = f"{key}:c{block_index:03d}"
+            base = {
+                "segment_id": segment_id,
+                "chapter_id": key,
+                "chapter_index": chapter_index,
+                "chapter_title": title,
+                "block_index": block_index,
+                "source_location": location,
+            }
+            source_segments.append(
+                {
+                    **base,
+                    "source_text": source_text,
+                    "source_path": str(source_path),
+                    "status": "pending",
+                }
+            )
+            translated_segments.append(
+                {
+                    **base,
+                    "translated_text": translated_text,
+                    "target_language": target_language,
+                    "status": "needs_review",
+                }
+            )
+
+        if not bool(chapter.get("translate", True)):
+            text = chapter_source_markdown.strip()
+            if text:
+                append_segment(text, text)
+            continue
+
+        media_segments = (
+            [("media", chapter_source_markdown.strip())]
+            if _is_preserved_apparatus_block(chapter_source_markdown)
+            else _split_markdown_media_segments(chapter_source_markdown)
+        )
+        for segment_kind, segment_markdown in media_segments:
+            text = segment_markdown.strip()
+            if not text:
+                continue
+            if segment_kind == "media":
+                continue
+            for chunk in split_markdown_into_chunks(text, max_chunk_chars):
+                translation_chunk = TranslationChunk(index=global_chunk_index, markdown=chunk.markdown)
+                translated_text = _read_chunk_cache(cache_dir, translation_chunk)
+                append_segment(chunk.markdown, translated_text)
+                global_chunk_index += 1
+
+    return _merge_reading_review_segments(source_segments, translated_segments)
+
+
+def _merge_reading_review_segments(
+    source_segments: list[dict[str, Any]],
+    translated_segments: list[dict[str, Any]],
+    *,
+    min_chars: int = 1500,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Merge adjacent translation chunks into longer reading units for human review."""
+    if not source_segments:
+        return [], []
+
+    translated_by_id = {segment["segment_id"]: segment for segment in translated_segments}
+    merged_source: list[dict[str, Any]] = []
+    merged_translated: list[dict[str, Any]] = []
+    block_index_by_chapter: dict[str, int] = defaultdict(int)
+
+    source_parts: list[str] = []
+    translated_parts: list[str] = []
+    part_ids: list[str] = []
+    active_chapter: dict[str, Any] | None = None
+
+    def flush() -> None:
+        nonlocal source_parts, translated_parts, part_ids, active_chapter
+        if not active_chapter or not source_parts:
+            return
+        chapter_id = str(active_chapter["chapter_id"])
+        block_index_by_chapter[chapter_id] += 1
+        block_index = block_index_by_chapter[chapter_id]
+        segment_id = f"{chapter_id}:r{block_index:03d}"
+        base = {
+            "segment_id": segment_id,
+            "chapter_id": chapter_id,
+            "chapter_index": active_chapter["chapter_index"],
+            "chapter_title": active_chapter["chapter_title"],
+            "block_index": block_index,
+            "source_location": active_chapter["source_location"],
+            "translation_part_ids": list(part_ids),
+        }
+        merged_source.append(
+            {
+                **base,
+                "source_text": "\n\n".join(source_parts),
+                "source_path": active_chapter["source_path"],
+                "status": "pending",
+            }
+        )
+        merged_translated.append(
+            {
+                **base,
+                "translated_text": "\n\n".join(part for part in translated_parts if part.strip()),
+                "target_language": active_chapter["target_language"],
+                "status": "needs_review",
+            }
+        )
+        source_parts = []
+        translated_parts = []
+        part_ids = []
+        active_chapter = None
+
+    for source in source_segments:
+        chapter_id = str(source["chapter_id"])
+        if active_chapter and chapter_id != str(active_chapter["chapter_id"]):
+            flush()
+
+        if active_chapter is None:
+            translated = translated_by_id.get(str(source["segment_id"]), {})
+            active_chapter = {
+                "chapter_id": chapter_id,
+                "chapter_index": source["chapter_index"],
+                "chapter_title": source["chapter_title"],
+                "source_location": source.get("source_location"),
+                "source_path": source.get("source_path"),
+                "target_language": translated.get("target_language"),
+            }
+
+        translated = translated_by_id.get(str(source["segment_id"]), {})
+        source_parts.append(str(source.get("source_text") or ""))
+        translated_parts.append(str(translated.get("translated_text") or ""))
+        part_ids.append(str(source["segment_id"]))
+
+        combined_len = sum(len(part) for part in source_parts)
+        if combined_len >= min_chars:
+            flush()
+
+    flush()
+    return merged_source, merged_translated
 
 
 def _ascii_letter_count(text: str) -> int:
@@ -255,24 +434,37 @@ def build_review_artifacts(
     target_language: str,
     book: dict[str, Any],
     translated_chapters: list[dict[str, Any]],
+    cache_dir: Path | None = None,
+    max_chunk_chars: int = 9000,
 ) -> dict[str, Any]:
-    segments = build_source_segments(book, source_path=source_path)
-    translated_segments = build_translated_segments(
-        segments,
-        translated_chapters,
-        target_language=target_language,
-    )
-    review_items = detect_review_items(segments, translated_segments, target_language=target_language)
+    if cache_dir is not None and cache_dir.exists():
+        segments, translated_segments_list = build_aligned_review_segments(
+            book,
+            source_path=source_path,
+            target_language=target_language,
+            cache_dir=cache_dir,
+            max_chunk_chars=max_chunk_chars,
+        )
+    else:
+        segments = build_source_segments(book, source_path=source_path)
+        translated_segments_list = build_translated_segments(
+            segments,
+            translated_chapters,
+            target_language=target_language,
+        )
+    review_items = detect_review_items(segments, translated_segments_list, target_language=target_language)
     return {
         "segments": {
             "schema": SCHEMA_SEGMENTS,
             "source_path": str(source_path),
+            "alignment": "reading_units" if cache_dir is not None and cache_dir.exists() else "paragraph_blocks",
             "segments": segments,
         },
         "translated_segments": {
             "schema": SCHEMA_TRANSLATED_SEGMENTS,
             "target_language": target_language,
-            "segments": translated_segments,
+            "alignment": "reading_units" if cache_dir is not None and cache_dir.exists() else "paragraph_blocks",
+            "segments": translated_segments_list,
         },
         "review_items": {
             "schema": SCHEMA_ITEMS,
@@ -309,13 +501,152 @@ def apply_review_state(translated_segments_payload: Any, review_state: dict[str,
         if not isinstance(decision, dict):
             continue
         approved_text = str(decision.get("approved_text") or "").strip()
-        if approved_text:
+        if approved_text and decision.get("status") in {"approved", "resolved"}:
             segment["translated_text"] = approved_text
         if decision.get("status"):
             segment["status"] = str(decision["status"])
         if decision.get("reviewer_comment"):
             segment["reviewer_comment"] = str(decision["reviewer_comment"])
     return segments
+
+
+def _rewrite_prompt(source_text: str, current_translation: str, reviewer_comment: str) -> str:
+    source = source_text.strip()
+    comment = reviewer_comment.strip()
+    current = current_translation.strip()
+    current_section = current if current else "(none — translate the source text from scratch)"
+    return (
+        "Rewrite this translation according to the reviewer instruction.\n"
+        "Return only the revised target-language text. Do not include explanations or placeholders.\n\n"
+        "SOURCE TEXT:\n"
+        f"{source}\n\n"
+        "CURRENT TRANSLATION:\n"
+        f"{current_section}\n\n"
+        "REVIEWER INSTRUCTION:\n"
+        f"{comment}"
+    )
+
+
+def _cjk_count(text: str) -> int:
+    return sum(1 for char in text if "\u4e00" <= char <= "\u9fff")
+
+
+def _looks_like_model_refusal(text: str) -> bool:
+    return any(pattern.search(text) for pattern in MODEL_REFUSAL_PATTERNS)
+
+
+def _translate_missing_segment(
+    *,
+    translator: Any,
+    index: int,
+    source_text: str,
+    reviewer_comment: str,
+    source_language: str | None,
+    target_language: str,
+) -> str:
+    source = source_text.strip()
+    if not source:
+        return ""
+    resolved_source_language = source_language or "en"
+    chunk = TranslationChunk(index=index, markdown=source)
+    candidate = translator.translate_chunk(
+        chunk=chunk,
+        source_language=resolved_source_language,
+        target_language=target_language,
+    ).strip()
+    if _is_valid_rewrite_candidate(source, candidate, target_language):
+        return candidate
+    if not reviewer_comment:
+        return candidate
+    retry_prompt = _rewrite_prompt(source, "", reviewer_comment)
+    return translator.translate_chunk(
+        TranslationChunk(index=index, markdown=retry_prompt),
+        source_language=resolved_source_language,
+        target_language=target_language,
+    ).strip()
+
+
+def _is_valid_rewrite_candidate(source_text: str, candidate: str, target_language: str) -> bool:
+    text = candidate.strip()
+    if not text:
+        return False
+    if _looks_like_model_refusal(text):
+        return False
+    normalized = text.lower().strip("[]")
+    if normalized in {"missing translation", "missing transalation"}:
+        return False
+    if target_language.lower().startswith("zh") and LATIN_WORD_RE.search(source_text):
+        if not CJK_RE.search(text):
+            return False
+        source_letters = sum(1 for char in source_text if char.isascii() and char.isalpha())
+        if source_letters >= 40 and _cjk_count(text) < max(12, source_letters // 8):
+            return False
+    return True
+
+
+def rewrite_review_requests(
+    *,
+    run_dir: Path,
+    translator: Any,
+    source_language: str | None,
+    target_language: str,
+) -> dict[str, Any]:
+    project = review_project_from_run(run_dir)
+    source_by_id = {segment["segment_id"]: segment for segment in project["segments"]}
+    translated_by_id = {segment["segment_id"]: segment for segment in project["translated_segments"]}
+    state = dict(project["review_state"])
+    decisions = state.setdefault("decisions", {})
+    rewritten_count = 0
+
+    for segment_id, decision in list(decisions.items()):
+        if not isinstance(decision, dict):
+            continue
+        if decision.get("action") != "model_rewrite" or decision.get("status") not in {"open", "requested"}:
+            continue
+        source = source_by_id.get(segment_id)
+        translated = translated_by_id.get(segment_id)
+        if source is None or translated is None:
+            continue
+        reviewer_comment = str(decision.get("reviewer_comment") or "").strip()
+        if not reviewer_comment:
+            continue
+        source_text = str(source.get("source_text") or "").strip()
+        current_translation = str(translated.get("translated_text") or "").strip()
+        if not source_text:
+            decision["rewrite_error"] = "Source text is empty; cannot model-rewrite this segment."
+            continue
+        if not current_translation:
+            candidate = _translate_missing_segment(
+                translator=translator,
+                index=rewritten_count,
+                source_text=source_text,
+                reviewer_comment=reviewer_comment,
+                source_language=source_language,
+                target_language=target_language,
+            )
+        else:
+            prompt = _rewrite_prompt(source_text, current_translation, reviewer_comment)
+            candidate = translator.translate_chunk(
+                TranslationChunk(index=rewritten_count, markdown=prompt),
+                source_language=source_language or "en",
+                target_language=target_language,
+            ).strip()
+        if not _is_valid_rewrite_candidate(source_text, candidate, target_language):
+            decision["rewrite_error"] = "Model returned an invalid rewrite candidate; segment remains open."
+            continue
+        decision.pop("rewrite_error", None)
+        decision["status"] = "candidate"
+        decision["approved_text"] = candidate
+        decision["model_generated_at"] = utc_now()
+        decision["model"] = getattr(translator, "name", "unknown")
+        rewritten_count += 1
+
+    state["updated_at"] = utc_now()
+    (run_dir / "review_state.json").write_text(
+        json.dumps(state, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return {"rewritten_count": rewritten_count, "review_state_path": str(run_dir / "review_state.json")}
 
 
 def translated_segments_to_markdown(translated_segments_payload: Any) -> str:

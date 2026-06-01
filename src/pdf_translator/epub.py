@@ -87,6 +87,17 @@ td, th {
   border: 1px solid #d1d5db;
   padding: 0.5rem;
   vertical-align: top;
+  word-break: break-word;
+}
+table.worksheet-table {
+  display: block;
+  overflow-x: auto;
+  font-size: 0.84rem;
+  line-height: 1.45;
+}
+table.worksheet-table td,
+table.worksheet-table th {
+  min-width: 7rem;
 }
 li {
   margin: 0.25rem 0 0.55rem;
@@ -156,8 +167,18 @@ def _markdown_to_body_html(markdown_text: str) -> str:
     markdown_text = RAW_HTML_TAG_RE.sub(lambda match: escape(match.group(0)), markdown_text)
     html = markdown(markdown_text, extensions=["tables", "fenced_code", "sane_lists"])
     soup = BeautifulSoup(html, "html.parser")
+    _annotate_worksheet_tables(soup)
     _compact_trailing_note_cluster(soup)
     return "".join(str(child) for child in soup.contents)
+
+
+def _annotate_worksheet_tables(soup: BeautifulSoup) -> None:
+    for table in soup.find_all("table"):
+        text = table.get_text(" ", strip=True)
+        if "□" in text or " ph#:" in text.lower() or text.count("________") >= 2:
+            classes = table.get("class") or []
+            if "worksheet-table" not in classes:
+                table["class"] = [*classes, "worksheet-table"]
 
 
 def _is_note_marker_node(node) -> bool:

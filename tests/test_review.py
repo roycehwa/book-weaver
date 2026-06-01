@@ -5,12 +5,30 @@ import pytest
 
 from pdf_translator.review import (
     apply_review_state,
+    build_aligned_review_segments,
     build_review_artifacts,
     create_review_state,
     review_project_from_run,
+    rewrite_review_requests,
     translated_segments_to_chapters,
     write_versioned_outputs,
+    _is_valid_rewrite_candidate,
+    _looks_like_model_refusal,
+    _rewrite_prompt,
 )
+from pdf_translator.translate import _chunk_cache_path
+from pdf_translator.models import TranslationChunk
+
+
+class EchoRewriteTranslator:
+    name = "echo-rewrite"
+
+    def __init__(self) -> None:
+        self.prompts: list[str] = []
+
+    def translate_chunk(self, chunk, source_language: str | None, target_language: str) -> str:
+        self.prompts.append(chunk.markdown)
+        return "这是模型根据意见生成的候选译文。"
 
 
 def sample_book() -> dict:
@@ -112,6 +130,25 @@ def test_apply_review_state_updates_segment_text_and_approval() -> None:
     assert untouched["translated_text"] == "旧译文。"
 
 
+def test_apply_review_state_does_not_export_unapproved_model_candidate() -> None:
+    translated_segments = [
+        {"segment_id": "s1", "translated_text": "旧译文。", "status": "needs_review"},
+    ]
+    state = {
+        "decisions": {
+            "s1": {
+                "status": "candidate",
+                "action": "model_rewrite",
+                "approved_text": "模型候选译文。",
+            }
+        }
+    }
+
+    applied = apply_review_state(translated_segments, state)
+
+    assert applied[0]["translated_text"] == "旧译文。"
+
+
 def test_write_versioned_outputs_preserves_parent_and_manifest(tmp_path: Path) -> None:
     artifacts = build_review_artifacts(
         source_path=Path("book.epub"),
@@ -189,3 +226,165 @@ def test_review_project_from_run_loads_json_contract(tmp_path: Path) -> None:
     assert project["run_dir"] == str(run_dir)
     assert project["segments"][0]["source_text"].startswith("This is")
     assert project["review_state"]["schema"] == "translation_review_state_v1"
+
+
+def test_rewrite_review_requests_writes_candidate_for_model_decision(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    artifacts = build_review_artifacts(
+        source_path=Path("book.epub"),
+        target_language="zh-CN",
+        book=sample_book(),
+        translated_chapters=[
+            {"index": 1, "chapter_id": "ch-001-intro", "title": "Introduction", "markdown": "旧译文。\n\n第二段旧译文。"},
+            {"index": 2, "chapter_id": "ch-002-body", "title": "Body", "markdown": "第三段旧译文。"},
+        ],
+    )
+    artifacts["review_state"]["decisions"] = {
+        "ch-001-intro:s002": {
+            "status": "open",
+            "action": "model_rewrite",
+            "reviewer_comment": "补译遗漏内容。",
+        }
+    }
+    for name, payload in artifacts.items():
+        (run_dir / f"{name}.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    translator = EchoRewriteTranslator()
+    result = rewrite_review_requests(
+        run_dir=run_dir,
+        translator=translator,
+        source_language="en",
+        target_language="zh-CN",
+    )
+
+    state = json.loads((run_dir / "review_state.json").read_text(encoding="utf-8"))
+    decision = state["decisions"]["ch-001-intro:s002"]
+    assert result["rewritten_count"] == 1
+    assert decision["status"] == "candidate"
+    assert decision["approved_text"] == "这是模型根据意见生成的候选译文。"
+    assert "补译遗漏内容" in translator.prompts[0]
+
+
+def test_rewrite_prompt_for_missing_translation_uses_source_text() -> None:
+    prompt = _rewrite_prompt(
+        "A second paragraph was omitted by the translation model and must be restored.",
+        "旧译文。",
+        "请完整翻译成中文。",
+    )
+    assert "SOURCE TEXT:" in prompt
+    assert "CURRENT TRANSLATION:" in prompt
+    assert "[missing translation]" not in prompt
+
+
+def test_is_valid_rewrite_candidate_rejects_placeholder() -> None:
+    source = "A second paragraph was omitted by the translation model and must be restored."
+    assert not _is_valid_rewrite_candidate(source, "[missing translation]", "zh-CN")
+    assert not _is_valid_rewrite_candidate(
+        source,
+        "您未在消息中提供需要翻译的 Markdown 内容。请提供您希望翻译成简体中文的 Markdown 文档。",
+        "zh-CN",
+    )
+    assert _looks_like_model_refusal("您未在消息中提供需要翻译的 Markdown 内容。")
+    assert _is_valid_rewrite_candidate(source, "第二段被翻译模型遗漏，现已补译恢复。", "zh-CN")
+
+
+def test_rewrite_review_requests_skips_invalid_candidate_for_missing_translation(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    artifacts = build_review_artifacts(
+        source_path=Path("book.epub"),
+        target_language="zh-CN",
+        book=sample_book(),
+        translated_chapters=[
+            {"index": 1, "chapter_id": "ch-001-intro", "title": "Introduction", "markdown": "第一段。\n\n"},
+            {"index": 2, "chapter_id": "ch-002-body", "title": "Body", "markdown": ""},
+        ],
+    )
+    artifacts["review_state"]["decisions"] = {
+        "ch-001-intro:s002": {
+            "status": "open",
+            "action": "model_rewrite",
+            "reviewer_comment": "请完整补译。",
+        }
+    }
+    for name, payload in artifacts.items():
+        (run_dir / f"{name}.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    class BadRewriteTranslator:
+        name = "bad-rewrite"
+
+        def translate_chunk(self, chunk, source_language: str | None, target_language: str) -> str:
+            return "[missing translation]"
+
+    result = rewrite_review_requests(
+        run_dir=run_dir,
+        translator=BadRewriteTranslator(),
+        source_language="en",
+        target_language="zh-CN",
+    )
+
+    state = json.loads((run_dir / "review_state.json").read_text(encoding="utf-8"))
+    decision = state["decisions"]["ch-001-intro:s002"]
+    assert result["rewritten_count"] == 0
+    assert decision["status"] == "open"
+    assert decision["rewrite_error"]
+
+
+def test_build_aligned_review_segments_pairs_translation_cache(tmp_path: Path) -> None:
+    from pdf_translator.chunking import split_markdown_into_chunks
+    from pdf_translator.translate import _chapter_markdown_for_translation, _split_markdown_media_segments
+
+    cache_dir = tmp_path / "translation-cache"
+    cache_dir.mkdir()
+    book = sample_book()
+    chapter_markdown = _chapter_markdown_for_translation(book["chapters"][0])
+    chunk_markdown = ""
+    for segment_kind, segment_markdown in _split_markdown_media_segments(chapter_markdown):
+        if segment_kind != "text":
+            continue
+        chunks = split_markdown_into_chunks(segment_markdown, 9000)
+        assert chunks
+        chunk_markdown = chunks[0].markdown
+        break
+    assert chunk_markdown
+    cache_path = _chunk_cache_path(cache_dir, TranslationChunk(index=0, markdown=chunk_markdown))
+    cache_path.write_text("这是与原文 chunk 对齐的中文译文。\n", encoding="utf-8")
+
+    source_segments, translated_segments = build_aligned_review_segments(
+        book,
+        source_path=Path("book.epub"),
+        target_language="zh-CN",
+        cache_dir=cache_dir,
+        max_chunk_chars=9000,
+    )
+
+    intro = next(segment for segment in source_segments if segment["chapter_id"] == "ch-001-intro")
+    translated = next(segment for segment in translated_segments if segment["segment_id"] == intro["segment_id"])
+    assert "This is a long English paragraph" in intro["source_text"]
+    assert "中文译文" in translated["translated_text"]
+    assert "This is a long English paragraph" not in translated["translated_text"]
+
+
+def test_read_chunk_cache_falls_back_to_index_only_filename(tmp_path: Path) -> None:
+    from pdf_translator.chunking import split_markdown_into_chunks
+    from pdf_translator.translate import _chapter_markdown_for_translation, _read_chunk_cache, _split_markdown_media_segments
+
+    cache_dir = tmp_path / "translation-cache"
+    cache_dir.mkdir()
+    book = sample_book()
+    chapter_markdown = _chapter_markdown_for_translation(book["chapters"][0])
+    chunk_markdown = ""
+    for segment_kind, segment_markdown in _split_markdown_media_segments(chapter_markdown):
+        if segment_kind != "text":
+            continue
+        chunks = split_markdown_into_chunks(segment_markdown, 9000)
+        chunk_markdown = chunks[0].markdown
+        break
+    assert chunk_markdown
+    # Simulate an older cache entry whose content hash no longer matches the current chunk markdown.
+    legacy_path = cache_dir / "chunk-000000-deadbeefdeadbeef.md"
+    legacy_path.write_text("旧缓存里的中文译文。\n", encoding="utf-8")
+
+    translated = _read_chunk_cache(cache_dir, TranslationChunk(index=0, markdown=chunk_markdown))
+    assert "旧缓存" in translated

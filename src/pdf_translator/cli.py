@@ -23,10 +23,13 @@ from pdf_translator.render import render_pdf_from_markdown
 from pdf_translator.review import (
     apply_review_state,
     review_project_from_run,
+    rewrite_review_requests,
     translated_segments_to_chapters,
     write_versioned_outputs,
 )
+from pdf_translator.table_translate import run_translate_tables
 from pdf_translator.profile import build_document_profile
+from pdf_translator.translate import build_translator
 from pdf_translator.validation import run_validation_manifest, write_validation_report
 
 
@@ -234,6 +237,32 @@ def build_parser() -> argparse.ArgumentParser:
         help="Per-request polish timeout. Defaults to the translator timeout, e.g. MINIMAX_HTTP_TIMEOUT_SECONDS.",
     )
 
+    table_parser = subparsers.add_parser(
+        "translate-tables",
+        help="Translate preserved English markdown tables in a completed run and rebuild EPUBs.",
+    )
+    table_parser.add_argument(
+        "run_dir",
+        type=Path,
+        help="Path to a completed translate run containing translated-chapters.json.",
+    )
+    table_parser.add_argument(
+        "--target-lang",
+        default="zh-CN",
+        help="Target language, for example zh-CN.",
+    )
+    table_parser.add_argument(
+        "--source-lang",
+        default="en",
+        help="Source language for table content.",
+    )
+    table_parser.add_argument(
+        "--translator",
+        default="minimax",
+        choices=["openai", "mock", "minimax", "compatible", "openai-compatible"],
+        help="Translation backend used for table requests.",
+    )
+
     review_export_parser = subparsers.add_parser(
         "review-export",
         help="Apply review_state.json and export a versioned reviewed Markdown/PDF/EPUB.",
@@ -263,6 +292,32 @@ def build_parser() -> argparse.ArgumentParser:
         default="epub",
         choices=["pdf", "epub", "both"],
         help="Rendered output format for the reviewed version.",
+    )
+
+    review_rewrite_parser = subparsers.add_parser(
+        "review-rewrite",
+        help="Generate model rewrite candidates for review_state model_rewrite decisions.",
+    )
+    review_rewrite_parser.add_argument(
+        "run_dir",
+        type=Path,
+        help="Path to a completed translate run containing review_state.json.",
+    )
+    review_rewrite_parser.add_argument(
+        "--target-lang",
+        default="zh-CN",
+        help="Target language, for example zh-CN.",
+    )
+    review_rewrite_parser.add_argument(
+        "--source-lang",
+        default=None,
+        help="Optional source language for rewrite prompts.",
+    )
+    review_rewrite_parser.add_argument(
+        "--translator",
+        default="minimax",
+        choices=["openai", "mock", "minimax", "compatible", "openai-compatible"],
+        help="Translation backend used to generate rewrite candidates.",
     )
 
     agent_parser = subparsers.add_parser(
@@ -404,7 +459,6 @@ def _print_preflight(preflight: dict[str, object]) -> None:
     warnings = preflight.get("warnings") or []
     for warning in warnings:
         print(f"Warning: {warning}")
-
 
 
 def _run_review_export(
@@ -573,6 +627,21 @@ def main() -> None:
                 f"accepted={result.accepted_count} "
                 f"rejected={result.rejected_count}"
             )
+        elif args.command == "translate-tables":
+            result = run_translate_tables(
+                run_dir=args.run_dir,
+                target_language=args.target_lang,
+                translator_name=args.translator,
+                source_language=args.source_lang,
+            )
+            print(f"Table translation report: {result.report_path}")
+            print(
+                "Table summary: "
+                f"translated={result.translated_table_count} "
+                f"skipped={result.skipped_table_count}"
+            )
+            print(f"Translated EPUB: {result.translated_epub_path}")
+            print(f"Polished EPUB: {result.polished_epub_path}")
         elif args.command == "review-export":
             result = _run_review_export(
                 run_dir=args.run_dir,
@@ -589,6 +658,15 @@ def main() -> None:
                 print(f"Reviewed EPUB: {rendered_files['translated_epub']}")
             if "translated_pdf" in rendered_files:
                 print(f"Reviewed PDF: {rendered_files['translated_pdf']}")
+        elif args.command == "review-rewrite":
+            result = rewrite_review_requests(
+                run_dir=args.run_dir.expanduser().resolve(),
+                translator=build_translator(args.translator),
+                source_language=args.source_lang,
+                target_language=args.target_lang,
+            )
+            print(f"Rewrite candidates generated: {result['rewritten_count']}")
+            print(f"Review state updated: {result['review_state_path']}")
         elif args.command == "agent-once":
             try:
                 result = run_agent_once(
