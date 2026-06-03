@@ -112,6 +112,60 @@ def test_book_rebuild_marks_epub_apparatus_chapters_as_non_toc_resources() -> No
     assert by_title["Chapter 1"]["chapter_id"] == "ch-003-chapter-1"
 
 
+def test_book_rebuild_marks_chinese_epub_apparatus_chapters_as_non_toc_resources() -> None:
+    structured = {
+        "_epub_meta": {
+            "schema": "epub_ingest_v1",
+            "chapters": [
+                {"title": "书 名 页", "markdown": "逻辑哲学论\n"},
+                {"title": "版 权 页", "markdown": "Copyright.\n"},
+                {"title": "目 录", "markdown": "正文 ........ 1\n"},
+                {"title": "正文", "markdown": "这里是正文。"},
+                {"title": "索 引", "markdown": "词条，12\n"},
+            ],
+        }
+    }
+
+    result = build_book_reconstruction(structured)
+
+    by_title = {chapter["title"]: chapter for chapter in result["chapters"]}
+    assert by_title["书 名 页"]["translate"] is False
+    assert by_title["版 权 页"]["toc"] is False
+    assert by_title["目 录"]["translate"] is False
+    assert by_title["正文"]["translate"] is True
+    assert by_title["索 引"]["toc"] is False
+
+
+def test_book_rebuild_splits_numbered_epub_body_hidden_after_chinese_preface() -> None:
+    propositions = [f"{index}.1 命题 {index}。" for index in range(1, 23)]
+    structured = {
+        "_epub_meta": {
+            "schema": "epub_ingest_v1",
+            "chapters": [
+                {
+                    "title": "前 言",
+                    "markdown": "\n\n".join(
+                        [
+                            "本书讨论语言的边界。",
+                            "凡可说的都应说清。",
+                            "作者在此致谢。",
+                            *propositions,
+                        ]
+                    ),
+                }
+            ],
+        }
+    }
+
+    result = build_book_reconstruction(structured)
+
+    assert [chapter["title"] for chapter in result["chapters"]] == ["前 言", "正文"]
+    assert "本书讨论语言的边界" in result["chapters"][0]["markdown"]
+    assert "1.1 命题 1" not in result["chapters"][0]["markdown"]
+    assert result["chapters"][1]["markdown"].startswith("1.1 命题 1")
+    assert "22.1 命题 22" in result["chapters"][1]["markdown"]
+
+
 def test_book_rebuild_adds_pdf_cover_chapter(monkeypatch, tmp_path) -> None:
     cover = tmp_path / "cover.png"
     cover.write_bytes(b"png")

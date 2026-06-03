@@ -7,7 +7,7 @@ import pytest
 import pypdfium2 as pdfium
 
 from pdf_translator.guardrails import InputGateError, PdfPreflight, _enforce_text_layer, ingest_pdf_guarded
-from pdf_translator.ingest import build_pdf_converter, clean_book_reflow_markdown
+from pdf_translator.ingest import build_pdf_converter, clean_book_reflow_markdown, detect_language
 from pdf_translator.models import NormalizedDocument
 
 
@@ -66,6 +66,12 @@ Running Book Header
     assert "![Image](/tmp/image.png)" in cleaned
     assert "| A | B |" in cleaned
     assert "6. Nelson" in cleaned
+
+
+def test_detect_language_prefers_cjk_signal_over_metadata_noise() -> None:
+    text = "这是一本中文书籍的正文。" * 30 + " Romanized title noise no no no."
+
+    assert detect_language(text) == "zh-cn"
 
 
 def test_clean_book_reflow_markdown_keeps_first_repeated_section_heading() -> None:

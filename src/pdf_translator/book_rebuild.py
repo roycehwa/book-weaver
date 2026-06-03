@@ -63,13 +63,15 @@ OUTLINE_SKIP_TITLE_RE = re.compile(
     r"^(?:front\s*matter|frontmatter|copyright|dedication|contents|table of contents|"
     r"list of (?:figures|tables|illustrations)(?: and (?:figures|tables|illustrations))?|"
     r"tables|figures|text boxes?|glossary|abbreviations|notes|endnotes|bibliography|references|works cited|"
-    r".*index|index of .*)$",
+    r".*index|index of .*|书\s*名\s*页|扉\s*页|版\s*权\s*页|目\s*录|索\s*引|文\s*前)$",
     re.IGNORECASE,
 )
 OUTLINE_DROP_TITLE_RE = re.compile(
     r"^(?:title page|half title|start of frontmatter|navigation|page list)$",
     re.IGNORECASE,
 )
+EPUB_PREFACE_TITLE_RE = re.compile(r"^(?:preface|前\s*言)$", re.IGNORECASE)
+EPUB_NUMBERED_PROPOSITION_RE = re.compile(r"^\s*\d+(?:\.\d+)*(?:\s|\[\[)")
 
 
 @dataclass(slots=True)
@@ -1101,6 +1103,43 @@ def _chapter_pages_from_outline(
     return chapters
 
 
+def _split_epub_preface_numbered_body(
+    title: str,
+    markdown: str,
+    trace_markdown: str,
+) -> list[tuple[str, str, str]]:
+    """Split EPUBs that hide a long numbered main text after a short preface."""
+    if not EPUB_PREFACE_TITLE_RE.match(_clean_book_text(title)):
+        return [(title, markdown, trace_markdown)]
+
+    blocks = [block.strip() for block in re.split(r"\n\s*\n", markdown or "") if block.strip()]
+    if len(blocks) < 24:
+        return [(title, markdown, trace_markdown)]
+
+    split_at: int | None = None
+    for index, block in enumerate(blocks):
+        if index < 3 or index > 60:
+            continue
+        if not EPUB_NUMBERED_PROPOSITION_RE.match(block):
+            continue
+        proposition_tail = sum(1 for candidate in blocks[index:] if EPUB_NUMBERED_PROPOSITION_RE.match(candidate))
+        if proposition_tail >= 20:
+            split_at = index
+            break
+    if split_at is None:
+        return [(title, markdown, trace_markdown)]
+
+    trace_blocks = [block.strip() for block in re.split(r"\n\s*\n", trace_markdown or "") if block.strip()]
+    if len(trace_blocks) != len(blocks):
+        trace_blocks = blocks
+
+    body_title = "正文" if re.search(r"[\u4e00-\u9fff]", title) else "Main Text"
+    return [
+        (title, "\n\n".join(blocks[:split_at]), "\n\n".join(trace_blocks[:split_at])),
+        (body_title, "\n\n".join(blocks[split_at:]), "\n\n".join(trace_blocks[split_at:])),
+    ]
+
+
 def _build_book_from_epub_meta(meta: dict[str, Any], source_path: Path | None) -> dict[str, Any]:
     raw_chapters = meta.get("chapters") or []
     raw_assets = meta.get("assets") or []
@@ -1122,40 +1161,43 @@ def _build_book_from_epub_meta(meta: dict[str, Any], source_path: Path | None) -
         if "## page list" in md.lower() and md.count("\n- [") > 25:
             continue
 
-        i = len(chapters) + 1
-        if md and not md.endswith("\n"):
-            md += "\n"
         tr = str(entry.get("trace_markdown") or md).strip()
-        if tr and not tr.endswith("\n"):
-            tr += "\n"
         sip = entry.get("source_internal_path")
-        is_cover_title = title_clean in {"cover", "cover page"}
-        is_preserved_resource = bool(is_cover_title or OUTLINE_SKIP_TITLE_RE.match(title))
-        chapters.append(
-            {
-                "index": i,
-                "title": title,
-                "page_start": i,
-                "page_end": i,
-                "source_pages": [i],
-                "markdown": md,
-                "trace_markdown": tr,
-                "translate": not is_preserved_resource,
-                "preserve_original": is_preserved_resource,
-                "resource_only": is_preserved_resource,
-                "source_internal_path": sip if isinstance(sip, str) else None,
-                "toc": not is_preserved_resource,
-            }
-        )
-        pages.append(
-            {
-                "page_no": i,
-                "page_kind": "body",
-                "chapter_title": None,
-                "figure_count": 0,
-                "table_count": 0,
-            }
-        )
+        chapter_parts = _split_epub_preface_numbered_body(title, md, tr)
+        for part_title, part_markdown, part_trace_markdown in chapter_parts:
+            i = len(chapters) + 1
+            if part_markdown and not part_markdown.endswith("\n"):
+                part_markdown += "\n"
+            if part_trace_markdown and not part_trace_markdown.endswith("\n"):
+                part_trace_markdown += "\n"
+            part_title_clean = _clean_book_text(part_title).lower()
+            is_cover_title = part_title_clean in {"cover", "cover page"}
+            is_preserved_resource = bool(is_cover_title or OUTLINE_SKIP_TITLE_RE.match(part_title))
+            chapters.append(
+                {
+                    "index": i,
+                    "title": part_title,
+                    "page_start": i,
+                    "page_end": i,
+                    "source_pages": [i],
+                    "markdown": part_markdown,
+                    "trace_markdown": part_trace_markdown,
+                    "translate": not is_preserved_resource,
+                    "preserve_original": is_preserved_resource,
+                    "resource_only": is_preserved_resource,
+                    "source_internal_path": sip if isinstance(sip, str) else None,
+                    "toc": not is_preserved_resource,
+                }
+            )
+            pages.append(
+                {
+                    "page_no": i,
+                    "page_kind": "body",
+                    "chapter_title": None,
+                    "figure_count": 0,
+                    "table_count": 0,
+                }
+            )
 
     full_markdown_parts: list[str] = []
     trace_markdown_parts: list[str] = []

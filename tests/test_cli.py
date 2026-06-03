@@ -21,6 +21,28 @@ def test_public_cli_book_and_magazine_profiles_only() -> None:
         parser.parse_args(["articles-html", "sample.pdf"])
 
 
+def test_public_cli_accepts_intake_command() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "intake",
+            "sample.pdf",
+            "--source-lang",
+            "zh-CN",
+            "--profile",
+            "book",
+            "--max-chunk-chars",
+            "7000",
+        ]
+    )
+
+    assert args.command == "intake"
+    assert str(args.source_pdf) == "sample.pdf"
+    assert args.source_lang == "zh-CN"
+    assert args.profile == "book"
+    assert args.max_chunk_chars == 7000
+
+
 def test_public_cli_accepts_polish_command() -> None:
     parser = build_parser()
     args = parser.parse_args(
@@ -39,6 +61,18 @@ def test_public_cli_accepts_polish_command() -> None:
     assert args.command == "polish"
     assert str(args.run_dir) == "runs/sample"
     assert args.request_timeout_seconds == 600
+
+
+def test_public_cli_accepts_finalize_and_cleanup_commands() -> None:
+    parser = build_parser()
+    finalize_args = parser.parse_args(["finalize", "runs/sample"])
+    cleanup_args = parser.parse_args(["cleanup", "runs/sample", "--dry-run", "--keep-caches"])
+
+    assert finalize_args.command == "finalize"
+    assert str(finalize_args.run_dir) == "runs/sample"
+    assert cleanup_args.command == "cleanup"
+    assert cleanup_args.dry_run is True
+    assert cleanup_args.keep_caches is True
 
 
 def test_public_cli_accepts_knowledge_build_command() -> None:
@@ -88,3 +122,27 @@ def test_public_cli_accepts_knowledge_review_command() -> None:
     assert args.knowledge_command == "review"
     assert str(args.run_dir) == "runs/sample"
     assert str(args.answers) == "answers.txt"
+
+
+def test_public_cli_accepts_knowledge_brief_and_feedback_commands() -> None:
+    parser = build_parser()
+    brief_args = parser.parse_args(["knowledge", "brief", "runs/sample"])
+    feedback_args = parser.parse_args(["knowledge", "feedback", "runs/sample", "--input", "feedback.md"])
+
+    assert brief_args.command == "knowledge"
+    assert brief_args.knowledge_command == "brief"
+    assert str(brief_args.run_dir) == "runs/sample"
+    assert feedback_args.command == "knowledge"
+    assert feedback_args.knowledge_command == "feedback"
+    assert str(feedback_args.run_dir) == "runs/sample"
+    assert str(feedback_args.input) == "feedback.md"
+
+
+def test_public_cli_accepts_knowledge_extract_command() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["knowledge", "extract", "runs/sample", "--network-model", "argument_network"])
+
+    assert args.command == "knowledge"
+    assert args.knowledge_command == "extract"
+    assert str(args.run_dir) == "runs/sample"
+    assert args.network_model == "argument_network"

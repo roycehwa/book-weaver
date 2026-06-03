@@ -308,30 +308,30 @@ Exporters should read from Zone 3, not directly from model output.
 
 ## What Should Be Testable Next
 
-The current `knowledge build` command is too structural for users to judge. The next testable layer should produce human-readable inspection output.
+The current `knowledge build` and `knowledge plan` outputs are necessary engineering inputs, but they are still the wrong primary review object for readers. A user normally starts with a book frame, reading goals, highlights, chapter notes, and partial insights. The next testable layer should therefore produce a readable entry point and accept feedback without asking the user to edit machine graph artifacts.
 
 Next command:
 
 ```bash
-book-weaver knowledge suitability RUN_DIR
+book-weaver knowledge brief RUN_DIR
 ```
 
 Outputs:
 
-- `knowledge/suitability-report.json`
-- `knowledge/suitability.md`
+- `knowledge/reader-brief.md`
+- `knowledge/reader-brief.html`
+- `knowledge/feedback-template.md`
 
-The Markdown report should show:
+The brief should show:
 
-- Detected book profile.
-- Whether the book is worth knowledge extraction.
-- Which chapters are high value.
-- Which chapters should be skipped.
-- Which extraction schema should be used.
-- Expected outputs.
-- Risks: tables, formulas, narrative coreference, citations, footnotes, glossary, index.
+- Book identity, language mode, current profile / network organization judgment.
+- A part map and chapter map.
+- High-value reading sections vs apparatus sections.
+- Short chapter cards.
+- Candidate top-level questions / concepts / events where available.
+- A natural-language feedback prompt for book framing, highlights, chapter notes, concepts, relation hints, and external references.
 
-This gives the user something concrete to inspect before spending model calls on extraction.
+This gives the user a readable starting point before machine candidates are fused into a knowledge draft.
 
 ## Recommended Next Implementation
 
@@ -339,14 +339,15 @@ Do not build a full graph yet.
 
 Implement this sequence:
 
-1. `knowledge suitability`
-2. `knowledge anchors`
-3. `knowledge extract --profile argumentative`
-4. `knowledge inspect`
-5. `knowledge accept`
-6. `knowledge export --format markdown-vault`
+1. `knowledge brief`
+2. `knowledge feedback --input FILE`
+3. Feedback raw storage and first-pass alignment to BookIR
+4. `knowledge extract --network-model argument_network` as a machine candidate source
+5. `knowledge draft`
+6. `knowledge accept`
+7. `knowledge export --format markdown-vault`
 
-The first useful user-facing validation point is `suitability.md`, not a graph database.
+The first useful user-facing validation point is `Reader Brief`. The first knowledge-structure artifact worth user inspection is `Joint Draft`, not a raw graph database or extracted-node dump.
 
 ## Explicit Non-Goals for Now
 

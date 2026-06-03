@@ -8,16 +8,16 @@ Instead of translating directly on PDF coordinates, it runs a staged flow:
 
 1. Ingest the PDF into a normalized `Markdown + JSON` representation.
 2. Rebuild books into a structured `book.json` plus inspectable Markdown views.
-3. Translate book chapters when the source language requires it.
-4. Render a clean EPUB reading edition by default, with PDF still available as an optional output.
-5. Prepare stable chapter, page, asset, and provenance structures for downstream knowledge extraction.
+3. Prepare stable chapter, page, asset, and provenance structures for downstream knowledge extraction.
+4. Translate book chapters only when a reading edition or bilingual knowledge input is needed.
+5. Render a clean EPUB reading edition when the translation branch is selected, with PDF still available as an optional output.
 
 This keeps user intervention low, removes most layout noise from the reading path, and keeps the intermediate structure reusable for later wiki, graph, mindmap, and knowledge-base workflows.
 
 ## Why this architecture
 
 - Better reading order than line-by-line extraction.
-- Works for native PDFs and OCR-backed scanned PDFs.
+- Works for text-layer PDFs and EPUBs; OCR-only scans are rejected or treated as weak support.
 - Easier to debug because every stage has an inspectable intermediate artifact.
 - Easy to swap translator backends without touching parsing.
 - Knowledge extraction can reuse the same BookIR instead of rebuilding structure again.
@@ -52,7 +52,20 @@ pip install -U pip
 pip install -e .
 ```
 
-Run:
+Mainline ingest without translation:
+
+```bash
+book-weaver intake /absolute/path/to/file.pdf --profile book
+book-weaver knowledge build runs/<file-stem>
+book-weaver knowledge metadata runs/<file-stem>
+book-weaver knowledge plan runs/<file-stem> --metadata-prior auto
+book-weaver knowledge brief runs/<file-stem>
+book-weaver knowledge feedback runs/<file-stem> --input feedback.md
+book-weaver knowledge extract runs/<file-stem> --network-model argument_network
+book-weaver finalize runs/<file-stem>
+```
+
+Run translation only when a translated reading edition is needed:
 
 ```bash
 book-weaver translate /absolute/path/to/file.pdf --profile book --target-lang zh-CN
@@ -60,16 +73,34 @@ book-weaver translate /absolute/path/to/file.pdf --profile book --target-lang zh
 
 The previous `pdf-translator` command remains available as a compatibility alias during the transition.
 
-Outputs are written to `./runs/<pdf-stem>/` by default:
+Outputs are written to `./runs/<pdf-stem>/` by default.
+
+Mainline `intake` outputs:
 
 - `normalized.md`
 - `normalized.json`
 - `reconstructed.md`
-- `translated.md`
-- `<source-stem> (zh-CN).epub`
+- `book.json`
+- `book.md`
+- `book-trace.md`
+- `chapter-report.json`
 - `manifest.json`
 
-`normalized.md` is the raw Docling export. For book profile runs, `book.json` is the source of truth, `book.md` is the cleaned reading view, `translation-input.md` is the chapter-aware translation source, and the named EPUB is the default reading output. `translated.md` remains a stable internal intermediate for cache reuse, polish, and diffing.
+Translation branch outputs additionally include:
+
+- `translated.md`
+- `<source-stem> (zh-CN).epub`
+- `translation-cache/`
+
+`normalized.md` is the raw Docling export. For book profile runs, `book.json` is the source of truth, `book.md` is the cleaned reading view, and `translation-input.md` is the chapter-aware translation source when translation is requested. `translated.md` remains a stable internal intermediate for cache reuse, polish, and diffing.
+
+`book-weaver knowledge build` writes `knowledge/bilingual-input.json` and a readable `knowledge/bilingual-input.md` summary in addition to `semantic-units.json`. The bilingual contract is conservative: unit-level translated text is used only when original and translated blocks align safely; otherwise chapter-level translation is preserved as reading context without fake paragraph pairing.
+
+`book-weaver knowledge extract` is profile-specific. The first implemented extractor is `argument_network`, which writes `knowledge/extracted-nodes.json`, `knowledge/extracted-edges.json`, and `knowledge/extraction-report.md`. Other network models intentionally return an unsupported report until their own algorithms are implemented.
+
+The Phase B user-feedback baseline is defined in [`docs/PHASE_B_FEEDBACK_WORKFLOW.md`](docs/PHASE_B_FEEDBACK_WORKFLOW.md). `book-weaver knowledge brief` writes `knowledge/reader-brief.md`, `knowledge/reader-brief.html`, and `knowledge/feedback-template.md`. `book-weaver knowledge feedback RUN_DIR --input feedback.md` preserves raw reader input under `knowledge/feedback/raw/`, writes deterministic first-pass alignment under `knowledge/feedback/aligned/`, and applies structural feedback such as network-model correction, preserve/skip requests, and external reference priors back to `knowledge/plan.json`.
+
+After QA, `book-weaver finalize runs/<file-stem>` writes `phase_a_status.json` for downstream agents. Use `book-weaver cleanup runs/<file-stem> --dry-run` before deleting temporary ingest/cache files.
 
 Use `book-weaver profile /path/to/file.pdf --profile auto` to classify pages into `accept`, `assist`, `skip_content`, and `reject_structure`. The built-in profiles are `magazine` and `book`.
 
@@ -97,6 +128,7 @@ All thresholds can be overridden from the CLI:
 
 ```bash
 book-weaver profile ./sample.pdf --profile magazine --ingest-timeout-seconds 180
+book-weaver intake ./book.pdf --profile book --max-file-size-mb 120 --max-page-count 1500
 book-weaver translate ./book.pdf --profile book --max-file-size-mb 120 --max-page-count 1500
 book-weaver validate ./suite.json --ingest-timeout-seconds 240
 ```
@@ -165,5 +197,6 @@ book-weaver translate ./book.pdf --profile book --target-lang zh-CN --translator
 - The output EPUB/PDF is intentionally reflowed. It is a translated reading edition, not a coordinate-faithful clone of the source PDF.
 - Project identity and rename rules are documented in [`docs/PROJECT_IDENTITY.md`](docs/PROJECT_IDENTITY.md).
 - Book pipeline invariants are documented in [`docs/BOOK_PIPELINE_RULES.md`](docs/BOOK_PIPELINE_RULES.md).
+- Bilingual knowledge handoff rules are documented in [`docs/BILINGUAL_KNOWLEDGE_CONTRACT.md`](docs/BILINGUAL_KNOWLEDGE_CONTRACT.md).
 - For PDF books, tables, charts, figures, and covers are preserved as visual assets whenever crops are available. They should not be converted to Markdown tables by default.
 - If you need original-layout replacement later, treat that as a separate downstream project.

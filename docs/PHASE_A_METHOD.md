@@ -1,6 +1,6 @@
-# Phase A Method: Translation and Book Splitter
+# Phase A Method: Book Intake and Optional Translation
 
-Phase A is the stable book-processing stage before knowledge extraction. It accepts one PDF or EPUB book, builds BookIR, optionally translates it, renders a reading EPUB, and leaves a minimal, reproducible artifact set for Phase B.
+Phase A is the stable book intake stage before knowledge extraction. It accepts one PDF or EPUB book, builds BookIR, and leaves a minimal, reproducible artifact set for Phase B. Translation is an optional reading/language-normalization branch, not the mainline.
 
 New deployments, including Agent-based scheduled runs, should follow this document rather than ad hoc commands from prior experiments.
 
@@ -13,10 +13,10 @@ Phase A handles:
 - BookIR generation: `book.json`.
 - Chapter splitting with stable `chapter_id`.
 - Image, table, cover, apparatus preservation.
-- English or other foreign-language to Chinese translation.
-- Polish for mixed untranslated English defects.
-- EPUB reading output.
-- Internal EPUB href validation.
+- Optional English or other foreign-language to Chinese translation.
+- Optional polish for mixed untranslated English defects.
+- Optional EPUB reading output.
+- Internal EPUB href validation when EPUB output is rendered.
 - Artifact retention and cleanup rules.
 
 Phase A does not handle:
@@ -43,20 +43,35 @@ Rejected or weak-support input:
 
 ## Language Flow
 
-Phase A has two language paths.
+Phase A has a required intake path and an optional translation path.
 
-### Foreign-Language Source
+### Required Intake Path
 
-For English or other non-Chinese books:
+For every supported book, regardless of language:
 
 1. Ingest source.
 2. Build `book.json`.
-3. Generate `book.md` and `translation-input.md`.
-4. Translate by chapter/chunk.
-5. Render named EPUB.
-6. Run polish.
-7. Use polished output as the final reading artifact.
-8. Feed both original and translated text into Phase B later.
+3. Generate `book.md`, `book-trace.md`, `translation-input.md`, and `chapter-report.json`.
+4. Feed `book.json + book.md + book-images/` into Phase B.
+
+Command:
+
+```bash
+book-weaver intake SOURCE --profile book
+```
+
+This command must not call any translation API and must not require `translation-cache/`.
+
+### Foreign-Language Source
+
+For English or other non-Chinese books, translation is selected only when the user needs a translated reading edition or bilingual knowledge input:
+
+1. Run the required intake path.
+2. Translate by chapter/chunk.
+3. Render named EPUB.
+4. Run polish when needed.
+5. Use polished output as the final reading artifact.
+6. Feed both original and translated text into Phase B when bilingual input is needed.
 
 Phase B input for foreign-language books:
 
@@ -71,12 +86,10 @@ Phase B input for foreign-language books:
 
 For Chinese books:
 
-1. Ingest source.
-2. Build `book.json`.
-3. Generate `book.md`.
-4. Skip translation.
-5. Optionally render a reading EPUB directly from `book.md`.
-6. Feed original text into Phase B.
+1. Run the required intake path.
+2. Skip translation.
+3. Feed original text into Phase B.
+4. Optionally render a source-language reading EPUB later if needed.
 
 Implementation requirement:
 
@@ -95,14 +108,24 @@ and target_language startswith "zh"
 
 ## Core Commands
 
-Current foreign-language command:
+Current mainline command:
+
+```bash
+book-weaver intake SOURCE --profile book
+book-weaver knowledge build RUN_DIR
+book-weaver knowledge metadata RUN_DIR
+book-weaver knowledge plan RUN_DIR --metadata-prior auto
+book-weaver finalize RUN_DIR
+```
+
+Current optional foreign-language reading command:
 
 ```bash
 book-weaver translate SOURCE --profile book --target-lang zh-CN --format epub --translator minimax
 book-weaver polish RUN_DIR --target-lang zh-CN --translator minimax
 ```
 
-Future fixed command shape:
+Optional reading command shape:
 
 ```bash
 book-weaver translate SOURCE --profile book --target-lang zh-CN --format epub
@@ -110,7 +133,7 @@ book-weaver polish RUN_DIR --target-lang zh-CN
 book-weaver finalize RUN_DIR
 ```
 
-`finalize` is not yet implemented. Until then, use the retention rules below manually or in an Agent script.
+`finalize` writes `phase_a_status.json`, which is the preferred handoff file for Agent execution and Phase B.
 
 ## Required Artifacts
 
@@ -125,14 +148,14 @@ These files are required for Phase B or auditability and must be retained.
 - `chapter-report.json`
 - `profile.json`
 - `book-images/`
-- final reading EPUB
 
-### Retain For Foreign-Language Books
+### Retain For Translated Books
 
 - `translation-input.md`
 - `translated.md`
 - `translated.polished.md` if polish has run
 - `polish-report.json` if polish has run
+- final reading EPUB
 
 ### Retain Temporarily For Resume / Debug
 
@@ -164,7 +187,7 @@ Keep `translation-cache/` only when:
 
 ## Final Artifact Selection
 
-Phase A final text source:
+Phase A final text source for downstream use:
 
 ```text
 translated.polished.md
@@ -172,7 +195,7 @@ else translated.md
 else book.md
 ```
 
-Phase A final EPUB:
+Phase A final EPUB when the reading branch ran:
 
 ```text
 <source-stem> (zh-CN polished).epub
@@ -184,16 +207,20 @@ Phase B should never guess this. It should read a future `stage1-final.json`, or
 
 ## Quality Gates
 
-A Phase A run is acceptable only if:
+A Phase A intake run is acceptable only if:
 
 - `book.json` exists.
 - All chapters have `chapter_id`.
+- Images and tables expected in `book-images/` remain present.
+- `manifest.json` records source, preflight, render policy, and artifact paths.
+
+A translated reading run additionally requires:
+
 - Named EPUB exists.
 - EPUB internal href validation has `resolved_ratio == 1.0`, or unresolved links are explicitly waived.
-- For translated books, polish high-confidence candidates are zero after final polish, or remaining candidates are manually accepted as names/citations.
+- Polish high-confidence candidates are zero after final polish, or remaining candidates are manually accepted as names/citations.
 - `English（中文）` generated gloss pollution is zero.
-- Images and tables expected in `book-images/` remain present.
-- `manifest.json` records source, target language, preflight, render files, and href validation.
+- `manifest.json` records target language, render files, and href validation.
 
 ## Known Translation Failure Mode
 
@@ -216,16 +243,21 @@ Recommended logic:
 
 1. Scan input directory for `.pdf` and `.epub`.
 2. Skip files with an existing accepted run.
-3. Run `book-weaver translate`.
-4. If source is non-Chinese, run `book-weaver polish`.
-5. Run Phase A QA:
+3. Run `book-weaver intake`.
+4. If a translated reading artifact or bilingual Phase B input is required, run `book-weaver translate`.
+5. If translation ran, run `book-weaver polish` when QA detects mixed-language defects.
+6. Run Phase A QA:
    - check `manifest.json`;
-   - check final EPUB exists;
    - check `chapter_id` coverage;
-   - check href validation;
-   - scan final Markdown for high-confidence untranslated English.
-6. Write or update a run status file.
-7. Clean temporary artifacts only after successful QA.
+   - check `book-images/`;
+   - if translation ran, check final EPUB, href validation, and high-confidence untranslated English.
+7. Run `book-weaver finalize RUN_DIR`.
+8. Clean temporary artifacts only after successful QA:
+
+```bash
+book-weaver cleanup RUN_DIR --dry-run
+book-weaver cleanup RUN_DIR
+```
 
 Recommended status file:
 
@@ -279,13 +311,5 @@ For Chinese books, `book.md` is both source and final text.
 
 ## Open Implementation Items
 
-- Add a formal `--skip-translation-if-same-language` behavior to `translate`.
-- Add `book-weaver finalize RUN_DIR`.
-- Add `phase_a_status.json`.
 - Add an Agent batch runner or documented cron/automation template.
-- Add cleanup command with dry-run mode:
-
-```bash
-book-weaver cleanup RUN_DIR --phase-a --dry-run
-book-weaver cleanup RUN_DIR --phase-a
-```
+- Add stricter `finalize` gates for image/table coverage once image expectations become fully deterministic.

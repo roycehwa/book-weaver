@@ -267,34 +267,44 @@ No model call.
 - Build `knowledge/chapters.json` from `book.json`.
 - Build `knowledge/semantic-units.json` from chapters.
 - Preserve page ranges, paragraph indexes, asset refs, source hashes.
-- Emit profile-neutral Markdown wiki stubs.
+- Keep original-only and bilingual input contracts explicit.
 
-### Phase 1: profile classification
+### Phase 1: readable book frame
 
-Low-cost model call per book.
+The reader should not begin by reviewing machine-extracted graph fragments.
 
-- Input: metadata, TOC, chapter titles, sampled chapter openings.
-- Output: suitability report.
-- Human may override profile.
+- Build `Reader Brief` from metadata, TOC, chapter titles, chapter samples, and initial network plan.
+- Show high-value sections, apparatus sections, candidate organizing branches, and current risks in plain language.
+- Provide a feedback template that accepts natural-language framing, goals, highlights, notes, relation hints, and external references.
 
-### Phase 2: profile-specific extraction
+### Phase 2: feedback intake and alignment
 
-Model calls per chapter or semantic unit.
+User input is a first-class source of structure, not a patch on top of a finished machine graph.
+
+- Preserve raw highlights, notes, chapter insights, whole-book insights, and external references.
+- Align feedback to `chapter_id`, `unit_id`, page ranges, excerpt hashes, and machine candidates when possible.
+- Keep unaligned whole-book insights valid.
+- Keep external reviews as weak priors rather than accepted book evidence.
+
+### Phase 3: profile-specific machine candidates
+
+Model or rule calls per chapter or semantic unit.
 
 - Use strict schema per profile.
-- Require evidence for every extracted item.
-- Store raw extraction candidates separately from accepted knowledge.
+- Require evidence for every source-derived candidate.
+- Store raw machine candidates separately from feedback and accepted knowledge.
 
-### Phase 3: normalization and merge
+### Phase 4: joint draft and acceptance
 
-- Entity/concept canonicalization.
-- Alias / translation / original-language name mapping.
-- Duplicate claim and concept merge.
-- Confidence scoring.
+- Fuse user feedback and machine candidates into a readable `Joint Draft`.
+- Distinguish `source_derived`, `machine_candidate`, `user_observed`, `user_supported`, and `accepted`.
+- Show conflicts, gaps, unsupported relation hints, and low-confidence branches.
+- Normalize concepts, people, terms, aliases, translation variants, and duplicate claims only after draft-level context is available.
 
-### Phase 4: outputs
+### Phase 5: outputs
 
-- `knowledge/wiki/`
+- `knowledge/accepted/`
+- Markdown vault / wiki pages.
 - `knowledge/indexes/`
 - `knowledge/graphs/*.json`
 - `knowledge/mindmap.mmd`

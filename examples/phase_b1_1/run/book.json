@@ -1,0 +1,32 @@
+{
+  "chapters": [
+    {
+      "index": 1,
+      "chapter_id": "ch-001-guide",
+      "title": "Chapter 1 Practical Guide",
+      "page_start": 1,
+      "page_end": 8,
+      "source_pages": [1, 2, 3, 4, 5, 6, 7, 8],
+      "markdown": "# Chapter 1 Practical Guide\n\nThis guide introduces a practical method for reading institutional change.\n\nThe chapter offers a tool, a practice, a case, and an action sequence.\n\nIt is useful as orientation, but the later chronology changes the book's emphasis.\n\nA reader should treat the method as a frame for historical interpretation.\n"
+    },
+    {
+      "index": 2,
+      "chapter_id": "ch-002-chronology",
+      "title": "Appendix: Chronology",
+      "page_start": 91,
+      "page_end": 96,
+      "source_pages": [91, 92, 93, 94, 95, 96],
+      "markdown": "# Appendix: Chronology\n\n1900: The first public institution is founded.\n\n1910: A reform movement changes the public role of the institution.\n\n1925: A later committee publishes evidence that reframes the earlier reform.\n"
+    },
+    {
+      "index": 3,
+      "chapter_id": "ch-003-index",
+      "title": "Index",
+      "page_start": 97,
+      "page_end": 99,
+      "source_pages": [97, 98, 99],
+      "markdown": "# Index\n\nInstitution, 1, 12, 91.\n\nReform, 4, 93.\n"
+    }
+  ],
+  "assets": []
+}

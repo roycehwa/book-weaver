@@ -10,7 +10,12 @@ from pdf_translator.chunking import split_markdown_into_chunks
 from pdf_translator.config import RunSettings
 from pdf_translator.epub import render_epub_from_book, validate_epub_internal_hrefs
 from pdf_translator.guardrails import ingest_pdf_guarded
-from pdf_translator.models import PipelineArtifacts
+from pdf_translator.models import (
+    BookTranslationResult,
+    PipelineArtifacts,
+    TranslatedChapter,
+    TranslationResult,
+)
 from pdf_translator.profile import build_document_profile
 from pdf_translator.render import render_pdf_from_markdown
 from pdf_translator.translate import (
@@ -92,7 +97,15 @@ def _build_chapter_report(book: dict, *, max_chunk_chars: int) -> dict:
     }
 
 
-def run_translation_pipeline(settings: RunSettings) -> PipelineArtifacts:
+def _prepare_intake_artifacts(settings: RunSettings) -> tuple[
+    PipelineArtifacts,
+    object,
+    object,
+    dict,
+    dict | None,
+    str,
+    dict[str, str],
+]:
     output_dir = build_output_dir(settings.output_dir, settings.source_pdf)
     output_dir.mkdir(parents=True, exist_ok=True)
     artifacts = build_artifacts(output_dir, settings.source_pdf, settings.target_language)
@@ -165,27 +178,119 @@ def run_translation_pipeline(settings: RunSettings) -> PipelineArtifacts:
         encoding="utf-8",
     )
 
-    translator = build_translator(settings.translator)
-    translation_cache_dir = output_dir / "translation-cache"
+    return artifacts, normalized, preflight, profile, book, translation_input_markdown, extra_files
+
+
+def _is_chinese_language(language: str | None) -> bool:
+    if not language:
+        return False
+    normalized = language.strip().lower().replace("_", "-")
+    return normalized in {"zh", "zh-cn", "zh-tw", "chinese", "中文"} or normalized.startswith("zh-")
+
+
+def run_intake_pipeline(settings: RunSettings) -> PipelineArtifacts:
+    artifacts, normalized, preflight, profile, book, _translation_input_markdown, extra_files = _prepare_intake_artifacts(
+        settings
+    )
+
+    manifest = {
+        "mode": "intake",
+        "source_pdf": str(settings.source_pdf),
+        "output_dir": str(artifacts.output_dir),
+        "translator": None,
+        "source_language": settings.source_language,
+        "target_language": None,
+        "chunk_count": 0,
+        "translation": {
+            "mode": "not_requested",
+            "cache_dir": None,
+        },
+        "preflight": preflight.as_dict(),
+        "render": {
+            "format": "none",
+            "policy": (book or {}).get("render_policy", {}),
+        },
+        "files": {
+            "normalized_markdown": str(artifacts.normalized_markdown_path),
+            "normalized_json": str(artifacts.normalized_json_path),
+            "profile_json": str(artifacts.profile_json_path),
+            "reconstructed_markdown": str(artifacts.reconstructed_markdown_path),
+            "translation_input_markdown": str(artifacts.translation_input_markdown_path),
+            "images_dir": str(normalized.images_dir) if normalized.images_dir else None,
+            **extra_files,
+        },
+    }
+    artifacts.manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return artifacts
+
+
+def run_translation_pipeline(settings: RunSettings) -> PipelineArtifacts:
+    artifacts, normalized, preflight, profile, book, translation_input_markdown, extra_files = _prepare_intake_artifacts(
+        settings
+    )
+
+    translation_cache_dir = artifacts.output_dir / "translation-cache"
     translated_chapters = None
-    if book is not None:
-        translated = translate_book_chapters(
-            book=book,
-            settings=settings,
-            translator=translator,
-            cache_dir=translation_cache_dir,
-            concurrency=settings.translation_concurrency,
-        )
-        translated_chapters = translated.translated_chapters
+    translation_mode = "translated"
+    if _is_chinese_language(settings.source_language) and _is_chinese_language(settings.target_language):
+        translation_mode = "skipped_same_language"
+        if book is not None:
+            translated_chapters = [
+                TranslatedChapter(
+                    index=int(chapter.get("index", index)),
+                    chapter_id=chapter.get("chapter_id"),
+                    title=str(chapter.get("title") or f"Chapter {index}"),
+                    page_start=chapter.get("page_start"),
+                    page_end=chapter.get("page_end"),
+                    markdown=str(chapter.get("markdown") or "").strip() + "\n",
+                    source_pages=[int(page_no) for page_no in chapter.get("source_pages", [])],
+                    source_internal_path=chapter.get("source_internal_path"),
+                    toc=bool(chapter.get("toc", True)),
+                )
+                for index, chapter in enumerate(book.get("chapters", []), start=1)
+            ]
+            translated = BookTranslationResult(
+                translated_markdown="\n\n".join(
+                    chapter.markdown.strip() for chapter in translated_chapters if chapter.markdown.strip()
+                ).strip()
+                + "\n",
+                translated_chapters=translated_chapters,
+                source_language=settings.source_language,
+                target_language=settings.target_language,
+                translator=translation_mode,
+                chunk_count=0,
+            )
+        else:
+            translated = TranslationResult(
+                translated_markdown=translation_input_markdown.strip() + "\n",
+                source_language=settings.source_language,
+                target_language=settings.target_language,
+                translator=translation_mode,
+                chunk_count=0,
+            )
     else:
-        chunks = split_markdown_into_chunks(translation_input_markdown, settings.max_chunk_chars)
-        translated = translate_markdown(
-            chunks=chunks,
-            settings=settings,
-            translator=translator,
-            cache_dir=translation_cache_dir,
-            concurrency=settings.translation_concurrency,
-        )
+        translator = build_translator(settings.translator)
+        if book is not None:
+            translated = translate_book_chapters(
+                book=book,
+                settings=settings,
+                translator=translator,
+                cache_dir=translation_cache_dir,
+                concurrency=settings.translation_concurrency,
+            )
+            translated_chapters = translated.translated_chapters
+        else:
+            chunks = split_markdown_into_chunks(translation_input_markdown, settings.max_chunk_chars)
+            translated = translate_markdown(
+                chunks=chunks,
+                settings=settings,
+                translator=translator,
+                cache_dir=translation_cache_dir,
+                concurrency=settings.translation_concurrency,
+            )
 
     artifacts.translated_markdown_path.write_text(
         translated.translated_markdown,
@@ -231,16 +336,18 @@ def run_translation_pipeline(settings: RunSettings) -> PipelineArtifacts:
         rendered_files["epub_href_validation"] = validate_epub_internal_hrefs(artifacts.translated_epub_path)
 
     manifest = {
+        "mode": "translate",
         "source_pdf": str(settings.source_pdf),
-        "output_dir": str(output_dir),
+        "output_dir": str(artifacts.output_dir),
         "translator": translated.translator,
         "source_language": translated.source_language,
         "target_language": translated.target_language,
         "chunk_count": translated.chunk_count,
         "translation": {
+            "mode": translation_mode,
             "concurrency": settings.translation_concurrency,
             "max_chunk_chars": settings.max_chunk_chars,
-            "cache_dir": str(translation_cache_dir),
+            "cache_dir": str(translation_cache_dir) if translation_mode != "skipped_same_language" else None,
         },
         "preflight": preflight.as_dict(),
         "render": {
@@ -254,7 +361,7 @@ def run_translation_pipeline(settings: RunSettings) -> PipelineArtifacts:
             "reconstructed_markdown": str(artifacts.reconstructed_markdown_path),
             "translation_input_markdown": str(artifacts.translation_input_markdown_path),
             "translated_markdown": str(artifacts.translated_markdown_path),
-            "translation_cache_dir": str(translation_cache_dir),
+            "translation_cache_dir": str(translation_cache_dir) if translation_mode != "skipped_same_language" else None,
             "images_dir": str(normalized.images_dir) if normalized.images_dir else None,
             **rendered_files,
             **extra_files,

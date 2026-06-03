@@ -2,15 +2,19 @@ from __future__ import annotations
 
 from pathlib import Path
 import json
+import shutil
 
 from pdf_translator.knowledge import (
     apply_user_review,
+    build_knowledge_extraction,
     build_knowledge_package,
     build_knowledge_plan,
     build_metadata_prior,
+    build_reader_brief,
     build_suitability_report,
     emit_mindmap_mermaid_from_book,
     emit_wiki_outline_from_book,
+    ingest_reader_feedback,
     parse_user_review_answers,
 )
 
@@ -74,8 +78,10 @@ def test_build_knowledge_package_writes_deterministic_core_files(tmp_path: Path)
     paths = build_knowledge_package(run_dir)
 
     assert paths["manifest"].is_file()
+    assert paths["bilingual_input_markdown"].is_file()
     chapters = json.loads(paths["chapters"].read_text(encoding="utf-8"))
     units = json.loads(paths["semantic_units"].read_text(encoding="utf-8"))
+    bilingual = json.loads(paths["bilingual_input"].read_text(encoding="utf-8"))
     assets = json.loads(paths["assets"].read_text(encoding="utf-8"))
     source_map = json.loads(paths["source_map"].read_text(encoding="utf-8"))
     manifest = json.loads(paths["manifest"].read_text(encoding="utf-8"))
@@ -84,10 +90,23 @@ def test_build_knowledge_package_writes_deterministic_core_files(tmp_path: Path)
     assert chapters[1]["chapter_id"].startswith("ch-002-beta")
     assert [unit["kind"] for unit in units] == ["heading", "paragraph", "image", "heading", "list"]
     assert units[1]["text_translated"] == "第一段。"
+    assert units[1]["language_mode"] == "bilingual"
+    assert units[1]["translation_alignment"] == "block_index"
+    assert units[1]["text_original_hash"]
+    assert units[1]["text_translated_hash"]
     assert units[1]["source_pages"] == [3, 4]
+    assert bilingual["mode"] == "bilingual"
+    assert bilingual["alignment"]["unit_levels"]["block_index"] == 2
+    assert bilingual["chapters"][0]["translated_markdown"].startswith("# 阿尔法")
     assert assets == [{"kind": "figure", "path": "images/f1.png", "page_no": 3}]
     assert source_map["semantic_units"]["ch-001-alpha-u0002"]["page_start"] == 3
     assert manifest["counts"] == {"chapters": 2, "semantic_units": 5, "assets": 1}
+    assert manifest["language"]["mode"] == "bilingual"
+    assert "bilingual_input" in manifest["files"]
+    bilingual_md = paths["bilingual_input_markdown"].read_text(encoding="utf-8")
+    assert "Bilingual Knowledge Input" in bilingual_md
+    assert "Content Samples" in bilingual_md
+    assert "First paragraph." in bilingual_md
 
 
 def test_build_knowledge_package_does_not_force_unsafe_translation_alignment(tmp_path: Path) -> None:
@@ -108,8 +127,43 @@ def test_build_knowledge_package_does_not_force_unsafe_translation_alignment(tmp
     paths = build_knowledge_package(run_dir)
     units = json.loads(paths["semantic_units"].read_text(encoding="utf-8"))
 
+    bilingual = json.loads(paths["bilingual_input"].read_text(encoding="utf-8"))
+
     assert all(unit["text_translated"] is None for unit in units)
-    assert all(unit["translation_alignment"] == "unavailable" for unit in units)
+    assert all(unit["translation_alignment"] == "chapter_only" for unit in units)
+    assert bilingual["chapters"][0]["translated_markdown"] == "# 甲\n\n只有一段。"
+    assert bilingual["chapters"][0]["unit_alignment"] == "chapter_only"
+
+
+def test_build_knowledge_package_marks_original_only_for_chinese_or_untranslated_input(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "book.json").write_text(
+        json.dumps(
+            {
+                "chapters": [
+                    {"index": 1, "chapter_id": "ch-001-a", "title": "A", "markdown": "# A\n\n原文。\n"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "book.md").write_text("# A\n\n原文。\n", encoding="utf-8")
+    (run_dir / "manifest.json").write_text(
+        json.dumps({"source_language": "zh-CN", "translation": {"mode": "not_requested"}}),
+        encoding="utf-8",
+    )
+
+    paths = build_knowledge_package(run_dir)
+    units = json.loads(paths["semantic_units"].read_text(encoding="utf-8"))
+    manifest = json.loads(paths["manifest"].read_text(encoding="utf-8"))
+    bilingual = json.loads(paths["bilingual_input"].read_text(encoding="utf-8"))
+
+    assert manifest["language"]["mode"] == "monolingual_original"
+    assert units[1]["translation_alignment"] == "original_only"
+    assert units[1]["text_translated"] is None
+    assert bilingual["mode"] == "monolingual_original"
+    assert bilingual["chapters"][0]["translated_markdown"] is None
 
 
 def test_build_suitability_report_detects_argumentative_book(tmp_path: Path) -> None:
@@ -262,6 +316,52 @@ def test_build_knowledge_plan_selects_argument_network(tmp_path: Path) -> None:
     assert plan["final_plan"]["chapter_roles"][0]["role"] == "skip"
     assert plan["final_plan"]["chapter_roles"][1]["role"] == "extract"
     assert "claims" in md
+
+
+def test_build_knowledge_plan_skips_chinese_navigation_chapters(tmp_path: Path) -> None:
+    run_dir = tmp_path / "逻辑哲学论"
+    run_dir.mkdir()
+    (run_dir / "book.json").write_text(
+        json.dumps(
+            {
+                "chapters": [
+                    {"index": 1, "title": "书 名 页", "markdown": "# 书 名 页\n\n逻辑哲学论。\n"},
+                    {"index": 2, "title": "版 权 页", "markdown": "# 版 权 页\n\n版权信息。\n"},
+                    {"index": 3, "title": "目 录", "markdown": "# 目 录\n\n正文 1。\n"},
+                    {
+                        "index": 4,
+                        "title": "逻辑哲学论",
+                        "markdown": "# 逻辑哲学论\n\n谨以此书纪念我的朋友。\n\n格言：凡能说的，都可说清。\n",
+                    },
+                    {
+                        "index": 5,
+                        "title": "正文",
+                        "markdown": (
+                            "# 正文\n\n"
+                            "1 世界是一切发生的事情。\n\n"
+                            "1.1 世界是事实的总和。\n\n"
+                            "2 发生的事情即事实的存在。\n\n"
+                            "2.01 事态是对象的结合。\n"
+                        ),
+                    },
+                    {"index": 6, "title": "索 引", "markdown": "# 索 引\n\n世界，1。\n"},
+                ],
+                "assets": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    paths = build_knowledge_plan(run_dir)
+    plan = json.loads(paths["plan"].read_text(encoding="utf-8"))
+    roles = {chapter["title"]: chapter["role"] for chapter in plan["final_plan"]["chapter_roles"]}
+
+    assert roles["书 名 页"] == "skip"
+    assert roles["版 权 页"] == "skip"
+    assert roles["目 录"] == "skip"
+    assert roles["逻辑哲学论"] == "skip"
+    assert roles["正文"] == "extract"
+    assert roles["索 引"] == "skip"
 
 
 def test_build_knowledge_plan_selects_playbook_network_and_preserves_use_case_appendix(tmp_path: Path) -> None:
@@ -508,3 +608,292 @@ def test_apply_user_review_updates_plan_without_user_editing_json(tmp_path: Path
     assert roles["Index"] == "skip"
     assert (run_dir / "knowledge" / "reference-prior.json").exists()
     assert "User Review" in md
+
+
+def test_build_reader_brief_writes_user_facing_artifacts(tmp_path: Path) -> None:
+    run_dir = tmp_path / "Brief Book"
+    run_dir.mkdir()
+    (run_dir / "book.json").write_text(
+        json.dumps(
+            {
+                "chapters": [
+                    {
+                        "index": 1,
+                        "chapter_id": "ch-001-main",
+                        "title": "1. Main Argument",
+                        "markdown": (
+                            "# 1. Main Argument\n\n"
+                            "This book argues that institutions need evidence and judgment.\n\n"
+                            "Therefore the chapter develops a claim about public reason.\n"
+                        ),
+                    },
+                    {"index": 2, "chapter_id": "ch-002-index", "title": "Index", "markdown": "# Index\n\nA 1.\n"},
+                ],
+                "assets": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    build_knowledge_plan(run_dir)
+
+    paths = build_reader_brief(run_dir)
+    md = paths["markdown"].read_text(encoding="utf-8")
+    html = paths["html"].read_text(encoding="utf-8")
+    template = paths["template"].read_text(encoding="utf-8")
+
+    assert "Reader Brief" in md
+    assert "Book Frame" in md
+    assert "Chapter Cards" in md
+    assert "ch-001-main" in md
+    assert "This book argues" in md
+    assert "<html" in html
+    assert "Reader Feedback" in template
+
+
+def test_ingest_reader_feedback_preserves_and_aligns_feedback(tmp_path: Path) -> None:
+    run_dir = tmp_path / "Feedback Book"
+    run_dir.mkdir()
+    (run_dir / "book.json").write_text(
+        json.dumps(
+            {
+                "chapters": [
+                    {
+                        "index": 1,
+                        "chapter_id": "ch-001-main",
+                        "title": "Main Argument",
+                        "markdown": (
+                            "# Main Argument\n\n"
+                            "This book argues that public reason needs evidence.\n\n"
+                            "A court report supports the institutional claim.\n"
+                        ),
+                    }
+                ],
+                "assets": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    build_knowledge_package(run_dir)
+    feedback = tmp_path / "feedback.md"
+    feedback.write_text(
+        """
+        # Reader Feedback
+
+        ## Reading Goals
+
+        - Focus on the institutional claim.
+
+        ## Highlights
+
+        - Chapter: ch-001-main
+          Excerpt: This book argues that public reason needs evidence.
+          Note: This should seed the first claim.
+
+        ## External References
+
+        - https://example.test/review
+        """,
+        encoding="utf-8",
+    )
+
+    paths = ingest_reader_feedback(run_dir, feedback)
+    raw = json.loads(paths["raw"].read_text(encoding="utf-8"))
+    aligned = json.loads(paths["aligned"].read_text(encoding="utf-8"))
+
+    assert paths["raw_markdown"].is_file()
+    assert raw["schema"] == "book_weaver_reader_feedback_raw_v1"
+    assert {obj["kind"] for obj in raw["objects"]}.issuperset({"reading_goal", "highlight", "external_reference"})
+    assert aligned["summary"]["aligned"] >= 1
+    highlight = next(obj for obj in aligned["objects"] if obj["kind"] == "highlight")
+    assert highlight["alignment"]["status"] == "aligned"
+    assert "ch-001-main" in highlight["alignment"]["chapter_ids"]
+    assert "ch-001-main-u0002" in highlight["alignment"]["unit_ids"]
+
+
+def test_ingest_reader_feedback_absorbs_structural_review_inputs(tmp_path: Path) -> None:
+    run_dir = tmp_path / "Feedback Review Book"
+    run_dir.mkdir()
+    (run_dir / "book.json").write_text(
+        json.dumps(
+            {
+                "chapters": [
+                    {
+                        "index": 1,
+                        "title": "Chapter 1 Practical Guide",
+                        "markdown": "# Chapter 1 Practical Guide\n\nA guide with a tool.\n\nA practice.\n\nA case.\n\nAn action.\n",
+                    },
+                    {
+                        "index": 2,
+                        "title": "Appendix: Chronology",
+                        "markdown": "# Appendix: Chronology\n\n1900 event.\n\n1910 event.\n",
+                    },
+                    {"index": 3, "title": "Index", "markdown": "# Index\n\nA 1\n"},
+                ],
+                "assets": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    build_knowledge_plan(run_dir)
+    feedback = tmp_path / "feedback.md"
+    feedback.write_text(
+        """
+        # Reader Feedback
+
+        ## Frame Corrections
+
+        - This should be event_timeline_network plus concept_network, not only a playbook.
+
+        ## Preserve
+
+        - Preserve the chronology appendix.
+
+        ## Skip
+
+        - Skip the index and publisher pages.
+
+        ## Book-Level Insights
+
+        - The chronology is central context for the book's argument.
+
+        ## External References
+
+        - https://example.test/review
+        - External review says the chronology is not a disposable appendix.
+        """,
+        encoding="utf-8",
+    )
+
+    paths = ingest_reader_feedback(run_dir, feedback)
+    raw = json.loads(paths["raw"].read_text(encoding="utf-8"))
+    plan = json.loads(paths["plan"].read_text(encoding="utf-8"))
+    review = json.loads(paths["review"].read_text(encoding="utf-8"))
+    roles = {chapter["title"]: chapter["role"] for chapter in plan["final_plan"]["chapter_roles"]}
+    aligned = json.loads(paths["aligned"].read_text(encoding="utf-8"))
+
+    assert raw["structural_review"]["network_override"] == "event_timeline_network"
+    assert "concept_network" in raw["structural_review"]["secondary_network_models"]
+    assert review["network_override"] == "event_timeline_network"
+    assert plan["final_plan"]["primary_network_model"] == "event_timeline_network"
+    assert roles["Appendix: Chronology"] == "preserve"
+    assert roles["Index"] == "skip"
+    assert paths["reference_prior"].exists()
+    assert any(obj["kind"] == "book_level_user_insight" for obj in aligned["objects"])
+
+
+def test_phase_b1_1_example_demo_is_runnable(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    source_run = repo_root / "examples" / "phase_b1_1" / "run"
+    source_feedback = repo_root / "examples" / "phase_b1_1" / "feedback.md"
+    run_dir = tmp_path / "run"
+    shutil.copytree(source_run, run_dir)
+
+    build_knowledge_plan(run_dir)
+    brief_paths = build_reader_brief(run_dir)
+    feedback_paths = ingest_reader_feedback(run_dir, source_feedback)
+
+    plan = json.loads((run_dir / "knowledge" / "plan.json").read_text(encoding="utf-8"))
+    review = json.loads(feedback_paths["review"].read_text(encoding="utf-8"))
+    aligned = json.loads(feedback_paths["aligned"].read_text(encoding="utf-8"))
+    roles = {chapter["title"]: chapter["role"] for chapter in plan["final_plan"]["chapter_roles"]}
+
+    assert brief_paths["markdown"].is_file()
+    assert brief_paths["html"].is_file()
+    assert plan["final_plan"]["primary_network_model"] == "event_timeline_network"
+    assert "concept_network" in plan["final_plan"]["secondary_network_models"]
+    assert review["preserve_content_types"] == ["appendix", "chronology"]
+    assert review["skip_content_types"] == ["index", "publisher_pages"]
+    assert roles["Appendix: Chronology"] == "preserve"
+    assert roles["Index"] == "skip"
+    assert aligned["summary"]["total"] > 0
+
+
+def test_build_knowledge_extraction_runs_argument_network_only(tmp_path: Path) -> None:
+    run_dir = tmp_path / "Argument Book"
+    run_dir.mkdir()
+    (run_dir / "book.json").write_text(
+        json.dumps(
+            {
+                "chapters": [
+                    {"index": 1, "title": "Copyright Page", "markdown": "# Copyright Page\n\nCopyright.\n"},
+                    {
+                        "index": 2,
+                        "chapter_id": "ch-002-argument",
+                        "title": "1. Why Institutions Matter",
+                        "markdown": (
+                            "# 1. Why Institutions Matter\n\n"
+                            "This chapter argues that political theory requires a concept of institutional evidence.\n\n"
+                            "For example, court records and policy reports show how the claim works in practice.\n\n"
+                            "However, the older framework cannot explain the same evidence.\n\n"
+                            "Therefore the chapter develops an argument about institutional judgment.\n\n"
+                            "In 2024, a university report documented a court case involving institutional judgment.\n"
+                        ),
+                    },
+                    {
+                        "index": 3,
+                        "chapter_id": "ch-003-related",
+                        "title": "2. Institutional Judgment Elsewhere",
+                        "markdown": (
+                            "# 2. Institutional Judgment Elsewhere\n\n"
+                            "This chapter argues that institutional judgment also shapes later policy.\n\n"
+                            "The evidence from another court report supports this claim.\n\n"
+                            "A 2025 policy case shows the institution changing its rule.\n\n"
+                            "Therefore institutional evidence travels across chapters.\n"
+                        ),
+                    },
+                ],
+                "assets": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    paths = build_knowledge_extraction(run_dir, network_model="argument_network")
+    manifest = json.loads(paths["manifest"].read_text(encoding="utf-8"))
+    nodes = json.loads(paths["nodes"].read_text(encoding="utf-8"))
+    edges = json.loads(paths["edges"].read_text(encoding="utf-8"))
+    report = paths["report"].read_text(encoding="utf-8")
+
+    assert manifest["status"] == "completed"
+    assert manifest["network_model"] == "argument_network"
+    node_types = {node["node_type"] for node in nodes}
+    assert node_types.issuperset({"question", "claim", "evidence", "concept"})
+    assert node_types & {"fact", "data_point", "case"}
+    assert any(edge["edge_type"] == "supports" for edge in edges)
+    assert any(edge["edge_type"] in {"cross_supports", "relates_to_concept"} for edge in edges)
+    assert all(node["source"]["chapter_id"] for node in nodes)
+    assert "Knowledge Extraction Report" in report
+    assert "Chapter Argument Maps" in report
+    assert "Claims and Support" in report
+    assert "Facts / Data / Cases" in report
+    assert "Cross-Chapter Links" in report
+    assert "Edge Index" in report
+
+
+def test_build_knowledge_extraction_does_not_apply_argument_logic_to_other_models(tmp_path: Path) -> None:
+    run_dir = tmp_path / "Historical Book"
+    run_dir.mkdir()
+    (run_dir / "book.json").write_text(
+        json.dumps(
+            {
+                "chapters": [
+                    {
+                        "index": 1,
+                        "title": "A Historical Event",
+                        "markdown": "# A Historical Event\n\nThe event happened in 1900.\n\nActors moved across the empire.\n",
+                    }
+                ],
+                "assets": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    paths = build_knowledge_extraction(run_dir, network_model="event_timeline_network")
+    manifest = json.loads(paths["manifest"].read_text(encoding="utf-8"))
+    nodes = json.loads(paths["nodes"].read_text(encoding="utf-8"))
+    report = paths["report"].read_text(encoding="utf-8")
+
+    assert manifest["status"] == "unsupported"
+    assert nodes == []
+    assert "no extractor yet" in report

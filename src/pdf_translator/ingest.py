@@ -259,6 +259,10 @@ def detect_language(text: str) -> str | None:
     sample = " ".join(text.split())[:4000]
     if not sample:
         return None
+    cjk_count = sum(1 for char in sample if "\u4e00" <= char <= "\u9fff")
+    alpha_count = sum(1 for char in sample if char.isalpha())
+    if cjk_count >= 40 and cjk_count / max(alpha_count, 1) >= 0.20:
+        return "zh-cn"
     try:
         return detect(sample)
     except LangDetectException:

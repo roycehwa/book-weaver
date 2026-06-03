@@ -22,7 +22,7 @@ Input: one PDF or EPUB book.
 4. If the user wants knowledge processing:
    - Chinese source: use original BookIR and original text.
    - Non-Chinese source: translate first, then use original + translation as bilingual knowledge input.
-5. Branch B writes `knowledge/` artifacts: chapters, semantic units, suitability report, profile-specific candidates, wiki/index/graph outputs.
+5. Branch B writes `knowledge/` artifacts in a user-feedback loop: chapters, semantic units, reader brief, feedback objects, profile-specific machine candidates, joint draft, accepted knowledge, and exports.
 
 ## Phase 1: Polish As A Formal Stage
 
@@ -138,114 +138,140 @@ Reference projects:
 - `PDFMathTranslate`: formulas/charts/TOC/annotations as protected layout objects.
 - `LLM_PDF_Translator`: LLM-based reference checking.
 
-## Phase 4: Knowledge Export Core
+## Phase 4: Reader Brief And Feedback Intake
 
-Goal: Add a second branch from the same BookIR for knowledge processing.
+Goal: Turn BookIR and planning outputs into a reader-facing entry point, then accept user understanding without forcing users to review machine graph fragments.
 
-Command:
+Commands:
 
 ```bash
-book-weaver knowledge-export RUN_DIR --format json
+book-weaver knowledge brief RUN_DIR
+book-weaver knowledge feedback RUN_DIR --input feedback.md
 ```
 
 Outputs:
 
-- `knowledge/book.json`
-- `knowledge/chapters.jsonl`
-- `knowledge/concepts.jsonl`
-- `knowledge/quotes.jsonl`
-- `knowledge/claims.jsonl`
-- `knowledge/summary.json`
-
-Schema:
-
-- `chapter_id`
-- `chapter_title`
-- `page_start`
-- `page_end`
-- `source_path`
-- `translated_epub_path`
-- `summary_short`
-- `summary_long`
-- `key_concepts`
-- `people`
-- `places`
-- `works`
-- `claims`
-- `quotes`
-- `links`
+- `knowledge/reader-brief.md`
+- `knowledge/reader-brief.html`
+- `knowledge/feedback-template.md`
+- `knowledge/feedback/raw/*.json`
+- `knowledge/feedback/aligned/*.json`
 
 Implementation steps:
 
-1. Add stable `chapter_id` to BookIR.
-2. Generate chapter-level summaries from translated text.
-3. Extract concepts, people, places, works, claims, and quotes per chapter.
-4. Add cross-chapter concept normalization.
-5. Add deterministic JSONL outputs first; defer Notion writing until schemas stabilize.
+1. Render a readable book frame from BookIR, metadata prior, network plan, chapter decisions, and light chapter samples.
+2. Include part map, chapter cards, high-value sections, apparatus sections, and current network organization judgment.
+3. Accept natural-language feedback: book-level frame corrections, reading goals, highlights, chapter notes, concept hints, relation hints, external reference material, and disagreements.
+4. Preserve raw feedback before any model rewriting.
+5. Align feedback to `chapter_id`, `unit_id`, page ranges, excerpt hashes, and candidate nodes when possible.
+6. Keep unaligned whole-book insights as valid feedback objects.
 
 Acceptance:
 
-- Knowledge export works without Notion.
-- Every extracted item points back to `chapter_id` and page range.
-- Re-running export is deterministic when using cache.
+- Users can give useful feedback from the brief without opening JSON or raw candidate graphs.
+- Imported or pasted highlights remain traceable to original user input.
+- External reviews and recommendations remain weak priors, not accepted source evidence.
+- Chinese original-only runs and bilingual translated runs use the same feedback path.
 
-Reference projects:
+## Phase 5: Joint Draft And Accepted Knowledge
 
-- `zotero-pdf-translate`: annotations, notes, metadata as first-class research objects.
+Goal: Fuse user feedback and machine candidates into an inspectable knowledge draft, then create a clean accepted layer.
 
-## Phase 5: Notion Export
+Commands:
 
-Goal: Use Notion as a knowledge workspace, not as the primary translation engine.
+```bash
+book-weaver knowledge extract RUN_DIR --network-model argument_network
+book-weaver knowledge draft RUN_DIR
+book-weaver knowledge accept RUN_DIR
+```
+
+Outputs:
+
+- `knowledge/candidates/`
+- `knowledge/joint-draft.md`
+- `knowledge/joint-draft.html`
+- `knowledge/accepted/nodes.jsonl`
+- `knowledge/accepted/edges.jsonl`
+- `knowledge/accepted/quality-report.json`
+
+Implementation steps:
+
+1. Standardize candidate provenance across profile-specific extractors.
+2. Keep machine candidates separate from user feedback.
+3. Render a Joint Draft organized by the selected profile: questions/claims for argumentative books, events/timelines for historical books, procedures/playbooks for practical books, and so on.
+4. Mark every draft item as source-derived, machine candidate, user-observed, user-supported, or accepted.
+5. Show conflicts, unmatched feedback, uncertain relations, and missing evidence.
+6. Promote only policy-compliant items into accepted knowledge.
+
+Acceptance:
+
+- The Joint Draft is readable as a structured book knowledge memo.
+- Every accepted item has provenance or an explicit user-origin state.
+- User disagreement is not collapsed into the author's claim.
+- Candidate extraction can improve without rewriting accepted export contracts.
+
+## Phase 6: Local Knowledge Export
+
+Goal: Export accepted knowledge into a usable local knowledge base before binding to external platforms.
 
 Command:
 
 ```bash
-book-weaver notion-export RUN_DIR --database-id DATABASE_ID
+book-weaver knowledge export RUN_DIR --format markdown-vault
 ```
 
-Notion databases:
+Outputs:
 
-- `Books`
-- `Chapters`
-- `Concepts`
-- `Quotes`
-- `Claims`
-- `People`
-- `Places`
-- `Works`
+- `knowledge/export/markdown-vault/`
+- Book index pages.
+- Concept / claim / event / case pages as supported by the profile.
+- Source and provenance links.
+- Mindmap and graph JSON sidecars where useful.
 
 Implementation steps:
 
-1. Generate `notion-export/manifest.json` before writing to Notion.
-2. Map Books and Chapters first.
-3. Add Concepts, Quotes, and Claims after schema validation.
-4. Store local IDs and Notion page IDs for idempotent updates.
-5. Keep Notion AI optional and manual; do not depend on it for pipeline correctness.
+1. Export only accepted knowledge plus explicit user-authored insight objects.
+2. Keep a local manifest for idempotent export.
+3. Preserve links back to BookIR, source text, translation where available, and feedback sources.
+4. Keep local Markdown as the first usable target; add Notion, Obsidian, Neo4j, or other platforms after export contracts stabilize.
 
 Acceptance:
 
-- Re-running does not create duplicate pages.
-- Each Notion chapter page links back to source file, EPUB, chapter ID, and page range.
-- Notion export can be skipped without affecting EPUB output.
+- The export is browsable without a graph database.
+- A reader can move from book overview to connected nodes and back to evidence.
+- Re-running export does not duplicate nodes.
 
-Reference:
+## Phase 7: External Workspace Export
 
-- Notion API supports pages, databases, blocks, users, comments, and content operations; it should be treated as a storage and collaboration API, not a guaranteed AI processing API.
+Goal: Use Notion and other platforms as workspaces or destinations, not as the source of truth.
 
-## Phase 6: Batch And Profile System
+Possible targets:
+
+- Notion
+- Obsidian
+- Neo4j
+- RAG/search indexes
+
+Notion requirements when implemented:
+
+- Generate a local export manifest before writing remotely.
+- Store local IDs and remote IDs for idempotent updates.
+- Keep Notion AI optional and manual; do not depend on it for pipeline correctness.
+
+## Phase 8: Batch And Profile System
 
 Goal: Make the project usable across a directory of books.
 
 Command:
 
 ```bash
-book-weaver batch /path/to/books --profile book --format epub --polish --knowledge-export
+book-weaver batch /path/to/books --profile book --format epub --polish --knowledge-stage brief
 ```
 
 Implementation steps:
 
 1. Add batch manifest with one row per source file.
-2. Track states: `pending`, `ingesting`, `translated`, `polished`, `knowledge_exported`, `failed`.
+2. Track states: `pending`, `ingesting`, `translated`, `polished`, `brief_ready`, `feedback_waiting`, `draft_ready`, `knowledge_exported`, `failed`.
 3. Skip already completed stages by default.
 4. Add per-file warnings for scanned PDFs, huge files, math-heavy files, and poor chapter structure.
 5. Generate batch-level summary HTML or Markdown.
@@ -261,7 +287,7 @@ Reference projects:
 - `PDFMathTranslate`: directory/batch translation.
 - `LLM_PDF_Translator`: skip already translated outputs.
 
-## Phase 7: Optional Reader-Oriented Features
+## Phase 9: Optional Reader-Oriented Features
 
 Goal: Improve human QA and selective work without bloating the core pipeline.
 
@@ -284,10 +310,12 @@ Reference projects:
 1. Phase 1: `polish`
 2. Phase 2: translation run controls
 3. Phase 3: protected object and apparatus classification
-4. Phase 4: knowledge export JSON
-5. Phase 5: Notion export
-6. Phase 6: batch mode
-7. Phase 7: optional reader QA features
+4. Phase 4: Reader Brief and feedback intake
+5. Phase 5: Joint Draft and accepted knowledge
+6. Phase 6: local Markdown vault export
+7. Phase 7: external workspace exports
+8. Phase 8: batch mode
+9. Phase 9: optional reader QA features
 
 ## Do Not Do Yet
 

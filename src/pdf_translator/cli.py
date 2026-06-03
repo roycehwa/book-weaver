@@ -11,16 +11,21 @@ from pdf_translator.guardrails import (
     ingest_pdf_guarded,
 )
 from pdf_translator.knowledge import (
+    NETWORK_MODELS,
     apply_user_review,
+    build_knowledge_extraction,
     build_knowledge_package,
     build_knowledge_plan,
     build_metadata_prior,
+    build_reader_brief,
     build_suitability_report,
     emit_mindmap_mermaid_from_book,
     emit_wiki_outline_from_book,
+    ingest_reader_feedback,
     load_book_json,
 )
-from pdf_translator.pipeline import run_translation_pipeline
+from pdf_translator.lifecycle import cleanup_run, finalize_run
+from pdf_translator.pipeline import run_intake_pipeline, run_translation_pipeline
 from pdf_translator.polish import run_polish
 from pdf_translator.profile import build_document_profile
 from pdf_translator.validation import run_validation_manifest, write_validation_report
@@ -32,6 +37,57 @@ def build_parser() -> argparse.ArgumentParser:
         description="Ingest books, translate when needed, and prepare reading and knowledge artifacts.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    intake_parser = subparsers.add_parser(
+        "intake",
+        help="Ingest a book and build BookIR without translation.",
+    )
+    intake_parser.add_argument(
+        "source_pdf",
+        type=Path,
+        help="Path to source document: PDF (Docling) or EPUB (spine XHTML).",
+    )
+    intake_parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("runs"),
+        help="Base directory for intake artifacts.",
+    )
+    intake_parser.add_argument(
+        "--source-lang",
+        default=None,
+        help="Optional source language. If omitted, language will be auto-detected.",
+    )
+    intake_parser.add_argument(
+        "--max-chunk-chars",
+        type=int,
+        default=9000,
+        help="Chunk-size estimate used in chapter reports.",
+    )
+    intake_parser.add_argument(
+        "--profile",
+        default="book",
+        choices=["auto", "magazine", "book"],
+        help="Profile used for ingest guardrails. Defaults to book for the mainline workflow.",
+    )
+    intake_parser.add_argument(
+        "--ingest-timeout-seconds",
+        type=int,
+        default=DEFAULT_INGEST_TIMEOUT_SECONDS,
+        help="Hard timeout for the ingest stage. Use 0 to disable.",
+    )
+    intake_parser.add_argument(
+        "--max-file-size-mb",
+        type=float,
+        default=None,
+        help="Override the hard input gate for file size in MB.",
+    )
+    intake_parser.add_argument(
+        "--max-page-count",
+        type=int,
+        default=None,
+        help="Override the hard input gate for page count.",
+    )
 
     translate_parser = subparsers.add_parser(
         "translate",
@@ -230,6 +286,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="Per-request polish timeout. Defaults to the translator timeout, e.g. MINIMAX_HTTP_TIMEOUT_SECONDS.",
     )
 
+    finalize_parser = subparsers.add_parser(
+        "finalize",
+        help="Write phase_a_status.json for a completed intake or translate run.",
+    )
+    finalize_parser.add_argument(
+        "run_dir",
+        type=Path,
+        help="Path to a completed intake or translate run.",
+    )
+
+    cleanup_parser = subparsers.add_parser(
+        "cleanup",
+        help="Remove temporary intake/translation artifacts after a run has been accepted.",
+    )
+    cleanup_parser.add_argument(
+        "run_dir",
+        type=Path,
+        help="Path to a completed intake or translate run.",
+    )
+    cleanup_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Only write cleanup-dry-run.json and print what would be removed.",
+    )
+    cleanup_parser.add_argument(
+        "--keep-caches",
+        action="store_true",
+        help="Keep translation-cache/ and polish-cache/ even during cleanup.",
+    )
+
     knowledge_parser = subparsers.add_parser(
         "knowledge",
         help="Build and export Phase B knowledge artifacts.",
@@ -237,12 +323,12 @@ def build_parser() -> argparse.ArgumentParser:
     knowledge_sub = knowledge_parser.add_subparsers(dest="knowledge_command", required=True)
     knowledge_build = knowledge_sub.add_parser(
         "build",
-        help="Build deterministic chapters, semantic units, assets, and source map from a Phase A run.",
+        help="Build deterministic chapters, semantic units, assets, and source map from an intake/translate run.",
     )
     knowledge_build.add_argument(
         "run_dir",
         type=Path,
-        help="Path to a completed Phase A run containing book.json.",
+        help="Path to a completed intake or translate run containing book.json.",
     )
     knowledge_build.add_argument(
         "--out",
@@ -257,7 +343,7 @@ def build_parser() -> argparse.ArgumentParser:
     knowledge_suitability.add_argument(
         "run_dir",
         type=Path,
-        help="Path to a completed Phase A run containing book.json.",
+        help="Path to a completed intake or translate run containing book.json.",
     )
     knowledge_suitability.add_argument(
         "--out",
@@ -272,7 +358,7 @@ def build_parser() -> argparse.ArgumentParser:
     knowledge_metadata.add_argument(
         "run_dir",
         type=Path,
-        help="Path to a completed Phase A run containing manifest.json.",
+        help="Path to a completed intake or translate run containing manifest.json.",
     )
     knowledge_metadata.add_argument(
         "--out",
@@ -298,7 +384,7 @@ def build_parser() -> argparse.ArgumentParser:
     knowledge_plan.add_argument(
         "run_dir",
         type=Path,
-        help="Path to a completed Phase A run containing book.json.",
+        help="Path to a completed intake or translate run containing book.json.",
     )
     knowledge_plan.add_argument(
         "--out",
@@ -325,7 +411,7 @@ def build_parser() -> argparse.ArgumentParser:
     knowledge_review.add_argument(
         "run_dir",
         type=Path,
-        help="Path to a completed Phase A run containing book.json.",
+        help="Path to a completed intake or translate run containing book.json.",
     )
     knowledge_review.add_argument(
         "--answers",
@@ -339,6 +425,63 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional output directory. Defaults to RUN_DIR/knowledge.",
     )
+    knowledge_brief = knowledge_sub.add_parser(
+        "brief",
+        help="Render the reader-facing Phase B brief and feedback template.",
+    )
+    knowledge_brief.add_argument(
+        "run_dir",
+        type=Path,
+        help="Path to a completed intake or translate run containing book.json.",
+    )
+    knowledge_brief.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help="Optional output directory. Defaults to RUN_DIR/knowledge.",
+    )
+    knowledge_feedback = knowledge_sub.add_parser(
+        "feedback",
+        help="Preserve reader feedback and write first-pass alignment objects.",
+    )
+    knowledge_feedback.add_argument(
+        "run_dir",
+        type=Path,
+        help="Path to a completed intake or translate run containing a knowledge package.",
+    )
+    knowledge_feedback.add_argument(
+        "--input",
+        type=Path,
+        required=True,
+        help="Markdown or plain-text feedback file based on feedback-template.md.",
+    )
+    knowledge_feedback.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help="Optional output directory. Defaults to RUN_DIR/knowledge.",
+    )
+    knowledge_extract = knowledge_sub.add_parser(
+        "extract",
+        help="Run a profile-specific knowledge extractor. The first implemented extractor is argument_network.",
+    )
+    knowledge_extract.add_argument(
+        "run_dir",
+        type=Path,
+        help="Path to a completed intake or translate run containing knowledge plan inputs.",
+    )
+    knowledge_extract.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help="Optional output directory. Defaults to RUN_DIR/knowledge.",
+    )
+    knowledge_extract.add_argument(
+        "--network-model",
+        default=None,
+        choices=sorted(NETWORK_MODELS.keys()),
+        help="Override the planned network model. Defaults to knowledge/plan.json final_plan.",
+    )
     wiki_outline = knowledge_sub.add_parser(
         "wiki-outline",
         help="Write per-chapter Markdown stubs and index.md under a directory.",
@@ -347,7 +490,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--book-json",
         type=Path,
         required=True,
-        help="Path to book.json from a translate run.",
+        help="Path to book.json from an intake or translate run.",
     )
     wiki_outline.add_argument(
         "--out",
@@ -363,7 +506,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--book-json",
         type=Path,
         required=True,
-        help="Path to book.json from a translate run.",
+        help="Path to book.json from an intake or translate run.",
     )
     mindmap_cmd.add_argument(
         "--out",
@@ -398,7 +541,32 @@ def main() -> None:
     args = parser.parse_args()
 
     try:
-        if args.command == "translate":
+        if args.command == "intake":
+            settings = RunSettings(
+                source_pdf=args.source_pdf.expanduser().resolve(),
+                output_dir=args.output_dir.expanduser().resolve(),
+                target_language=args.source_lang or "source",
+                source_language=args.source_lang,
+                translator="none",
+                max_chunk_chars=args.max_chunk_chars,
+                profile_name=args.profile,
+                output_format="none",
+                ingest_timeout_seconds=args.ingest_timeout_seconds,
+                max_file_size_mb=args.max_file_size_mb,
+                max_page_count=args.max_page_count,
+            )
+            artifacts = run_intake_pipeline(settings)
+            manifest = json.loads(artifacts.manifest_path.read_text(encoding="utf-8"))
+            _print_preflight(manifest["preflight"])
+            print(f"Intake artifacts written to: {artifacts.output_dir}")
+            files = manifest.get("files", {})
+            if "book_json" in files:
+                print(f"BookIR: {files['book_json']}")
+            if "book_markdown" in files:
+                print(f"Book Markdown: {files['book_markdown']}")
+            if "chapter_report" in files:
+                print(f"Chapter report: {files['chapter_report']}")
+        elif args.command == "translate":
             settings = RunSettings(
                 source_pdf=args.source_pdf.expanduser().resolve(),
                 output_dir=args.output_dir.expanduser().resolve(),
@@ -494,12 +662,35 @@ def main() -> None:
                 f"accepted={result.accepted_count} "
                 f"rejected={result.rejected_count}"
             )
+        elif args.command == "finalize":
+            result = finalize_run(args.run_dir)
+            status = result["status"]
+            print(f"Phase A status: {result['status_path']}")
+            print(
+                "Finalize summary: "
+                f"status={status['status']} "
+                f"ready_for_phase_b={status['ready_for_phase_b']} "
+                f"chapters={status['chapter_count']} "
+                f"chapter_id_coverage={status['chapter_id_coverage']}"
+            )
+        elif args.command == "cleanup":
+            result = cleanup_run(
+                args.run_dir,
+                dry_run=args.dry_run,
+                include_caches=not args.keep_caches,
+            )
+            report = result["report"]
+            count = len(report["would_remove"] if report["dry_run"] else report["removed"])
+            print(f"Cleanup report: {result['report_path']}")
+            print(f"Cleanup summary: dry_run={report['dry_run']} count={count}")
         elif args.command == "knowledge":
             if args.knowledge_command == "build":
                 paths = build_knowledge_package(args.run_dir, out_dir=args.out)
                 print(f"Knowledge manifest: {paths['manifest']}")
                 print(f"Chapters: {paths['chapters']}")
                 print(f"Semantic units: {paths['semantic_units']}")
+                print(f"Bilingual input: {paths['bilingual_input']}")
+                print(f"Bilingual summary: {paths['bilingual_input_markdown']}")
                 print(f"Assets: {paths['assets']}")
                 print(f"Source map: {paths['source_map']}")
             elif args.knowledge_command == "suitability":
@@ -531,6 +722,31 @@ def main() -> None:
                 print(f"Reference prior: {paths['reference_prior']}")
                 print(f"Plan JSON: {paths['plan']}")
                 print(f"Plan Markdown: {paths['markdown']}")
+            elif args.knowledge_command == "brief":
+                paths = build_reader_brief(args.run_dir, out_dir=args.out)
+                print(f"Reader brief: {paths['markdown']}")
+                print(f"Reader brief HTML: {paths['html']}")
+                print(f"Feedback template: {paths['template']}")
+            elif args.knowledge_command == "feedback":
+                paths = ingest_reader_feedback(args.run_dir, args.input, out_dir=args.out)
+                print(f"Raw feedback Markdown: {paths['raw_markdown']}")
+                print(f"Raw feedback JSON: {paths['raw']}")
+                print(f"Aligned feedback: {paths['aligned']}")
+                if "review" in paths:
+                    print(f"User review: {paths['review']}")
+                    print(f"Reference prior: {paths['reference_prior']}")
+                    print(f"Plan JSON: {paths['plan']}")
+                    print(f"Plan Markdown: {paths['plan_markdown']}")
+            elif args.knowledge_command == "extract":
+                paths = build_knowledge_extraction(
+                    args.run_dir,
+                    out_dir=args.out,
+                    network_model=args.network_model,
+                )
+                print(f"Extraction manifest: {paths['manifest']}")
+                print(f"Extracted nodes: {paths['nodes']}")
+                print(f"Extracted edges: {paths['edges']}")
+                print(f"Extraction report: {paths['report']}")
             elif args.knowledge_command == "wiki-outline":
                 book_path = args.book_json.expanduser().resolve()
                 book = load_book_json(book_path)
