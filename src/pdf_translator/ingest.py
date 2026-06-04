@@ -22,16 +22,19 @@ def build_pdf_converter(
     generate_picture_images: bool = False,
 ) -> Any:
     from docling.backend.pypdfium2_backend import PyPdfiumDocumentBackend
+    from docling.datamodel.accelerator_options import AcceleratorDevice, AcceleratorOptions
     from docling.datamodel.base_models import InputFormat
     from docling.datamodel.pipeline_options import PdfPipelineOptions
     from docling.document_converter import DocumentConverter, PdfFormatOption
 
+    # RT-DETR layout models use float64 ops that MPS rejects; CPU is stable on macOS.
     pipeline_options = PdfPipelineOptions(
         do_ocr=False,
         do_table_structure=enable_table_structure,
         force_backend_text=True,
         generate_picture_images=generate_picture_images,
         images_scale=2.0 if generate_picture_images else 1.0,
+        accelerator_options=AcceleratorOptions(device=AcceleratorDevice.CPU),
     )
     return DocumentConverter(
         format_options={

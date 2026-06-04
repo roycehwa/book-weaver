@@ -319,6 +319,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["openai", "mock", "minimax", "compatible", "openai-compatible"],
         help="Translation backend used to generate rewrite candidates.",
     )
+    review_rewrite_parser.add_argument(
+        "--segment-id",
+        default=None,
+        help="Rewrite only one segment instead of all open model_rewrite requests.",
+    )
 
     agent_parser = subparsers.add_parser(
         "agent-once",
@@ -664,6 +669,7 @@ def main() -> None:
                 translator=build_translator(args.translator),
                 source_language=args.source_lang,
                 target_language=args.target_lang,
+                segment_id=args.segment_id,
             )
             print(f"Rewrite candidates generated: {result['rewritten_count']}")
             print(f"Review state updated: {result['review_state_path']}")

@@ -22,6 +22,8 @@ SCHEMA_SEGMENTS = "translation_review_segments_v1"
 SCHEMA_TRANSLATED_SEGMENTS = "translation_review_translated_segments_v1"
 SCHEMA_ITEMS = "translation_review_items_v1"
 SCHEMA_STATE = "translation_review_state_v1"
+SCHEMA_PRE_REVIEW = "translation_pre_review_v1"
+SCHEMA_CHAPTER_MARKS = "translation_review_chapter_marks_v1"
 
 CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 LATIN_WORD_RE = re.compile(r"\b[A-Za-z][A-Za-z'’-]{3,}\b")
@@ -413,16 +415,50 @@ def detect_review_items(
     return items
 
 
+def build_pre_review_report(
+    segments: list[dict[str, Any]],
+    review_items: list[dict[str, Any]],
+    *,
+    method: str = "rules_v1",
+) -> dict[str, Any]:
+    """Machine pre-review: audit source/translation pairs and flag questionable segments."""
+    issue_counts: dict[str, int] = defaultdict(int)
+    flagged_segment_ids: list[str] = []
+    for item in review_items:
+        issue_counts[str(item.get("issue_type") or "unknown")] += 1
+        segment_id = str(item.get("segment_id") or "").strip()
+        if segment_id:
+            flagged_segment_ids.append(segment_id)
+    total_segments = len(segments)
+    flagged_segments = len(flagged_segment_ids)
+    return {
+        "schema": SCHEMA_PRE_REVIEW,
+        "status": "completed",
+        "completed_at": utc_now(),
+        "method": method,
+        "total_segments": total_segments,
+        "flagged_segments": flagged_segments,
+        "clean_segments": max(total_segments - flagged_segments, 0),
+        "issue_counts": dict(sorted(issue_counts.items())),
+        "flagged_segment_ids": flagged_segment_ids,
+    }
+
+
 def create_review_state(review_items: list[dict[str, Any]]) -> dict[str, Any]:
+    flagged_count = len(review_items)
     return {
         "schema": SCHEMA_STATE,
         "created_at": utc_now(),
         "updated_at": utc_now(),
         "summary": {
-            "total_items": len(review_items),
-            "open_items": len(review_items),
+            "total_items": flagged_count,
+            "open_items": flagged_count,
             "approved_items": 0,
             "resolved_items": 0,
+        },
+        "workflow": {
+            "pre_review_completed": True,
+            "human_review_mode": "issues_only" if flagged_count else "full",
         },
         "decisions": {},
     }
@@ -453,6 +489,7 @@ def build_review_artifacts(
             target_language=target_language,
         )
     review_items = detect_review_items(segments, translated_segments_list, target_language=target_language)
+    pre_review = build_pre_review_report(segments, review_items)
     return {
         "segments": {
             "schema": SCHEMA_SEGMENTS,
@@ -472,6 +509,11 @@ def build_review_artifacts(
             "items": review_items,
         },
         "review_state": create_review_state(review_items),
+        "pre_review": pre_review,
+        "chapter_marks": {
+            "schema": SCHEMA_CHAPTER_MARKS,
+            "marks": [],
+        },
     }
 
 
@@ -590,6 +632,7 @@ def rewrite_review_requests(
     translator: Any,
     source_language: str | None,
     target_language: str,
+    segment_id: str | None = None,
 ) -> dict[str, Any]:
     project = review_project_from_run(run_dir)
     source_by_id = {segment["segment_id"]: segment for segment in project["segments"]}
@@ -598,13 +641,15 @@ def rewrite_review_requests(
     decisions = state.setdefault("decisions", {})
     rewritten_count = 0
 
-    for segment_id, decision in list(decisions.items()):
+    for current_segment_id, decision in list(decisions.items()):
+        if segment_id is not None and current_segment_id != segment_id:
+            continue
         if not isinstance(decision, dict):
             continue
         if decision.get("action") != "model_rewrite" or decision.get("status") not in {"open", "requested"}:
             continue
-        source = source_by_id.get(segment_id)
-        translated = translated_by_id.get(segment_id)
+        source = source_by_id.get(current_segment_id)
+        translated = translated_by_id.get(current_segment_id)
         if source is None or translated is None:
             continue
         reviewer_comment = str(decision.get("reviewer_comment") or "").strip()
@@ -709,16 +754,164 @@ def translated_segments_to_chapters(translated_segments_payload: Any) -> list[di
     return chapters
 
 
+def _segment_index_map(segments: list[dict[str, Any]]) -> dict[str, int]:
+    return {str(segment["segment_id"]): index for index, segment in enumerate(segments)}
+
+
+def empty_chapter_marks_payload() -> dict[str, Any]:
+    return {"schema": SCHEMA_CHAPTER_MARKS, "marks": []}
+
+
+def load_chapter_marks(run_dir: Path) -> dict[str, Any]:
+    path = run_dir / "review_chapter_marks.json"
+    if not path.exists():
+        return empty_chapter_marks_payload()
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        return empty_chapter_marks_payload()
+    marks = payload.get("marks", [])
+    if not isinstance(marks, list):
+        marks = []
+    return {"schema": SCHEMA_CHAPTER_MARKS, "marks": [dict(item) for item in marks]}
+
+
+def save_chapter_marks(run_dir: Path, payload: dict[str, Any]) -> Path:
+    path = run_dir / "review_chapter_marks.json"
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+
+def add_review_chapter_mark(
+    *,
+    run_dir: Path,
+    segments: list[dict[str, Any]],
+    segment_id: str,
+    chapter_title: str,
+    mark_id: str | None = None,
+) -> dict[str, Any]:
+    import uuid
+
+    index_by_id = _segment_index_map(segments)
+    if segment_id not in index_by_id:
+        raise ValueError(f"Unknown review segment: {segment_id}")
+    title = chapter_title.strip()
+    if not title:
+        raise ValueError("chapter_title is required")
+    payload = load_chapter_marks(run_dir)
+    marks = payload["marks"]
+    for existing in marks:
+        if existing.get("segment_id") == segment_id:
+            existing["chapter_title"] = title
+            existing["updated_at"] = utc_now()
+            save_chapter_marks(run_dir, payload)
+            return payload
+    marks.append(
+        {
+            "mark_id": mark_id or str(uuid.uuid4()),
+            "segment_id": segment_id,
+            "chapter_title": title,
+            "segment_index": index_by_id[segment_id],
+            "created_at": utc_now(),
+        }
+    )
+    marks.sort(key=lambda item: int(item.get("segment_index") or index_by_id.get(str(item.get("segment_id")), 0)))
+    save_chapter_marks(run_dir, payload)
+    return payload
+
+
+def remove_review_chapter_mark(*, run_dir: Path, mark_id: str) -> dict[str, Any]:
+    payload = load_chapter_marks(run_dir)
+    marks = payload["marks"]
+    filtered = [item for item in marks if str(item.get("mark_id")) != mark_id]
+    if len(filtered) == len(marks):
+        raise ValueError(f"Chapter mark not found: {mark_id}")
+    payload["marks"] = filtered
+    save_chapter_marks(run_dir, payload)
+    return payload
+
+
+def build_chapter_groups_from_marks(
+    segments: list[dict[str, Any]],
+    marks: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Build chapter ranges using user segment marks."""
+    if not segments or not marks:
+        return []
+
+    index_by_id = _segment_index_map(segments)
+    boundary_indexes: list[int] = []
+    titles_by_index: dict[int, str] = {}
+    for mark in marks:
+        segment_id = str(mark.get("segment_id") or "").strip()
+        if segment_id not in index_by_id:
+            continue
+        index = index_by_id[segment_id]
+        if index in titles_by_index:
+            titles_by_index[index] = str(mark.get("chapter_title") or titles_by_index[index]).strip()
+            continue
+        boundary_indexes.append(index)
+        titles_by_index[index] = str(mark.get("chapter_title") or "").strip() or display_chapter_title_from_segment(segments[index])
+    if not boundary_indexes:
+        return []
+
+    boundary_indexes = sorted(set(boundary_indexes))
+    groups: list[dict[str, Any]] = []
+    for idx, start in enumerate(boundary_indexes):
+        end = boundary_indexes[idx + 1] if idx + 1 < len(boundary_indexes) else len(segments)
+        groups.append(
+            {
+                "chapter_id": f"user-mark-{start:04d}",
+                "display_title": titles_by_index[start],
+                "first_segment_index": start,
+                "segment_count": end - start,
+                "is_user_mark": True,
+                "mark_segment_id": segments[start]["segment_id"],
+            }
+        )
+    return groups
+
+
+def display_chapter_title_from_segment(segment: dict[str, Any]) -> str:
+    raw = str(segment.get("chapter_title") or "").strip()
+    if raw and not raw.lower().startswith("untitled section"):
+        return raw
+    source = str(segment.get("source_text") or "")
+    heading = re.search(r"^#{1,3}\s+(.+)$", source, re.M)
+    if heading:
+        return heading.group(1).strip()
+    return raw or f"章节 {segment.get('chapter_index') or ''}"
+
+
+def update_review_workflow(run_dir: Path, *, human_review_mode: str) -> dict[str, Any]:
+    if human_review_mode not in {"issues_only", "full"}:
+        raise ValueError("human_review_mode must be issues_only or full")
+    state_path = run_dir / "review_state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    workflow = state.setdefault("workflow", {})
+    if not isinstance(workflow, dict):
+        workflow = {}
+        state["workflow"] = workflow
+    workflow["human_review_mode"] = human_review_mode
+    workflow["pre_review_completed"] = True
+    state["updated_at"] = utc_now()
+    state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    return state
+
+
 def write_review_artifacts(run_dir: Path, artifacts: dict[str, Any]) -> dict[str, str]:
     paths = {
         "segments": run_dir / "segments.json",
         "translated_segments": run_dir / "translated_segments.json",
         "review_items": run_dir / "review_items.json",
         "review_state": run_dir / "review_state.json",
+        "pre_review": run_dir / "pre_review.json",
+        "chapter_marks": run_dir / "review_chapter_marks.json",
     }
     for key, path in paths.items():
+        if key not in artifacts:
+            continue
         path.write_text(json.dumps(artifacts[key], ensure_ascii=False, indent=2), encoding="utf-8")
-    return {key: str(path) for key, path in paths.items()}
+    return {key: str(path) for key, path in paths.items() if key in artifacts}
 
 
 def review_project_from_run(run_dir: Path) -> dict[str, Any]:
@@ -726,12 +919,21 @@ def review_project_from_run(run_dir: Path) -> dict[str, Any]:
     translated_segments = json.loads((run_dir / "translated_segments.json").read_text(encoding="utf-8"))
     review_items = json.loads((run_dir / "review_items.json").read_text(encoding="utf-8"))
     review_state = json.loads((run_dir / "review_state.json").read_text(encoding="utf-8"))
+    pre_review_path = run_dir / "pre_review.json"
+    if pre_review_path.exists():
+        pre_review = json.loads(pre_review_path.read_text(encoding="utf-8"))
+    else:
+        segment_list = _payload_segments(segments)
+        item_list = _payload_items(review_items)
+        pre_review = build_pre_review_report(segment_list, item_list)
     return {
         "run_dir": str(run_dir),
         "segments": _payload_segments(segments),
         "translated_segments": _payload_segments(translated_segments),
         "review_items": _payload_items(review_items),
         "review_state": review_state,
+        "pre_review": pre_review,
+        "chapter_marks": load_chapter_marks(run_dir),
     }
 
 
