@@ -90,6 +90,42 @@ def test_build_review_artifacts_creates_segments_and_initial_queue() -> None:
     assert "mixed_english" in issue_types
     assert "missing_translation" in issue_types
     assert artifacts["review_state"]["summary"]["total_items"] == len(artifacts["review_items"]["items"])
+    assert artifacts["pre_review"]["flagged_segments"] == len(artifacts["review_items"]["items"])
+    assert artifacts["review_state"]["workflow"]["human_review_mode"] == "issues_only"
+
+
+def test_review_chapter_marks_split_outline(tmp_path: Path) -> None:
+    import json
+
+    from pdf_translator.review import add_review_chapter_mark, build_chapter_groups_from_marks, write_review_artifacts
+
+    artifacts = build_review_artifacts(
+        source_path=Path("book.epub"),
+        target_language="zh-CN",
+        book=sample_book(),
+        translated_chapters=[
+            {
+                "index": 1,
+                "chapter_id": "ch-001-intro",
+                "title": "Introduction",
+                "markdown": "译文一。\n\n译文二。",
+            }
+        ],
+    )
+    write_review_artifacts(tmp_path, artifacts)
+    segments = artifacts["segments"]["segments"]
+    second_id = segments[1]["segment_id"]
+    add_review_chapter_mark(
+        run_dir=tmp_path,
+        segments=segments,
+        segment_id=second_id,
+        chapter_title="第二章",
+    )
+    marks = json.loads((tmp_path / "review_chapter_marks.json").read_text(encoding="utf-8"))["marks"]
+    groups = build_chapter_groups_from_marks(segments, marks)
+    assert len(groups) == 1
+    assert groups[0]["display_title"] == "第二章"
+    assert groups[0]["first_segment_index"] == 1
 
 
 def test_apply_review_state_updates_segment_text_and_approval() -> None:
