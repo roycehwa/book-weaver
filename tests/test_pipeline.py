@@ -121,3 +121,28 @@ def test_translate_pipeline_skips_model_for_same_chinese_language(tmp_path: Path
     assert manifest["chunk_count"] == 0
     assert manifest["files"]["translation_cache_dir"] is None
     assert "正文。" in artifacts.translated_markdown_path.read_text(encoding="utf-8")
+
+
+def test_translate_pipeline_writes_review_artifacts_for_real_translation(tmp_path: Path, monkeypatch) -> None:
+    _patch_intake_dependencies(monkeypatch)
+    settings = RunSettings(
+        source_pdf=tmp_path / "english-book.epub",
+        output_dir=tmp_path / "runs",
+        target_language="zh-CN",
+        source_language="en",
+        translator="mock",
+        max_chunk_chars=9000,
+        profile_name="book",
+        output_format="none",
+    )
+
+    artifacts = pipeline_module.run_translation_pipeline(settings)
+    manifest = json.loads(artifacts.manifest_path.read_text(encoding="utf-8"))
+
+    assert manifest["translation"]["mode"] == "translated"
+    assert manifest["files"]["translated_chapters"].endswith("translated-chapters.json")
+    for key in ["segments", "translated_segments", "review_items", "review_state", "pre_review", "chapter_marks"]:
+        assert key in manifest["files"]
+        assert Path(manifest["files"][key]).exists()
+    review_state = json.loads(Path(manifest["files"]["review_state"]).read_text(encoding="utf-8"))
+    assert review_state["schema"] == "translation_review_state_v1"

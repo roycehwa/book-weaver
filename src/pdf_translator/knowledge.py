@@ -9,6 +9,8 @@ from typing import Any, Callable
 
 import requests
 
+from pdf_translator.lifecycle import resolve_phase_a_handoff
+
 
 def _slug_title(title: str, index: int) -> str:
     slug = re.sub(r"[^A-Za-z0-9]+", "-", title).strip("-").lower()[:48]
@@ -106,14 +108,6 @@ def _split_markdown_by_heading_count(markdown: str, expected_count: int) -> list
         return []
     starts.append(len(markdown))
     return [markdown[starts[i] : starts[i + 1]].strip() + "\n" for i in range(expected_count)]
-
-
-def _find_final_markdown(run_dir: Path) -> Path | None:
-    for name in ("translated.polished.md", "translated.md", "book.md"):
-        path = run_dir / name
-        if path.exists():
-            return path
-    return None
 
 
 def _build_chapters(book: dict[str, Any]) -> list[dict[str, Any]]:
@@ -217,7 +211,7 @@ def _build_bilingual_input(
             unit_alignment = "block_index"
         elif translated_blocks:
             unit_alignment = "chapter_only"
-        elif package_mode == "monolingual_original":
+        elif package_mode == "monolingual_source":
             unit_alignment = "original_only"
         else:
             unit_alignment = "unavailable"
@@ -390,16 +384,12 @@ def build_knowledge_package(run_dir: Path, out_dir: Path | None = None) -> dict[
     knowledge_dir = (out_dir.expanduser().resolve() if out_dir else run_dir / "knowledge")
     knowledge_dir.mkdir(parents=True, exist_ok=True)
 
-    final_markdown_path = _find_final_markdown(run_dir)
+    handoff = resolve_phase_a_handoff(run_dir)
+    final_markdown_path = handoff.get("reading_markdown")
     translated_chapter_markdown: list[str] = []
-    translation_mode = str(manifest.get("translation", {}).get("mode") or "")
-    package_mode = "monolingual_original"
+    package_mode = "monolingual_source"
     translation_alignment = "missing"
-    if (
-        final_markdown_path is not None
-        and final_markdown_path.name != "book.md"
-        and translation_mode != "skipped_same_language"
-    ):
+    if handoff.get("mode") == "source_plus_translation" and final_markdown_path is not None:
         package_mode = "bilingual"
         translated_text = final_markdown_path.read_text(encoding="utf-8")
         translated_chapter_markdown = _split_markdown_by_heading_count(
@@ -407,7 +397,7 @@ def build_knowledge_package(run_dir: Path, out_dir: Path | None = None) -> dict[
             len(book.get("chapters") or []),
         )
         translation_alignment = "chapter_heading_count" if translated_chapter_markdown else "unavailable"
-    elif final_markdown_path is not None:
+    elif handoff.get("mode") == "source_only" and final_markdown_path is not None:
         translation_alignment = "original_only"
 
     chapters = _build_chapters(book)
@@ -422,8 +412,10 @@ def build_knowledge_package(run_dir: Path, out_dir: Path | None = None) -> dict[
         translated_chapter_markdown,
         run_dir=run_dir,
         final_markdown_path=final_markdown_path,
-        source_language=manifest.get("source_language"),
-        target_language=manifest.get("target_language"),
+        source_language=handoff.get("source_language") or manifest.get("source_language"),
+        target_language=(
+            handoff.get("reading_language") if handoff.get("mode") == "source_plus_translation" else None
+        ),
         package_mode=package_mode,
         chapter_split_alignment=translation_alignment,
     )
@@ -438,10 +430,16 @@ def build_knowledge_package(run_dir: Path, out_dir: Path | None = None) -> dict[
             "book_json": str(book_path),
             "book_markdown": str(run_dir / "book.md") if (run_dir / "book.md").exists() else None,
             "final_markdown": str(final_markdown_path) if final_markdown_path else None,
+            "phase_a_content_source": handoff.get("content_source"),
+            "phase_a_review_status": handoff.get("review_status"),
+            "phase_a_review_version": handoff.get("review_version"),
         },
         "language": {
-            "source_language": manifest.get("source_language"),
-            "target_language": manifest.get("target_language"),
+            "source_language": handoff.get("source_language") or manifest.get("source_language"),
+            "target_language": (
+                handoff.get("reading_language") if handoff.get("mode") == "source_plus_translation" else None
+            ),
+            "reading_language": handoff.get("reading_language"),
             "mode": package_mode,
             "translation_alignment": translation_alignment,
         },

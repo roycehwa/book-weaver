@@ -159,11 +159,107 @@ def test_build_knowledge_package_marks_original_only_for_chinese_or_untranslated
     manifest = json.loads(paths["manifest"].read_text(encoding="utf-8"))
     bilingual = json.loads(paths["bilingual_input"].read_text(encoding="utf-8"))
 
-    assert manifest["language"]["mode"] == "monolingual_original"
+    assert manifest["language"]["mode"] == "monolingual_source"
+    assert manifest["language"]["reading_language"] == "zh-CN"
     assert units[1]["translation_alignment"] == "original_only"
     assert units[1]["text_translated"] is None
-    assert bilingual["mode"] == "monolingual_original"
+    assert bilingual["mode"] == "monolingual_source"
     assert bilingual["chapters"][0]["translated_markdown"] is None
+
+
+def test_build_knowledge_package_accepts_english_source_without_translation(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "book.json").write_text(
+        json.dumps(
+            {
+                "chapters": [
+                    {
+                        "index": 1,
+                        "chapter_id": "ch-001-a",
+                        "title": "A",
+                        "markdown": "# A\n\nEnglish source text.\n",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "book.md").write_text("# A\n\nEnglish source text.\n", encoding="utf-8")
+    (run_dir / "manifest.json").write_text(
+        json.dumps({"source_language": "en", "translation": {"mode": "not_requested"}}),
+        encoding="utf-8",
+    )
+
+    paths = build_knowledge_package(run_dir)
+    manifest = json.loads(paths["manifest"].read_text(encoding="utf-8"))
+    units = json.loads(paths["semantic_units"].read_text(encoding="utf-8"))
+
+    assert manifest["language"]["mode"] == "monolingual_source"
+    assert manifest["language"]["source_language"] == "en"
+    assert manifest["language"]["reading_language"] == "en"
+    assert manifest["language"]["target_language"] is None
+    assert manifest["source"]["phase_a_content_source"] == "source_book"
+    assert units[1]["text_original"] == "English source text."
+    assert units[1]["text_translated"] is None
+
+
+def test_build_knowledge_package_uses_approved_reviewed_translation(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    version_dir = run_dir / "versions" / "review-v2"
+    version_dir.mkdir(parents=True)
+    (run_dir / "book.json").write_text(
+        json.dumps(
+            {
+                "chapters": [
+                    {
+                        "index": 1,
+                        "chapter_id": "ch-001-a",
+                        "title": "A",
+                        "markdown": "# A\n\nEnglish source text.\n",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "book.md").write_text("# A\n\nEnglish source text.\n", encoding="utf-8")
+    (run_dir / "translated.md").write_text("# 甲\n\n机器初译。\n", encoding="utf-8")
+    reviewed_path = version_dir / "translated.md"
+    reviewed_path.write_text("# 甲\n\n用户批准译文。\n", encoding="utf-8")
+    (run_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "source_language": "en",
+                "target_language": "zh-CN",
+                "translation": {"mode": "translated"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (version_dir / "version-manifest.json").write_text(
+        json.dumps(
+            {
+                "schema": "translation_review_version_v2",
+                "version": "review-v2",
+                "target_language": "zh-CN",
+                "review": {"status": "approved", "approved_at": "2026-06-10T10:00:00+00:00"},
+                "files": {"translated_markdown": "versions/review-v2/translated.md"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    paths = build_knowledge_package(run_dir)
+    manifest = json.loads(paths["manifest"].read_text(encoding="utf-8"))
+    units = json.loads(paths["semantic_units"].read_text(encoding="utf-8"))
+
+    assert manifest["language"]["mode"] == "bilingual"
+    assert manifest["language"]["reading_language"] == "zh-CN"
+    assert manifest["source"]["phase_a_content_source"] == "reviewed_translation"
+    assert manifest["source"]["phase_a_review_status"] == "approved"
+    assert manifest["source"]["phase_a_review_version"] == "review-v2"
+    assert units[1]["text_translated"] == "用户批准译文。"
 
 
 def test_build_suitability_report_detects_argumentative_book(tmp_path: Path) -> None:

@@ -69,6 +69,10 @@ Run translation only when a translated reading edition is needed:
 
 ```bash
 book-weaver translate /absolute/path/to/file.pdf --profile book --target-lang zh-CN
+book-weaver review status runs/<file-stem>
+book-weaver review rewrite runs/<file-stem> --translator minimax
+book-weaver review export runs/<file-stem> --version reviewed-v1 --approve --format epub
+book-weaver finalize runs/<file-stem>
 ```
 
 The previous `pdf-translator` command remains available as a compatibility alias during the transition.
@@ -95,6 +99,13 @@ Translation branch outputs additionally include:
 `normalized.md` is the raw Docling export. For book profile runs, `book.json` is the source of truth, `book.md` is the cleaned reading view, and `translation-input.md` is the chapter-aware translation source when translation is requested. `translated.md` remains a stable internal intermediate for cache reuse, polish, and diffing.
 
 `book-weaver knowledge build` writes `knowledge/bilingual-input.json` and a readable `knowledge/bilingual-input.md` summary in addition to `semantic-units.json`. The bilingual contract is conservative: unit-level translated text is used only when original and translated blocks align safely; otherwise chapter-level translation is preserved as reading context without fake paragraph pairing.
+
+Phase B is not Chinese-only. `finalize` writes a `phase_a_status_v2` handoff with one of two input modes:
+
+- `source_only`: Chinese, English, or another source language enters Phase B directly from `book.json` and `book.md`.
+- `source_plus_translation`: the original BookIR is paired with a translated reading layer.
+
+If translation review has started, the machine translation is not used by Phase B until `book-weaver review export ... --approve` creates an approved reviewed version. While review is pending, the source book remains a valid `source_only` Phase B input.
 
 `book-weaver knowledge extract` is profile-specific. The first implemented extractor is `argument_network`, which writes `knowledge/extracted-nodes.json`, `knowledge/extracted-edges.json`, and `knowledge/extraction-report.md`. Other network models intentionally return an unsupported report until their own algorithms are implemented.
 

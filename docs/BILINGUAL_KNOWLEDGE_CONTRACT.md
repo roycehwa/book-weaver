@@ -19,7 +19,8 @@ Translated text improves readability, but original text remains the evidence sou
 
 `knowledge/manifest.json.language.mode` has two current values:
 
-- `monolingual_original`: no usable translated text is required. Chinese books and untranslated intake runs use this mode.
+- `monolingual_source`: no translated text is required. Chinese, English, and other source-language books may enter Phase B directly in this mode.
+- `bilingual`: the source BookIR is paired with a translated reading layer. When translation review exists, only an explicitly approved reviewed version may supply this layer.
 - `bilingual`: original text and translated text are both available at least at chapter level.
 
 ## Files

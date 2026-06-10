@@ -20,8 +20,9 @@ Input: one PDF or EPUB book.
 2. Detect source language and build stable chapter IDs.
 3. If the user only wants a reading deliverable, run Branch A and stop.
 4. If the user wants knowledge processing:
-   - Chinese source: use original BookIR and original text.
-   - Non-Chinese source: translate first, then use original + translation as bilingual knowledge input.
+   - Any source language may enter directly as `source_only`.
+   - When a translated reading layer is required, use original BookIR plus the explicitly approved reviewed translation as `source_plus_translation`.
+   - A machine translation under active review must not silently become the Phase B reading layer.
 5. Branch B writes `knowledge/` artifacts in a user-feedback loop: chapters, semantic units, reader brief, feedback objects, profile-specific machine candidates, joint draft, accepted knowledge, and exports.
 
 ## Phase 1: Polish As A Formal Stage

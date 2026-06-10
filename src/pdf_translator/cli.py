@@ -25,9 +25,23 @@ from pdf_translator.knowledge import (
     load_book_json,
 )
 from pdf_translator.lifecycle import cleanup_run, finalize_run
-from pdf_translator.pipeline import run_intake_pipeline, run_translation_pipeline
+from pdf_translator.pipeline import (
+    run_intake_pipeline,
+    run_translation_pipeline,
+    safe_delivery_file_stem,
+)
 from pdf_translator.polish import run_polish
 from pdf_translator.profile import build_document_profile
+from pdf_translator.render import render_pdf_from_markdown
+from pdf_translator.review import (
+    apply_review_state,
+    review_project_from_run,
+    rewrite_review_requests,
+    translated_segments_to_chapters,
+    write_versioned_outputs,
+)
+from pdf_translator.epub import render_epub_from_book, validate_epub_internal_hrefs
+from pdf_translator.translate import build_translator
 from pdf_translator.validation import run_validation_manifest, write_validation_report
 
 
@@ -316,6 +330,44 @@ def build_parser() -> argparse.ArgumentParser:
         help="Keep translation-cache/ and polish-cache/ even during cleanup.",
     )
 
+    review_parser = subparsers.add_parser(
+        "review",
+        help="Inspect, rewrite, and export reviewed translation versions.",
+    )
+    review_sub = review_parser.add_subparsers(dest="review_command", required=True)
+    review_status = review_sub.add_parser(
+        "status",
+        help="Show machine pre-review and human review state for a translation run.",
+    )
+    review_status.add_argument("run_dir", type=Path)
+    review_rewrite = review_sub.add_parser(
+        "rewrite",
+        help="Generate model rewrite candidates requested in review_state.json.",
+    )
+    review_rewrite.add_argument("run_dir", type=Path)
+    review_rewrite.add_argument("--target-lang", default="zh-CN")
+    review_rewrite.add_argument("--source-lang", default=None)
+    review_rewrite.add_argument(
+        "--translator",
+        default="minimax",
+        choices=["openai", "mock", "minimax", "compatible", "openai-compatible"],
+    )
+    review_rewrite.add_argument("--segment-id", default=None)
+    review_export = review_sub.add_parser(
+        "export",
+        help="Apply approved segment decisions and export a versioned translation.",
+    )
+    review_export.add_argument("run_dir", type=Path)
+    review_export.add_argument("--version", required=True)
+    review_export.add_argument("--parent-version", default=None)
+    review_export.add_argument("--target-lang", default="zh-CN")
+    review_export.add_argument("--format", default="epub", choices=["pdf", "epub", "both"])
+    review_export.add_argument(
+        "--approve",
+        action="store_true",
+        help="Mark this reviewed version approved for Phase B consumption.",
+    )
+
     knowledge_parser = subparsers.add_parser(
         "knowledge",
         help="Build and export Phase B knowledge artifacts.",
@@ -518,6 +570,80 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _run_review_export(
+    *,
+    run_dir: Path,
+    version_name: str,
+    parent_version: str | None,
+    target_language: str,
+    output_format: str,
+    approve: bool,
+) -> dict[str, object]:
+    run_dir = run_dir.expanduser().resolve()
+    project = review_project_from_run(run_dir)
+    applied_segments = apply_review_state(project["translated_segments"], project["review_state"])
+    version = write_versioned_outputs(
+        run_dir=run_dir,
+        version_name=version_name,
+        target_language=target_language,
+        translated_segments=applied_segments,
+        parent_version=parent_version,
+        approval_status="approved" if approve else "draft",
+    )
+    version_dir = Path(version["version_dir"])
+    translated_markdown_path = Path(version["translated_markdown_path"])
+    translated_markdown = translated_markdown_path.read_text(encoding="utf-8")
+    rendered_files: dict[str, object] = {}
+
+    manifest = {}
+    manifest_path = run_dir / "manifest.json"
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    source_name = Path(str(manifest.get("source_pdf") or run_dir.name)).stem
+    book = {
+        "metadata": {"schema": "review_export_fallback"},
+        "chapters": translated_segments_to_chapters(applied_segments),
+    }
+    if (run_dir / "book.json").exists():
+        book = json.loads((run_dir / "book.json").read_text(encoding="utf-8"))
+
+    delivery_stem = safe_delivery_file_stem(Path(source_name), target_language)
+    if output_format in {"pdf", "both"}:
+        pdf_path = version_dir / f"{delivery_stem}.pdf"
+        render_pdf_from_markdown(
+            title=f"{source_name} ({target_language})",
+            markdown_text=translated_markdown,
+            output_path=pdf_path,
+        )
+        rendered_files["translated_pdf"] = str(pdf_path)
+    if output_format in {"epub", "both"}:
+        epub_path = version_dir / f"{delivery_stem}.epub"
+        render_epub_from_book(
+            book=book,
+            translated_chapters=translated_segments_to_chapters(applied_segments),
+            output_path=epub_path,
+            title=f"{source_name} ({target_language})",
+            language=target_language,
+        )
+        rendered_files["translated_epub"] = str(epub_path)
+        rendered_files["epub_href_validation"] = validate_epub_internal_hrefs(epub_path)
+
+    version_manifest_path = version_dir / "version-manifest.json"
+    version_manifest = json.loads(version_manifest_path.read_text(encoding="utf-8"))
+    version_manifest["render"] = {"format": output_format}
+    version_manifest["files"].update(
+        {
+            key: str(Path(value).relative_to(run_dir)) if isinstance(value, str) else value
+            for key, value in rendered_files.items()
+        }
+    )
+    version_manifest_path.write_text(
+        json.dumps(version_manifest, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return {"version": version, "rendered_files": rendered_files}
+
+
 def _print_preflight(preflight: dict[str, object]) -> None:
     processed_page_count = preflight.get("ingest_page_count")
     page_count = preflight["page_count"]
@@ -683,6 +809,53 @@ def main() -> None:
             count = len(report["would_remove"] if report["dry_run"] else report["removed"])
             print(f"Cleanup report: {result['report_path']}")
             print(f"Cleanup summary: dry_run={report['dry_run']} count={count}")
+        elif args.command == "review":
+            if args.review_command == "status":
+                project = review_project_from_run(args.run_dir.expanduser().resolve())
+                pre_review = project["pre_review"]
+                state = project["review_state"]
+                print(
+                    "Pre-review: "
+                    f"segments={pre_review.get('total_segments', 0)} "
+                    f"flagged={pre_review.get('flagged_segments', 0)} "
+                    f"clean={pre_review.get('clean_segments', 0)}"
+                )
+                summary = state.get("summary") or {}
+                print(
+                    "Human review: "
+                    f"mode={(state.get('workflow') or {}).get('human_review_mode')} "
+                    f"open={summary.get('open_items', 0)} "
+                    f"approved={summary.get('approved_items', 0)} "
+                    f"resolved={summary.get('resolved_items', 0)}"
+                )
+            elif args.review_command == "rewrite":
+                result = rewrite_review_requests(
+                    run_dir=args.run_dir.expanduser().resolve(),
+                    translator=build_translator(args.translator),
+                    source_language=args.source_lang,
+                    target_language=args.target_lang,
+                    segment_id=args.segment_id,
+                )
+                print(f"Rewrite candidates generated: {result['rewritten_count']}")
+                print(f"Review state updated: {result['review_state_path']}")
+            elif args.review_command == "export":
+                result = _run_review_export(
+                    run_dir=args.run_dir,
+                    version_name=args.version,
+                    parent_version=args.parent_version,
+                    target_language=args.target_lang,
+                    output_format=args.format,
+                    approve=args.approve,
+                )
+                version = result["version"]
+                print(f"Reviewed version: {version['version_dir']}")
+                print(f"Reviewed Markdown: {version['translated_markdown_path']}")
+                print(f"Approval status: {'approved' if args.approve else 'draft'}")
+                rendered_files = result["rendered_files"]
+                if "translated_epub" in rendered_files:
+                    print(f"Reviewed EPUB: {rendered_files['translated_epub']}")
+                if "translated_pdf" in rendered_files:
+                    print(f"Reviewed PDF: {rendered_files['translated_pdf']}")
         elif args.command == "knowledge":
             if args.knowledge_command == "build":
                 paths = build_knowledge_package(args.run_dir, out_dir=args.out)

@@ -75,6 +75,44 @@ def test_public_cli_accepts_finalize_and_cleanup_commands() -> None:
     assert cleanup_args.keep_caches is True
 
 
+def test_public_cli_accepts_translation_review_commands() -> None:
+    parser = build_parser()
+    status_args = parser.parse_args(["review", "status", "runs/sample"])
+    rewrite_args = parser.parse_args(
+        [
+            "review",
+            "rewrite",
+            "runs/sample",
+            "--target-lang",
+            "zh-CN",
+            "--translator",
+            "mock",
+            "--segment-id",
+            "ch-001:c001",
+        ]
+    )
+    export_args = parser.parse_args(
+        [
+            "review",
+            "export",
+            "runs/sample",
+            "--version",
+            "review-v2",
+            "--format",
+            "epub",
+            "--approve",
+        ]
+    )
+
+    assert status_args.command == "review"
+    assert status_args.review_command == "status"
+    assert rewrite_args.review_command == "rewrite"
+    assert rewrite_args.segment_id == "ch-001:c001"
+    assert export_args.review_command == "export"
+    assert export_args.version == "review-v2"
+    assert export_args.approve is True
+
+
 def test_public_cli_accepts_knowledge_build_command() -> None:
     parser = build_parser()
     args = parser.parse_args(["knowledge", "build", "runs/sample"])

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import asdict
 from pathlib import Path
 import re
 
@@ -18,6 +19,7 @@ from pdf_translator.models import (
 )
 from pdf_translator.profile import build_document_profile
 from pdf_translator.render import render_pdf_from_markdown
+from pdf_translator.review import build_review_artifacts, write_review_artifacts
 from pdf_translator.translate import (
     build_translator,
     estimate_translation_chunk_count,
@@ -95,6 +97,42 @@ def _build_chapter_report(book: dict, *, max_chunk_chars: int) -> dict:
         ),
         "chapters": chapters,
     }
+
+
+def _fallback_book_from_markdown(source_path: Path, markdown: str) -> dict:
+    return {
+        "metadata": {"schema": "markdown_fallback", "schema_version": 1},
+        "chapters": [
+            {
+                "index": 1,
+                "chapter_id": "ch-001-document",
+                "title": source_path.stem,
+                "markdown": markdown,
+                "source_pages": [],
+                "toc": True,
+            }
+        ],
+    }
+
+
+def _translated_chapters_payload(
+    *,
+    source_path: Path,
+    translated_markdown: str,
+    translated_chapters: list[TranslatedChapter] | None,
+) -> list[dict]:
+    if translated_chapters is not None:
+        return [asdict(chapter) if isinstance(chapter, TranslatedChapter) else dict(chapter) for chapter in translated_chapters]
+    return [
+        {
+            "index": 1,
+            "chapter_id": "ch-001-document",
+            "title": source_path.stem,
+            "markdown": translated_markdown,
+            "source_pages": [],
+            "toc": True,
+        }
+    ]
 
 
 def _prepare_intake_artifacts(settings: RunSettings) -> tuple[
@@ -296,6 +334,28 @@ def run_translation_pipeline(settings: RunSettings) -> PipelineArtifacts:
         translated.translated_markdown,
         encoding="utf-8",
     )
+    translated_chapters_payload = _translated_chapters_payload(
+        source_path=settings.source_pdf,
+        translated_markdown=translated.translated_markdown,
+        translated_chapters=translated_chapters,
+    )
+    translated_chapters_path = artifacts.output_dir / "translated-chapters.json"
+    translated_chapters_path.write_text(
+        json.dumps(translated_chapters_payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    extra_files["translated_chapters"] = str(translated_chapters_path)
+    if translation_mode == "translated":
+        review_source_book = book or _fallback_book_from_markdown(settings.source_pdf, translation_input_markdown)
+        review_artifacts = build_review_artifacts(
+            source_path=settings.source_pdf,
+            target_language=translated.target_language,
+            book=review_source_book,
+            translated_chapters=translated_chapters_payload,
+            cache_dir=translation_cache_dir if translation_cache_dir.exists() else None,
+            max_chunk_chars=settings.max_chunk_chars,
+        )
+        extra_files.update(write_review_artifacts(artifacts.output_dir, review_artifacts))
     rendered_files: dict[str, str] = {}
     if settings.output_format in {"pdf", "both"}:
         render_pdf_from_markdown(
