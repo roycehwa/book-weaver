@@ -464,6 +464,33 @@ def create_review_state(review_items: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def summarize_review_state(review_items: list[dict[str, Any]], review_state: dict[str, Any]) -> dict[str, int]:
+    """Compute current counts from decisions instead of trusting the creation-time snapshot."""
+    decisions = review_state.get("decisions")
+    if not isinstance(decisions, dict):
+        decisions = {}
+    item_segment_ids = [str(item.get("segment_id") or "") for item in review_items]
+    if item_segment_ids:
+        statuses = [
+            str((decisions.get(segment_id) or {}).get("status") or "open")
+            for segment_id in item_segment_ids
+        ]
+    else:
+        statuses = [
+            str(decision.get("status") or "open")
+            for decision in decisions.values()
+            if isinstance(decision, dict)
+        ]
+    approved = sum(1 for status in statuses if status == "approved")
+    resolved = sum(1 for status in statuses if status == "resolved")
+    return {
+        "total_items": len(statuses),
+        "open_items": len(statuses) - approved - resolved,
+        "approved_items": approved,
+        "resolved_items": resolved,
+    }
+
+
 def build_review_artifacts(
     *,
     source_path: Path,

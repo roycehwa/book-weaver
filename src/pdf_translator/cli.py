@@ -37,6 +37,7 @@ from pdf_translator.review import (
     apply_review_state,
     review_project_from_run,
     rewrite_review_requests,
+    summarize_review_state,
     translated_segments_to_chapters,
     write_versioned_outputs,
 )
@@ -814,13 +815,13 @@ def main() -> None:
                 project = review_project_from_run(args.run_dir.expanduser().resolve())
                 pre_review = project["pre_review"]
                 state = project["review_state"]
+                summary = summarize_review_state(project["review_items"], state)
                 print(
                     "Pre-review: "
                     f"segments={pre_review.get('total_segments', 0)} "
                     f"flagged={pre_review.get('flagged_segments', 0)} "
                     f"clean={pre_review.get('clean_segments', 0)}"
                 )
-                summary = state.get("summary") or {}
                 print(
                     "Human review: "
                     f"mode={(state.get('workflow') or {}).get('human_review_mode')} "

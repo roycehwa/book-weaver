@@ -10,6 +10,7 @@ from pdf_translator.review import (
     create_review_state,
     review_project_from_run,
     rewrite_review_requests,
+    summarize_review_state,
     translated_segments_to_chapters,
     write_versioned_outputs,
     _is_valid_rewrite_candidate,
@@ -164,6 +165,29 @@ def test_apply_review_state_updates_segment_text_and_approval() -> None:
     assert updated["translated_text"] == "第二段已经补全后的译文。"
     assert updated["status"] == "approved"
     assert untouched["translated_text"] == "旧译文。"
+
+
+def test_summarize_review_state_recomputes_approved_items() -> None:
+    items = [
+        {"segment_id": "s1"},
+        {"segment_id": "s2"},
+    ]
+    state = {
+        "summary": {"total_items": 2, "open_items": 2, "approved_items": 0, "resolved_items": 0},
+        "decisions": {
+            "s1": {"status": "approved"},
+            "s2": {"status": "candidate"},
+        },
+    }
+
+    summary = summarize_review_state(items, state)
+
+    assert summary == {
+        "total_items": 2,
+        "open_items": 1,
+        "approved_items": 1,
+        "resolved_items": 0,
+    }
 
 
 def test_apply_review_state_does_not_export_unapproved_model_candidate() -> None:
