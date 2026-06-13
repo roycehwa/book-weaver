@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import zipfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from zipfile import ZipFile
 
@@ -144,6 +145,8 @@ def test_render_epub_restores_note_ids_and_backlinks(tmp_path: Path) -> None:
             if name.startswith("OEBPS/chapters/") and name.endswith(".xhtml")
         )
         chapter = zf.read(chapter_name).decode("utf-8")
+        ET.fromstring(chapter)
+        assert 'xmlns:epub="http://www.idpf.org/2007/ops"' in chapter
         assert 'id="R_c01-note-0001"' in chapter
         assert 'epub:type="noteref"' in chapter
         assert 'id="c01-note-0001"' in chapter

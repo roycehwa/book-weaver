@@ -369,7 +369,7 @@ def _rewrite_images(
 def _chapter_xhtml(*, title: str, body_html: str, language: str, body_id: str | None = None) -> str:
     id_attr = f' id="{escape(body_id)}"' if body_id else ""
     return f"""<?xml version="1.0" encoding="utf-8"?>
-<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="{escape(language)}">
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" xml:lang="{escape(language)}">
 <head>
   <meta charset="utf-8" />
   <title>{escape(title)}</title>
