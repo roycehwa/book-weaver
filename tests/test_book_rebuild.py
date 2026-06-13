@@ -117,6 +117,32 @@ def test_book_rebuild_marks_epub_apparatus_chapters_as_non_toc_resources() -> No
     assert by_title["Chapter 1"]["chapter_id"] == "ch-003-chapter-1"
 
 
+def test_epub_front_and_back_matter_translation_policy() -> None:
+    structured = {
+        "_epub_meta": {
+            "schema": "epub_ingest_v1",
+            "chapters": [
+                {"title": "Copyright", "markdown": "Copyright notice."},
+                {"title": "Dedication", "markdown": "For everyone who helped."},
+                {"title": "Acknowledgments", "markdown": "Thanks to the editors."},
+                {"title": "About the Author", "markdown": "The author biography."},
+                {"title": "Index", "markdown": "Alpha, 1"},
+                {"title": "End User License Agreement", "markdown": "License terms."},
+            ],
+        }
+    }
+
+    result = build_book_reconstruction(structured)
+    by_title = {chapter["title"]: chapter for chapter in result["chapters"]}
+
+    assert by_title["Copyright"]["translate"] is False
+    assert by_title["Dedication"]["translate"] is True
+    assert by_title["Acknowledgments"]["translate"] is True
+    assert by_title["About the Author"]["translate"] is True
+    assert by_title["Index"]["translate"] is False
+    assert by_title["End User License Agreement"]["translate"] is False
+
+
 def test_book_rebuild_adds_pdf_cover_chapter(monkeypatch, tmp_path) -> None:
     cover = tmp_path / "cover.png"
     cover.write_bytes(b"png")

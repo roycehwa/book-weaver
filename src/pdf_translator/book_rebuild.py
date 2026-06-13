@@ -67,9 +67,10 @@ BOOK_SECTION_START_RE = re.compile(
     re.IGNORECASE,
 )
 OUTLINE_SKIP_TITLE_RE = re.compile(
-    r"^(?:front\s*matter|frontmatter|copyright|dedication|contents|table of contents|"
+    r"^(?:front\s*matter|frontmatter|copyright|contents|table of contents|"
     r"list of (?:figures|tables|illustrations)(?: and (?:figures|tables|illustrations))?|"
     r"tables|figures|text boxes?|glossary|abbreviations|notes|endnotes|bibliography|references|works cited|"
+    r"end user licen[cs]e agreement|eula|legal notice|terms of use|"
     r".*index|index of .*)$",
     re.IGNORECASE,
 )
