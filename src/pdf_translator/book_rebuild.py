@@ -19,7 +19,7 @@ from pdf_translator.reconstruct import (
 )
 
 
-TOP_TITLE_BAND = 480.0
+TOP_TITLE_BAND = 450.0
 MAX_TITLE_LINE_WORDS = 12
 BODY_TEXT_MIN_CHARS = 260
 # Trailing footnote promotion (_promote_trailing_footnote_like_items): conservative per-page
@@ -48,6 +48,13 @@ CHAPTER_MARKER_RE = re.compile(
     re.IGNORECASE,
 )
 PURE_CHAPTER_TITLE_RE = re.compile(r"^(?:chapter|part)$", re.IGNORECASE)
+NUMBERED_CHAPTER_TITLE_RE = re.compile(
+    r"^\d{1,3}\s+[A-Z][A-Z0-9'’&,:;/()\-–— ]{2,}$"
+)
+PART_WITH_TITLE_RE = re.compile(
+    rf"^part\s+(?:\d+|{ROMAN_NUMERAL_RE}|{NUMBER_WORD_RE})\s+\S.+$",
+    re.IGNORECASE,
+)
 TOC_LINE_RE = re.compile(r"\.{2,}\s*\d+$|^\d+\s+[A-Z].+\d+$")
 NOTE_LINE_RE = re.compile(r"^(?:\d+|\*|†|‡)\s+")
 REFERENCE_TITLE_RE = re.compile(r"^(?:further reading|references|bibliography|works cited)$", re.IGNORECASE)
@@ -737,6 +744,11 @@ def _looks_like_toc(lines: list[str], *, page_no: int, total_pages: int) -> bool
     if toc_hits >= 4:
         return True
     if page_no <= min(12, max(total_pages // 8, 1)):
+        apparatus_page_refs = len(
+            re.findall(r"\b(?:notes|references|bibliography|index)\s+\d+\b", joined)
+        )
+        if apparatus_page_refs >= 2:
+            return True
         title_like_lines = [
             line
             for line in normalized_lines
@@ -759,6 +771,12 @@ def _looks_like_references(lines: list[str], *, page_no: int, total_pages: int) 
     cleaned = [re.sub(r"^[#>\s]+", "", _normalize_text(line)) for line in lines[:20]]
     if any(REFERENCE_TITLE_RE.match(line) for line in cleaned[:4]):
         return True
+    joined = " ".join(cleaned).lower()
+    if page_no <= min(8, max(total_pages // 8, 1)) and (
+        "publication is in copyright" in joined
+        or ("first published" in joined and ("isbn" in joined or "publisher" in joined))
+    ):
+        return False
     citation_hits = sum(
         1
         for line in cleaned
@@ -863,6 +881,12 @@ def _detect_chapter_title(blocks: list[LayoutBlock]) -> str | None:
 
     if PURE_CHAPTER_TITLE_RE.match(first) and len(candidates) > 1:
         return f"{first} {candidates[1]}"
+
+    if NUMBERED_CHAPTER_TITLE_RE.match(first):
+        return first
+
+    if PART_WITH_TITLE_RE.match(first):
+        return first
 
     if len(candidates) >= 2 and CHAPTER_MARKER_RE.match(candidates[0]):
         return f"{candidates[0]}: {candidates[1]}"
@@ -1019,6 +1043,71 @@ def _build_preserved_resource_chapters(
             }
         )
     return preserved
+
+
+def _layout_apparatus_title(page: dict[str, Any]) -> str | None:
+    title = _clean_book_text(str(page.get("chapter_title") or ""))
+    if not title:
+        for line in page.get("content_lines") or []:
+            candidate = _clean_heading_text(str(line))
+            if candidate:
+                title = candidate
+                break
+    if re.fullmatch(r"(?:notes|endnotes)", title, flags=re.IGNORECASE):
+        return "Notes"
+    if REFERENCE_TITLE_RE.match(title):
+        return "References"
+    if INDEX_TITLE_RE.match(title):
+        return "Index"
+    return None
+
+
+def _build_layout_apparatus_chapters(pages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    chapters: list[dict[str, Any]] = []
+    current_pages: list[dict[str, Any]] = []
+    current_title: str | None = None
+
+    def flush(end_page: int | None = None) -> None:
+        nonlocal current_pages, current_title
+        if not current_pages or current_title is None:
+            return
+        markdown = _build_chapter_markdown(current_pages, include_page_markers=False)
+        page_start = int(current_pages[0]["page_no"])
+        page_end = max(page_start, int(end_page or current_pages[-1]["page_no"]))
+        chapters.append(
+            {
+                "index": -1,
+                "title": current_title,
+                "page_start": page_start,
+                "page_end": page_end,
+                "source_pages": list(range(page_start, page_end + 1)),
+                "markdown": markdown,
+                "trace_markdown": _build_chapter_markdown(current_pages, include_page_markers=True),
+                "translate": False,
+                "preserve_original": True,
+                "resource_only": True,
+                "toc": False,
+            }
+        )
+        current_pages = []
+        current_title = None
+
+    for page in pages:
+        apparatus_title = _layout_apparatus_title(page)
+        if apparatus_title is not None:
+            if current_title != apparatus_title:
+                flush(int(page["page_no"]) - 1)
+                current_title = apparatus_title
+            current_pages.append(page)
+            continue
+        if current_title is None:
+            continue
+        if page.get("chapter_title"):
+            flush(int(page["page_no"]) - 1)
+            continue
+        current_pages.append(page)
+    flush(max((int(page["page_no"]) for page in pages), default=0))
+    return chapters
 
 
 def _preserved_resource_title(page: dict[str, Any]) -> str:
@@ -1351,7 +1440,8 @@ def build_book_reconstruction(
         chapter_markdown = _build_chapter_markdown(current_pages, include_page_markers=False)
         chapter_markdown = _strip_duplicate_leading_heading(chapter_markdown, chapter_title)
         trace_markdown = _build_chapter_markdown(current_pages, include_page_markers=True)
-        if not chapter_markdown.strip():
+        is_part_divider = bool(current_title and PART_WITH_TITLE_RE.match(current_title))
+        if not chapter_markdown.strip() and not is_part_divider:
             current_pages = []
             current_title = None
             return
@@ -1373,7 +1463,20 @@ def build_book_reconstruction(
 
     has_content_chapters = any(not bool(chapter.get("resource_only")) for chapter in chapters)
     if not has_content_chapters:
+        layout_apparatus = (
+            _build_layout_apparatus_chapters(pages)
+            if source_pdf is not None and images_dir is not None
+            else []
+        )
+        apparatus_page_numbers = {
+            int(page_no)
+            for chapter in layout_apparatus
+            for page_no in chapter.get("source_pages", [])
+        }
         for page in pages:
+            if int(page["page_no"]) in apparatus_page_numbers:
+                flush()
+                continue
             if page["page_kind"] in {"toc", "references", "index"}:
                 flush()
                 continue
@@ -1392,6 +1495,7 @@ def build_book_reconstruction(
             current_pages.append(page)
 
         flush()
+        chapters.extend(layout_apparatus)
 
     chapters.extend(_build_preserved_resource_chapters(pages, chapters))
     chapters.sort(key=lambda chapter: (int(chapter.get("page_start") or 0), int(chapter.get("index") or 0)))

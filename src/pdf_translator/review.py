@@ -359,6 +359,7 @@ def detect_review_items(
     translated_segments: list[dict[str, Any]],
     *,
     target_language: str,
+    text_operation: str = "translate",
 ) -> list[dict[str, Any]]:
     translated_by_id = {segment["segment_id"]: segment for segment in translated_segments}
     items: list[dict[str, Any]] = []
@@ -370,11 +371,20 @@ def detect_review_items(
         severity = "medium"
         evidence: dict[str, Any] = {}
 
+        source_text = str(source.get("source_text") or "").strip()
         if not translated_text:
-            issue_type = "missing_translation"
+            issue_type = "missing_content" if text_operation == "preserve" else "missing_translation"
             severity = "high"
+        elif text_operation == "preserve":
+            if len(source_text) >= 200 and len(translated_text) < len(source_text) * 0.5:
+                issue_type = "possibly_incomplete"
+                severity = "high"
+                evidence = {
+                    "source_length": len(source_text),
+                    "output_length": len(translated_text),
+                }
         elif target_language.lower().startswith("zh"):
-            source_ascii = _ascii_letter_count(str(source.get("source_text") or ""))
+            source_ascii = _ascii_letter_count(source_text)
             translated_ascii = _ascii_letter_count(translated_text)
             translated_cjk = _cjk_count(translated_text)
             mixed_words, mixed_lines = _mixed_english_signal(translated_text)
@@ -468,6 +478,7 @@ def build_review_artifacts(
     *,
     source_path: Path,
     target_language: str,
+    text_operation: str = "translate",
     book: dict[str, Any],
     translated_chapters: list[dict[str, Any]],
     cache_dir: Path | None = None,
@@ -488,8 +499,17 @@ def build_review_artifacts(
             translated_chapters,
             target_language=target_language,
         )
-    review_items = detect_review_items(segments, translated_segments_list, target_language=target_language)
-    pre_review = build_pre_review_report(segments, review_items)
+    review_items = detect_review_items(
+        segments,
+        translated_segments_list,
+        target_language=target_language,
+        text_operation=text_operation,
+    )
+    pre_review = build_pre_review_report(
+        segments,
+        review_items,
+        method="preserve_integrity_v1" if text_operation == "preserve" else "rules_v1",
+    )
     return {
         "segments": {
             "schema": SCHEMA_SEGMENTS,
@@ -506,6 +526,7 @@ def build_review_artifacts(
         "review_items": {
             "schema": SCHEMA_ITEMS,
             "target_language": target_language,
+            "text_operation": text_operation,
             "items": review_items,
         },
         "review_state": create_review_state(review_items),

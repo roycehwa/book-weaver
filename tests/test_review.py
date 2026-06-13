@@ -94,6 +94,30 @@ def test_build_review_artifacts_creates_segments_and_initial_queue() -> None:
     assert artifacts["review_state"]["workflow"]["human_review_mode"] == "issues_only"
 
 
+def test_preserve_review_uses_content_integrity_checks_not_translation_checks() -> None:
+    book = sample_book()
+    artifacts = build_review_artifacts(
+        source_path=Path("book.epub"),
+        target_language="zh-CN",
+        text_operation="preserve",
+        book=book,
+        translated_chapters=[
+            {
+                "index": chapter["index"],
+                "chapter_id": chapter["chapter_id"],
+                "title": chapter["title"],
+                "markdown": chapter["markdown"],
+            }
+            for chapter in book["chapters"]
+        ],
+    )
+
+    assert artifacts["review_items"]["text_operation"] == "preserve"
+    assert artifacts["review_items"]["items"] == []
+    assert artifacts["pre_review"]["method"] == "preserve_integrity_v1"
+    assert artifacts["pre_review"]["flagged_segments"] == 0
+
+
 def test_review_chapter_marks_split_outline(tmp_path: Path) -> None:
     import json
 

@@ -29,6 +29,79 @@ def test_should_skip_translation_for_chinese_source_to_chinese_target() -> None:
     assert not should_skip_translation("en", "zh-CN")
 
 
+def test_pipeline_processing_mode_can_preserve_english_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "English Book.pdf"
+    source.write_bytes(b"%PDF")
+    preflight = PdfPreflight(
+        source_pdf=source,
+        profile_name="book",
+        page_count=1,
+        file_size_bytes=4,
+        warn_page_count=None,
+        max_page_count=None,
+        warn_file_size_mb=None,
+        max_file_size_mb=None,
+    )
+    normalized = NormalizedDocument(
+        source_pdf=source,
+        raw_markdown="# Chapter One\n\nEnglish text.",
+        reconstructed_markdown="# Chapter One\n\nEnglish text.",
+        structured={"pages": []},
+        detected_language="en",
+    )
+    stages: list[tuple[str, dict]] = []
+
+    monkeypatch.setattr(
+        "pdf_translator.pipeline.ingest_pdf_guarded",
+        lambda *args, **kwargs: (normalized, preflight),
+    )
+    monkeypatch.setattr(
+        "pdf_translator.pipeline.build_document_profile",
+        lambda *args, **kwargs: {"profile": "magazine"},
+    )
+    monkeypatch.setattr(
+        "pdf_translator.pipeline.build_translator",
+        lambda name: (_ for _ in ()).throw(AssertionError("translator should not be built")),
+    )
+    monkeypatch.setattr(
+        "pdf_translator.pipeline.render_epub_from_book",
+        lambda **kwargs: Path(kwargs["output_path"]).write_bytes(b"epub"),
+    )
+    monkeypatch.setattr(
+        "pdf_translator.pipeline.validate_epub_internal_hrefs",
+        lambda path: {"total_internal_hrefs": 0},
+    )
+
+    artifacts = run_translation_pipeline(
+        RunSettings(
+            source_pdf=source,
+            output_dir=tmp_path / "runs",
+            target_language="zh-CN",
+            source_language=None,
+            translator="minimax",
+            max_chunk_chars=9000,
+            profile_name="book",
+            processing_mode="preserve",
+        ),
+        on_stage=lambda stage, data: stages.append((stage, data)),
+    )
+
+    manifest = __import__("json").loads(artifacts.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["processing_mode"] == "preserve"
+    assert manifest["text_operation"] == "preserve"
+    assert manifest["translator"] == "skipped"
+    assert [stage for stage, _ in stages] == [
+        "ingesting",
+        "reconstructing",
+        "preserving",
+        "validating",
+        "pre_review",
+    ]
+
+
 def test_pipeline_skips_translation_for_chinese_source(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

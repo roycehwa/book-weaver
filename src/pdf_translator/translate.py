@@ -126,7 +126,7 @@ def _looks_untranslated_for_target(source: str, translated: str, target_language
         return True
     if source_ascii < 1000 and translated_cjk >= 160:
         return False
-    if _looks_reference_or_note_heavy(source) and (translated_cjk >= 220 or source_ascii < 1200):
+    if _looks_reference_or_note_heavy(source) and (translated_cjk >= 200 or source_ascii < 1200):
         return False
     # For data-heavy content (tables, appendices), high CJK count indicates valid translation
     if translated_cjk >= 1000:
@@ -209,7 +209,7 @@ def _allow_mixed_english_for_target(source: str, translated: str, target_languag
     source_ascii = _ascii_letter_count(source)
     if source_ascii < 1000:
         return True
-    if _looks_reference_or_note_heavy(source) and translated_cjk >= 220:
+    if _looks_reference_or_note_heavy(source) and translated_cjk >= 200:
         return True
     translated_ascii = _ascii_letter_count(translated)
     # Dense scholarly prose often preserves technical terms, quoted terms, names, and citations.

@@ -492,8 +492,11 @@ def _epub_collect_navpoint_labels(ncx_root: ET.Element, ncx_internal: str) -> di
                         href = raw.replace("\\", "/")
             if label and href:
                 joined = posixpath.normpath(str(PurePosixPath(ncx_dir) / href))
-                out[joined] = label
-                out[PurePosixPath(joined).name] = label
+                # The first fragment-free label is the spine chapter title.
+                # Later nested entries often point to the same XHTML file
+                # (for example a final "Notes" anchor) and must not replace it.
+                out.setdefault(joined, label)
+                out.setdefault(PurePosixPath(joined).name, label)
             walk_nav_map(el)
 
     for child in ncx_root:

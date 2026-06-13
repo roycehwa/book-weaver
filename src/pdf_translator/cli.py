@@ -5,12 +5,18 @@ import json
 from pathlib import Path
 
 from pdf_translator.agent_runner import DEFAULT_AGENT_SOURCE_ROOT, AgentLockError, run_agent_once
+from pdf_translator.ng_repair import repair_ng_directory
+from pdf_translator.ng_salvage import (
+    first_missing_chunk_index,
+    salvage_chunk_via_split_translation,
+)
 from pdf_translator.config import DEFAULT_TRANSLATION_CONCURRENCY, RunSettings
 from pdf_translator.guardrails import (
     DEFAULT_INGEST_TIMEOUT_SECONDS,
     IngestGuardrailError,
     ingest_pdf_guarded,
 )
+from pdf_translator.jobs import BookJobRunner, JobRepository
 from pdf_translator.knowledge import (
     emit_mindmap_mermaid_from_book,
     emit_wiki_outline_from_book,
@@ -39,6 +45,79 @@ def build_parser() -> argparse.ArgumentParser:
         description="Translate PDFs through a normalized Markdown/JSON pipeline.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    job_parser = subparsers.add_parser(
+        "job",
+        help="Run and inspect durable resumable book-processing jobs.",
+    )
+    job_subparsers = job_parser.add_subparsers(dest="job_command", required=True)
+    job_run_parser = job_subparsers.add_parser("run", help="Create and run a book job.")
+    job_run_parser.add_argument("source", type=Path, help="Source PDF or EPUB.")
+    job_run_parser.add_argument(
+        "--mode",
+        dest="processing_mode",
+        default="auto",
+        choices=["auto", "translate", "preserve"],
+        help="Choose automatic language-based behavior, force translation, or preserve source text.",
+    )
+    job_run_parser.add_argument("--source-lang", default=None)
+    job_run_parser.add_argument("--target-lang", default="zh-CN")
+    job_run_parser.add_argument(
+        "--translator",
+        default="minimax",
+        choices=["openai", "mock", "minimax", "compatible", "openai-compatible"],
+    )
+    job_run_parser.add_argument(
+        "--format",
+        default="epub",
+        choices=["pdf", "epub", "both"],
+    )
+    job_run_parser.add_argument("--jobs-dir", type=Path, default=Path("jobs"))
+    job_run_parser.add_argument("--json", dest="as_json", action="store_true")
+
+    job_create_parser = job_subparsers.add_parser(
+        "create",
+        help="Create a durable job without executing it.",
+    )
+    job_create_parser.add_argument("source", type=Path, help="Source PDF or EPUB.")
+    job_create_parser.add_argument(
+        "--mode",
+        dest="processing_mode",
+        default="auto",
+        choices=["auto", "translate", "preserve"],
+    )
+    job_create_parser.add_argument("--source-lang", default=None)
+    job_create_parser.add_argument("--target-lang", default="zh-CN")
+    job_create_parser.add_argument(
+        "--translator",
+        default="minimax",
+        choices=["openai", "mock", "minimax", "compatible", "openai-compatible"],
+    )
+    job_create_parser.add_argument(
+        "--format",
+        default="epub",
+        choices=["pdf", "epub", "both"],
+    )
+    job_create_parser.add_argument("--jobs-dir", type=Path, default=Path("jobs"))
+    job_create_parser.add_argument("--json", dest="as_json", action="store_true")
+
+    job_execute_parser = job_subparsers.add_parser(
+        "execute",
+        help="Execute a previously created job.",
+    )
+    job_execute_parser.add_argument("job_id")
+    job_execute_parser.add_argument("--jobs-dir", type=Path, default=Path("jobs"))
+    job_execute_parser.add_argument("--json", dest="as_json", action="store_true")
+
+    job_status_parser = job_subparsers.add_parser("status", help="Read a durable job snapshot.")
+    job_status_parser.add_argument("job_id")
+    job_status_parser.add_argument("--jobs-dir", type=Path, default=Path("jobs"))
+    job_status_parser.add_argument("--json", dest="as_json", action="store_true")
+
+    job_resume_parser = job_subparsers.add_parser("resume", help="Resume a failed job.")
+    job_resume_parser.add_argument("job_id")
+    job_resume_parser.add_argument("--jobs-dir", type=Path, default=Path("jobs"))
+    job_resume_parser.add_argument("--json", dest="as_json", action="store_true")
 
     translate_parser = subparsers.add_parser(
         "translate",
@@ -406,6 +485,57 @@ def build_parser() -> argparse.ArgumentParser:
         default=2,
         help="Maximum automatic retries for one NG book before newer EN/CN sources are allowed to run.",
     )
+    agent_parser.add_argument(
+        "--no-auto-repair-ng",
+        action="store_true",
+        help="Skip the NG directory inspection and auto-repair pass before picking work.",
+    )
+
+    repair_ng_parser = subparsers.add_parser(
+        "repair-ng",
+        help="Inspect NG books, remove ghost dirs, and reset retryable failures.",
+    )
+    repair_ng_parser.add_argument(
+        "--source-root",
+        type=Path,
+        default=DEFAULT_AGENT_SOURCE_ROOT,
+        help="Root containing EN, CN, OK, and NG directories.",
+    )
+    repair_ng_parser.add_argument(
+        "--max-ng-retries",
+        type=int,
+        default=2,
+        help="Retry budget used to decide whether a failure is exhausted.",
+    )
+    repair_ng_parser.add_argument(
+        "--max-auto-repair-resets",
+        type=int,
+        default=3,
+        help="Maximum automatic retry resets per NG book.",
+    )
+
+    salvage_ng_parser = subparsers.add_parser(
+        "salvage-ng",
+        help="Salvage blocker chunks in NG books via split translation, then report status.",
+    )
+    salvage_ng_parser.add_argument(
+        "--source-root",
+        type=Path,
+        default=DEFAULT_AGENT_SOURCE_ROOT,
+        help="Root containing NG directory.",
+    )
+    salvage_ng_parser.add_argument(
+        "--translator",
+        default="minimax",
+        choices=["openai", "mock", "minimax", "compatible", "openai-compatible"],
+        help="Translation backend used for split salvage.",
+    )
+    salvage_ng_parser.add_argument(
+        "--chunk",
+        type=int,
+        default=None,
+        help="Optional explicit chunk index to salvage in every NG book that contains it.",
+    )
 
     knowledge_parser = subparsers.add_parser(
         "knowledge",
@@ -531,12 +661,45 @@ def _run_review_export(
     return {"version": version, "rendered_files": rendered_files}
 
 
+def run_job_command(args: argparse.Namespace) -> dict[str, object]:
+    repository = JobRepository(args.jobs_dir)
+    if args.job_command in {"run", "create"}:
+        snapshot = repository.create(
+            source_path=args.source,
+            processing_mode=args.processing_mode,
+            source_language=args.source_lang,
+            target_language=args.target_lang,
+            translator=args.translator,
+            output_format=args.format,
+        )
+        print(f"Job ID: {snapshot['job_id']}", flush=True)
+        if args.job_command == "run":
+            snapshot = BookJobRunner(repository).run(snapshot["job_id"])
+    elif args.job_command == "execute":
+        snapshot = BookJobRunner(repository).run(args.job_id)
+    elif args.job_command == "status":
+        snapshot = repository.load(args.job_id)
+    elif args.job_command == "resume":
+        snapshot = BookJobRunner(repository).resume(args.job_id)
+    else:
+        raise ValueError(f"Unsupported job command: {args.job_command!r}.")
+
+    if args.as_json:
+        print(json.dumps(snapshot, ensure_ascii=False, indent=2))
+    else:
+        print(f"Job state: {snapshot['state']}")
+        print(f"Job revision: {snapshot['revision']}")
+    return snapshot
+
+
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
     try:
-        if args.command == "translate":
+        if args.command == "job":
+            run_job_command(args)
+        elif args.command == "translate":
             settings = RunSettings(
                 source_pdf=args.source_pdf.expanduser().resolve(),
                 output_dir=args.output_dir.expanduser().resolve(),
@@ -673,6 +836,48 @@ def main() -> None:
             )
             print(f"Rewrite candidates generated: {result['rewritten_count']}")
             print(f"Review state updated: {result['review_state_path']}")
+        elif args.command == "repair-ng":
+            report = repair_ng_directory(
+                args.source_root,
+                max_ng_retries=args.max_ng_retries,
+                max_auto_repair_resets=args.max_auto_repair_resets,
+            )
+            lines = report.summary_lines()
+            if lines:
+                for line in lines:
+                    print(line)
+            else:
+                print("NG repair: no changes needed.")
+        elif args.command == "salvage-ng":
+            ng_dir = args.source_root.expanduser().resolve() / "NG"
+            if not ng_dir.exists():
+                print("salvage-ng: NG directory not found.")
+                raise SystemExit(0)
+            salvaged = 0
+            for book_dir in sorted(ng_dir.iterdir(), key=lambda path: path.name):
+                if not book_dir.is_dir() or book_dir.name.startswith("."):
+                    continue
+                run_dirs = [path for path in book_dir.iterdir() if path.is_dir() and (path / "book.json").exists()]
+                if not run_dirs:
+                    continue
+                run_dir = run_dirs[0]
+                chunk_index = args.chunk or first_missing_chunk_index(run_dir)
+                if chunk_index is None:
+                    print(f"salvage-ng: skip {book_dir.name[:60]} (complete cache)")
+                    continue
+                print(f"salvage-ng: {book_dir.name[:60]} chunk {chunk_index}")
+                try:
+                    cache_path = salvage_chunk_via_split_translation(
+                        run_dir,
+                        chunk_index,
+                        translator_name=args.translator,
+                    )
+                except Exception as exc:
+                    print(f"  failed chunk {chunk_index}: {exc}")
+                    continue
+                print(f"  wrote {cache_path}")
+                salvaged += 1
+            print(f"salvage-ng: salvaged {salvaged} blocker chunk(s).")
         elif args.command == "agent-once":
             try:
                 result = run_agent_once(
@@ -689,6 +894,7 @@ def main() -> None:
                     polish_translator=args.polish_translator,
                     source_lanes=tuple(args.source_lanes or ("EN", "CN")),
                     max_ng_retries=args.max_ng_retries,
+                    auto_repair_ng=not args.no_auto_repair_ng,
                 )
             except AgentLockError as exc:
                 print(str(exc))

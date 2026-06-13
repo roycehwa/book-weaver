@@ -107,6 +107,7 @@ class RunSettings:
     max_chunk_chars: int
     profile_name: str = "auto"
     output_format: str = "epub"
+    processing_mode: str = "auto"
     translation_concurrency: int = DEFAULT_TRANSLATION_CONCURRENCY
     ingest_timeout_seconds: int | None = DEFAULT_INGEST_TIMEOUT_SECONDS
     max_file_size_mb: float | None = None

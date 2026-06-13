@@ -170,6 +170,7 @@ def test_agent_once_resumes_failed_ng_before_new_sources(
     assert result.destination_dir is not None
     assert result.destination_dir.parent == source_root / "OK"
     assert (result.destination_dir / "Failed Book.pdf").exists()
+    assert not failed_dir.exists()
     status = json.loads((result.destination_dir / "phase-a-status.json").read_text(encoding="utf-8"))
     assert status["resume_from_ng"] is True
 

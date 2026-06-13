@@ -11,6 +11,7 @@ from typing import Any
 
 from pdf_translator.config import DEFAULT_TRANSLATION_CONCURRENCY, RunSettings
 from pdf_translator.guardrails import DEFAULT_INGEST_TIMEOUT_SECONDS, IngestExecutionError, InputGateError
+from pdf_translator.ng_repair import repair_ng_directory
 from pdf_translator.pipeline import run_translation_pipeline
 from pdf_translator.polish import run_polish
 
@@ -56,11 +57,22 @@ def run_agent_once(
     polish_translator: str | None = None,
     source_lanes: tuple[str, ...] = ("EN", "CN"),
     max_ng_retries: int = 2,
+    auto_repair_ng: bool = True,
+    max_auto_repair_resets: int = 3,
 ) -> AgentRunResult:
     source_root = source_root.expanduser().resolve()
     source_root.mkdir(parents=True, exist_ok=True)
     for name in ("EN", "CN", "OK", "NG"):
         (source_root / name).mkdir(parents=True, exist_ok=True)
+
+    if auto_repair_ng:
+        repair_report = repair_ng_directory(
+            source_root,
+            max_ng_retries=max_ng_retries,
+            max_auto_repair_resets=max_auto_repair_resets,
+        )
+        for line in repair_report.summary_lines():
+            print(line)
 
     lock_path = source_root / ".pdf-translator-agent.lock"
     with _agent_lock(lock_path):
@@ -313,6 +325,7 @@ def _finalize_run(
             if child == destination_dir or child.name == "phase-a-status.json":
                 continue
             shutil.move(str(child), str(_unique_path(destination_dir / child.name)))
+        (failed_dir / "phase-a-status.json").unlink(missing_ok=True)
         _cleanup_empty_work_base(failed_dir)
     return destination_dir
 

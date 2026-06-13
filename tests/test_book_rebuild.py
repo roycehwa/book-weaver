@@ -701,3 +701,143 @@ def test_book_rebuild_promotes_book_section_starts_to_chapters() -> None:
     assert "# Preface" in result["full_markdown"]
     assert "# Introduction" in result["full_markdown"]
     assert "# Chapter 1: The First Chapter" in result["full_markdown"]
+
+
+def test_book_rebuild_detects_compact_numbered_chapters_near_top_band() -> None:
+    structured = {
+        "body": {
+            "children": [{"$ref": f"#/texts/{index}"} for index in range(6)]
+        },
+        "texts": [
+            {"label": "section_header", "text": "PREFACE", "prov": _prov(1, 60, 473)},
+            {"label": "text", "text": "Preface body.", "prov": _prov(1, 60, 360)},
+            {"label": "section_header", "text": "1 PATH DEPENDENCE", "prov": _prov(2, 60, 472)},
+            {"label": "text", "text": "First chapter body.", "prov": _prov(2, 60, 360)},
+            {"label": "section_header", "text": "2 AMBIVALENCE", "prov": _prov(3, 60, 473)},
+            {"label": "text", "text": "Second chapter body.", "prov": _prov(3, 60, 360)},
+        ],
+        "pictures": [],
+        "tables": [],
+    }
+
+    result = build_book_reconstruction(structured)
+
+    assert [chapter["title"] for chapter in result["chapters"]] == [
+        "PREFACE",
+        "1 PATH DEPENDENCE",
+        "2 AMBIVALENCE",
+    ]
+
+
+def test_book_rebuild_detects_part_divider_with_title() -> None:
+    structured = {
+        "body": {
+            "children": [{"$ref": f"#/texts/{index}"} for index in range(4)]
+        },
+        "texts": [
+            {"label": "section_header", "text": "Part II AUTARKY AND ARMAMENT", "prov": _prov(1, 60, 477)},
+            {"label": "text", "text": "Part introduction.", "prov": _prov(1, 60, 360)},
+            {"label": "section_header", "text": "3 COMPLIANCE", "prov": _prov(2, 60, 473)},
+            {"label": "text", "text": "Chapter body.", "prov": _prov(2, 60, 360)},
+        ],
+        "pictures": [],
+        "tables": [],
+    }
+
+    result = build_book_reconstruction(structured)
+
+    assert [chapter["title"] for chapter in result["chapters"]] == [
+        "Part II AUTARKY AND ARMAMENT",
+        "3 COMPLIANCE",
+    ]
+
+
+def test_book_rebuild_keeps_title_only_part_divider() -> None:
+    structured = {
+        "body": {
+            "children": [{"$ref": f"#/texts/{index}"} for index in range(3)]
+        },
+        "texts": [
+            {"label": "section_header", "text": "Part II AUTARKY AND ARMAMENT", "prov": _prov(1, 60, 477)},
+            {"label": "section_header", "text": "3 COMPLIANCE", "prov": _prov(2, 60, 473)},
+            {"label": "text", "text": "Chapter body.", "prov": _prov(2, 60, 360)},
+        ],
+        "pictures": [],
+        "tables": [],
+    }
+
+    result = build_book_reconstruction(structured)
+
+    assert [chapter["title"] for chapter in result["chapters"]] == [
+        "Part II AUTARKY AND ARMAMENT",
+        "3 COMPLIANCE",
+    ]
+    assert result["chapters"][0]["markdown"] == ""
+
+
+def test_book_rebuild_preserves_contiguous_layout_apparatus_pages(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(book_rebuild, "_render_pdf_cover_page", lambda source_pdf, images_dir: None)
+    monkeypatch.setattr(book_rebuild, "_crop_pdf_regions", lambda *args, **kwargs: {})
+    monkeypatch.setattr(
+        book_rebuild,
+        "_render_pdf_page_image",
+        lambda source_pdf, images_dir, page_no: tmp_path / f"page-{page_no}.png",
+    )
+    structured = {
+        "body": {
+            "children": [{"$ref": f"#/texts/{index}"} for index in range(6)]
+        },
+        "texts": [
+            {"label": "section_header", "text": "1 BODY", "prov": _prov(1, 60, 473)},
+            {"label": "text", "text": "Chapter body.", "prov": _prov(1, 60, 360)},
+            {"label": "section_header", "text": "REFERENCES", "prov": _prov(2, 60, 473)},
+            {"label": "text", "text": "Reference page one.", "prov": _prov(2, 60, 360)},
+            {"label": "text", "text": "Reference page two.", "prov": _prov(3, 60, 360)},
+            {"label": "section_header", "text": "INDEX", "prov": _prov(4, 60, 473)},
+        ],
+        "pictures": [],
+        "tables": [],
+    }
+
+    result = build_book_reconstruction(
+        structured,
+        source_pdf=tmp_path / "book.pdf",
+        images_dir=tmp_path,
+    )
+
+    assert [chapter["title"] for chapter in result["chapters"]] == ["1 BODY", "References", "Index"]
+    assert result["chapters"][1]["source_pages"] == [2, 3]
+    assert result["chapters"][2]["source_pages"] == [4]
+    assert "page-2.png" in result["chapters"][1]["markdown"]
+    assert "page-3.png" in result["chapters"][1]["markdown"]
+
+
+def test_book_rebuild_does_not_start_apparatus_from_copyright_citations(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(book_rebuild, "_render_pdf_cover_page", lambda source_pdf, images_dir: None)
+    monkeypatch.setattr(book_rebuild, "_crop_pdf_regions", lambda *args, **kwargs: {})
+    structured = {
+        "body": {
+            "children": [{"$ref": f"#/texts/{index}"} for index in range(8)]
+        },
+        "texts": [
+            {"label": "section_header", "text": "Publisher address", "prov": _prov(1, 60, 473)},
+            {"label": "text", "text": "This publication is in copyright.", "prov": _prov(1, 60, 430)},
+            {"label": "text", "text": "First published 2025. ISBN 978-1-234.", "prov": _prov(1, 60, 400)},
+            {"label": "text", "text": "Digital edition 2025 by Publisher.", "prov": _prov(1, 60, 370)},
+            {"label": "text", "text": "Catalog record 2024.", "prov": _prov(1, 60, 340)},
+            {"label": "text", "text": "Typeset 2023.", "prov": _prov(1, 60, 310)},
+            {"label": "section_header", "text": "1 BODY", "prov": _prov(2, 60, 473)},
+            {"label": "text", "text": "Chapter body.", "prov": _prov(2, 60, 360)},
+        ],
+        "pictures": [],
+        "tables": [],
+    }
+
+    result = build_book_reconstruction(
+        structured,
+        source_pdf=tmp_path / "book.pdf",
+        images_dir=tmp_path,
+    )
+
+    assert all(chapter["title"] != "References" for chapter in result["chapters"])
+    assert result["pages"][0]["page_kind"] != "references"

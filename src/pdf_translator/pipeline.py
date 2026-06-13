@@ -4,6 +4,7 @@ from dataclasses import asdict
 import json
 from pathlib import Path
 import re
+from typing import Any, Callable
 
 from pdf_translator.book_rebuild import build_book_reconstruction
 from pdf_translator.book_views import render_book_markdown, render_translation_input_markdown
@@ -11,6 +12,7 @@ from pdf_translator.chunking import split_markdown_into_chunks
 from pdf_translator.config import RunSettings
 from pdf_translator.epub import render_epub_from_book, validate_epub_internal_hrefs
 from pdf_translator.guardrails import ingest_pdf_guarded
+from pdf_translator.jobs import resolve_text_operation
 from pdf_translator.models import BookTranslationResult, PipelineArtifacts, TranslatedChapter, TranslationResult
 from pdf_translator.profile import build_document_profile
 from pdf_translator.render import render_pdf_from_markdown
@@ -183,11 +185,19 @@ def _translated_chapters_payload(
     ]
 
 
-def run_translation_pipeline(settings: RunSettings) -> PipelineArtifacts:
+def run_translation_pipeline(
+    settings: RunSettings,
+    on_stage: Callable[[str, dict[str, Any]], None] | None = None,
+) -> PipelineArtifacts:
+    def enter_stage(stage: str, **data: Any) -> None:
+        if on_stage is not None:
+            on_stage(stage, {"stage_percent": 0, **data})
+
     output_dir = build_output_dir(settings.output_dir, settings.source_pdf)
     output_dir.mkdir(parents=True, exist_ok=True)
     artifacts = build_artifacts(output_dir, settings.source_pdf, settings.target_language)
 
+    enter_stage("ingesting")
     normalized, preflight = ingest_pdf_guarded(
         settings.source_pdf,
         profile_name=settings.profile_name,
@@ -198,8 +208,14 @@ def run_translation_pipeline(settings: RunSettings) -> PipelineArtifacts:
     )
     if settings.source_language is None:
         settings.source_language = normalized.detected_language
-    skip_translation = should_skip_translation(settings.source_language, settings.target_language)
+    text_operation = resolve_text_operation(
+        settings.processing_mode,
+        settings.source_language,
+        settings.target_language,
+    )
+    skip_translation = text_operation == "preserve"
 
+    enter_stage("reconstructing", source_language=settings.source_language)
     artifacts.normalized_markdown_path.write_text(normalized.raw_markdown, encoding="utf-8")
     artifacts.normalized_json_path.write_text(
         json.dumps(normalized.structured, ensure_ascii=False, indent=2),
@@ -259,6 +275,11 @@ def run_translation_pipeline(settings: RunSettings) -> PipelineArtifacts:
 
     translation_cache_dir = output_dir / "translation-cache"
     translated_chapters = None
+    enter_stage(
+        "preserving" if skip_translation else "translating",
+        source_language=settings.source_language,
+        text_operation=text_operation,
+    )
     if skip_translation and book is not None:
         translated = _book_without_translation(book, settings)
         translated_chapters = translated.translated_chapters
@@ -285,6 +306,7 @@ def run_translation_pipeline(settings: RunSettings) -> PipelineArtifacts:
                 concurrency=settings.translation_concurrency,
             )
 
+    enter_stage("validating")
     artifacts.translated_markdown_path.write_text(
         translated.translated_markdown,
         encoding="utf-8",
@@ -304,10 +326,12 @@ def run_translation_pipeline(settings: RunSettings) -> PipelineArtifacts:
             encoding="utf-8",
         )
         extra_files["translated_chapters"] = str(translated_chapters_path)
+    enter_stage("pre_review")
     review_source_book = book or _fallback_book_from_markdown(settings.source_pdf, translation_input_markdown)
     review_artifacts = build_review_artifacts(
         source_path=settings.source_pdf,
         target_language=translated.target_language,
+        text_operation=text_operation,
         book=review_source_book,
         translated_chapters=_translated_chapters_payload(
             source_path=settings.source_pdf,
@@ -361,7 +385,15 @@ def run_translation_pipeline(settings: RunSettings) -> PipelineArtifacts:
         "source_pdf": str(settings.source_pdf),
         "output_dir": str(output_dir),
         "translator": translated.translator,
-        "translation_mode": "skipped_same_language" if skip_translation else "translated",
+        "processing_mode": settings.processing_mode,
+        "text_operation": text_operation,
+        "translation_mode": (
+            "preserved"
+            if settings.processing_mode == "preserve"
+            else "skipped_same_language"
+            if skip_translation
+            else "translated"
+        ),
         "source_language": translated.source_language,
         "target_language": translated.target_language,
         "chunk_count": translated.chunk_count,
