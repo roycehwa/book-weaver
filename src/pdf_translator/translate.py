@@ -290,6 +290,7 @@ def _translate_chunk_resumable(
     translator: BaseTranslator,
     cache_dir: Path | None,
     retry_count: int = 3,
+    allow_sensitive_split: bool = True,
 ) -> str:
     cache_path: Path | None = None
     if cache_dir is not None:
@@ -337,11 +338,144 @@ def _translate_chunk_resumable(
             return translated
         except Exception as exc:
             last_error = exc
+            if allow_sensitive_split and "new_sensitive" in str(exc).lower():
+                try:
+                    translated = _translate_sensitive_chunk_parts(
+                        chunk=chunk,
+                        source_language=source_language,
+                        target_language=target_language,
+                        translator=translator,
+                    )
+                    _assert_translation_quality(
+                        chunk=chunk,
+                        translated=translated,
+                        target_language=target_language,
+                        translator_name=translator.name,
+                    )
+                    if cache_path is not None:
+                        tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+                        tmp_path.write_text(translated + "\n", encoding="utf-8")
+                        tmp_path.replace(cache_path)
+                    return translated
+                except Exception as split_exc:
+                    last_error = split_exc
+                break
             if attempt + 1 >= max(1, retry_count):
                 break
             time.sleep(min(2**attempt, 8))
 
     raise ValueError(f"Translation failed for chunk {chunk.index} after {retry_count} attempts: {last_error}") from last_error
+
+
+def _split_sensitive_source(source: str, *, max_part_chars: int) -> list[str]:
+    paragraphs = [part.strip() for part in source.split("\n\n") if part.strip()]
+    if not paragraphs:
+        return [source]
+    parts: list[str] = []
+    current = ""
+    for paragraph in paragraphs:
+        candidate = f"{current}\n\n{paragraph}".strip() if current else paragraph
+        if len(candidate) <= max_part_chars:
+            current = candidate
+            continue
+        if current:
+            parts.append(current)
+        if len(paragraph) <= max_part_chars:
+            current = paragraph
+            continue
+        lines = paragraph.splitlines()
+        block = ""
+        for line in lines:
+            line_candidate = f"{block}\n{line}".strip() if block else line
+            if len(line_candidate) <= max_part_chars:
+                block = line_candidate
+                continue
+            if block:
+                parts.append(block)
+            block = line
+        current = block
+    if current:
+        parts.append(current)
+    return parts
+
+
+def _translate_sensitive_chunk_parts(
+    *,
+    chunk: TranslationChunk,
+    source_language: str | None,
+    target_language: str,
+    translator: BaseTranslator,
+) -> str:
+    last_error: Exception | None = None
+    for max_part_chars in (2800, 1400, 900, 500):
+        try:
+            translated_parts = [
+                _translate_sensitive_part(
+                    chunk=TranslationChunk(
+                        index=chunk.index * 1000 + offset,
+                        markdown=part,
+                    ),
+                    source_language=source_language,
+                    target_language=target_language,
+                    translator=translator,
+                    retry_count=3,
+                )
+                for offset, part in enumerate(
+                    _split_sensitive_source(chunk.markdown, max_part_chars=max_part_chars)
+                )
+            ]
+            translated = "\n\n".join(part.strip() for part in translated_parts if part.strip())
+            _assert_translation_quality(
+                chunk=chunk,
+                translated=translated,
+                target_language=target_language,
+                translator_name=translator.name,
+            )
+            return translated
+        except ValueError as exc:
+            last_error = exc
+            message = str(exc).lower()
+            if "new_sensitive" in message or "looks untranslated" in message or "looks incomplete" in message:
+                continue
+            raise
+    assert last_error is not None
+    raise last_error
+
+
+def _translate_sensitive_part(
+    *,
+    chunk: TranslationChunk,
+    source_language: str | None,
+    target_language: str,
+    translator: BaseTranslator,
+    retry_count: int,
+) -> str:
+    last_error: Exception | None = None
+    for attempt in range(max(1, retry_count)):
+        try:
+            translated = _complete_translation_attempt(
+                translator=translator,
+                chunk=chunk,
+                source_language=source_language,
+                target_language=target_language,
+                quality_retry=str(last_error) if isinstance(last_error, ValueError) else None,
+            ).strip()
+            if not translated:
+                raise ValueError(f"Empty translation returned for chunk {chunk.index}.")
+            return _strip_generated_english_chinese_glosses(
+                chunk.markdown,
+                translated,
+                target_language,
+            )
+        except Exception as exc:
+            last_error = exc
+            if attempt + 1 >= max(1, retry_count):
+                break
+            time.sleep(min(2**attempt, 8))
+    raise ValueError(
+        f"Sensitive split translation failed for chunk {chunk.index} "
+        f"after {retry_count} attempts: {last_error}"
+    ) from last_error
 
 
 def _translate_chunks_ordered(
@@ -716,6 +850,8 @@ def _is_preserved_apparatus_block(block: str) -> bool:
         return False
     first_line = stripped.splitlines()[0].strip().lower()
     if first_line in {"# list of illustrations", "# list of tables", "# list of figures"}:
+        return True
+    if re.match(r"^-\s+\[\*\*\d+\.\*\*\]\([^)]+\)", first_line):
         return True
     link_count = stripped.count("](")
     if link_count < 8:

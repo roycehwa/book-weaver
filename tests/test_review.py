@@ -72,7 +72,7 @@ def test_build_review_artifacts_creates_segments_and_initial_queue() -> None:
                 "page_end": 2,
                 "source_pages": [1, 2],
                 "source_internal_path": "OEBPS/intro.xhtml",
-                "markdown": "这是第一段译文。\n\n这一段 mixed English phrase 仍然没有翻译。",
+                "markdown": "这是第一段译文。\n\n这一段 mixed english phrase remains 仍然没有翻译。",
             }
         ],
     )
@@ -116,6 +116,50 @@ def test_preserve_review_uses_content_integrity_checks_not_translation_checks() 
     assert artifacts["review_items"]["items"] == []
     assert artifacts["pre_review"]["method"] == "preserve_integrity_v1"
     assert artifacts["pre_review"]["flagged_segments"] == 0
+
+
+def test_translation_review_skips_preserved_resource_chapters() -> None:
+    book = {
+        "chapters": [
+            {
+                "index": 1,
+                "chapter_id": "ch-001-cover",
+                "title": "Cover",
+                "markdown": "![Cover](cover.png)",
+                "translate": False,
+                "preserve_original": True,
+            },
+            {
+                "index": 2,
+                "chapter_id": "ch-002-body",
+                "title": "Body",
+                "markdown": "English body text that needs translation.",
+                "translate": True,
+            },
+        ]
+    }
+
+    artifacts = build_review_artifacts(
+        source_path=Path("book.epub"),
+        target_language="zh-CN",
+        book=book,
+        translated_chapters=[
+            {
+                "index": 1,
+                "chapter_id": "ch-001-cover",
+                "title": "Cover",
+                "markdown": "![Cover](cover.png)",
+            },
+            {
+                "index": 2,
+                "chapter_id": "ch-002-body",
+                "title": "Body",
+                "markdown": "这是已经翻译完成的中文正文。",
+            },
+        ],
+    )
+
+    assert artifacts["review_items"]["items"] == []
 
 
 def test_review_chapter_marks_split_outline(tmp_path: Path) -> None:

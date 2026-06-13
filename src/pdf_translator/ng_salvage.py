@@ -11,15 +11,16 @@ from pdf_translator.translate import (
     _chapter_markdown_for_translation,
     _is_preserved_apparatus_block,
     _split_markdown_media_segments,
+    _split_sensitive_source,
+    _translate_sensitive_part,
     _chunk_cache_path,
-    _translate_chunk_resumable,
     build_translator,
 )
 
 
 def iter_global_chunks(book: dict, *, max_chunk_chars: int = 9000) -> list[TranslationChunk]:
     chunks: list[TranslationChunk] = []
-    chunk_index = 1
+    chunk_index = 0
     for chapter in book.get("chapters", []):
         chapter_source = _chapter_markdown_for_translation(chapter)
         if not bool(chapter.get("translate", True)):
@@ -71,35 +72,7 @@ def inject_global_chunk_cache(
 
 
 def _split_for_sensitive_translation(source: str, *, max_part_chars: int = 2800) -> list[str]:
-    paragraphs = [part.strip() for part in source.split("\n\n") if part.strip()]
-    if not paragraphs:
-        return [source]
-    parts: list[str] = []
-    current = ""
-    for paragraph in paragraphs:
-        candidate = f"{current}\n\n{paragraph}".strip() if current else paragraph
-        if len(candidate) <= max_part_chars:
-            current = candidate
-            continue
-        if current:
-            parts.append(current)
-        if len(paragraph) <= max_part_chars:
-            current = paragraph
-            continue
-        lines = paragraph.splitlines()
-        block = ""
-        for line in lines:
-            line_candidate = f"{block}\n{line}".strip() if block else line
-            if len(line_candidate) <= max_part_chars:
-                block = line_candidate
-                continue
-            if block:
-                parts.append(block)
-            block = line
-        current = block
-    if current:
-        parts.append(current)
-    return parts
+    return _split_sensitive_source(source, max_part_chars=max_part_chars)
 
 
 def _translate_split_parts(
@@ -114,12 +87,11 @@ def _translate_split_parts(
     for offset, part in enumerate(parts):
         part_chunk = TranslationChunk(index=chunk_index * 1000 + offset, markdown=part)
         translated_parts.append(
-            _translate_chunk_resumable(
+            _translate_sensitive_part(
                 chunk=part_chunk,
                 source_language=source_language,
                 target_language=target_language,
                 translator=translator,
-                cache_dir=None,
                 retry_count=3,
             )
         )
@@ -180,7 +152,7 @@ def first_missing_chunk_index(run_dir: Path, *, max_chunk_chars: int = 9000) -> 
     book = load_run_book(run_dir)
     total = len(iter_global_chunks(book, max_chunk_chars=max_chunk_chars))
     cached = {int(path.name.split("-")[1]) for path in (run_dir / "translation-cache").glob("chunk-*.md")}
-    for index in range(1, total + 1):
+    for index in range(total):
         if index not in cached:
             return index
     return None

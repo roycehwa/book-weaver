@@ -115,6 +115,7 @@ def build_source_segments(book: dict[str, Any], *, source_path: Path) -> list[di
                     "source_text": block,
                     "source_path": str(source_path),
                     "source_location": _segment_location(chapter),
+                    "translate": bool(chapter.get("translate", True)),
                     "status": "pending",
                 }
             )
@@ -148,6 +149,7 @@ def build_translated_segments(
                 "translated_text": translated_text,
                 "target_language": target_language,
                 "source_location": segment.get("source_location", {}),
+                "translate": bool(segment.get("translate", True)),
                 "status": "needs_review",
             }
         )
@@ -186,6 +188,7 @@ def build_aligned_review_segments(
                 "chapter_title": title,
                 "block_index": block_index,
                 "source_location": location,
+                "translate": bool(chapter.get("translate", True)),
             }
             source_segments.append(
                 {
@@ -266,6 +269,7 @@ def _merge_reading_review_segments(
             "block_index": block_index,
             "source_location": active_chapter["source_location"],
             "translation_part_ids": list(part_ids),
+            "translate": active_chapter["translate"],
         }
         merged_source.append(
             {
@@ -302,6 +306,7 @@ def _merge_reading_review_segments(
                 "source_location": source.get("source_location"),
                 "source_path": source.get("source_path"),
                 "target_language": translated.get("target_language"),
+                "translate": bool(source.get("translate", True)),
             }
 
         translated = translated_by_id.get(str(source["segment_id"]), {})
@@ -372,6 +377,8 @@ def detect_review_items(
         evidence: dict[str, Any] = {}
 
         source_text = str(source.get("source_text") or "").strip()
+        if not bool(source.get("translate", True)) and text_operation == "translate":
+            continue
         if not translated_text:
             issue_type = "missing_content" if text_operation == "preserve" else "missing_translation"
             severity = "high"
@@ -401,7 +408,7 @@ def detect_review_items(
             elif source_ascii >= 500 and translated_cjk + int(translated_ascii * 0.35) < source_ascii * 0.16:
                 issue_type = "possibly_incomplete"
                 severity = "high"
-            elif mixed_words >= 2 or mixed_lines >= 1:
+            elif mixed_words >= 3:
                 issue_type = "mixed_english"
                 severity = "medium"
 

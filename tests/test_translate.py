@@ -135,6 +135,100 @@ def test_translate_markdown_retries_empty_chunk(tmp_path: Path, monkeypatch: pyt
     assert result.translated_markdown == "Translated.\n"
 
 
+def test_translate_markdown_splits_minimax_sensitive_chunk(tmp_path: Path) -> None:
+    class SensitiveTranslator(BaseTranslator):
+        name = "minimax"
+
+        def __init__(self) -> None:
+            self.sizes: list[int] = []
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            self.sizes.append(len(chunk.markdown))
+            if len(chunk.markdown) > 2800:
+                raise ValueError("MiniMax translation failed: output new_sensitive (1027)")
+            return "这是拆分后生成的完整中文译文。" * max(40, len(chunk.markdown) // 20)
+
+    source = ("First sensitive paragraph. " * 90) + "\n\n" + ("Second sensitive paragraph. " * 90)
+    settings = RunSettings(
+        source_pdf=tmp_path / "source.pdf",
+        output_dir=tmp_path,
+        target_language="zh-CN",
+        source_language="en",
+        translator="minimax",
+        max_chunk_chars=9000,
+    )
+    translator = SensitiveTranslator()
+
+    result = translate_markdown(
+        chunks=[TranslationChunk(index=0, markdown=source)],
+        settings=settings,
+        translator=translator,
+        cache_dir=tmp_path / "cache",
+        retry_count=6,
+    )
+
+    assert translator.sizes[0] > 2800
+    assert all(size <= 2800 for size in translator.sizes[1:])
+    assert translator.sizes.count(translator.sizes[0]) == 1
+    assert "拆分后生成" in result.translated_markdown
+
+
+def test_translate_book_preserves_numbered_citation_blocks() -> None:
+    class CountingTranslator(BaseTranslator):
+        name = "realish"
+
+        def __init__(self) -> None:
+            self.sources: list[str] = []
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            self.sources.append(chunk.markdown)
+            return "这是正文的完整中文翻译。" * 30
+
+    citation = (
+        "- [**16.**](OPS/chapter.xhtml#note-16) "
+        "*The Theory of Everything* (Working Title Films, 2014)."
+    )
+    book = {
+        "chapters": [
+            {
+                "index": 1,
+                "title": "Chapter 1",
+                "markdown": f"Body prose that should be translated.\n\n{citation}",
+                "translate": True,
+            }
+        ]
+    }
+    settings = RunSettings(
+        source_pdf=Path("source.epub"),
+        output_dir=Path("out"),
+        target_language="zh-CN",
+        source_language="en",
+        translator="realish",
+        max_chunk_chars=9000,
+    )
+    translator = CountingTranslator()
+
+    result = translate_book_chapters(
+        book=book,
+        settings=settings,
+        translator=translator,
+    )
+
+    assert len(translator.sources) == 1
+    assert citation not in translator.sources[0]
+    assert citation in result.translated_chapters[0].markdown
+
+
 def test_translate_markdown_retries_untranslated_chinese_output(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     class InitiallyUntranslatedTranslator(BaseTranslator):
         name = "realish"
