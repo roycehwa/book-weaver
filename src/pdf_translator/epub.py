@@ -245,12 +245,17 @@ def build_epub_internal_href_map(chapters: list[dict], chapter_files: list[str])
     return href_map
 
 
-def rewrite_epub_internal_hrefs(body_html: str, *, href_map: dict[str, str]) -> str:
+def rewrite_epub_internal_hrefs(
+    body_html: str,
+    *,
+    href_map: dict[str, str],
+    current_source_path: str | None = None,
+) -> str:
     """Rewrite same-publication links to output chapter files.
 
-    Current contract is L2 chapter-level remapping. Source XHTML fragments are
-    intentionally dropped unless a future L3 fragment/id map exists; preserving
-    unknown fragments would create broken EPUB links.
+    EPUB note links carry stable fragment pairs such as ``note-1`` and
+    ``R_note-1``. Restore those ids while remapping the source chapter path so
+    note references and backlinks remain functional in rebuilt EPUBs.
     """
     soup = BeautifulSoup(body_html, "html.parser")
     for anchor in soup.find_all("a"):
@@ -273,7 +278,41 @@ def rewrite_epub_internal_hrefs(body_html: str, *, href_map: dict[str, str]) -> 
         if not target:
             continue
         base = PurePosixPath(target).name
-        anchor["href"] = base
+        is_same_chapter = (
+            isinstance(current_source_path, str)
+            and key == _norm_epub_zip_internal_path(unquote(current_source_path))
+        )
+        is_note_fragment = frag.startswith("R_") or "note-" in frag.lower()
+        anchor["href"] = (
+            f"{base}#{frag}"
+            if sep and frag and is_same_chapter and is_note_fragment
+            else base
+        )
+        if not frag or not is_same_chapter or not is_note_fragment:
+            continue
+        if frag.startswith("R_"):
+            note_id = frag[2:]
+            note_target = soup.new_tag("span")
+            note_target["id"] = note_id
+            note_target["epub:type"] = "footnote"
+            note_target["role"] = "doc-footnote"
+            anchor.insert_before(note_target)
+        else:
+            anchor["id"] = f"R_{frag}"
+            anchor["epub:type"] = "noteref"
+            anchor["role"] = "doc-noteref"
+    ids = {
+        str(tag.get("id"))
+        for tag in soup.find_all(attrs={"id": True})
+        if tag.get("id")
+    }
+    for anchor in soup.find_all("a"):
+        href = anchor.get("href")
+        if not isinstance(href, str) or "#R_" not in href:
+            continue
+        fragment = href.partition("#")[2]
+        if fragment not in ids:
+            del anchor["href"]
     return "".join(str(child) for child in soup.contents)
 
 
@@ -472,7 +511,11 @@ def render_epub_from_book(
         chapter_id = str(chapter.get("chapter_id") or "").strip() or None
         markdown_text = str(chapter.get("markdown") or "")
         body_html = _markdown_to_body_html(markdown_text)
-        body_html = rewrite_epub_internal_hrefs(body_html, href_map=href_map)
+        body_html = rewrite_epub_internal_hrefs(
+            body_html,
+            href_map=href_map,
+            current_source_path=chapter.get("source_internal_path"),
+        )
         body_html = _rewrite_images(body_html, image_map, image_items, image_roots)
         if chapter.get("preserve_original") or chapter.get("resource_only") or APPARATUS_TITLE_RE.match(chapter_title):
             body_html = _wrap_preserved_apparatus(body_html)

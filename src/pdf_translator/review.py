@@ -782,6 +782,51 @@ def translated_segments_to_chapters(translated_segments_payload: Any) -> list[di
     return chapters
 
 
+def restore_review_chapter_apparatus(
+    chapters: list[dict[str, Any]],
+    base_translated_chapters: Any,
+) -> list[dict[str, Any]]:
+    """Restore chapter-end notes omitted from reading-unit review segments."""
+    base_items = (
+        base_translated_chapters.get("chapters", [])
+        if isinstance(base_translated_chapters, dict)
+        else base_translated_chapters
+    )
+    if not isinstance(base_items, list):
+        return chapters
+    base_by_index = {
+        int(item.get("index") or 0): item
+        for item in base_items
+        if isinstance(item, dict)
+    }
+    note_heading = re.compile(r"^#{1,6}\s+(?:notes?|注释|註釋)\s*$", re.IGNORECASE | re.MULTILINE)
+    note_item = re.compile(
+        r"^-\s+\[\*\*\d+\.\*\*\]\([^)]+#R_[^)]+\)",
+        re.MULTILINE,
+    )
+    restored: list[dict[str, Any]] = []
+    for chapter in chapters:
+        merged = dict(chapter)
+        base = base_by_index.get(int(chapter.get("index") or 0))
+        if not isinstance(base, dict):
+            restored.append(merged)
+            continue
+        for key in ("source_internal_path", "toc", "preserve_original", "resource_only"):
+            if key in base:
+                merged[key] = base[key]
+        reviewed_markdown = str(merged.get("markdown") or "").rstrip()
+        base_markdown = str(base.get("markdown") or base.get("translated_markdown") or "")
+        match = note_heading.search(base_markdown) or note_item.search(base_markdown)
+        if match:
+            base_notes = base_markdown[match.start():].strip()
+            reviewed_match = note_heading.search(reviewed_markdown) or note_item.search(reviewed_markdown)
+            if reviewed_match:
+                reviewed_markdown = reviewed_markdown[:reviewed_match.start()].rstrip()
+            merged["markdown"] = f"{reviewed_markdown}\n\n{base_notes}\n"
+        restored.append(merged)
+    return restored
+
+
 def _segment_index_map(segments: list[dict[str, Any]]) -> dict[str, int]:
     return {str(segment["segment_id"]): index for index, segment in enumerate(segments)}
 

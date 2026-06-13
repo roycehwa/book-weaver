@@ -29,6 +29,7 @@ from pdf_translator.render import render_pdf_from_markdown
 from pdf_translator.review import (
     apply_review_state,
     review_project_from_run,
+    restore_review_chapter_apparatus,
     rewrite_review_requests,
     translated_segments_to_chapters,
     write_versioned_outputs,
@@ -643,6 +644,12 @@ def _run_review_export(
     if output_format in {"epub", "both"}:
         epub_path = version_dir / f"{delivery_stem}.epub"
         translated_chapters = translated_segments_to_chapters(applied_segments)
+        base_chapters_path = run_dir / "translated-chapters.json"
+        if base_chapters_path.exists():
+            translated_chapters = restore_review_chapter_apparatus(
+                translated_chapters,
+                json.loads(base_chapters_path.read_text(encoding="utf-8")),
+            )
         render_epub_from_book(
             book=book,
             translated_chapters=translated_chapters,

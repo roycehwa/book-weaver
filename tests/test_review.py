@@ -13,6 +13,7 @@ from pdf_translator.review import (
     translated_segments_to_chapters,
     write_versioned_outputs,
     _is_valid_rewrite_candidate,
+    restore_review_chapter_apparatus,
     _looks_like_model_refusal,
     _rewrite_prompt,
 )
@@ -29,6 +30,69 @@ class EchoRewriteTranslator:
     def translate_chunk(self, chunk, source_language: str | None, target_language: str) -> str:
         self.prompts.append(chunk.markdown)
         return "这是模型根据意见生成的候选译文。"
+
+
+def test_restore_review_chapter_apparatus_appends_base_notes() -> None:
+    reviewed = [
+        {
+            "index": 1,
+            "title": "Chapter",
+            "markdown": (
+                "# 章节\n\n审阅后的正文。\n\n### 注释\n\n"
+                "- [**99.**](OPS/c01.xhtml#R_c01-note-0099) Incomplete note."
+            ),
+        }
+    ]
+    base = [
+        {
+            "index": 1,
+            "source_internal_path": "OPS/c01.xhtml",
+            "markdown": (
+                "# Chapter\n\nBase body.[1](OPS/c01.xhtml#c01-note-0001)\n\n"
+                "### Notes\n\n"
+                "- [**1.**](OPS/c01.xhtml#R_c01-note-0001) Preserved note."
+            ),
+        }
+    ]
+
+    restored = restore_review_chapter_apparatus(reviewed, base)
+
+    assert "审阅后的正文" in restored[0]["markdown"]
+    assert "Preserved note" in restored[0]["markdown"]
+    assert "Incomplete note" not in restored[0]["markdown"]
+    assert restored[0]["source_internal_path"] == "OPS/c01.xhtml"
+    assert restored[0]["markdown"].count("###") == 1
+
+
+def test_restore_review_chapter_apparatus_handles_notes_without_heading() -> None:
+    reviewed = [
+        {
+            "index": 1,
+            "title": "Chapter",
+            "markdown": (
+                "# 章节\n\n审阅后的正文。\n\n"
+                "- [**1.**](OPS/c01.xhtml#R_c01-note-0001) Partial note."
+            ),
+        }
+    ]
+    base = [
+        {
+            "index": 1,
+            "source_internal_path": "OPS/c01.xhtml",
+            "markdown": (
+                "# Chapter\n\nBase body.[1](OPS/c01.xhtml#c01-note-0001)\n\n"
+                "- [**1.**](OPS/c01.xhtml#R_c01-note-0001) First note.\n\n"
+                "- [**2.**](OPS/c01.xhtml#R_c01-note-0002) Second note."
+            ),
+        }
+    ]
+
+    restored = restore_review_chapter_apparatus(reviewed, base)
+
+    assert "审阅后的正文" in restored[0]["markdown"]
+    assert "Partial note" not in restored[0]["markdown"]
+    assert "First note" in restored[0]["markdown"]
+    assert "Second note" in restored[0]["markdown"]
 
 
 def sample_book() -> dict:
