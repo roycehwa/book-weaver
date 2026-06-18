@@ -86,6 +86,7 @@ class JobRepository:
         target_language: str = "zh-CN",
         translator: str = "minimax",
         output_format: str = "epub",
+        ingest_timeout_seconds: int | None = None,
         job_id: str | None = None,
     ) -> dict[str, Any]:
         source = Path(source_path).expanduser().resolve()
@@ -128,6 +129,7 @@ class JobRepository:
                     "target_language": target_language,
                     "translator": translator,
                     "output_format": output_format,
+                    "ingest_timeout_seconds": ingest_timeout_seconds,
                 },
                 "resolved": {
                     "source_language": None,
@@ -310,6 +312,8 @@ class BookJobRunner:
                 resolved["text_operation"] = data["text_operation"]
             changes: dict[str, Any] = {
                 "state": stage,
+                "failed_stage": None,
+                "error": None,
                 "progress": {
                     "stage_percent": int(data.get("stage_percent", 0)),
                     "overall_percent": self._OVERALL_PERCENT.get(stage, 0),
@@ -343,6 +347,10 @@ class BookJobRunner:
         except Exception as exc:
             failed_stage = current_stage or snapshot.get("failed_stage") or "created"
             error_code, retryable = self._classify_failure(exc, failed_stage)
+            reason = self._safe_failure_reason(exc, error_code)
+            details = {"stage": failed_stage}
+            if reason:
+                details["reason"] = reason
             self.repository.update(
                 job_id,
                 state="failed",
@@ -351,7 +359,7 @@ class BookJobRunner:
                     "code": error_code,
                     "message": f"Job failed during {failed_stage}.",
                     "retryable": retryable,
-                    "details": {"stage": failed_stage},
+                    "details": details,
                 },
             )
             self.repository.append_event(
@@ -389,6 +397,7 @@ class BookJobRunner:
             profile_name="book",
             output_format=request["output_format"],
             processing_mode=request["processing_mode"],
+            ingest_timeout_seconds=request.get("ingest_timeout_seconds"),
         )
 
     def _complete_stage(self, job_id: str, stage: str) -> None:
@@ -451,6 +460,9 @@ class BookJobRunner:
 
     @staticmethod
     def _classify_failure(exc: Exception, stage: str) -> tuple[str, bool]:
+        message = str(exc)
+        if "MINIMAX_API_KEY" in message or "LLM_API_KEY" in message:
+            return "configuration_error", True
         if stage == "ingesting" and _exception_chain_contains(
             exc,
             (FileNotFoundError, zipfile.BadZipFile),
@@ -464,6 +476,17 @@ class BookJobRunner:
         except ImportError:
             pass
         return "job_stage_failed", True
+
+    @staticmethod
+    def _safe_failure_reason(exc: Exception, error_code: str) -> str | None:
+        if error_code != "configuration_error":
+            return None
+        message = str(exc).strip()
+        if not message:
+            return None
+        if "MINIMAX_API_KEY" in message or "LLM_API_KEY" in message:
+            return message
+        return None
 
 
 def _exception_chain_contains(exc: BaseException, types: tuple[type[BaseException], ...]) -> bool:

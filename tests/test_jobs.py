@@ -45,6 +45,7 @@ def test_repository_creates_durable_job_snapshot_and_initial_event(tmp_path: Pat
         target_language="zh-CN",
         translator="mock",
         output_format="epub",
+        ingest_timeout_seconds=900,
     )
 
     loaded = repository.load(snapshot["job_id"])
@@ -56,6 +57,7 @@ def test_repository_creates_durable_job_snapshot_and_initial_event(tmp_path: Pat
     assert loaded["source"]["size_bytes"] == len(b"example epub")
     assert len(loaded["source"]["sha256"]) == 64
     assert loaded["request"]["processing_mode"] == "auto"
+    assert loaded["request"]["ingest_timeout_seconds"] == 900
     assert loaded["resolved"]["text_operation"] is None
     assert loaded["artifacts"] == {}
     assert loaded["error"] is None
@@ -155,10 +157,12 @@ def test_job_runner_reaches_review_ready_and_maps_artifacts(tmp_path: Path) -> N
         processing_mode="preserve",
         source_language="en",
         output_format="epub",
+        ingest_timeout_seconds=900,
     )
 
     def fake_pipeline(settings, on_stage):
         assert settings.processing_mode == "preserve"
+        assert settings.ingest_timeout_seconds == 900
         assert settings.source_pdf == repository.job_dir(created["job_id"]) / "source" / source.name
         output_dir = settings.output_dir / source.stem
         output_dir.mkdir(parents=True)
@@ -213,6 +217,11 @@ def test_job_runner_records_failure_and_resume_uses_existing_job(tmp_path: Path)
         nonlocal attempts
         attempts += 1
         on_stage("ingesting", {"stage_percent": 100, "source_language": "en"})
+        if attempts == 2:
+            resumed_snapshot = repository.load(created["job_id"])
+            assert resumed_snapshot["state"] == "ingesting"
+            assert resumed_snapshot["error"] is None
+            assert resumed_snapshot["failed_stage"] is None
         on_stage("translating", {"stage_percent": 20, "text_operation": "translate"})
         if attempts == 1:
             raise RuntimeError("provider token expired: secret-value")
@@ -267,6 +276,31 @@ def test_job_runner_marks_invalid_source_non_retryable(tmp_path: Path) -> None:
     failed = repository.load(created["job_id"])
     assert failed["error"]["code"] == "invalid_source"
     assert failed["error"]["retryable"] is False
+
+
+def test_job_runner_records_translation_configuration_error_reason(tmp_path: Path) -> None:
+    source = tmp_path / "source.pdf"
+    source.write_bytes(b"%PDF")
+    repository = JobRepository(tmp_path / "jobs")
+    created = repository.create(source_path=source, translator="minimax")
+
+    def missing_config_pipeline(settings, on_stage):
+        on_stage("ingesting", {"stage_percent": 100, "source_language": "en"})
+        on_stage("translating", {"stage_percent": 0, "text_operation": "translate"})
+        raise ValueError("MINIMAX_API_KEY or LLM_API_KEY is required when translator='minimax'.")
+
+    with pytest.raises(ValueError, match="MINIMAX_API_KEY"):
+        BookJobRunner(repository, pipeline_runner=missing_config_pipeline).run(created["job_id"])
+
+    failed = repository.load(created["job_id"])
+    assert failed["state"] == "failed"
+    assert failed["failed_stage"] == "translating"
+    assert failed["error"]["code"] == "configuration_error"
+    assert failed["error"]["retryable"] is True
+    assert failed["error"]["details"] == {
+        "stage": "translating",
+        "reason": "MINIMAX_API_KEY or LLM_API_KEY is required when translator='minimax'.",
+    }
 
 
 def _pipeline_artifacts(

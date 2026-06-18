@@ -99,6 +99,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="epub",
         choices=["pdf", "epub", "both"],
     )
+    job_create_parser.add_argument(
+        "--ingest-timeout-seconds",
+        type=int,
+        default=None,
+        help="Hard timeout for the ingest stage. Use 0 to disable. Defaults to pipeline setting.",
+    )
     job_create_parser.add_argument("--jobs-dir", type=Path, default=Path("jobs"))
     job_create_parser.add_argument("--json", dest="as_json", action="store_true")
 
@@ -678,6 +684,7 @@ def run_job_command(args: argparse.Namespace) -> dict[str, object]:
             target_language=args.target_lang,
             translator=args.translator,
             output_format=args.format,
+            ingest_timeout_seconds=args.ingest_timeout_seconds,
         )
         print(f"Job ID: {snapshot['job_id']}", flush=True)
         if args.job_command == "run":
