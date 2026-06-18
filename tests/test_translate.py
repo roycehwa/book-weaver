@@ -857,3 +857,182 @@ def test_minimax_translator_uses_anthropic_messages_api(monkeypatch: pytest.Monk
             "content": "Source language: en\nTarget language: zh-CN\nMarkdown chunk index: 3\n\n# Title\n\nBody.",
         }
     ]
+
+
+def test_build_translator_supports_deepl(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DEEPL_AUTH_KEY", "test-key")
+    monkeypatch.setenv("DEEPL_BASE_URL", "https://api.deepl.com")
+
+    translator = build_translator("deepl")
+
+    assert translator.name == "deepl"
+
+
+def test_deepl_translator_calls_translate_api(monkeypatch: pytest.MonkeyPatch) -> None:
+    from pdf_translator.config import DeepLSettings
+    from pdf_translator.translate import DeepLTranslator
+
+    captured: dict[str, object] = {}
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {"translations": [{"text": "# 标题\n\n正文。"}]}
+
+    def fake_post(
+        url: str,
+        *,
+        json: dict[str, object],
+        headers: dict[str, str],
+        timeout: tuple[int, float],
+    ) -> FakeResponse:
+        captured["url"] = url
+        captured["headers"] = headers
+        captured["body"] = json
+        captured["timeout"] = timeout
+        return FakeResponse()
+
+    monkeypatch.setattr("requests.post", fake_post)
+    translator = DeepLTranslator(
+        DeepLSettings(auth_key="test-key", base_url="https://api.deepl.com")
+    )
+
+    result = translator.translate_chunk(
+        TranslationChunk(index=3, markdown="# Title\n\nBody."),
+        source_language="en",
+        target_language="zh-CN",
+    )
+
+    assert result == "# 标题\n\n正文。"
+    assert captured["url"] == "https://api.deepl.com/v2/translate"
+    assert captured["headers"]["Authorization"] == "DeepL-Auth-Key test-key"
+    body = captured["body"]
+    assert body["text"] == ["# Title\n\nBody."]
+    assert body["target_lang"] == "ZH"
+    assert body["source_lang"] == "EN"
+    assert body["preserve_formatting"] is True
+
+
+def test_translate_markdown_falls_back_to_deepl_on_sensitive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SensitiveMiniMax(BaseTranslator):
+        name = "minimax"
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            raise ValueError("MiniMax translation failed: output new_sensitive (1027)")
+
+    class FakeDeepL(BaseTranslator):
+        name = "deepl"
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            return "这是备用 DeepL 翻译得到的完整中文内容。" * 40
+
+    real_build = build_translator
+
+    def fake_build(name: str) -> BaseTranslator:
+        if name.strip().lower() == "deepl":
+            return FakeDeepL()
+        return real_build(name)
+
+    monkeypatch.setenv("TRANSLATION_FALLBACK", "deepl")
+    monkeypatch.setenv("DEEPL_AUTH_KEY", "test-key")
+    monkeypatch.setattr("pdf_translator.translate.build_translator", fake_build)
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
+
+    source = ("Taiwan policy remains sensitive. " * 90) + "\n\n" + ("Second paragraph on Beijing. " * 90)
+    settings = RunSettings(
+        source_pdf=tmp_path / "source.pdf",
+        output_dir=tmp_path,
+        target_language="zh-CN",
+        source_language="en",
+        translator="minimax",
+        max_chunk_chars=9000,
+    )
+
+    result = translate_markdown(
+        chunks=[TranslationChunk(index=0, markdown=source)],
+        settings=settings,
+        translator=SensitiveMiniMax(),
+        cache_dir=tmp_path / "cache",
+        retry_count=2,
+    )
+
+    assert "备用 DeepL" in result.translated_markdown
+
+
+def test_translate_markdown_skips_deepl_for_non_sensitive_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailingTranslator(BaseTranslator):
+        name = "minimax"
+        calls = 0
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            FailingTranslator.calls += 1
+            return "This is still English prose. " * 30
+
+    class FakeDeepL(BaseTranslator):
+        name = "deepl"
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            raise AssertionError("DeepL should not be called for quality-only failures")
+
+    real_build = build_translator
+
+    def fake_build(name: str) -> BaseTranslator:
+        if name.strip().lower() == "deepl":
+            return FakeDeepL()
+        return real_build(name)
+
+    monkeypatch.setenv("TRANSLATION_FALLBACK", "deepl")
+    monkeypatch.setenv("DEEPL_AUTH_KEY", "test-key")
+    monkeypatch.setattr("pdf_translator.translate.build_translator", fake_build)
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
+
+    settings = RunSettings(
+        source_pdf=tmp_path / "source.pdf",
+        output_dir=tmp_path,
+        target_language="zh-CN",
+        source_language="en",
+        translator="minimax",
+        max_chunk_chars=1000,
+    )
+
+    with pytest.raises(ValueError, match="looks untranslated"):
+        translate_markdown(
+            chunks=[
+                TranslationChunk(
+                    index=0,
+                    markdown="This source English paragraph needs translation. " * 30,
+                )
+            ],
+            settings=settings,
+            translator=FailingTranslator(),
+            cache_dir=tmp_path / "cache",
+            retry_count=2,
+        )

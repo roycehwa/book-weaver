@@ -16,8 +16,10 @@ from pdf_translator.chunking import split_markdown_into_chunks
 from pdf_translator.config import (
     DEFAULT_MINIMAX_MAX_TOKENS,
     CompatibleAPISettings,
+    DeepLSettings,
     OpenAISettings,
     RunSettings,
+    _load_local_env,
 )
 from pdf_translator.models import BookTranslationResult, TranslatedChapter, TranslationChunk, TranslationResult
 
@@ -113,7 +115,14 @@ def _cjk_count(text: str) -> int:
     return sum(1 for char in text if "\u4e00" <= char <= "\u9fff")
 
 
+def _is_newsletter_boilerplate_block(source: str) -> bool:
+    lower = source.lower()
+    return "newsletter sign-up" in lower or "newslettersignup" in lower or "authoralerts" in lower
+
+
 def _looks_untranslated_for_target(source: str, translated: str, target_language: str) -> bool:
+    if _is_newsletter_boilerplate_block(source):
+        return False
     if not target_language.lower().startswith("zh"):
         return False
     source_ascii = _ascii_letter_count(source)
@@ -313,6 +322,7 @@ def _translate_chunk_resumable(
                     return cached
 
     last_error: Exception | None = None
+    had_sensitive_failure = False
     for attempt in range(max(1, retry_count)):
         try:
             translated = _complete_translation_attempt(
@@ -338,6 +348,8 @@ def _translate_chunk_resumable(
             return translated
         except Exception as exc:
             last_error = exc
+            if "new_sensitive" in str(exc).lower():
+                had_sensitive_failure = True
             if allow_sensitive_split and "new_sensitive" in str(exc).lower():
                 try:
                     translated = _translate_sensitive_chunk_parts(
@@ -359,12 +371,168 @@ def _translate_chunk_resumable(
                     return translated
                 except Exception as split_exc:
                     last_error = split_exc
+                    if "new_sensitive" in str(split_exc).lower():
+                        had_sensitive_failure = True
                 break
             if attempt + 1 >= max(1, retry_count):
                 break
             time.sleep(min(2**attempt, 8))
 
+    fallback_translated: str | None = None
+    if had_sensitive_failure:
+        fallback_translated = _try_fallback_translation(
+            chunk=chunk,
+            source_language=source_language,
+            target_language=target_language,
+            primary_translator=translator,
+            cache_path=cache_path,
+        )
+    if fallback_translated is not None:
+        return fallback_translated
+
     raise ValueError(f"Translation failed for chunk {chunk.index} after {retry_count} attempts: {last_error}") from last_error
+
+
+def _deepl_usage_state_path() -> Path:
+    return Path.home() / ".hermes" / "state" / "deepl-usage.json"
+
+
+def _deepl_monthly_char_budget() -> int:
+    raw = os.getenv("DEEPL_MONTHLY_CHAR_BUDGET", "1800000").strip()
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 1_800_000
+
+
+def _deepl_load_usage() -> dict[str, object]:
+    path = _deepl_usage_state_path()
+    if not path.exists():
+        return {"month": "", "characters": 0, "chunks": 0}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {"month": "", "characters": 0, "chunks": 0}
+    if not isinstance(payload, dict):
+        return {"month": "", "characters": 0, "chunks": 0}
+    return payload
+
+
+def _deepl_current_month_key() -> str:
+    return time.strftime("%Y-%m")
+
+
+def _deepl_characters_used_this_month() -> int:
+    usage = _deepl_load_usage()
+    if str(usage.get("month") or "") != _deepl_current_month_key():
+        return 0
+    return int(usage.get("characters") or 0)
+
+
+def _deepl_budget_allows(char_count: int) -> bool:
+    budget = _deepl_monthly_char_budget()
+    if budget <= 0:
+        return False
+    return _deepl_characters_used_this_month() + char_count <= budget
+
+
+def _deepl_record_usage(char_count: int, *, chunk_index: int) -> None:
+    path = _deepl_usage_state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    month = _deepl_current_month_key()
+    usage = _deepl_load_usage()
+    if str(usage.get("month") or "") != month:
+        usage = {"month": month, "characters": 0, "chunks": 0}
+    usage["characters"] = int(usage.get("characters") or 0) + char_count
+    usage["chunks"] = int(usage.get("chunks") or 0) + 1
+    usage["last_chunk_index"] = chunk_index
+    path.write_text(json.dumps(usage, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _deepl_language_code(language: str | None, *, role: str) -> str | None:
+    if not language:
+        return None
+    normalized = language.strip().lower().replace("_", "-")
+    if normalized in {"en", "en-us", "en-gb"}:
+        return "EN"
+    if normalized.startswith("zh"):
+        if any(token in normalized for token in ("hant", "tw", "hk", "traditional")):
+            return "ZH-HANT"
+        return "ZH"
+    if role == "target":
+        raise ValueError(f"Unsupported DeepL target language: {language}")
+    return None
+
+
+def _resolve_fallback_translator(*, primary_name: str) -> BaseTranslator | None:
+    _load_local_env()
+    fallback_name = (os.getenv("TRANSLATION_FALLBACK") or "").strip().lower()
+    if not fallback_name:
+        if os.getenv("DEEPL_AUTH_KEY") or os.getenv("DEEPL_API_KEY"):
+            fallback_name = "deepl"
+        else:
+            return None
+    if fallback_name == primary_name.strip().lower():
+        return None
+    try:
+        return build_translator(fallback_name)
+    except ValueError:
+        return None
+
+
+def _try_fallback_translation(
+    *,
+    chunk: TranslationChunk,
+    source_language: str | None,
+    target_language: str,
+    primary_translator: BaseTranslator,
+    cache_path: Path | None,
+) -> str | None:
+    fallback = _resolve_fallback_translator(primary_name=primary_translator.name)
+    if fallback is None:
+        return None
+
+    source_chars = len(chunk.markdown)
+    if not _deepl_budget_allows(source_chars):
+        return None
+
+    last_error: Exception | None = None
+    for attempt in (
+        lambda: fallback.translate_chunk(
+            chunk=chunk,
+            source_language=source_language,
+            target_language=target_language,
+        ),
+        lambda: _translate_sensitive_chunk_parts(
+            chunk=chunk,
+            source_language=source_language,
+            target_language=target_language,
+            translator=fallback,
+        ),
+    ):
+        try:
+            translated = attempt().strip()
+            if not translated:
+                raise ValueError(f"Empty fallback translation returned for chunk {chunk.index}.")
+            translated = _strip_generated_english_chinese_glosses(chunk.markdown, translated, target_language)
+            _assert_translation_quality(
+                chunk=chunk,
+                translated=translated,
+                target_language=target_language,
+                translator_name=fallback.name,
+            )
+            if cache_path is not None:
+                tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+                tmp_path.write_text(translated + "\n", encoding="utf-8")
+                tmp_path.replace(cache_path)
+            if fallback.name == "deepl":
+                _deepl_record_usage(source_chars, chunk_index=chunk.index)
+            return translated
+        except Exception as exc:
+            last_error = exc
+    if last_error is not None:
+        return None
+    return None
 
 
 def _split_sensitive_source(source: str, *, max_part_chars: int) -> list[str]:
@@ -469,6 +637,8 @@ def _translate_sensitive_part(
             )
         except Exception as exc:
             last_error = exc
+            if "new_sensitive" in str(exc).lower():
+                break
             if attempt + 1 >= max(1, retry_count):
                 break
             time.sleep(min(2**attempt, 8))
@@ -677,6 +847,63 @@ class MiniMaxAnthropicTranslator(BaseTranslator):
         return text
 
 
+class DeepLTranslator(BaseTranslator):
+    name = "deepl"
+
+    def __init__(self, settings: DeepLSettings) -> None:
+        self.auth_key = settings.auth_key
+        self.base_url = settings.base_url.rstrip("/")
+        self.http_timeout = float(os.getenv("DEEPL_HTTP_TIMEOUT_SECONDS", "120"))
+
+    def translate_chunk(
+        self,
+        chunk: TranslationChunk,
+        source_language: str | None,
+        target_language: str,
+    ) -> str:
+        payload: dict[str, object] = {
+            "text": [chunk.markdown],
+            "target_lang": _deepl_language_code(target_language, role="target"),
+            "preserve_formatting": True,
+        }
+        source_lang = _deepl_language_code(source_language, role="source")
+        if source_lang:
+            payload["source_lang"] = source_lang
+
+        try:
+            response = requests.post(
+                f"{self.base_url}/v2/translate",
+                json=payload,
+                headers={
+                    "Authorization": f"DeepL-Auth-Key {self.auth_key}",
+                    "Content-Type": "application/json",
+                },
+                timeout=(10, self.http_timeout),
+            )
+            response.raise_for_status()
+            response_data = response.json()
+        except requests.HTTPError as exc:
+            error_body = exc.response.text if exc.response is not None else ""
+            status_code = exc.response.status_code if exc.response else "?"
+            raise ValueError(
+                f"DeepL translation failed for chunk {chunk.index}: "
+                f"HTTP {status_code}: {error_body[:500]}"
+            ) from exc
+        except requests.RequestException as exc:
+            raise ValueError(f"DeepL translation failed for chunk {chunk.index}: {exc}") from exc
+
+        translations = response_data.get("translations")
+        if not isinstance(translations, list) or not translations:
+            raise ValueError(f"Empty DeepL translation returned for chunk {chunk.index}.")
+        first = translations[0]
+        if not isinstance(first, dict):
+            raise ValueError(f"Malformed DeepL translation returned for chunk {chunk.index}.")
+        text = str(first.get("text") or "").strip()
+        if not text:
+            raise ValueError(f"Empty DeepL translation returned for chunk {chunk.index}.")
+        return text
+
+
 def _complete_translation_attempt(
     *,
     translator: BaseTranslator,
@@ -791,6 +1018,8 @@ def build_translator(name: str) -> BaseTranslator:
         return OpenAICompatibleTranslator(CompatibleAPISettings.from_env("compatible"))
     if normalized == "minimax":
         return MiniMaxAnthropicTranslator(CompatibleAPISettings.from_env("minimax"))
+    if normalized == "deepl":
+        return DeepLTranslator(DeepLSettings.from_env())
     raise ValueError(f"Unsupported translator backend: {name}")
 
 

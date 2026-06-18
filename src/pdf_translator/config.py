@@ -12,6 +12,7 @@ DEFAULT_MINIMAX_MODEL = "MiniMax-M2.7-highspeed"
 DEFAULT_MINIMAX_BASE_URL = "https://api.minimaxi.com/anthropic/v1/messages"
 # Book chunks are sized for ingest quality; zh outputs often need more completion budget than 2048.
 DEFAULT_MINIMAX_MAX_TOKENS = 8192
+DEFAULT_DEEPL_BASE_URL = "https://api.deepl.com"
 DEFAULT_TRANSLATION_CONCURRENCY = 12
 
 
@@ -95,6 +96,23 @@ class CompatibleAPISettings:
                 ", ".join(missing) + " required when translator='compatible'."
             )
         return cls(api_key=api_key, base_url=base_url, model=model)
+
+
+@dataclass(slots=True)
+class DeepLSettings:
+    auth_key: str
+    base_url: str = DEFAULT_DEEPL_BASE_URL
+
+    @classmethod
+    def from_env(cls) -> "DeepLSettings":
+        _load_local_env()
+        auth_key = os.getenv("DEEPL_AUTH_KEY") or os.getenv("DEEPL_API_KEY")
+        if not auth_key:
+            raise ValueError("DEEPL_AUTH_KEY is required when translator='deepl'.")
+        return cls(
+            auth_key=auth_key,
+            base_url=os.getenv("DEEPL_BASE_URL", DEFAULT_DEEPL_BASE_URL).rstrip("/"),
+        )
 
 
 @dataclass(slots=True)
