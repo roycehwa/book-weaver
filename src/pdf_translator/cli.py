@@ -73,6 +73,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="epub",
         choices=["pdf", "epub", "both"],
     )
+    job_run_parser.add_argument(
+        "--ingest-timeout-seconds",
+        type=int,
+        default=None,
+        help="Hard timeout for the ingest stage. Use 0 to disable. Defaults to pipeline setting.",
+    )
     job_run_parser.add_argument("--jobs-dir", type=Path, default=Path("jobs"))
     job_run_parser.add_argument("--json", dest="as_json", action="store_true")
 

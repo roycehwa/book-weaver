@@ -138,6 +138,7 @@ def test_public_cli_accepts_job_commands() -> None:
     assert run_args.command == "job"
     assert run_args.job_command == "run"
     assert run_args.processing_mode == "preserve"
+    assert run_args.ingest_timeout_seconds is None
     assert run_args.as_json is True
     assert status_args.job_command == "status"
     assert status_args.as_json is True
