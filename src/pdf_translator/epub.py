@@ -87,6 +87,17 @@ td, th {
   border: 1px solid #d1d5db;
   padding: 0.5rem;
   vertical-align: top;
+  word-break: break-word;
+}
+table.worksheet-table {
+  display: block;
+  overflow-x: auto;
+  font-size: 0.84rem;
+  line-height: 1.45;
+}
+table.worksheet-table td,
+table.worksheet-table th {
+  min-width: 7rem;
 }
 li {
   margin: 0.25rem 0 0.55rem;
@@ -156,8 +167,18 @@ def _markdown_to_body_html(markdown_text: str) -> str:
     markdown_text = RAW_HTML_TAG_RE.sub(lambda match: escape(match.group(0)), markdown_text)
     html = markdown(markdown_text, extensions=["tables", "fenced_code", "sane_lists"])
     soup = BeautifulSoup(html, "html.parser")
+    _annotate_worksheet_tables(soup)
     _compact_trailing_note_cluster(soup)
     return "".join(str(child) for child in soup.contents)
+
+
+def _annotate_worksheet_tables(soup: BeautifulSoup) -> None:
+    for table in soup.find_all("table"):
+        text = table.get_text(" ", strip=True)
+        if "□" in text or " ph#:" in text.lower() or text.count("________") >= 2:
+            classes = table.get("class") or []
+            if "worksheet-table" not in classes:
+                table["class"] = [*classes, "worksheet-table"]
 
 
 def _is_note_marker_node(node) -> bool:
@@ -224,12 +245,17 @@ def build_epub_internal_href_map(chapters: list[dict], chapter_files: list[str])
     return href_map
 
 
-def rewrite_epub_internal_hrefs(body_html: str, *, href_map: dict[str, str]) -> str:
+def rewrite_epub_internal_hrefs(
+    body_html: str,
+    *,
+    href_map: dict[str, str],
+    current_source_path: str | None = None,
+) -> str:
     """Rewrite same-publication links to output chapter files.
 
-    Current contract is L2 chapter-level remapping. Source XHTML fragments are
-    intentionally dropped unless a future L3 fragment/id map exists; preserving
-    unknown fragments would create broken EPUB links.
+    EPUB note links carry stable fragment pairs such as ``note-1`` and
+    ``R_note-1``. Restore those ids while remapping the source chapter path so
+    note references and backlinks remain functional in rebuilt EPUBs.
     """
     soup = BeautifulSoup(body_html, "html.parser")
     for anchor in soup.find_all("a"):
@@ -252,21 +278,78 @@ def rewrite_epub_internal_hrefs(body_html: str, *, href_map: dict[str, str]) -> 
         if not target:
             continue
         base = PurePosixPath(target).name
-        anchor["href"] = base
+        is_same_chapter = (
+            isinstance(current_source_path, str)
+            and key == _norm_epub_zip_internal_path(unquote(current_source_path))
+        )
+        is_note_fragment = frag.startswith("R_") or "note-" in frag.lower()
+        anchor["href"] = (
+            f"{base}#{frag}"
+            if sep and frag and is_same_chapter and is_note_fragment
+            else base
+        )
+        if not frag or not is_same_chapter or not is_note_fragment:
+            continue
+        if frag.startswith("R_"):
+            note_id = frag[2:]
+            note_target = soup.new_tag("span")
+            note_target["id"] = note_id
+            note_target["epub:type"] = "footnote"
+            note_target["role"] = "doc-footnote"
+            anchor.insert_before(note_target)
+        else:
+            anchor["id"] = f"R_{frag}"
+            anchor["epub:type"] = "noteref"
+            anchor["role"] = "doc-noteref"
+    ids = {
+        str(tag.get("id"))
+        for tag in soup.find_all(attrs={"id": True})
+        if tag.get("id")
+    }
+    for anchor in soup.find_all("a"):
+        href = anchor.get("href")
+        if not isinstance(href, str) or "#R_" not in href:
+            continue
+        fragment = href.partition("#")[2]
+        if fragment not in ids:
+            del anchor["href"]
     return "".join(str(child) for child in soup.contents)
 
 
-def _rewrite_images(body_html: str, image_map: dict[Path, str], image_items: list[tuple[str, Path]]) -> str:
+def _resolve_image_source_path(raw_src: str, image_roots: list[Path]) -> Path | None:
+    source_path = Path(unquote(raw_src)).expanduser()
+    candidates = [source_path]
+    if not source_path.is_absolute():
+        candidates.extend(root / source_path for root in image_roots)
+    if source_path.parent.name:
+        candidates.extend(root / source_path.parent.name / source_path.name for root in image_roots)
+    candidates.extend(root / source_path.name for root in image_roots)
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if candidate.exists():
+            return candidate.resolve()
+    return None
+
+
+def _rewrite_images(
+    body_html: str,
+    image_map: dict[Path, str],
+    image_items: list[tuple[str, Path]],
+    image_roots: list[Path],
+) -> str:
     soup = BeautifulSoup(body_html, "html.parser")
     used_names: set[str] = set(image_map.values())
     for image in soup.find_all("img"):
         raw_src = image.get("src")
         if not raw_src or str(raw_src).startswith("#"):
             continue
-        source_path = Path(unquote(str(raw_src))).expanduser()
-        if not source_path.exists():
+        resolved = _resolve_image_source_path(str(raw_src), image_roots)
+        if resolved is None:
             continue
-        resolved = source_path.resolve()
         if resolved not in image_map:
             base_name = resolved.name
             candidate = base_name
@@ -286,7 +369,7 @@ def _rewrite_images(body_html: str, image_map: dict[Path, str], image_items: lis
 def _chapter_xhtml(*, title: str, body_html: str, language: str, body_id: str | None = None) -> str:
     id_attr = f' id="{escape(body_id)}"' if body_id else ""
     return f"""<?xml version="1.0" encoding="utf-8"?>
-<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="{escape(language)}">
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" xml:lang="{escape(language)}">
 <head>
   <meta charset="utf-8" />
   <title>{escape(title)}</title>
@@ -420,6 +503,7 @@ def render_epub_from_book(
     chapter_documents: list[tuple[str, str]] = []
     image_map: dict[Path, str] = {}
     image_items: list[tuple[str, Path]] = []
+    image_roots = [output_path.parent.resolve()]
 
     for chapter, chapter_file in zip(chapters, chapter_files):
         index = int(chapter.get("index") or 1)
@@ -427,8 +511,12 @@ def render_epub_from_book(
         chapter_id = str(chapter.get("chapter_id") or "").strip() or None
         markdown_text = str(chapter.get("markdown") or "")
         body_html = _markdown_to_body_html(markdown_text)
-        body_html = rewrite_epub_internal_hrefs(body_html, href_map=href_map)
-        body_html = _rewrite_images(body_html, image_map, image_items)
+        body_html = rewrite_epub_internal_hrefs(
+            body_html,
+            href_map=href_map,
+            current_source_path=chapter.get("source_internal_path"),
+        )
+        body_html = _rewrite_images(body_html, image_map, image_items, image_roots)
         if chapter.get("preserve_original") or chapter.get("resource_only") or APPARATUS_TITLE_RE.match(chapter_title):
             body_html = _wrap_preserved_apparatus(body_html)
         chapter_documents.append(

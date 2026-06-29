@@ -7,6 +7,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+from pdf_translator.glossary import glossary_terms_missing_in_translation, load_active_entries_for_translation
 from pdf_translator.models import TranslationChunk
 from pdf_translator.chunking import split_markdown_into_chunks
 from pdf_translator.translate import (
@@ -115,6 +116,7 @@ def build_source_segments(book: dict[str, Any], *, source_path: Path) -> list[di
                     "source_text": block,
                     "source_path": str(source_path),
                     "source_location": _segment_location(chapter),
+                    "translate": bool(chapter.get("translate", True)),
                     "status": "pending",
                 }
             )
@@ -148,6 +150,7 @@ def build_translated_segments(
                 "translated_text": translated_text,
                 "target_language": target_language,
                 "source_location": segment.get("source_location", {}),
+                "translate": bool(segment.get("translate", True)),
                 "status": "needs_review",
             }
         )
@@ -186,6 +189,7 @@ def build_aligned_review_segments(
                 "chapter_title": title,
                 "block_index": block_index,
                 "source_location": location,
+                "translate": bool(chapter.get("translate", True)),
             }
             source_segments.append(
                 {
@@ -266,6 +270,7 @@ def _merge_reading_review_segments(
             "block_index": block_index,
             "source_location": active_chapter["source_location"],
             "translation_part_ids": list(part_ids),
+            "translate": active_chapter["translate"],
         }
         merged_source.append(
             {
@@ -302,6 +307,7 @@ def _merge_reading_review_segments(
                 "source_location": source.get("source_location"),
                 "source_path": source.get("source_path"),
                 "target_language": translated.get("target_language"),
+                "translate": bool(source.get("translate", True)),
             }
 
         translated = translated_by_id.get(str(source["segment_id"]), {})
@@ -359,6 +365,8 @@ def detect_review_items(
     translated_segments: list[dict[str, Any]],
     *,
     target_language: str,
+    text_operation: str = "translate",
+    glossary_entries: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     translated_by_id = {segment["segment_id"]: segment for segment in translated_segments}
     items: list[dict[str, Any]] = []
@@ -370,11 +378,22 @@ def detect_review_items(
         severity = "medium"
         evidence: dict[str, Any] = {}
 
+        source_text = str(source.get("source_text") or "").strip()
+        if not bool(source.get("translate", True)) and text_operation == "translate":
+            continue
         if not translated_text:
-            issue_type = "missing_translation"
+            issue_type = "missing_content" if text_operation == "preserve" else "missing_translation"
             severity = "high"
+        elif text_operation == "preserve":
+            if len(source_text) >= 200 and len(translated_text) < len(source_text) * 0.5:
+                issue_type = "possibly_incomplete"
+                severity = "high"
+                evidence = {
+                    "source_length": len(source_text),
+                    "output_length": len(translated_text),
+                }
         elif target_language.lower().startswith("zh"):
-            source_ascii = _ascii_letter_count(str(source.get("source_text") or ""))
+            source_ascii = _ascii_letter_count(source_text)
             translated_ascii = _ascii_letter_count(translated_text)
             translated_cjk = _cjk_count(translated_text)
             mixed_words, mixed_lines = _mixed_english_signal(translated_text)
@@ -391,9 +410,29 @@ def detect_review_items(
             elif source_ascii >= 500 and translated_cjk + int(translated_ascii * 0.35) < source_ascii * 0.16:
                 issue_type = "possibly_incomplete"
                 severity = "high"
-            elif mixed_words >= 2 or mixed_lines >= 1:
+            elif mixed_words >= 3:
                 issue_type = "mixed_english"
                 severity = "medium"
+
+        if (
+            issue_type is None
+            and text_operation == "translate"
+            and target_language.lower().startswith("zh")
+            and glossary_entries
+            and translated_text
+        ):
+            missing_terms = glossary_terms_missing_in_translation(
+                source_text,
+                translated_text,
+                glossary_entries,
+            )
+            if missing_terms:
+                issue_type = "glossary_drift"
+                severity = "high"
+                evidence = {
+                    **evidence,
+                    "missing_glossary_terms": missing_terms,
+                }
 
         if issue_type is None:
             continue
@@ -444,26 +483,6 @@ def build_pre_review_report(
     }
 
 
-def create_review_state(review_items: list[dict[str, Any]]) -> dict[str, Any]:
-    flagged_count = len(review_items)
-    return {
-        "schema": SCHEMA_STATE,
-        "created_at": utc_now(),
-        "updated_at": utc_now(),
-        "summary": {
-            "total_items": flagged_count,
-            "open_items": flagged_count,
-            "approved_items": 0,
-            "resolved_items": 0,
-        },
-        "workflow": {
-            "pre_review_completed": True,
-            "human_review_mode": "issues_only" if flagged_count else "full",
-        },
-        "decisions": {},
-    }
-
-
 def summarize_review_state(review_items: list[dict[str, Any]], review_state: dict[str, Any]) -> dict[str, int]:
     """Compute current counts from decisions instead of trusting the creation-time snapshot."""
     decisions = review_state.get("decisions")
@@ -491,14 +510,36 @@ def summarize_review_state(review_items: list[dict[str, Any]], review_state: dic
     }
 
 
+def create_review_state(review_items: list[dict[str, Any]]) -> dict[str, Any]:
+    flagged_count = len(review_items)
+    return {
+        "schema": SCHEMA_STATE,
+        "created_at": utc_now(),
+        "updated_at": utc_now(),
+        "summary": {
+            "total_items": flagged_count,
+            "open_items": flagged_count,
+            "approved_items": 0,
+            "resolved_items": 0,
+        },
+        "workflow": {
+            "pre_review_completed": True,
+            "human_review_mode": "issues_only" if flagged_count else "full",
+        },
+        "decisions": {},
+    }
+
+
 def build_review_artifacts(
     *,
     source_path: Path,
     target_language: str,
+    text_operation: str = "translate",
     book: dict[str, Any],
     translated_chapters: list[dict[str, Any]],
     cache_dir: Path | None = None,
     max_chunk_chars: int = 9000,
+    run_dir: Path | None = None,
 ) -> dict[str, Any]:
     if cache_dir is not None and cache_dir.exists():
         segments, translated_segments_list = build_aligned_review_segments(
@@ -515,8 +556,19 @@ def build_review_artifacts(
             translated_chapters,
             target_language=target_language,
         )
-    review_items = detect_review_items(segments, translated_segments_list, target_language=target_language)
-    pre_review = build_pre_review_report(segments, review_items)
+    glossary_entries = load_active_entries_for_translation(run_dir) if run_dir is not None else []
+    review_items = detect_review_items(
+        segments,
+        translated_segments_list,
+        target_language=target_language,
+        text_operation=text_operation,
+        glossary_entries=glossary_entries or None,
+    )
+    pre_review = build_pre_review_report(
+        segments,
+        review_items,
+        method="preserve_integrity_v1" if text_operation == "preserve" else "rules_v1",
+    )
     return {
         "segments": {
             "schema": SCHEMA_SEGMENTS,
@@ -533,6 +585,7 @@ def build_review_artifacts(
         "review_items": {
             "schema": SCHEMA_ITEMS,
             "target_language": target_language,
+            "text_operation": text_operation,
             "items": review_items,
         },
         "review_state": create_review_state(review_items),
@@ -781,6 +834,51 @@ def translated_segments_to_chapters(translated_segments_payload: Any) -> list[di
     return chapters
 
 
+def restore_review_chapter_apparatus(
+    chapters: list[dict[str, Any]],
+    base_translated_chapters: Any,
+) -> list[dict[str, Any]]:
+    """Restore chapter-end notes omitted from reading-unit review segments."""
+    base_items = (
+        base_translated_chapters.get("chapters", [])
+        if isinstance(base_translated_chapters, dict)
+        else base_translated_chapters
+    )
+    if not isinstance(base_items, list):
+        return chapters
+    base_by_index = {
+        int(item.get("index") or 0): item
+        for item in base_items
+        if isinstance(item, dict)
+    }
+    note_heading = re.compile(r"^#{1,6}\s+(?:notes?|注释|註釋)\s*$", re.IGNORECASE | re.MULTILINE)
+    note_item = re.compile(
+        r"^-\s+\[\*\*\d+\.\*\*\]\([^)]+#R_[^)]+\)",
+        re.MULTILINE,
+    )
+    restored: list[dict[str, Any]] = []
+    for chapter in chapters:
+        merged = dict(chapter)
+        base = base_by_index.get(int(chapter.get("index") or 0))
+        if not isinstance(base, dict):
+            restored.append(merged)
+            continue
+        for key in ("source_internal_path", "toc", "preserve_original", "resource_only"):
+            if key in base:
+                merged[key] = base[key]
+        reviewed_markdown = str(merged.get("markdown") or "").rstrip()
+        base_markdown = str(base.get("markdown") or base.get("translated_markdown") or "")
+        match = note_heading.search(base_markdown) or note_item.search(base_markdown)
+        if match:
+            base_notes = base_markdown[match.start():].strip()
+            reviewed_match = note_heading.search(reviewed_markdown) or note_item.search(reviewed_markdown)
+            if reviewed_match:
+                reviewed_markdown = reviewed_markdown[:reviewed_match.start()].rstrip()
+            merged["markdown"] = f"{reviewed_markdown}\n\n{base_notes}\n"
+        restored.append(merged)
+    return restored
+
+
 def _segment_index_map(segments: list[dict[str, Any]]) -> dict[str, int]:
     return {str(segment["segment_id"]): index for index, segment in enumerate(segments)}
 
@@ -971,12 +1069,9 @@ def write_versioned_outputs(
     target_language: str,
     translated_segments: Any,
     parent_version: str | None = None,
-    approval_status: str = "draft",
 ) -> dict[str, str]:
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", version_name):
         raise ValueError("Unsafe review version name. Use letters, numbers, dots, underscores, or dashes.")
-    if approval_status not in {"draft", "approved"}:
-        raise ValueError("approval_status must be draft or approved")
     version_dir = run_dir / "versions" / version_name
     version_dir.mkdir(parents=True, exist_ok=True)
     translated_markdown = translated_segments_to_markdown(translated_segments)
@@ -1000,18 +1095,14 @@ def write_versioned_outputs(
     manifest_path.write_text(
         json.dumps(
             {
-                "schema": "translation_review_version_v2",
+                "schema": "translation_review_version_v1",
                 "version": version_name,
                 "parent_version": parent_version,
                 "target_language": target_language,
                 "created_at": utc_now(),
-                "review": {
-                    "status": approval_status,
-                    "approved_at": utc_now() if approval_status == "approved" else None,
-                },
                 "files": {
-                    "translated_markdown": str(translated_markdown_path.relative_to(run_dir)),
-                    "translated_segments": str(translated_segments_path.relative_to(run_dir)),
+                    "translated_markdown": str(translated_markdown_path),
+                    "translated_segments": str(translated_segments_path),
                 },
             },
             ensure_ascii=False,

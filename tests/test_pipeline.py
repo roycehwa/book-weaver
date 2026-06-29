@@ -146,3 +146,80 @@ def test_translate_pipeline_writes_review_artifacts_for_real_translation(tmp_pat
         assert Path(manifest["files"][key]).exists()
     review_state = json.loads(Path(manifest["files"]["review_state"]).read_text(encoding="utf-8"))
     assert review_state["schema"] == "translation_review_state_v1"
+
+
+def test_translate_pipeline_writes_translation_job_files(tmp_path: Path, monkeypatch) -> None:
+    _patch_intake_dependencies(monkeypatch)
+    settings = RunSettings(
+        source_pdf=tmp_path / "english-book.epub",
+        output_dir=tmp_path / "runs",
+        target_language="zh-CN",
+        source_language="en",
+        translator="mock",
+        max_chunk_chars=9000,
+        profile_name="book",
+        output_format="none",
+    )
+
+    artifacts = pipeline_module.run_translation_pipeline(settings)
+    manifest = json.loads(artifacts.manifest_path.read_text(encoding="utf-8"))
+
+    for key in ["translation_job", "translation_progress", "translation_events"]:
+        assert key in manifest["files"]
+        assert Path(manifest["files"][key]).exists()
+
+    progress = json.loads(Path(manifest["files"]["translation_progress"]).read_text(encoding="utf-8"))
+    assert progress["status"] == "completed"
+    assert progress["total_chunks"] >= 1
+    assert progress["completed_chunks"] == progress["total_chunks"]
+
+
+def test_translate_pipeline_ignore_cache_removes_stale_cache(tmp_path: Path, monkeypatch) -> None:
+    _patch_intake_dependencies(monkeypatch)
+    run_dir = tmp_path / "runs" / "english-book"
+    stale_cache = run_dir / "translation-cache"
+    stale_cache.mkdir(parents=True)
+    (stale_cache / "chunk-000000-stale.md").write_text("bad stale cache\n", encoding="utf-8")
+
+    settings = RunSettings(
+        source_pdf=tmp_path / "english-book.epub",
+        output_dir=tmp_path / "runs",
+        target_language="zh-CN",
+        source_language="en",
+        translator="mock",
+        max_chunk_chars=9000,
+        profile_name="book",
+        output_format="none",
+        ignore_translation_cache=True,
+    )
+
+    artifacts = pipeline_module.run_translation_pipeline(settings)
+    manifest = json.loads(artifacts.manifest_path.read_text(encoding="utf-8"))
+
+    cache_dir = Path(manifest["files"]["translation_cache_dir"])
+    assert cache_dir.exists()
+    assert not (cache_dir / "chunk-000000-stale.md").exists()
+    assert manifest["translation"]["ignore_cache"] is True
+
+
+def test_pipeline_manifest_includes_existing_glossary_files(tmp_path: Path, monkeypatch) -> None:
+    _patch_intake_dependencies(monkeypatch)
+    run_dir = tmp_path / "runs" / "english-book"
+    glossary_dir = run_dir / "glossary"
+    glossary_dir.mkdir(parents=True)
+    (glossary_dir / "active.json").write_text('{"schema":"phase_a_glossary_v1","entries":[]}', encoding="utf-8")
+
+    settings = RunSettings(
+        source_pdf=tmp_path / "english-book.epub",
+        output_dir=tmp_path / "runs",
+        target_language="zh-CN",
+        source_language="en",
+        translator="mock",
+        max_chunk_chars=9000,
+        profile_name="book",
+        output_format="none",
+    )
+    artifacts = pipeline_module.run_translation_pipeline(settings)
+    manifest = json.loads(artifacts.manifest_path.read_text(encoding="utf-8"))
+
+    assert "glossary_active" in manifest["files"]

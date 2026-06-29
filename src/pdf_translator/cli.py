@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 from pdf_translator.config import DEFAULT_TRANSLATION_CONCURRENCY, RunSettings
@@ -10,6 +11,8 @@ from pdf_translator.guardrails import (
     IngestGuardrailError,
     ingest_pdf_guarded,
 )
+from pdf_translator.jobs import BookJobRunner, JobRepository
+from pdf_translator.job_control import format_event_line, format_progress_report, load_progress, load_translation_events
 from pdf_translator.knowledge import (
     NETWORK_MODELS,
     apply_user_review,
@@ -42,6 +45,14 @@ from pdf_translator.review import (
     write_versioned_outputs,
 )
 from pdf_translator.epub import render_epub_from_book, validate_epub_internal_hrefs
+from pdf_translator.glossary import (
+    apply_glossary_decision,
+    detect_glossary_profile_for_run,
+    extract_glossary_candidates,
+    glossary_status,
+)
+from pdf_translator.glossary_suggestions import suggest_glossary_targets
+from pdf_translator.workflow import glossary_ready_summary, mark_glossary_ready
 from pdf_translator.translate import build_translator
 from pdf_translator.validation import run_validation_manifest, write_validation_report
 
@@ -52,6 +63,126 @@ def build_parser() -> argparse.ArgumentParser:
         description="Ingest books, translate when needed, and prepare reading and knowledge artifacts.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    job_parser = subparsers.add_parser(
+        "job",
+        help="Run and inspect durable resumable book-processing jobs.",
+    )
+    job_subparsers = job_parser.add_subparsers(dest="job_command", required=True)
+    job_run_parser = job_subparsers.add_parser("run", help="Create and run a book job.")
+    job_run_parser.add_argument("source", type=Path, help="Source PDF or EPUB.")
+    job_run_parser.add_argument(
+        "--mode",
+        dest="processing_mode",
+        default="auto",
+        choices=["auto", "translate", "preserve"],
+        help="Choose automatic language-based behavior, force translation, or preserve source text.",
+    )
+    job_run_parser.add_argument("--source-lang", default=None)
+    job_run_parser.add_argument("--target-lang", default="zh-CN")
+    job_run_parser.add_argument(
+        "--translator",
+        default="minimax",
+        choices=["openai", "mock", "minimax", "compatible", "openai-compatible"],
+    )
+    job_run_parser.add_argument(
+        "--format",
+        default="epub",
+        choices=["pdf", "epub", "both"],
+    )
+    job_run_parser.add_argument(
+        "--ingest-timeout-seconds",
+        type=int,
+        default=None,
+        help="Hard timeout for the ingest stage. Use 0 to disable. Defaults to pipeline setting.",
+    )
+    job_run_parser.add_argument("--jobs-dir", type=Path, default=Path("jobs"))
+    job_run_parser.add_argument("--json", dest="as_json", action="store_true")
+
+    job_create_parser = job_subparsers.add_parser(
+        "create",
+        help="Create a durable job without executing it.",
+    )
+    job_create_parser.add_argument("source", type=Path, help="Source PDF or EPUB.")
+    job_create_parser.add_argument(
+        "--mode",
+        dest="processing_mode",
+        default="auto",
+        choices=["auto", "translate", "preserve"],
+    )
+    job_create_parser.add_argument("--source-lang", default=None)
+    job_create_parser.add_argument("--target-lang", default="zh-CN")
+    job_create_parser.add_argument(
+        "--translator",
+        default="minimax",
+        choices=["openai", "mock", "minimax", "compatible", "openai-compatible"],
+    )
+    job_create_parser.add_argument(
+        "--format",
+        default="epub",
+        choices=["pdf", "epub", "both"],
+    )
+    job_create_parser.add_argument(
+        "--ingest-timeout-seconds",
+        type=int,
+        default=None,
+        help="Hard timeout for the ingest stage. Use 0 to disable. Defaults to pipeline setting.",
+    )
+    job_create_parser.add_argument("--jobs-dir", type=Path, default=Path("jobs"))
+    job_create_parser.add_argument("--json", dest="as_json", action="store_true")
+
+    job_execute_parser = job_subparsers.add_parser(
+        "execute",
+        help="Execute a previously created job.",
+    )
+    job_execute_parser.add_argument("job_id")
+    job_execute_parser.add_argument("--jobs-dir", type=Path, default=Path("jobs"))
+    job_execute_parser.add_argument("--json", dest="as_json", action="store_true")
+
+    job_status_parser = job_subparsers.add_parser("status", help="Read a durable job snapshot.")
+    job_status_parser.add_argument("job_id")
+    job_status_parser.add_argument("--jobs-dir", type=Path, default=Path("jobs"))
+    job_status_parser.add_argument("--json", dest="as_json", action="store_true")
+
+    job_resume_parser = job_subparsers.add_parser("resume", help="Resume a failed job.")
+    job_resume_parser.add_argument("job_id")
+    job_resume_parser.add_argument("--jobs-dir", type=Path, default=Path("jobs"))
+    job_resume_parser.add_argument("--json", dest="as_json", action="store_true")
+    job_translate_parser = job_subparsers.add_parser(
+        "translate",
+        help="Run translation phase after glossary is marked ready.",
+    )
+    job_translate_parser.add_argument("job_id")
+    job_translate_parser.add_argument("--jobs-dir", type=Path, default=Path("jobs"))
+    job_translate_parser.add_argument("--json", dest="as_json", action="store_true")
+
+    job_progress_parser = job_subparsers.add_parser(
+        "progress",
+        help="Print chunk-level translation progress for a run directory.",
+    )
+    job_progress_parser.add_argument(
+        "run_dir",
+        type=Path,
+        help="Run directory containing jobs/progress.json.",
+    )
+    job_progress_parser.add_argument("--json", dest="as_json", action="store_true")
+
+    job_events_parser = job_subparsers.add_parser(
+        "events",
+        help="Show recent chunk-level translation events for a run directory.",
+    )
+    job_events_parser.add_argument(
+        "run_dir",
+        type=Path,
+        help="Run directory containing jobs/translation-events.jsonl.",
+    )
+    job_events_parser.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        help="Number of recent events to show.",
+    )
+    job_events_parser.add_argument("--json", dest="as_json", action="store_true")
 
     intake_parser = subparsers.add_parser(
         "intake",
@@ -111,7 +242,15 @@ def build_parser() -> argparse.ArgumentParser:
     translate_parser.add_argument(
         "source_pdf",
         type=Path,
-        help="Path to source document: PDF (Docling) or EPUB (spine XHTML).",
+        nargs="?",
+        default=None,
+        help="Path to source document. Omit when using --run-dir to translate an intake run.",
+    )
+    translate_parser.add_argument(
+        "--run-dir",
+        type=Path,
+        default=None,
+        help="Translate an existing intake run directory after glossary is marked ready.",
     )
     translate_parser.add_argument(
         "--output-dir",
@@ -148,6 +287,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Number of translation chunks to process concurrently.",
     )
     translate_parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume translation using valid cached chunks and write explicit job progress.",
+    )
+    translate_parser.add_argument(
+        "--ignore-cache",
+        action="store_true",
+        help="Delete existing translation cache for this run before translating.",
+    )
+    translate_parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress live translation progress output.",
+    )
+    translate_parser.add_argument(
         "--profile",
         default="auto",
         choices=["auto", "magazine", "book"],
@@ -156,8 +310,8 @@ def build_parser() -> argparse.ArgumentParser:
     translate_parser.add_argument(
         "--format",
         default="epub",
-        choices=["pdf", "epub", "both"],
-        help="Rendered output format. EPUB is the default reading output.",
+        choices=["pdf", "epub", "both", "none"],
+        help="Rendered output format. EPUB is the default reading output. Use none for translation-only runs.",
     )
     translate_parser.add_argument(
         "--ingest-timeout-seconds",
@@ -368,6 +522,60 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Mark this reviewed version approved for Phase B consumption.",
     )
+
+    glossary_parser = subparsers.add_parser(
+        "glossary",
+        help="Extract, apply, and inspect book glossary artifacts.",
+    )
+    glossary_sub = glossary_parser.add_subparsers(dest="glossary_command", required=True)
+    glossary_extract = glossary_sub.add_parser(
+        "extract",
+        help="Extract glossary candidates from book.json into glossary artifacts.",
+    )
+    glossary_extract.add_argument("run_dir", type=Path)
+    glossary_extract.add_argument(
+        "--profile",
+        choices=["humanities_history", "social_econ_philosophy", "science_tech_engineering"],
+        default=None,
+        help="Glossary extraction profile (default: auto-detect or keep user override).",
+    )
+    glossary_detect = glossary_sub.add_parser(
+        "detect",
+        help="Detect recommended glossary profile without writing artifacts.",
+    )
+    glossary_detect.add_argument("run_dir", type=Path)
+    glossary_suggest = glossary_sub.add_parser(
+        "suggest",
+        help="Generate Chinese translation suggestions for glossary candidates.",
+    )
+    glossary_suggest.add_argument("run_dir", type=Path)
+    glossary_suggest.add_argument("--target-lang", default="zh-CN")
+    glossary_suggest.add_argument(
+        "--translator",
+        default="minimax",
+        choices=["openai", "mock", "minimax", "compatible", "openai-compatible"],
+    )
+    glossary_apply = glossary_sub.add_parser(
+        "apply",
+        help="Apply a glossary decision and update active.json.",
+    )
+    glossary_apply.add_argument("run_dir", type=Path)
+    glossary_apply.add_argument("--source", required=True)
+    glossary_apply.add_argument("--target", default=None)
+    glossary_apply.add_argument("--type", dest="term_type", default="name_or_key_term")
+    glossary_apply.add_argument("--status", default="active", choices=["active", "rejected", "candidate"])
+    glossary_apply.add_argument("--decided-by", default="user")
+    glossary_status_parser = glossary_sub.add_parser(
+        "status",
+        help="Print glossary candidate and active counts.",
+    )
+    glossary_status_parser.add_argument("run_dir", type=Path)
+    glossary_ready_parser = glossary_sub.add_parser(
+        "ready",
+        help="Mark glossary finalized so translation may start.",
+    )
+    glossary_ready_parser.add_argument("run_dir", type=Path)
+    glossary_ready_parser.add_argument("--decided-by", default="user")
 
     knowledge_parser = subparsers.add_parser(
         "knowledge",
@@ -663,12 +871,72 @@ def _print_preflight(preflight: dict[str, object]) -> None:
         print(f"Warning: {warning}")
 
 
+def run_job_command(args: argparse.Namespace) -> dict[str, object]:
+    if args.job_command == "progress":
+        progress_path = args.run_dir.expanduser().resolve() / "jobs" / "progress.json"
+        if not progress_path.exists():
+            raise SystemExit(f"No translation progress found at: {progress_path}")
+        run_dir = args.run_dir.expanduser().resolve()
+        if args.as_json:
+            print(json.dumps(load_progress(run_dir), ensure_ascii=False, indent=2))
+        else:
+            print(format_progress_report(run_dir))
+        return load_progress(run_dir)
+
+    if args.job_command == "events":
+        events_path = args.run_dir.expanduser().resolve() / "jobs" / "translation-events.jsonl"
+        if not events_path.exists():
+            raise SystemExit(f"No translation events found at: {events_path}")
+        run_dir = args.run_dir.expanduser().resolve()
+        events = load_translation_events(run_dir, limit=args.limit)
+        if args.as_json:
+            print(json.dumps(events, ensure_ascii=False, indent=2))
+        else:
+            for event in events:
+                print(format_event_line(event))
+        return {"events": events}
+
+    repository = JobRepository(args.jobs_dir)
+    if args.job_command in {"run", "create"}:
+        snapshot = repository.create(
+            source_path=args.source,
+            processing_mode=args.processing_mode,
+            source_language=args.source_lang,
+            target_language=args.target_lang,
+            translator=args.translator,
+            output_format=args.format,
+            ingest_timeout_seconds=args.ingest_timeout_seconds,
+        )
+        print(f"Job ID: {snapshot['job_id']}", flush=True)
+        if args.job_command == "run":
+            snapshot = BookJobRunner(repository).run(snapshot["job_id"])
+    elif args.job_command == "execute":
+        snapshot = BookJobRunner(repository).run(args.job_id)
+    elif args.job_command == "status":
+        snapshot = repository.load(args.job_id)
+    elif args.job_command == "resume":
+        snapshot = BookJobRunner(repository).resume(args.job_id)
+    elif args.job_command == "translate":
+        snapshot = BookJobRunner(repository).run_translate_phase(args.job_id)
+    else:
+        raise ValueError(f"Unsupported job command: {args.job_command!r}.")
+
+    if args.as_json:
+        print(json.dumps(snapshot, ensure_ascii=False, indent=2))
+    else:
+        print(f"Job state: {snapshot['state']}")
+        print(f"Job revision: {snapshot['revision']}")
+    return snapshot
+
+
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
     try:
-        if args.command == "intake":
+        if args.command == "job":
+            run_job_command(args)
+        elif args.command == "intake":
             settings = RunSettings(
                 source_pdf=args.source_pdf.expanduser().resolve(),
                 output_dir=args.output_dir.expanduser().resolve(),
@@ -693,10 +961,29 @@ def main() -> None:
                 print(f"Book Markdown: {files['book_markdown']}")
             if "chapter_report" in files:
                 print(f"Chapter report: {files['chapter_report']}")
+            workflow_path = artifacts.output_dir / "workflow.json"
+            if workflow_path.exists():
+                workflow = json.loads(workflow_path.read_text(encoding="utf-8"))
+                print(f"Workflow stage: {workflow.get('stage')}")
+            if "glossary_candidates" in files:
+                print(f"Glossary candidates: {files['glossary_candidates']}")
         elif args.command == "translate":
+            if args.run_dir is None and args.source_pdf is None:
+                raise ValueError("Provide SOURCE_PDF or --run-dir.")
+            existing_run_dir = args.run_dir.expanduser().resolve() if args.run_dir else None
+            source_pdf = args.source_pdf.expanduser().resolve() if args.source_pdf else None
+            if existing_run_dir is not None:
+                manifest = json.loads((existing_run_dir / "manifest.json").read_text(encoding="utf-8"))
+                source_pdf = Path(str(manifest["source_pdf"])).expanduser().resolve()
+            if source_pdf is None:
+                raise ValueError("Could not resolve source document path.")
             settings = RunSettings(
-                source_pdf=args.source_pdf.expanduser().resolve(),
-                output_dir=args.output_dir.expanduser().resolve(),
+                source_pdf=source_pdf,
+                output_dir=(
+                    existing_run_dir.parent
+                    if existing_run_dir is not None
+                    else args.output_dir.expanduser().resolve()
+                ),
                 target_language=args.target_lang,
                 source_language=args.source_lang,
                 translator=args.translator,
@@ -707,12 +994,21 @@ def main() -> None:
                 ingest_timeout_seconds=args.ingest_timeout_seconds,
                 max_file_size_mb=args.max_file_size_mb,
                 max_page_count=args.max_page_count,
+                resume_translation=args.resume,
+                ignore_translation_cache=args.ignore_cache,
+                show_translation_progress=not args.quiet,
+                existing_run_dir=existing_run_dir,
+                require_glossary_ready=existing_run_dir is not None,
             )
             artifacts = run_translation_pipeline(settings)
             manifest = json.loads(artifacts.manifest_path.read_text(encoding="utf-8"))
             _print_preflight(manifest["preflight"])
             print(f"Artifacts written to: {artifacts.output_dir}")
             files = manifest.get("files", {})
+            if "translation_progress" in files:
+                progress_path = Path(files["translation_progress"])
+                if progress_path.exists():
+                    print(format_progress_report(progress_path.parent.parent))
             if "translated_epub" in files:
                 print(f"Translated EPUB: {files['translated_epub']}")
             if "translated_pdf" in files:
@@ -857,6 +1153,70 @@ def main() -> None:
                     print(f"Reviewed EPUB: {rendered_files['translated_epub']}")
                 if "translated_pdf" in rendered_files:
                     print(f"Reviewed PDF: {rendered_files['translated_pdf']}")
+        elif args.command == "glossary":
+            run_dir = args.run_dir.expanduser().resolve()
+            if args.glossary_command == "extract":
+                result = extract_glossary_candidates(
+                    run_dir,
+                    profile=args.profile,
+                    profile_source="user" if args.profile else None,
+                )
+                status = glossary_status(run_dir)
+                policy = result.get("policy", {})
+                print(f"Glossary profile: {policy.get('glossary_profile_label')} ({policy.get('glossary_profile')})")
+                print(f"Glossary candidates: {len(result['candidates'])}")
+                print(f"Glossary active entries: {status['active_count']}")
+            elif args.glossary_command == "detect":
+                detection = detect_glossary_profile_for_run(run_dir)
+                print(f"Recommended profile: {detection['glossary_profile_label']} ({detection['glossary_profile']})")
+                print(f"Confidence: {detection['glossary_profile_confidence']}")
+                for name, score in sorted(
+                    detection.get("glossary_profile_scores", {}).items(),
+                    key=lambda item: item[1],
+                    reverse=True,
+                ):
+                    print(f"  {name}: {score}")
+                if detection.get("humanities_subhints"):
+                    print(f"Sub-hints: {', '.join(detection['humanities_subhints'])}")
+            elif args.glossary_command == "suggest":
+                result = suggest_glossary_targets(
+                    run_dir,
+                    target_lang=args.target_lang,
+                    translator=args.translator,
+                )
+                report = result["report"]
+                print(f"Glossary suggestions: {report['suggested_count']}/{report['candidate_count']}")
+                print(f"Translator: {report['translator']} ({report.get('model')})")
+            elif args.glossary_command == "apply":
+                entry = apply_glossary_decision(
+                    run_dir,
+                    source=args.source,
+                    target=args.target,
+                    term_type=args.term_type,
+                    status=args.status,
+                    decided_by=args.decided_by,
+                )
+                print(f"Glossary decision applied: {entry['source']} -> {entry.get('target')}")
+            elif args.glossary_command == "status":
+                status = glossary_status(run_dir)
+                summary = glossary_ready_summary(run_dir)
+                print(f"Glossary candidates: {status['candidate_count']}")
+                print(f"Glossary active: {status['active_count']}")
+                print(f"Glossary entries: {status['entry_count']}")
+                if status.get("glossary_profile_label"):
+                    print(
+                        f"Glossary profile: {status['glossary_profile_label']} "
+                        f"({status.get('glossary_profile')}, confidence={status.get('glossary_profile_confidence')})"
+                    )
+                print(f"Workflow stage: {summary['workflow_stage']}")
+                print(f"Glossary ready: {summary['is_ready']}")
+            elif args.glossary_command == "ready":
+                workflow = mark_glossary_ready(run_dir, decided_by=args.decided_by)
+                summary = glossary_ready_summary(run_dir)
+                print(f"Glossary ready: {summary['ready_entries']} active terms")
+                print(f"Workflow stage: {workflow['stage']}")
+            else:
+                raise ValueError(f"Unsupported glossary command: {args.glossary_command!r}.")
         elif args.command == "knowledge":
             if args.knowledge_command == "build":
                 paths = build_knowledge_package(args.run_dir, out_dir=args.out)

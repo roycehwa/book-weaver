@@ -8,6 +8,7 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import requests
@@ -21,6 +22,7 @@ from pdf_translator.translate import (
     OpenAICompatibleTranslator,
     OpenAITranslator,
     build_translator,
+    translate_book_chapters,
 )
 
 
@@ -153,6 +155,18 @@ class PolishResult:
 
 class IncompletePolishBatchError(ValueError):
     pass
+
+
+class CacheOnlyTranslator(BaseTranslator):
+    name = "cache-only"
+
+    def translate_chunk(
+        self,
+        chunk: TranslationChunk,
+        source_language: str | None,
+        target_language: str,
+    ) -> str:
+        raise ValueError(f"missing cached translation for chunk {chunk.index}")
 
 
 def _ascii_letter_count(text: str) -> int:
@@ -452,7 +466,28 @@ def _translate_candidates(
     return results
 
 
-def _split_polished_markdown_into_chapters(book: dict[str, Any], markdown_text: str) -> list[dict[str, Any]]:
+TOP_LEVEL_HEADING_RE = re.compile(r"(?m)^#\s+.+$")
+
+
+def _split_top_level_heading_sections(markdown_text: str) -> list[str]:
+    matches = list(TOP_LEVEL_HEADING_RE.finditer(markdown_text))
+    if not matches:
+        stripped = markdown_text.strip()
+        return [stripped + "\n"] if stripped else []
+
+    sections: list[str] = []
+    leading = markdown_text[: matches[0].start()].strip()
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(markdown_text)
+        section = markdown_text[match.start() : end].strip()
+        if index == 0 and leading:
+            section = f"{leading}\n\n{section}"
+        if section:
+            sections.append(section + "\n")
+    return sections
+
+
+def _split_by_original_chapter_titles(book: dict[str, Any], markdown_text: str) -> list[dict[str, Any]]:
     chapters = book.get("chapters") or []
     if not chapters:
         return [{"index": 1, "title": "Book", "markdown": markdown_text}]
@@ -478,6 +513,104 @@ def _split_polished_markdown_into_chapters(book: dict[str, Any], markdown_text: 
         chapter_payloads.append({**chapter, "markdown": markdown_text[start:end].strip() + "\n"})
         cursor = end
     return chapter_payloads
+
+
+def _split_polished_markdown_into_chapters(book: dict[str, Any], markdown_text: str) -> list[dict[str, Any]]:
+    chapters = book.get("chapters") or []
+    if not chapters:
+        return [{"index": 1, "title": "Book", "markdown": markdown_text}]
+
+    sections = _split_top_level_heading_sections(markdown_text)
+    if len(sections) >= len(chapters):
+        chapter_payloads: list[dict[str, Any]] = []
+        for index, chapter in enumerate(chapters):
+            section = sections[index]
+            if index == len(chapters) - 1 and len(sections) > len(chapters):
+                section = "\n".join(section.strip() for section in sections[index:]).strip() + "\n"
+            chapter_payloads.append({**chapter, "markdown": section})
+        return chapter_payloads
+
+    return _split_by_original_chapter_titles(book, markdown_text)
+
+
+def _load_translated_chapter_payloads(run_dir: Path, book: dict[str, Any], target_language: str) -> list[dict[str, Any]] | None:
+    chapters_path = run_dir / "translated-chapters.json"
+    if chapters_path.exists():
+        try:
+            data = json.loads(chapters_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            data = None
+        if isinstance(data, list) and data:
+            return [item for item in data if isinstance(item, dict)]
+
+    cache_dir = run_dir / "translation-cache"
+    manifest_path = run_dir / "manifest.json"
+    if not cache_dir.exists() or not manifest_path.exists():
+        return None
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+
+    translation_settings = manifest.get("translation") if isinstance(manifest.get("translation"), dict) else {}
+    settings = SimpleNamespace(
+        max_chunk_chars=int(translation_settings.get("max_chunk_chars") or 6500),
+        source_language=manifest.get("source_language"),
+        target_language=manifest.get("target_language") or target_language,
+    )
+    try:
+        translated = translate_book_chapters(
+            book=book,
+            settings=settings,
+            translator=CacheOnlyTranslator(),
+            cache_dir=cache_dir,
+            retry_count=1,
+            concurrency=1,
+        )
+    except Exception:
+        return None
+
+    payloads = [
+        {
+            "index": chapter.index,
+            "chapter_id": chapter.chapter_id,
+            "title": chapter.title,
+            "page_start": chapter.page_start,
+            "page_end": chapter.page_end,
+            "markdown": chapter.markdown,
+            "source_pages": chapter.source_pages,
+            "source_internal_path": chapter.source_internal_path,
+            "toc": chapter.toc,
+        }
+        for chapter in translated.translated_chapters
+    ]
+    if payloads:
+        chapters_path.write_text(json.dumps(payloads, ensure_ascii=False, indent=2), encoding="utf-8")
+    return payloads or None
+
+
+def _apply_polish_replacements_to_chapters(
+    chapters: list[dict[str, Any]], accepted: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    replacements = {
+        str(record["before"]).strip(): str(record["after"]).strip()
+        for record in accepted
+        if str(record.get("before") or "").strip() and str(record.get("after") or "").strip()
+    }
+    if not replacements:
+        return chapters
+
+    patched: list[dict[str, Any]] = []
+    for chapter in chapters:
+        lines = []
+        for line in str(chapter.get("markdown") or "").splitlines():
+            leading = line[: len(line) - len(line.lstrip())]
+            trailing = line[len(line.rstrip()) :]
+            replacement = replacements.get(line.strip())
+            lines.append(f"{leading}{replacement}{trailing}" if replacement is not None else line)
+        markdown = "\n".join(lines).strip()
+        patched.append({**chapter, "markdown": markdown + "\n" if markdown else ""})
+    return patched
 
 
 def run_polish(
@@ -550,7 +683,11 @@ def run_polish(
     polished_markdown_path = run_dir / "translated.polished.md"
     polished_markdown_path.write_text(polished_markdown, encoding="utf-8")
 
-    polished_chapters = _split_polished_markdown_into_chapters(book, polished_markdown)
+    translated_chapters = _load_translated_chapter_payloads(run_dir, book, target_language)
+    if translated_chapters:
+        polished_chapters = _apply_polish_replacements_to_chapters(translated_chapters, accepted)
+    else:
+        polished_chapters = _split_polished_markdown_into_chapters(book, polished_markdown)
     delivery_stem = safe_delivery_file_stem(Path(run_dir.name), f"{target_language} polished")
     polished_epub_path = run_dir / f"{delivery_stem}.epub"
     render_epub_from_book(

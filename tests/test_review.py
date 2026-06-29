@@ -10,10 +10,10 @@ from pdf_translator.review import (
     create_review_state,
     review_project_from_run,
     rewrite_review_requests,
-    summarize_review_state,
     translated_segments_to_chapters,
     write_versioned_outputs,
     _is_valid_rewrite_candidate,
+    restore_review_chapter_apparatus,
     _looks_like_model_refusal,
     _rewrite_prompt,
 )
@@ -30,6 +30,69 @@ class EchoRewriteTranslator:
     def translate_chunk(self, chunk, source_language: str | None, target_language: str) -> str:
         self.prompts.append(chunk.markdown)
         return "这是模型根据意见生成的候选译文。"
+
+
+def test_restore_review_chapter_apparatus_appends_base_notes() -> None:
+    reviewed = [
+        {
+            "index": 1,
+            "title": "Chapter",
+            "markdown": (
+                "# 章节\n\n审阅后的正文。\n\n### 注释\n\n"
+                "- [**99.**](OPS/c01.xhtml#R_c01-note-0099) Incomplete note."
+            ),
+        }
+    ]
+    base = [
+        {
+            "index": 1,
+            "source_internal_path": "OPS/c01.xhtml",
+            "markdown": (
+                "# Chapter\n\nBase body.[1](OPS/c01.xhtml#c01-note-0001)\n\n"
+                "### Notes\n\n"
+                "- [**1.**](OPS/c01.xhtml#R_c01-note-0001) Preserved note."
+            ),
+        }
+    ]
+
+    restored = restore_review_chapter_apparatus(reviewed, base)
+
+    assert "审阅后的正文" in restored[0]["markdown"]
+    assert "Preserved note" in restored[0]["markdown"]
+    assert "Incomplete note" not in restored[0]["markdown"]
+    assert restored[0]["source_internal_path"] == "OPS/c01.xhtml"
+    assert restored[0]["markdown"].count("###") == 1
+
+
+def test_restore_review_chapter_apparatus_handles_notes_without_heading() -> None:
+    reviewed = [
+        {
+            "index": 1,
+            "title": "Chapter",
+            "markdown": (
+                "# 章节\n\n审阅后的正文。\n\n"
+                "- [**1.**](OPS/c01.xhtml#R_c01-note-0001) Partial note."
+            ),
+        }
+    ]
+    base = [
+        {
+            "index": 1,
+            "source_internal_path": "OPS/c01.xhtml",
+            "markdown": (
+                "# Chapter\n\nBase body.[1](OPS/c01.xhtml#c01-note-0001)\n\n"
+                "- [**1.**](OPS/c01.xhtml#R_c01-note-0001) First note.\n\n"
+                "- [**2.**](OPS/c01.xhtml#R_c01-note-0002) Second note."
+            ),
+        }
+    ]
+
+    restored = restore_review_chapter_apparatus(reviewed, base)
+
+    assert "审阅后的正文" in restored[0]["markdown"]
+    assert "Partial note" not in restored[0]["markdown"]
+    assert "First note" in restored[0]["markdown"]
+    assert "Second note" in restored[0]["markdown"]
 
 
 def sample_book() -> dict:
@@ -73,7 +136,7 @@ def test_build_review_artifacts_creates_segments_and_initial_queue() -> None:
                 "page_end": 2,
                 "source_pages": [1, 2],
                 "source_internal_path": "OEBPS/intro.xhtml",
-                "markdown": "这是第一段译文。\n\n这一段 mixed English phrase 仍然没有翻译。",
+                "markdown": "这是第一段译文。\n\n这一段 mixed english phrase remains 仍然没有翻译。",
             }
         ],
     )
@@ -93,6 +156,74 @@ def test_build_review_artifacts_creates_segments_and_initial_queue() -> None:
     assert artifacts["review_state"]["summary"]["total_items"] == len(artifacts["review_items"]["items"])
     assert artifacts["pre_review"]["flagged_segments"] == len(artifacts["review_items"]["items"])
     assert artifacts["review_state"]["workflow"]["human_review_mode"] == "issues_only"
+
+
+def test_preserve_review_uses_content_integrity_checks_not_translation_checks() -> None:
+    book = sample_book()
+    artifacts = build_review_artifacts(
+        source_path=Path("book.epub"),
+        target_language="zh-CN",
+        text_operation="preserve",
+        book=book,
+        translated_chapters=[
+            {
+                "index": chapter["index"],
+                "chapter_id": chapter["chapter_id"],
+                "title": chapter["title"],
+                "markdown": chapter["markdown"],
+            }
+            for chapter in book["chapters"]
+        ],
+    )
+
+    assert artifacts["review_items"]["text_operation"] == "preserve"
+    assert artifacts["review_items"]["items"] == []
+    assert artifacts["pre_review"]["method"] == "preserve_integrity_v1"
+    assert artifacts["pre_review"]["flagged_segments"] == 0
+
+
+def test_translation_review_skips_preserved_resource_chapters() -> None:
+    book = {
+        "chapters": [
+            {
+                "index": 1,
+                "chapter_id": "ch-001-cover",
+                "title": "Cover",
+                "markdown": "![Cover](cover.png)",
+                "translate": False,
+                "preserve_original": True,
+            },
+            {
+                "index": 2,
+                "chapter_id": "ch-002-body",
+                "title": "Body",
+                "markdown": "English body text that needs translation.",
+                "translate": True,
+            },
+        ]
+    }
+
+    artifacts = build_review_artifacts(
+        source_path=Path("book.epub"),
+        target_language="zh-CN",
+        book=book,
+        translated_chapters=[
+            {
+                "index": 1,
+                "chapter_id": "ch-001-cover",
+                "title": "Cover",
+                "markdown": "![Cover](cover.png)",
+            },
+            {
+                "index": 2,
+                "chapter_id": "ch-002-body",
+                "title": "Body",
+                "markdown": "这是已经翻译完成的中文正文。",
+            },
+        ],
+    )
+
+    assert artifacts["review_items"]["items"] == []
 
 
 def test_review_chapter_marks_split_outline(tmp_path: Path) -> None:
@@ -167,29 +298,6 @@ def test_apply_review_state_updates_segment_text_and_approval() -> None:
     assert untouched["translated_text"] == "旧译文。"
 
 
-def test_summarize_review_state_recomputes_approved_items() -> None:
-    items = [
-        {"segment_id": "s1"},
-        {"segment_id": "s2"},
-    ]
-    state = {
-        "summary": {"total_items": 2, "open_items": 2, "approved_items": 0, "resolved_items": 0},
-        "decisions": {
-            "s1": {"status": "approved"},
-            "s2": {"status": "candidate"},
-        },
-    }
-
-    summary = summarize_review_state(items, state)
-
-    assert summary == {
-        "total_items": 2,
-        "open_items": 1,
-        "approved_items": 1,
-        "resolved_items": 0,
-    }
-
-
 def test_apply_review_state_does_not_export_unapproved_model_candidate() -> None:
     translated_segments = [
         {"segment_id": "s1", "translated_text": "旧译文。", "status": "needs_review"},
@@ -235,33 +343,6 @@ def test_write_versioned_outputs_preserves_parent_and_manifest(tmp_path: Path) -
     assert version["translated_markdown_path"].endswith("translated.md")
     assert "# Introduction" in translated_md
     assert "第三段。" in translated_md
-
-
-def test_write_versioned_outputs_marks_explicit_phase_b_approval(tmp_path: Path) -> None:
-    artifacts = build_review_artifacts(
-        source_path=Path("book.epub"),
-        target_language="zh-CN",
-        book=sample_book(),
-        translated_chapters=[
-            {"index": 1, "chapter_id": "ch-001-intro", "title": "Introduction", "markdown": "第一段。"},
-            {"index": 2, "chapter_id": "ch-002-body", "title": "Body", "markdown": "第二段。"},
-        ],
-    )
-
-    write_versioned_outputs(
-        run_dir=tmp_path,
-        version_name="approved-v1",
-        target_language="zh-CN",
-        translated_segments=artifacts["translated_segments"],
-        approval_status="approved",
-    )
-    manifest = json.loads(
-        (tmp_path / "versions" / "approved-v1" / "version-manifest.json").read_text(encoding="utf-8")
-    )
-
-    assert manifest["schema"] == "translation_review_version_v2"
-    assert manifest["review"]["status"] == "approved"
-    assert manifest["review"]["approved_at"]
 
 
 def test_write_versioned_outputs_rejects_unsafe_version_name(tmp_path: Path) -> None:

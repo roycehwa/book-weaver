@@ -22,16 +22,19 @@ def build_pdf_converter(
     generate_picture_images: bool = False,
 ) -> Any:
     from docling.backend.pypdfium2_backend import PyPdfiumDocumentBackend
+    from docling.datamodel.accelerator_options import AcceleratorDevice, AcceleratorOptions
     from docling.datamodel.base_models import InputFormat
     from docling.datamodel.pipeline_options import PdfPipelineOptions
     from docling.document_converter import DocumentConverter, PdfFormatOption
 
+    # RT-DETR layout models use float64 ops that MPS rejects; CPU is stable on macOS.
     pipeline_options = PdfPipelineOptions(
         do_ocr=False,
         do_table_structure=enable_table_structure,
         force_backend_text=True,
         generate_picture_images=generate_picture_images,
         images_scale=2.0 if generate_picture_images else 1.0,
+        accelerator_options=AcceleratorOptions(device=AcceleratorDevice.CPU),
     )
     return DocumentConverter(
         format_options={
@@ -493,8 +496,11 @@ def _epub_collect_navpoint_labels(ncx_root: ET.Element, ncx_internal: str) -> di
                         href = raw.replace("\\", "/")
             if label and href:
                 joined = posixpath.normpath(str(PurePosixPath(ncx_dir) / href))
-                out[joined] = label
-                out[PurePosixPath(joined).name] = label
+                # The first fragment-free label is the spine chapter title.
+                # Later nested entries often point to the same XHTML file
+                # (for example a final "Notes" anchor) and must not replace it.
+                out.setdefault(joined, label)
+                out.setdefault(PurePosixPath(joined).name, label)
             walk_nav_map(el)
 
     for child in ncx_root:

@@ -19,6 +19,8 @@ class NormalizedDocument:
 class TranslationChunk:
     index: int
     markdown: str
+    glossary_entries: list[dict] | None = None
+    prompt_instruction: str | None = None
 
 
 @dataclass(slots=True)

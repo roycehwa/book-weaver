@@ -5,7 +5,7 @@ from pathlib import Path
 from zipfile import ZipFile
 
 from pdf_translator.models import TranslationChunk
-from pdf_translator.polish import run_polish, scan_polish_candidates
+from pdf_translator.polish import _split_polished_markdown_into_chapters, run_polish, scan_polish_candidates
 from pdf_translator.translate import BaseTranslator
 
 
@@ -154,6 +154,24 @@ def test_run_polish_writes_safe_markdown_epub_and_report(tmp_path: Path) -> None
     assert result.polished_epub_path.name == "run (zh-CN polished).epub"
     with ZipFile(result.polished_epub_path) as archive:
         assert "OEBPS/chapters/002-chapter-1.xhtml" in archive.namelist()
+
+
+def test_split_polished_markdown_uses_translated_heading_order() -> None:
+    book = {
+        "chapters": [
+            {"index": 1, "title": "Introduction", "markdown": "", "toc": True},
+            {"index": 2, "title": "Adoption", "markdown": "", "toc": True},
+        ]
+    }
+    markdown = "# 导论\n\n第一章正文。\n\n# 收养\n\n第二章正文。\n"
+
+    chapters = _split_polished_markdown_into_chapters(book, markdown)
+
+    assert chapters[0]["title"] == "Introduction"
+    assert "第一章正文" in chapters[0]["markdown"]
+    assert "第二章正文" not in chapters[0]["markdown"]
+    assert chapters[1]["title"] == "Adoption"
+    assert "第二章正文" in chapters[1]["markdown"]
 
 
 def test_run_polish_rejects_unsafe_shortening(tmp_path: Path) -> None:

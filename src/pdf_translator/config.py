@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from pdf_translator.guardrails import DEFAULT_INGEST_TIMEOUT_SECONDS
 
@@ -12,6 +14,7 @@ DEFAULT_MINIMAX_MODEL = "MiniMax-M2.7-highspeed"
 DEFAULT_MINIMAX_BASE_URL = "https://api.minimaxi.com/anthropic/v1/messages"
 # Book chunks are sized for ingest quality; zh outputs often need more completion budget than 2048.
 DEFAULT_MINIMAX_MAX_TOKENS = 8192
+DEFAULT_DEEPL_BASE_URL = "https://api.deepl.com"
 DEFAULT_TRANSLATION_CONCURRENCY = 12
 
 
@@ -98,6 +101,23 @@ class CompatibleAPISettings:
 
 
 @dataclass(slots=True)
+class DeepLSettings:
+    auth_key: str
+    base_url: str = DEFAULT_DEEPL_BASE_URL
+
+    @classmethod
+    def from_env(cls) -> "DeepLSettings":
+        _load_local_env()
+        auth_key = os.getenv("DEEPL_AUTH_KEY") or os.getenv("DEEPL_API_KEY")
+        if not auth_key:
+            raise ValueError("DEEPL_AUTH_KEY is required when translator='deepl'.")
+        return cls(
+            auth_key=auth_key,
+            base_url=os.getenv("DEEPL_BASE_URL", DEFAULT_DEEPL_BASE_URL).rstrip("/"),
+        )
+
+
+@dataclass(slots=True)
 class RunSettings:
     source_pdf: Path
     output_dir: Path
@@ -107,7 +127,15 @@ class RunSettings:
     max_chunk_chars: int
     profile_name: str = "auto"
     output_format: str = "epub"
+    processing_mode: str = "auto"
     translation_concurrency: int = DEFAULT_TRANSLATION_CONCURRENCY
     ingest_timeout_seconds: int | None = DEFAULT_INGEST_TIMEOUT_SECONDS
     max_file_size_mb: float | None = None
     max_page_count: int | None = None
+    resume_translation: bool = False
+    ignore_translation_cache: bool = False
+    show_translation_progress: bool = False
+    translation_progress_sink: Callable[[dict[str, Any]], None] | None = None
+    glossary_entries: list[dict[str, Any]] | None = None
+    existing_run_dir: Path | None = None
+    require_glossary_ready: bool = False

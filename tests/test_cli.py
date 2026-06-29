@@ -184,3 +184,54 @@ def test_public_cli_accepts_knowledge_extract_command() -> None:
     assert args.knowledge_command == "extract"
     assert str(args.run_dir) == "runs/sample"
     assert args.network_model == "argument_network"
+
+
+def test_public_cli_accepts_translate_resume_and_ignore_cache() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "translate",
+            "sample.epub",
+            "--target-lang",
+            "zh-CN",
+            "--resume",
+            "--ignore-cache",
+        ]
+    )
+
+    assert args.command == "translate"
+    assert args.resume is True
+    assert args.ignore_cache is True
+
+
+def test_public_cli_accepts_job_progress_command() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["job", "progress", "runs/sample"])
+
+    assert args.command == "job"
+    assert args.job_command == "progress"
+    assert str(args.run_dir) == "runs/sample"
+
+
+def test_public_cli_accepts_job_events_command() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["job", "events", "runs/sample", "--limit", "5"])
+
+    assert args.command == "job"
+    assert args.job_command == "events"
+    assert str(args.run_dir) == "runs/sample"
+    assert args.limit == 5
+
+
+def test_public_cli_accepts_glossary_commands() -> None:
+    parser = build_parser()
+    extract = parser.parse_args(["glossary", "extract", "runs/book"])
+    apply_args = parser.parse_args(
+        ["glossary", "apply", "runs/book", "--source", "Yellow Emperor", "--target", "黄帝", "--type", "cultural_term"]
+    )
+    status = parser.parse_args(["glossary", "status", "runs/book"])
+
+    assert extract.command == "glossary"
+    assert extract.glossary_command == "extract"
+    assert apply_args.source == "Yellow Emperor"
+    assert status.glossary_command == "status"

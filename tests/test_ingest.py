@@ -19,6 +19,7 @@ def test_build_pdf_converter_uses_fast_native_pdf_settings() -> None:
     assert pdf_option.pipeline_options.do_ocr is False
     assert pdf_option.pipeline_options.do_table_structure is False
     assert pdf_option.pipeline_options.force_backend_text is True
+    assert pdf_option.pipeline_options.accelerator_options.device == "cpu"
 
 
 def test_build_pdf_converter_book_enables_table_structure_and_images() -> None:

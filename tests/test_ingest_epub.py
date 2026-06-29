@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import io
+import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
 
 from pdf_translator.book_rebuild import build_book_reconstruction
-from pdf_translator.ingest import _epub_maybe_repair_staccato_toc_lines, ingest_epub
+from pdf_translator.ingest import (
+    _epub_collect_navpoint_labels,
+    _epub_maybe_repair_staccato_toc_lines,
+    ingest_epub,
+)
 
 
 def _write_epub(
@@ -78,6 +83,29 @@ def test_ingest_epub_nav_epub_type_toc_becomes_linked_lines(tmp_path: Path) -> N
     assert "[First Part](OEBPS/chapter1.xhtml#a)" in md
     assert "[Second Part](OEBPS/chapter1.xhtml#b)" in md
     assert "Body after." in md
+
+
+def test_ncx_nested_anchor_does_not_replace_spine_chapter_title() -> None:
+    root = ET.fromstring(
+        """<?xml version="1.0"?>
+<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/">
+  <navMap>
+    <navPoint>
+      <navLabel><text>CHAPTER 1: The Beginning</text></navLabel>
+      <content src="c01.xhtml"/>
+      <navPoint>
+        <navLabel><text>Notes</text></navLabel>
+        <content src="c01.xhtml#note"/>
+      </navPoint>
+    </navPoint>
+  </navMap>
+</ncx>"""
+    )
+
+    labels = _epub_collect_navpoint_labels(root, "OPS/toc.ncx")
+
+    assert labels["OPS/c01.xhtml"] == "CHAPTER 1: The Beginning"
+    assert labels["c01.xhtml"] == "CHAPTER 1: The Beginning"
 
 
 def test_ingest_epub_drops_hidden_page_list_and_landmarks(tmp_path: Path) -> None:

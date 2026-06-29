@@ -19,7 +19,7 @@ from pdf_translator.reconstruct import (
 )
 
 
-TOP_TITLE_BAND = 480.0
+TOP_TITLE_BAND = 450.0
 MAX_TITLE_LINE_WORDS = 12
 BODY_TEXT_MIN_CHARS = 260
 # Trailing footnote promotion (_promote_trailing_footnote_like_items): conservative per-page
@@ -48,6 +48,13 @@ CHAPTER_MARKER_RE = re.compile(
     re.IGNORECASE,
 )
 PURE_CHAPTER_TITLE_RE = re.compile(r"^(?:chapter|part)$", re.IGNORECASE)
+NUMBERED_CHAPTER_TITLE_RE = re.compile(
+    r"^\d{1,3}\s+[A-Z][A-Z0-9'’&,:;/()\-–— ]{2,}$"
+)
+PART_WITH_TITLE_RE = re.compile(
+    rf"^part\s+(?:\d+|{ROMAN_NUMERAL_RE}|{NUMBER_WORD_RE})\s+\S.+$",
+    re.IGNORECASE,
+)
 TOC_LINE_RE = re.compile(r"\.{2,}\s*\d+$|^\d+\s+[A-Z].+\d+$")
 NOTE_LINE_RE = re.compile(r"^(?:\d+|\*|†|‡)\s+")
 REFERENCE_TITLE_RE = re.compile(r"^(?:further reading|references|bibliography|works cited)$", re.IGNORECASE)
@@ -60,18 +67,17 @@ BOOK_SECTION_START_RE = re.compile(
     re.IGNORECASE,
 )
 OUTLINE_SKIP_TITLE_RE = re.compile(
-    r"^(?:front\s*matter|frontmatter|copyright|dedication|contents|table of contents|"
+    r"^(?:front\s*matter|frontmatter|copyright|contents|table of contents|"
     r"list of (?:figures|tables|illustrations)(?: and (?:figures|tables|illustrations))?|"
     r"tables|figures|text boxes?|glossary|abbreviations|notes|endnotes|bibliography|references|works cited|"
-    r".*index|index of .*|书\s*名\s*页|扉\s*页|版\s*权\s*页|目\s*录|索\s*引|文\s*前)$",
+    r"end user licen[cs]e agreement|eula|legal notice|terms of use|"
+    r".*index|index of .*)$",
     re.IGNORECASE,
 )
 OUTLINE_DROP_TITLE_RE = re.compile(
     r"^(?:title page|half title|start of frontmatter|navigation|page list)$",
     re.IGNORECASE,
 )
-EPUB_PREFACE_TITLE_RE = re.compile(r"^(?:preface|前\s*言)$", re.IGNORECASE)
-EPUB_NUMBERED_PROPOSITION_RE = re.compile(r"^\s*\d+(?:\.\d+)*(?:\s|\[\[)")
 
 
 @dataclass(slots=True)
@@ -659,7 +665,7 @@ def _page_content_items(
             page_no=block.page_no,
             left=block.left,
             top=block.top,
-            from_page_footer=block.label == "page_footer",
+            from_page_footer=block.label in {"footnote", "page_footer"},
         )
         for block in blocks
         if _format_book_block(block)
@@ -667,9 +673,16 @@ def _page_content_items(
     ]
     items.extend(figures)
     items.extend(tables)
+    columns = _cluster_columns(items)  # type: ignore[arg-type]
     ordered = sorted(
         items,
-        key=lambda item: (-item.top, item.left, _kind_reading_rank(item.kind)),
+        key=lambda item: (
+            item.from_page_footer,
+            _column_index(item, columns),  # type: ignore[arg-type]
+            -item.top,
+            item.left,
+            _kind_reading_rank(item.kind),
+        ),
     )
     ordered = _promote_trailing_footnote_like_items(ordered)
     out: list[BookItem] = []
@@ -732,6 +745,11 @@ def _looks_like_toc(lines: list[str], *, page_no: int, total_pages: int) -> bool
     if toc_hits >= 4:
         return True
     if page_no <= min(12, max(total_pages // 8, 1)):
+        apparatus_page_refs = len(
+            re.findall(r"\b(?:notes|references|bibliography|index)\s+\d+\b", joined)
+        )
+        if apparatus_page_refs >= 2:
+            return True
         title_like_lines = [
             line
             for line in normalized_lines
@@ -754,6 +772,12 @@ def _looks_like_references(lines: list[str], *, page_no: int, total_pages: int) 
     cleaned = [re.sub(r"^[#>\s]+", "", _normalize_text(line)) for line in lines[:20]]
     if any(REFERENCE_TITLE_RE.match(line) for line in cleaned[:4]):
         return True
+    joined = " ".join(cleaned).lower()
+    if page_no <= min(8, max(total_pages // 8, 1)) and (
+        "publication is in copyright" in joined
+        or ("first published" in joined and ("isbn" in joined or "publisher" in joined))
+    ):
+        return False
     citation_hits = sum(
         1
         for line in cleaned
@@ -858,6 +882,12 @@ def _detect_chapter_title(blocks: list[LayoutBlock]) -> str | None:
 
     if PURE_CHAPTER_TITLE_RE.match(first) and len(candidates) > 1:
         return f"{first} {candidates[1]}"
+
+    if NUMBERED_CHAPTER_TITLE_RE.match(first):
+        return first
+
+    if PART_WITH_TITLE_RE.match(first):
+        return first
 
     if len(candidates) >= 2 and CHAPTER_MARKER_RE.match(candidates[0]):
         return f"{candidates[0]}: {candidates[1]}"
@@ -997,10 +1027,11 @@ def _build_preserved_resource_chapters(
         markdown = _build_chapter_markdown([page], include_page_markers=False)
         if not markdown.strip():
             continue
+        title = _preserved_resource_title(page)
         preserved.append(
             {
                 "index": -1,
-                "title": f"Original Visual Page {page_no}",
+                "title": title,
                 "page_start": page_no,
                 "page_end": page_no,
                 "source_pages": [page_no],
@@ -1013,6 +1044,86 @@ def _build_preserved_resource_chapters(
             }
         )
     return preserved
+
+
+def _layout_apparatus_title(page: dict[str, Any]) -> str | None:
+    title = _clean_book_text(str(page.get("chapter_title") or ""))
+    if not title:
+        for line in page.get("content_lines") or []:
+            candidate = _clean_heading_text(str(line))
+            if candidate:
+                title = candidate
+                break
+    if re.fullmatch(r"(?:notes|endnotes)", title, flags=re.IGNORECASE):
+        return "Notes"
+    if REFERENCE_TITLE_RE.match(title):
+        return "References"
+    if INDEX_TITLE_RE.match(title):
+        return "Index"
+    return None
+
+
+def _build_layout_apparatus_chapters(pages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    chapters: list[dict[str, Any]] = []
+    current_pages: list[dict[str, Any]] = []
+    current_title: str | None = None
+
+    def flush(end_page: int | None = None) -> None:
+        nonlocal current_pages, current_title
+        if not current_pages or current_title is None:
+            return
+        markdown = _build_chapter_markdown(current_pages, include_page_markers=False)
+        page_start = int(current_pages[0]["page_no"])
+        page_end = max(page_start, int(end_page or current_pages[-1]["page_no"]))
+        chapters.append(
+            {
+                "index": -1,
+                "title": current_title,
+                "page_start": page_start,
+                "page_end": page_end,
+                "source_pages": list(range(page_start, page_end + 1)),
+                "markdown": markdown,
+                "trace_markdown": _build_chapter_markdown(current_pages, include_page_markers=True),
+                "translate": False,
+                "preserve_original": True,
+                "resource_only": True,
+                "toc": False,
+            }
+        )
+        current_pages = []
+        current_title = None
+
+    for page in pages:
+        apparatus_title = _layout_apparatus_title(page)
+        if apparatus_title is not None:
+            if current_title != apparatus_title:
+                flush(int(page["page_no"]) - 1)
+                current_title = apparatus_title
+            current_pages.append(page)
+            continue
+        if current_title is None:
+            continue
+        if page.get("chapter_title"):
+            flush(int(page["page_no"]) - 1)
+            continue
+        current_pages.append(page)
+    flush(max((int(page["page_no"]) for page in pages), default=0))
+    return chapters
+
+
+def _preserved_resource_title(page: dict[str, Any]) -> str:
+    page_no = int(page["page_no"])
+    page_kind = str(page.get("page_kind") or "")
+    if page_kind == "toc":
+        return "Contents"
+    if page_kind == "references":
+        return "References"
+    if page_kind == "index":
+        return "Index"
+    title = _infer_section_title([page], f"Visual Material Page {page_no}")
+    if _is_placeholder_title(title):
+        return f"Visual Material Page {page_no}"
+    return title
 
 
 def _build_cover_chapter(cover_path: Path | None) -> dict[str, Any] | None:
@@ -1103,48 +1214,12 @@ def _chapter_pages_from_outline(
     return chapters
 
 
-def _split_epub_preface_numbered_body(
-    title: str,
-    markdown: str,
-    trace_markdown: str,
-) -> list[tuple[str, str, str]]:
-    """Split EPUBs that hide a long numbered main text after a short preface."""
-    if not EPUB_PREFACE_TITLE_RE.match(_clean_book_text(title)):
-        return [(title, markdown, trace_markdown)]
-
-    blocks = [block.strip() for block in re.split(r"\n\s*\n", markdown or "") if block.strip()]
-    if len(blocks) < 24:
-        return [(title, markdown, trace_markdown)]
-
-    split_at: int | None = None
-    for index, block in enumerate(blocks):
-        if index < 3 or index > 60:
-            continue
-        if not EPUB_NUMBERED_PROPOSITION_RE.match(block):
-            continue
-        proposition_tail = sum(1 for candidate in blocks[index:] if EPUB_NUMBERED_PROPOSITION_RE.match(candidate))
-        if proposition_tail >= 20:
-            split_at = index
-            break
-    if split_at is None:
-        return [(title, markdown, trace_markdown)]
-
-    trace_blocks = [block.strip() for block in re.split(r"\n\s*\n", trace_markdown or "") if block.strip()]
-    if len(trace_blocks) != len(blocks):
-        trace_blocks = blocks
-
-    body_title = "正文" if re.search(r"[\u4e00-\u9fff]", title) else "Main Text"
-    return [
-        (title, "\n\n".join(blocks[:split_at]), "\n\n".join(trace_blocks[:split_at])),
-        (body_title, "\n\n".join(blocks[split_at:]), "\n\n".join(trace_blocks[split_at:])),
-    ]
-
-
 def _build_book_from_epub_meta(meta: dict[str, Any], source_path: Path | None) -> dict[str, Any]:
     raw_chapters = meta.get("chapters") or []
     raw_assets = meta.get("assets") or []
     chapters: list[dict[str, Any]] = []
     pages: list[dict[str, Any]] = []
+    in_outline_index = False
     for entry in raw_chapters:
         title = str(entry.get("title") or f"Section {len(chapters) + 1}")
         md = str(entry.get("markdown") or "").strip()
@@ -1161,43 +1236,50 @@ def _build_book_from_epub_meta(meta: dict[str, Any], source_path: Path | None) -
         if "## page list" in md.lower() and md.count("\n- [") > 25:
             continue
 
+        i = len(chapters) + 1
+        if md and not md.endswith("\n"):
+            md += "\n"
         tr = str(entry.get("trace_markdown") or md).strip()
+        if tr and not tr.endswith("\n"):
+            tr += "\n"
         sip = entry.get("source_internal_path")
-        chapter_parts = _split_epub_preface_numbered_body(title, md, tr)
-        for part_title, part_markdown, part_trace_markdown in chapter_parts:
-            i = len(chapters) + 1
-            if part_markdown and not part_markdown.endswith("\n"):
-                part_markdown += "\n"
-            if part_trace_markdown and not part_trace_markdown.endswith("\n"):
-                part_trace_markdown += "\n"
-            part_title_clean = _clean_book_text(part_title).lower()
-            is_cover_title = part_title_clean in {"cover", "cover page"}
-            is_preserved_resource = bool(is_cover_title or OUTLINE_SKIP_TITLE_RE.match(part_title))
-            chapters.append(
-                {
-                    "index": i,
-                    "title": part_title,
-                    "page_start": i,
-                    "page_end": i,
-                    "source_pages": [i],
-                    "markdown": part_markdown,
-                    "trace_markdown": part_trace_markdown,
-                    "translate": not is_preserved_resource,
-                    "preserve_original": is_preserved_resource,
-                    "resource_only": is_preserved_resource,
-                    "source_internal_path": sip if isinstance(sip, str) else None,
-                    "toc": not is_preserved_resource,
-                }
-            )
-            pages.append(
-                {
-                    "page_no": i,
-                    "page_kind": "body",
-                    "chapter_title": None,
-                    "figure_count": 0,
-                    "table_count": 0,
-                }
-            )
+        is_cover_title = title_clean in {"cover", "cover page"}
+        is_index_continuation = bool(
+            in_outline_index
+            and re.fullmatch(r"[A-Z]", title.strip(), flags=re.IGNORECASE)
+        )
+        is_preserved_resource = bool(
+            is_cover_title
+            or OUTLINE_SKIP_TITLE_RE.match(title)
+            or is_index_continuation
+        )
+        if INDEX_TITLE_RE.match(title):
+            in_outline_index = True
+        chapters.append(
+            {
+                "index": i,
+                "title": title,
+                "page_start": i,
+                "page_end": i,
+                "source_pages": [i],
+                "markdown": md,
+                "trace_markdown": tr,
+                "translate": not is_preserved_resource,
+                "preserve_original": is_preserved_resource,
+                "resource_only": is_preserved_resource,
+                "source_internal_path": sip if isinstance(sip, str) else None,
+                "toc": not is_preserved_resource,
+            }
+        )
+        pages.append(
+            {
+                "page_no": i,
+                "page_kind": "body",
+                "chapter_title": None,
+                "figure_count": 0,
+                "table_count": 0,
+            }
+        )
 
     full_markdown_parts: list[str] = []
     trace_markdown_parts: list[str] = []
@@ -1359,7 +1441,8 @@ def build_book_reconstruction(
         chapter_markdown = _build_chapter_markdown(current_pages, include_page_markers=False)
         chapter_markdown = _strip_duplicate_leading_heading(chapter_markdown, chapter_title)
         trace_markdown = _build_chapter_markdown(current_pages, include_page_markers=True)
-        if not chapter_markdown.strip():
+        is_part_divider = bool(current_title and PART_WITH_TITLE_RE.match(current_title))
+        if not chapter_markdown.strip() and not is_part_divider:
             current_pages = []
             current_title = None
             return
@@ -1379,8 +1462,22 @@ def build_book_reconstruction(
         current_pages = []
         current_title = None
 
-    if not chapters:
+    has_content_chapters = any(not bool(chapter.get("resource_only")) for chapter in chapters)
+    if not has_content_chapters:
+        layout_apparatus = (
+            _build_layout_apparatus_chapters(pages)
+            if source_pdf is not None and images_dir is not None
+            else []
+        )
+        apparatus_page_numbers = {
+            int(page_no)
+            for chapter in layout_apparatus
+            for page_no in chapter.get("source_pages", [])
+        }
         for page in pages:
+            if int(page["page_no"]) in apparatus_page_numbers:
+                flush()
+                continue
             if page["page_kind"] in {"toc", "references", "index"}:
                 flush()
                 continue
@@ -1399,6 +1496,7 @@ def build_book_reconstruction(
             current_pages.append(page)
 
         flush()
+        chapters.extend(layout_apparatus)
 
     chapters.extend(_build_preserved_resource_chapters(pages, chapters))
     chapters.sort(key=lambda chapter: (int(chapter.get("page_start") or 0), int(chapter.get("index") or 0)))

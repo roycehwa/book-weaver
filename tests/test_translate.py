@@ -135,6 +135,100 @@ def test_translate_markdown_retries_empty_chunk(tmp_path: Path, monkeypatch: pyt
     assert result.translated_markdown == "Translated.\n"
 
 
+def test_translate_markdown_splits_minimax_sensitive_chunk(tmp_path: Path) -> None:
+    class SensitiveTranslator(BaseTranslator):
+        name = "minimax"
+
+        def __init__(self) -> None:
+            self.sizes: list[int] = []
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            self.sizes.append(len(chunk.markdown))
+            if len(chunk.markdown) > 2800:
+                raise ValueError("MiniMax translation failed: output new_sensitive (1027)")
+            return "这是拆分后生成的完整中文译文。" * max(40, len(chunk.markdown) // 20)
+
+    source = ("First sensitive paragraph. " * 90) + "\n\n" + ("Second sensitive paragraph. " * 90)
+    settings = RunSettings(
+        source_pdf=tmp_path / "source.pdf",
+        output_dir=tmp_path,
+        target_language="zh-CN",
+        source_language="en",
+        translator="minimax",
+        max_chunk_chars=9000,
+    )
+    translator = SensitiveTranslator()
+
+    result = translate_markdown(
+        chunks=[TranslationChunk(index=0, markdown=source)],
+        settings=settings,
+        translator=translator,
+        cache_dir=tmp_path / "cache",
+        retry_count=6,
+    )
+
+    assert translator.sizes[0] > 2800
+    assert all(size <= 2800 for size in translator.sizes[1:])
+    assert translator.sizes.count(translator.sizes[0]) == 1
+    assert "拆分后生成" in result.translated_markdown
+
+
+def test_translate_book_preserves_numbered_citation_blocks() -> None:
+    class CountingTranslator(BaseTranslator):
+        name = "realish"
+
+        def __init__(self) -> None:
+            self.sources: list[str] = []
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            self.sources.append(chunk.markdown)
+            return "这是正文的完整中文翻译。" * 30
+
+    citation = (
+        "- [**16.**](OPS/chapter.xhtml#note-16) "
+        "*The Theory of Everything* (Working Title Films, 2014)."
+    )
+    book = {
+        "chapters": [
+            {
+                "index": 1,
+                "title": "Chapter 1",
+                "markdown": f"Body prose that should be translated.\n\n{citation}",
+                "translate": True,
+            }
+        ]
+    }
+    settings = RunSettings(
+        source_pdf=Path("source.epub"),
+        output_dir=Path("out"),
+        target_language="zh-CN",
+        source_language="en",
+        translator="realish",
+        max_chunk_chars=9000,
+    )
+    translator = CountingTranslator()
+
+    result = translate_book_chapters(
+        book=book,
+        settings=settings,
+        translator=translator,
+    )
+
+    assert len(translator.sources) == 1
+    assert citation not in translator.sources[0]
+    assert citation in result.translated_chapters[0].markdown
+
+
 def test_translate_markdown_retries_untranslated_chinese_output(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     class InitiallyUntranslatedTranslator(BaseTranslator):
         name = "realish"
@@ -174,6 +268,215 @@ def test_translate_markdown_retries_untranslated_chinese_output(tmp_path: Path, 
 
     assert translator.calls == 2
     assert "已经翻译成中文" in result.translated_markdown
+
+
+def test_translate_markdown_uses_quality_retry_prompt_after_bad_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class QualityRetryAwareTranslator(BaseTranslator):
+        name = "realish"
+
+        def __init__(self) -> None:
+            self.prompts: list[str] = []
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            self.prompts.append(chunk.markdown)
+            if len(self.prompts) == 1:
+                return "This is still English prose. " * 30
+            assert "QUALITY RETRY" in chunk.markdown
+            return "这是质量重试后得到的完整中文译文。" * 30
+
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
+    settings = RunSettings(
+        source_pdf=tmp_path / "source.pdf",
+        output_dir=tmp_path,
+        target_language="zh-CN",
+        source_language="en",
+        translator="realish",
+        max_chunk_chars=1000,
+    )
+    translator = QualityRetryAwareTranslator()
+
+    result = translate_markdown(
+        chunks=[TranslationChunk(index=0, markdown="This source English paragraph needs translation. " * 30)],
+        settings=settings,
+        translator=translator,
+        cache_dir=tmp_path / "cache",
+        retry_count=2,
+    )
+
+    assert len(translator.prompts) == 2
+    assert "质量重试后" in result.translated_markdown
+
+
+def test_translate_markdown_accepts_short_note_with_preserved_citations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CitationHeavyTranslator(BaseTranslator):
+        name = "realish"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            self.calls += 1
+            return (
+                "大学采取的行动并非仅仅基于课堂中使用 n-word。"
+                "该情境涉及一系列保密问题。"
+                "Stein (2019) quoting Augsburg spokesperson Rebecca John. "
+                "Chronicle of Higher Education, New York Times, https://example.com. "
+                * 8
+            )
+
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
+    settings = RunSettings(
+        source_pdf=tmp_path / "source.pdf",
+        output_dir=tmp_path,
+        target_language="zh-CN",
+        source_language="en",
+        translator="realish",
+        max_chunk_chars=1000,
+    )
+    translator = CitationHeavyTranslator()
+
+    result = translate_markdown(
+        chunks=[
+            TranslationChunk(
+                index=99,
+                markdown=(
+                    "The actions the university took were not solely based on the use of the n-word "
+                    "in the classroom. Stein (2019) quoting Augsburg spokesperson Rebecca John."
+                ),
+            )
+        ],
+        settings=settings,
+        translator=translator,
+        cache_dir=tmp_path / "cache",
+        retry_count=2,
+    )
+
+    assert translator.calls == 1
+    assert "大学采取的行动" in result.translated_markdown
+
+
+def test_translate_markdown_accepts_scholarly_terms_when_body_is_translated(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class TermKeepingTranslator(BaseTranslator):
+        name = "realish"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            self.calls += 1
+            return (
+                "我使用 wrong、wronging、rights、claims、trumps、side-constraints、exclusionary、"
+                "entitlement、authority、ex ante、ex post 这些术语来保持论证的一致性。"
+                "除此之外，本段已经说明：道德关系既包括行动之前他人如何约束我们，也包括伤害发生之后"
+                "投诉、问责、补偿、道歉与宽恕等实践如何形成关系。" * 10
+            )
+
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
+    settings = RunSettings(
+        source_pdf=tmp_path / "source.pdf",
+        output_dir=tmp_path,
+        target_language="zh-CN",
+        source_language="en",
+        translator="realish",
+        max_chunk_chars=9000,
+    )
+    translator = TermKeepingTranslator()
+
+    result = translate_markdown(
+        chunks=[
+            TranslationChunk(
+                index=2,
+                markdown=(
+                    "Wrongs, rights, claims, trumps, side-constraints, exclusionary duties, "
+                    "entitlements, and ex ante and ex post relations are technical terms in this chapter. "
+                    * 30
+                ),
+            )
+        ],
+        settings=settings,
+        translator=translator,
+        cache_dir=tmp_path / "cache",
+        retry_count=2,
+    )
+
+    assert translator.calls == 1
+    assert "道德关系" in result.translated_markdown
+
+
+def test_translate_markdown_accepts_short_bibliography_entries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BibliographyTranslator(BaseTranslator):
+        name = "realish"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            self.calls += 1
+            return chunk.markdown
+
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
+    settings = RunSettings(
+        source_pdf=tmp_path / "source.pdf",
+        output_dir=tmp_path,
+        target_language="zh-CN",
+        source_language="en",
+        translator="realish",
+        max_chunk_chars=1000,
+    )
+    translator = BibliographyTranslator()
+
+    result = translate_markdown(
+        chunks=[
+            TranslationChunk(
+                index=28,
+                markdown=(
+                    "# SelectiveBibliography\n\n"
+                    "Frigo, Daniela, Politica, esperienza e politesse (Milano, 2009), 25-55.\n\n"
+                    "Mattingly, Garrett, Renaissance Diplomacy (Boston et al., 1955).\n\n"
+                    "Queller, Donald E., The Office of Ambassador in the Middle Ages (Princeton, 1967)."
+                ),
+            )
+        ],
+        settings=settings,
+        translator=translator,
+        cache_dir=tmp_path / "cache",
+        retry_count=2,
+    )
+
+    assert translator.calls == 1
+    assert "SelectiveBibliography" in result.translated_markdown
 
 
 def test_translate_markdown_retries_mixed_english_chinese_output(
@@ -467,7 +770,9 @@ def test_minimax_settings_use_provider_env(monkeypatch: pytest.MonkeyPatch) -> N
 def test_minimax_settings_use_default_highspeed_model(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MINIMAX_API_KEY", "key")
     monkeypatch.delenv("MINIMAX_MODEL", raising=False)
+    monkeypatch.delenv("MINIMAX_BASE_URL", raising=False)
     monkeypatch.delenv("LLM_MODEL", raising=False)
+    monkeypatch.delenv("LLM_BASE_URL", raising=False)
 
     settings = CompatibleAPISettings.from_env("minimax")
 
@@ -554,3 +859,182 @@ def test_minimax_translator_uses_anthropic_messages_api(monkeypatch: pytest.Monk
             "content": "Source language: en\nTarget language: zh-CN\nMarkdown chunk index: 3\n\n# Title\n\nBody.",
         }
     ]
+
+
+def test_build_translator_supports_deepl(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DEEPL_AUTH_KEY", "test-key")
+    monkeypatch.setenv("DEEPL_BASE_URL", "https://api.deepl.com")
+
+    translator = build_translator("deepl")
+
+    assert translator.name == "deepl"
+
+
+def test_deepl_translator_calls_translate_api(monkeypatch: pytest.MonkeyPatch) -> None:
+    from pdf_translator.config import DeepLSettings
+    from pdf_translator.translate import DeepLTranslator
+
+    captured: dict[str, object] = {}
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {"translations": [{"text": "# 标题\n\n正文。"}]}
+
+    def fake_post(
+        url: str,
+        *,
+        json: dict[str, object],
+        headers: dict[str, str],
+        timeout: tuple[int, float],
+    ) -> FakeResponse:
+        captured["url"] = url
+        captured["headers"] = headers
+        captured["body"] = json
+        captured["timeout"] = timeout
+        return FakeResponse()
+
+    monkeypatch.setattr("requests.post", fake_post)
+    translator = DeepLTranslator(
+        DeepLSettings(auth_key="test-key", base_url="https://api.deepl.com")
+    )
+
+    result = translator.translate_chunk(
+        TranslationChunk(index=3, markdown="# Title\n\nBody."),
+        source_language="en",
+        target_language="zh-CN",
+    )
+
+    assert result == "# 标题\n\n正文。"
+    assert captured["url"] == "https://api.deepl.com/v2/translate"
+    assert captured["headers"]["Authorization"] == "DeepL-Auth-Key test-key"
+    body = captured["body"]
+    assert body["text"] == ["# Title\n\nBody."]
+    assert body["target_lang"] == "ZH"
+    assert body["source_lang"] == "EN"
+    assert body["preserve_formatting"] is True
+
+
+def test_translate_markdown_falls_back_to_deepl_on_sensitive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SensitiveMiniMax(BaseTranslator):
+        name = "minimax"
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            raise ValueError("MiniMax translation failed: output new_sensitive (1027)")
+
+    class FakeDeepL(BaseTranslator):
+        name = "deepl"
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            return "这是备用 DeepL 翻译得到的完整中文内容。" * 40
+
+    real_build = build_translator
+
+    def fake_build(name: str) -> BaseTranslator:
+        if name.strip().lower() == "deepl":
+            return FakeDeepL()
+        return real_build(name)
+
+    monkeypatch.setenv("TRANSLATION_FALLBACK", "deepl")
+    monkeypatch.setenv("DEEPL_AUTH_KEY", "test-key")
+    monkeypatch.setattr("pdf_translator.translate.build_translator", fake_build)
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
+
+    source = ("Taiwan policy remains sensitive. " * 90) + "\n\n" + ("Second paragraph on Beijing. " * 90)
+    settings = RunSettings(
+        source_pdf=tmp_path / "source.pdf",
+        output_dir=tmp_path,
+        target_language="zh-CN",
+        source_language="en",
+        translator="minimax",
+        max_chunk_chars=9000,
+    )
+
+    result = translate_markdown(
+        chunks=[TranslationChunk(index=0, markdown=source)],
+        settings=settings,
+        translator=SensitiveMiniMax(),
+        cache_dir=tmp_path / "cache",
+        retry_count=2,
+    )
+
+    assert "备用 DeepL" in result.translated_markdown
+
+
+def test_translate_markdown_skips_deepl_for_non_sensitive_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailingTranslator(BaseTranslator):
+        name = "minimax"
+        calls = 0
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            FailingTranslator.calls += 1
+            return "This is still English prose. " * 30
+
+    class FakeDeepL(BaseTranslator):
+        name = "deepl"
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            raise AssertionError("DeepL should not be called for quality-only failures")
+
+    real_build = build_translator
+
+    def fake_build(name: str) -> BaseTranslator:
+        if name.strip().lower() == "deepl":
+            return FakeDeepL()
+        return real_build(name)
+
+    monkeypatch.setenv("TRANSLATION_FALLBACK", "deepl")
+    monkeypatch.setenv("DEEPL_AUTH_KEY", "test-key")
+    monkeypatch.setattr("pdf_translator.translate.build_translator", fake_build)
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
+
+    settings = RunSettings(
+        source_pdf=tmp_path / "source.pdf",
+        output_dir=tmp_path,
+        target_language="zh-CN",
+        source_language="en",
+        translator="minimax",
+        max_chunk_chars=1000,
+    )
+
+    with pytest.raises(ValueError, match="looks untranslated"):
+        translate_markdown(
+            chunks=[
+                TranslationChunk(
+                    index=0,
+                    markdown="This source English paragraph needs translation. " * 30,
+                )
+            ],
+            settings=settings,
+            translator=FailingTranslator(),
+            cache_dir=tmp_path / "cache",
+            retry_count=2,
+        )

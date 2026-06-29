@@ -8,21 +8,25 @@ from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
 from pathlib import Path
+from typing import Protocol
 
 from openai import OpenAI
 import requests
 
 from pdf_translator.chunking import split_markdown_into_chunks
+from pdf_translator.glossary import select_glossary_entries_for_text
 from pdf_translator.config import (
     DEFAULT_MINIMAX_MAX_TOKENS,
     CompatibleAPISettings,
+    DeepLSettings,
     OpenAISettings,
     RunSettings,
+    _load_local_env,
 )
 from pdf_translator.models import BookTranslationResult, TranslatedChapter, TranslationChunk, TranslationResult
 
 
-TRANSLATION_PROMPT_VERSION = "v2-no-source-gloss"
+TRANSLATION_PROMPT_VERSION = "v3-quality-retry"
 
 
 SYSTEM_PROMPT = """You are a professional document translator.
@@ -64,24 +68,98 @@ ALLOWED_MIXED_LATIN_WORDS = {
 }
 
 
-def _translation_prompt(chunk: TranslationChunk, source_language: str | None, target_language: str) -> str:
+def build_translation_prompt(
+    markdown: str,
+    *,
+    source_language: str | None,
+    target_language: str,
+    chunk_index: int = 0,
+    glossary_entries: list[dict] | None = None,
+    prompt_instruction: str | None = None,
+) -> str:
     source = source_language or "auto-detect"
-    return (
+    prompt = (
         f"Source language: {source}\n"
         f"Target language: {target_language}\n"
-        f"Markdown chunk index: {chunk.index}\n\n"
-        f"{chunk.markdown}"
+        f"Markdown chunk index: {chunk_index}\n\n"
+        f"{markdown}"
     )
+    if glossary_entries:
+        glossary_lines = "\n".join(
+            f"- {entry['source']} => {entry.get('target') or ''}".rstrip()
+            for entry in glossary_entries
+        )
+        prompt += f"\n\nUse these glossary terms when relevant:\n{glossary_lines}\n"
+    if prompt_instruction:
+        prompt += f"\n\n{prompt_instruction}\n"
+    return prompt
+
+
+def _translation_prompt(
+    chunk: TranslationChunk,
+    source_language: str | None,
+    target_language: str,
+    *,
+    quality_retry: str | None = None,
+) -> str:
+    retry_note = (
+        "\nQuality retry: the previous output failed validation because it was not fully translated. "
+        "Translate every natural-language sentence completely into the target language now. "
+        "Do not return the source text unchanged.\n"
+        if quality_retry
+        else ""
+    )
+    prompt = build_translation_prompt(
+        chunk.markdown,
+        source_language=source_language,
+        target_language=target_language,
+        chunk_index=chunk.index,
+        glossary_entries=chunk.glossary_entries,
+        prompt_instruction=chunk.prompt_instruction,
+    )
+    if retry_note:
+        marker = f"Markdown chunk index: {chunk.index}\n\n"
+        if marker in prompt:
+            return prompt.replace(marker, f"Markdown chunk index: {chunk.index}\n{retry_note}\n", 1)
+    return prompt
+
+
+class TranslationObserver(Protocol):
+    def attempt_start(self, *, chunk_index: int, input_hash: str, attempt: int) -> None: ...
+
+    def attempt_success(self, *, chunk_index: int, input_hash: str, cache_path: Path | None) -> None: ...
+
+    def attempt_failure(
+        self,
+        *,
+        chunk_index: int,
+        input_hash: str,
+        attempt: int,
+        error_type: str,
+        message: str,
+        retryable: bool,
+    ) -> None: ...
+
+    def cache_hit(self, *, chunk_index: int, input_hash: str, cache_path: Path) -> None: ...
+
+    def cache_invalidated(self, *, chunk_index: int, input_hash: str, cache_path: Path, reason: str) -> None: ...
+
+
+def _chunk_input_hash(chunk: TranslationChunk) -> str:
+    glossary_part = ""
+    if chunk.glossary_entries:
+        glossary_part = json.dumps(chunk.glossary_entries, sort_keys=True, ensure_ascii=False)
+    instruction_part = chunk.prompt_instruction or ""
+    digest_input = f"{TRANSLATION_PROMPT_VERSION}\n{glossary_part}\n{instruction_part}\n{chunk.markdown}"
+    return hashlib.sha256(digest_input.encode("utf-8")).hexdigest()[:16]
 
 
 def _chunk_cache_path(cache_dir: Path, chunk: TranslationChunk) -> Path:
-    digest_input = f"{TRANSLATION_PROMPT_VERSION}\n{chunk.markdown}"
-    digest = hashlib.sha256(digest_input.encode("utf-8")).hexdigest()[:16]
-    return cache_dir / f"chunk-{chunk.index:06d}-{digest}.md"
+    return cache_dir / f"chunk-{chunk.index:06d}-{_chunk_input_hash(chunk)}.md"
 
 
 def _read_chunk_cache(cache_dir: Path, chunk: TranslationChunk) -> str:
-    """Read a cached chunk while supporting older index-stable cache names."""
+    """Return cached translation for a chunk, falling back to index-only filenames."""
     cache_path = _chunk_cache_path(cache_dir, chunk)
     if cache_path.exists():
         return cache_path.read_text(encoding="utf-8").strip()
@@ -99,7 +177,14 @@ def _cjk_count(text: str) -> int:
     return sum(1 for char in text if "\u4e00" <= char <= "\u9fff")
 
 
+def _is_newsletter_boilerplate_block(source: str) -> bool:
+    lower = source.lower()
+    return "newsletter sign-up" in lower or "newslettersignup" in lower or "authoralerts" in lower
+
+
 def _looks_untranslated_for_target(source: str, translated: str, target_language: str) -> bool:
+    if _is_newsletter_boilerplate_block(source):
+        return False
     if not target_language.lower().startswith("zh"):
         return False
     source_ascii = _ascii_letter_count(source)
@@ -110,6 +195,13 @@ def _looks_untranslated_for_target(source: str, translated: str, target_language
     # A valid zh translation may preserve names/citations, but it should not be overwhelmingly ASCII.
     if translated_cjk < 80 and translated_ascii > 250:
         return True
+    if source_ascii < 1000 and translated_cjk >= 160:
+        return False
+    if _looks_reference_or_note_heavy(source) and (translated_cjk >= 200 or source_ascii < 1200):
+        return False
+    # For data-heavy content (tables, appendices), high CJK count indicates valid translation
+    if translated_cjk >= 1000:
+        return False
     return translated_ascii / max(translated_ascii + translated_cjk, 1) > 0.72
 
 
@@ -169,6 +261,34 @@ def _mixed_untranslated_english_signal(text: str) -> tuple[int, int, int]:
     return suspect_word_count, mixed_line_count, max_line_suspects
 
 
+def _looks_reference_or_note_heavy(source: str) -> bool:
+    lower = source.lower()
+    if re.search(r"^#{1,3}\s+(?:notes?|references|bibliography|selective\s*bibliography|works cited|secondary sources|case law)\b", source, re.MULTILINE | re.IGNORECASE):
+        return True
+    citation_markers = len(re.findall(r"\b(?:vol\.|no\.|pp\.|doi:|https?://|www\.|press|university|journal|review|chronicle|proceedings)\b", lower))
+    year_markers = len(re.findall(r"\((?:1[5-9]\d{2}|20\d{2})\)|\b(?:1[5-9]\d{2}|20\d{2})\b", source))
+    note_markers = len(re.findall(r"^\s*(?:\d+|[*†‡])\s+", source, re.MULTILINE))
+    return citation_markers + year_markers + note_markers >= 8
+
+
+def _allow_mixed_english_for_target(source: str, translated: str, target_language: str) -> bool:
+    if not target_language.lower().startswith("zh"):
+        return False
+    translated_cjk = _cjk_count(translated)
+    if translated_cjk < 160:
+        return False
+    source_ascii = _ascii_letter_count(source)
+    if source_ascii < 1000:
+        return True
+    if _looks_reference_or_note_heavy(source) and translated_cjk >= 200:
+        return True
+    translated_ascii = _ascii_letter_count(translated)
+    # Dense scholarly prose often preserves technical terms, quoted terms, names, and citations.
+    # The gross untranslated / incomplete checks above catch the real failure modes; this gate
+    # should not reject otherwise substantial Chinese output for retained terminology.
+    return translated_cjk >= max(300, int(source_ascii * 0.12)) and translated_ascii <= translated_cjk * 3.5
+
+
 def _strip_generated_english_chinese_glosses(source: str, translated: str, target_language: str) -> str:
     if not target_language.lower().startswith("zh"):
         return translated
@@ -218,13 +338,15 @@ def _assert_translation_quality(
             f"(source_glosses={_english_then_chinese_gloss_count(chunk.markdown)}, "
             f"translated_glosses={_english_then_chinese_gloss_count(translated)})."
         )
+    if target_language.lower().startswith("zh") and _ascii_letter_count(chunk.markdown) < 1000 and _cjk_count(translated) >= 160:
+        return
     suspect_words, mixed_lines, max_line_suspects = _mixed_untranslated_english_signal(translated)
-    if suspect_words >= 18 and mixed_lines >= 2:
+    if suspect_words >= 18 and mixed_lines >= 2 and not _allow_mixed_english_for_target(chunk.markdown, translated, target_language):
         raise ValueError(
             f"Translation for chunk {chunk.index} contains mixed untranslated English "
             f"(suspect_words={suspect_words}, mixed_lines={mixed_lines}, max_line={max_line_suspects})."
         )
-    if max_line_suspects >= 10:
+    if max_line_suspects >= 10 and not _allow_mixed_english_for_target(chunk.markdown, translated, target_language):
         raise ValueError(
             f"Translation for chunk {chunk.index} contains a heavily mixed English line "
             f"(suspect_words={suspect_words}, mixed_lines={mixed_lines}, max_line={max_line_suspects})."
@@ -239,7 +361,10 @@ def _translate_chunk_resumable(
     translator: BaseTranslator,
     cache_dir: Path | None,
     retry_count: int = 3,
+    allow_sensitive_split: bool = True,
+    observer: TranslationObserver | None = None,
 ) -> str:
+    input_hash = _chunk_input_hash(chunk)
     cache_path: Path | None = None
     if cache_dir is not None:
         cache_dir.mkdir(parents=True, exist_ok=True)
@@ -255,18 +380,33 @@ def _translate_chunk_resumable(
                         target_language=target_language,
                         translator_name=translator.name,
                     )
-                except ValueError:
+                except ValueError as exc:
+                    if observer is not None:
+                        observer.cache_invalidated(
+                            chunk_index=chunk.index,
+                            input_hash=input_hash,
+                            cache_path=cache_path,
+                            reason=str(exc),
+                        )
                     cache_path.unlink(missing_ok=True)
                 else:
+                    if observer is not None:
+                        observer.cache_hit(chunk_index=chunk.index, input_hash=input_hash, cache_path=cache_path)
                     return cached
 
     last_error: Exception | None = None
+    had_sensitive_failure = False
     for attempt in range(max(1, retry_count)):
+        attempt_no = attempt + 1
         try:
-            translated = translator.translate_chunk(
+            if observer is not None:
+                observer.attempt_start(chunk_index=chunk.index, input_hash=input_hash, attempt=attempt_no)
+            translated = _complete_translation_attempt(
+                translator=translator,
                 chunk=chunk,
                 source_language=source_language,
                 target_language=target_language,
+                quality_retry=str(last_error) if isinstance(last_error, ValueError) else None,
             ).strip()
             if not translated:
                 raise ValueError(f"Empty translation returned for chunk {chunk.index}.")
@@ -281,14 +421,324 @@ def _translate_chunk_resumable(
                 tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
                 tmp_path.write_text(translated + "\n", encoding="utf-8")
                 tmp_path.replace(cache_path)
+            if observer is not None:
+                observer.attempt_success(chunk_index=chunk.index, input_hash=input_hash, cache_path=cache_path)
             return translated
         except Exception as exc:
             last_error = exc
+            if "new_sensitive" in str(exc).lower():
+                had_sensitive_failure = True
+            retryable = attempt + 1 < max(1, retry_count)
+            if allow_sensitive_split and "new_sensitive" in str(exc).lower():
+                retryable = False
+                try:
+                    translated = _translate_sensitive_chunk_parts(
+                        chunk=chunk,
+                        source_language=source_language,
+                        target_language=target_language,
+                        translator=translator,
+                    )
+                    _assert_translation_quality(
+                        chunk=chunk,
+                        translated=translated,
+                        target_language=target_language,
+                        translator_name=translator.name,
+                    )
+                    if cache_path is not None:
+                        tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+                        tmp_path.write_text(translated + "\n", encoding="utf-8")
+                        tmp_path.replace(cache_path)
+                    if observer is not None:
+                        observer.attempt_success(chunk_index=chunk.index, input_hash=input_hash, cache_path=cache_path)
+                    return translated
+                except Exception as split_exc:
+                    last_error = split_exc
+                    if "new_sensitive" in str(split_exc).lower():
+                        had_sensitive_failure = True
+                break
+            if observer is not None:
+                observer.attempt_failure(
+                    chunk_index=chunk.index,
+                    input_hash=input_hash,
+                    attempt=attempt_no,
+                    error_type=exc.__class__.__name__,
+                    message=str(exc),
+                    retryable=retryable,
+                )
             if attempt + 1 >= max(1, retry_count):
                 break
             time.sleep(min(2**attempt, 8))
 
+    fallback_translated: str | None = None
+    if had_sensitive_failure:
+        fallback_translated = _try_fallback_translation(
+            chunk=chunk,
+            source_language=source_language,
+            target_language=target_language,
+            primary_translator=translator,
+            cache_path=cache_path,
+        )
+    if fallback_translated is not None:
+        if observer is not None:
+            observer.attempt_success(chunk_index=chunk.index, input_hash=input_hash, cache_path=cache_path)
+        return fallback_translated
+
     raise ValueError(f"Translation failed for chunk {chunk.index} after {retry_count} attempts: {last_error}") from last_error
+
+
+def _deepl_usage_state_path() -> Path:
+    return Path.home() / ".hermes" / "state" / "deepl-usage.json"
+
+
+def _deepl_monthly_char_budget() -> int:
+    raw = os.getenv("DEEPL_MONTHLY_CHAR_BUDGET", "1800000").strip()
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 1_800_000
+
+
+def _deepl_load_usage() -> dict[str, object]:
+    path = _deepl_usage_state_path()
+    if not path.exists():
+        return {"month": "", "characters": 0, "chunks": 0}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {"month": "", "characters": 0, "chunks": 0}
+    if not isinstance(payload, dict):
+        return {"month": "", "characters": 0, "chunks": 0}
+    return payload
+
+
+def _deepl_current_month_key() -> str:
+    return time.strftime("%Y-%m")
+
+
+def _deepl_characters_used_this_month() -> int:
+    usage = _deepl_load_usage()
+    if str(usage.get("month") or "") != _deepl_current_month_key():
+        return 0
+    return int(usage.get("characters") or 0)
+
+
+def _deepl_budget_allows(char_count: int) -> bool:
+    budget = _deepl_monthly_char_budget()
+    if budget <= 0:
+        return False
+    return _deepl_characters_used_this_month() + char_count <= budget
+
+
+def _deepl_record_usage(char_count: int, *, chunk_index: int) -> None:
+    path = _deepl_usage_state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    month = _deepl_current_month_key()
+    usage = _deepl_load_usage()
+    if str(usage.get("month") or "") != month:
+        usage = {"month": month, "characters": 0, "chunks": 0}
+    usage["characters"] = int(usage.get("characters") or 0) + char_count
+    usage["chunks"] = int(usage.get("chunks") or 0) + 1
+    usage["last_chunk_index"] = chunk_index
+    path.write_text(json.dumps(usage, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _deepl_language_code(language: str | None, *, role: str) -> str | None:
+    if not language:
+        return None
+    normalized = language.strip().lower().replace("_", "-")
+    if normalized in {"en", "en-us", "en-gb"}:
+        return "EN"
+    if normalized.startswith("zh"):
+        if any(token in normalized for token in ("hant", "tw", "hk", "traditional")):
+            return "ZH-HANT"
+        return "ZH"
+    if role == "target":
+        raise ValueError(f"Unsupported DeepL target language: {language}")
+    return None
+
+
+def _resolve_fallback_translator(*, primary_name: str) -> BaseTranslator | None:
+    _load_local_env()
+    fallback_name = (os.getenv("TRANSLATION_FALLBACK") or "").strip().lower()
+    if not fallback_name:
+        if os.getenv("DEEPL_AUTH_KEY") or os.getenv("DEEPL_API_KEY"):
+            fallback_name = "deepl"
+        else:
+            return None
+    if fallback_name == primary_name.strip().lower():
+        return None
+    try:
+        return build_translator(fallback_name)
+    except ValueError:
+        return None
+
+
+def _try_fallback_translation(
+    *,
+    chunk: TranslationChunk,
+    source_language: str | None,
+    target_language: str,
+    primary_translator: BaseTranslator,
+    cache_path: Path | None,
+) -> str | None:
+    fallback = _resolve_fallback_translator(primary_name=primary_translator.name)
+    if fallback is None:
+        return None
+
+    source_chars = len(chunk.markdown)
+    if not _deepl_budget_allows(source_chars):
+        return None
+
+    last_error: Exception | None = None
+    for attempt in (
+        lambda: fallback.translate_chunk(
+            chunk=chunk,
+            source_language=source_language,
+            target_language=target_language,
+        ),
+        lambda: _translate_sensitive_chunk_parts(
+            chunk=chunk,
+            source_language=source_language,
+            target_language=target_language,
+            translator=fallback,
+        ),
+    ):
+        try:
+            translated = attempt().strip()
+            if not translated:
+                raise ValueError(f"Empty fallback translation returned for chunk {chunk.index}.")
+            translated = _strip_generated_english_chinese_glosses(chunk.markdown, translated, target_language)
+            _assert_translation_quality(
+                chunk=chunk,
+                translated=translated,
+                target_language=target_language,
+                translator_name=fallback.name,
+            )
+            if cache_path is not None:
+                tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+                tmp_path.write_text(translated + "\n", encoding="utf-8")
+                tmp_path.replace(cache_path)
+            if fallback.name == "deepl":
+                _deepl_record_usage(source_chars, chunk_index=chunk.index)
+            return translated
+        except Exception as exc:
+            last_error = exc
+    if last_error is not None:
+        return None
+    return None
+
+
+def _split_sensitive_source(source: str, *, max_part_chars: int) -> list[str]:
+    paragraphs = [part.strip() for part in source.split("\n\n") if part.strip()]
+    if not paragraphs:
+        return [source]
+    parts: list[str] = []
+    current = ""
+    for paragraph in paragraphs:
+        candidate = f"{current}\n\n{paragraph}".strip() if current else paragraph
+        if len(candidate) <= max_part_chars:
+            current = candidate
+            continue
+        if current:
+            parts.append(current)
+        if len(paragraph) <= max_part_chars:
+            current = paragraph
+            continue
+        lines = paragraph.splitlines()
+        block = ""
+        for line in lines:
+            line_candidate = f"{block}\n{line}".strip() if block else line
+            if len(line_candidate) <= max_part_chars:
+                block = line_candidate
+                continue
+            if block:
+                parts.append(block)
+            block = line
+        current = block
+    if current:
+        parts.append(current)
+    return parts
+
+
+def _translate_sensitive_chunk_parts(
+    *,
+    chunk: TranslationChunk,
+    source_language: str | None,
+    target_language: str,
+    translator: BaseTranslator,
+) -> str:
+    last_error: Exception | None = None
+    for max_part_chars in (2800, 1400, 900, 500):
+        try:
+            translated_parts = [
+                _translate_sensitive_part(
+                    chunk=TranslationChunk(
+                        index=chunk.index * 1000 + offset,
+                        markdown=part,
+                    ),
+                    source_language=source_language,
+                    target_language=target_language,
+                    translator=translator,
+                    retry_count=3,
+                )
+                for offset, part in enumerate(
+                    _split_sensitive_source(chunk.markdown, max_part_chars=max_part_chars)
+                )
+            ]
+            translated = "\n\n".join(part.strip() for part in translated_parts if part.strip())
+            _assert_translation_quality(
+                chunk=chunk,
+                translated=translated,
+                target_language=target_language,
+                translator_name=translator.name,
+            )
+            return translated
+        except ValueError as exc:
+            last_error = exc
+            message = str(exc).lower()
+            if "new_sensitive" in message or "looks untranslated" in message or "looks incomplete" in message:
+                continue
+            raise
+    assert last_error is not None
+    raise last_error
+
+
+def _translate_sensitive_part(
+    *,
+    chunk: TranslationChunk,
+    source_language: str | None,
+    target_language: str,
+    translator: BaseTranslator,
+    retry_count: int,
+) -> str:
+    last_error: Exception | None = None
+    for attempt in range(max(1, retry_count)):
+        try:
+            translated = _complete_translation_attempt(
+                translator=translator,
+                chunk=chunk,
+                source_language=source_language,
+                target_language=target_language,
+                quality_retry=str(last_error) if isinstance(last_error, ValueError) else None,
+            ).strip()
+            if not translated:
+                raise ValueError(f"Empty translation returned for chunk {chunk.index}.")
+            return _strip_generated_english_chinese_glosses(
+                chunk.markdown,
+                translated,
+                target_language,
+            )
+        except Exception as exc:
+            last_error = exc
+            if "new_sensitive" in str(exc).lower():
+                break
+            if attempt + 1 >= max(1, retry_count):
+                break
+            time.sleep(min(2**attempt, 8))
+    raise ValueError(
+        f"Sensitive split translation failed for chunk {chunk.index} "
+        f"after {retry_count} attempts: {last_error}"
+    ) from last_error
 
 
 def _translate_chunks_ordered(
@@ -300,6 +750,7 @@ def _translate_chunks_ordered(
     cache_dir: Path | None,
     retry_count: int,
     concurrency: int,
+    observer: TranslationObserver | None = None,
 ) -> list[str]:
     if concurrency <= 1 or len(chunks) <= 1:
         return [
@@ -310,6 +761,7 @@ def _translate_chunks_ordered(
                 translator=translator,
                 cache_dir=cache_dir,
                 retry_count=retry_count,
+                observer=observer,
             )
             for chunk in chunks
         ]
@@ -325,6 +777,7 @@ def _translate_chunks_ordered(
                 translator=translator,
                 cache_dir=cache_dir,
                 retry_count=retry_count,
+                observer=observer,
             ): position
             for position, chunk in enumerate(chunks)
         }
@@ -490,6 +943,167 @@ class MiniMaxAnthropicTranslator(BaseTranslator):
         return text
 
 
+class DeepLTranslator(BaseTranslator):
+    name = "deepl"
+
+    def __init__(self, settings: DeepLSettings) -> None:
+        self.auth_key = settings.auth_key
+        self.base_url = settings.base_url.rstrip("/")
+        self.http_timeout = float(os.getenv("DEEPL_HTTP_TIMEOUT_SECONDS", "120"))
+
+    def translate_chunk(
+        self,
+        chunk: TranslationChunk,
+        source_language: str | None,
+        target_language: str,
+    ) -> str:
+        payload: dict[str, object] = {
+            "text": [chunk.markdown],
+            "target_lang": _deepl_language_code(target_language, role="target"),
+            "preserve_formatting": True,
+        }
+        source_lang = _deepl_language_code(source_language, role="source")
+        if source_lang:
+            payload["source_lang"] = source_lang
+
+        try:
+            response = requests.post(
+                f"{self.base_url}/v2/translate",
+                json=payload,
+                headers={
+                    "Authorization": f"DeepL-Auth-Key {self.auth_key}",
+                    "Content-Type": "application/json",
+                },
+                timeout=(10, self.http_timeout),
+            )
+            response.raise_for_status()
+            response_data = response.json()
+        except requests.HTTPError as exc:
+            error_body = exc.response.text if exc.response is not None else ""
+            status_code = exc.response.status_code if exc.response else "?"
+            raise ValueError(
+                f"DeepL translation failed for chunk {chunk.index}: "
+                f"HTTP {status_code}: {error_body[:500]}"
+            ) from exc
+        except requests.RequestException as exc:
+            raise ValueError(f"DeepL translation failed for chunk {chunk.index}: {exc}") from exc
+
+        translations = response_data.get("translations")
+        if not isinstance(translations, list) or not translations:
+            raise ValueError(f"Empty DeepL translation returned for chunk {chunk.index}.")
+        first = translations[0]
+        if not isinstance(first, dict):
+            raise ValueError(f"Malformed DeepL translation returned for chunk {chunk.index}.")
+        text = str(first.get("text") or "").strip()
+        if not text:
+            raise ValueError(f"Empty DeepL translation returned for chunk {chunk.index}.")
+        return text
+
+
+def _complete_translation_attempt(
+    *,
+    translator: BaseTranslator,
+    chunk: TranslationChunk,
+    source_language: str | None,
+    target_language: str,
+    quality_retry: str | None = None,
+) -> str:
+    if quality_retry is None:
+        return translator.translate_chunk(
+            chunk=chunk,
+            source_language=source_language,
+            target_language=target_language,
+        )
+
+    prompt = _translation_prompt(
+        chunk,
+        source_language,
+        target_language,
+        quality_retry=quality_retry,
+    )
+    if isinstance(translator, MiniMaxAnthropicTranslator):
+        payload = {
+            "model": translator.model,
+            "max_tokens": translator.max_tokens,
+            "system": SYSTEM_PROMPT,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        try:
+            response = requests.post(
+                translator.endpoint,
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {translator.api_key}",
+                    "Content-Type": "application/json",
+                    "anthropic-version": "2023-06-01",
+                    "Connection": "close",
+                },
+                timeout=(10, translator.http_timeout),
+            )
+            response.raise_for_status()
+            response_data = response.json()
+        except requests.HTTPError as exc:
+            error_body = exc.response.text if exc.response is not None else ""
+            status_code = exc.response.status_code if exc.response else "?"
+            raise ValueError(
+                f"MiniMax translation failed for chunk {chunk.index}: "
+                f"HTTP {status_code}: {error_body[:500]}"
+            ) from exc
+        except requests.RequestException as exc:
+            raise ValueError(f"MiniMax translation failed for chunk {chunk.index}: {exc}") from exc
+        text_parts = [
+            str(item.get("text") or "")
+            for item in response_data.get("content", [])
+            if isinstance(item, dict) and item.get("type") == "text"
+        ]
+        text = "\n".join(part.strip() for part in text_parts if part.strip()).strip()
+        if not text:
+            raise ValueError(f"Empty MiniMax translation returned for chunk {chunk.index}.")
+        if response_data.get("stop_reason") == "max_tokens":
+            raise ValueError(
+                f"MiniMax translation was truncated for chunk {chunk.index} "
+                f"(stop_reason=max_tokens, max_tokens={translator.max_tokens}). "
+                "Increase MINIMAX_MAX_TOKENS (or MINIMAX_HTTP_TIMEOUT_SECONDS if the request timed out early). "
+                "Only reduce --max-chunk-chars if raising max_tokens is not enough."
+            )
+        return text
+
+    if isinstance(translator, OpenAITranslator):
+        response = translator.client.responses.create(
+            model=translator.model,
+            input=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        return response.output_text.strip()
+
+    if isinstance(translator, OpenAICompatibleTranslator):
+        response = translator.client.chat.completions.create(
+            model=translator.model,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        return (response.choices[0].message.content or "").strip()
+
+    retry_chunk = TranslationChunk(
+        index=chunk.index,
+        markdown=(
+            "QUALITY RETRY: translate the SOURCE_MARKDOWN completely. "
+            "Return only the translated Markdown.\n\n"
+            "SOURCE_MARKDOWN:\n"
+            f"{chunk.markdown}"
+        ),
+    )
+    return translator.translate_chunk(
+        chunk=retry_chunk,
+        source_language=source_language,
+        target_language=target_language,
+    )
+
+
 def build_translator(name: str) -> BaseTranslator:
     normalized = name.strip().lower()
     if normalized == "mock":
@@ -500,6 +1114,8 @@ def build_translator(name: str) -> BaseTranslator:
         return OpenAICompatibleTranslator(CompatibleAPISettings.from_env("compatible"))
     if normalized == "minimax":
         return MiniMaxAnthropicTranslator(CompatibleAPISettings.from_env("minimax"))
+    if normalized == "deepl":
+        return DeepLTranslator(DeepLSettings.from_env())
     raise ValueError(f"Unsupported translator backend: {name}")
 
 
@@ -509,17 +1125,36 @@ def translate_markdown(
     settings: RunSettings,
     translator: BaseTranslator,
     cache_dir: Path | None = None,
-    retry_count: int = 3,
+    retry_count: int = 6,
     concurrency: int = 1,
+    observer: TranslationObserver | None = None,
 ) -> TranslationResult:
+    glossary_entries = settings.glossary_entries or []
+    enriched_chunks = chunks
+    if glossary_entries:
+        enriched_chunks = [
+            TranslationChunk(
+                index=chunk.index,
+                markdown=chunk.markdown,
+                glossary_entries=select_glossary_entries_for_text(
+                    chunk.markdown,
+                    glossary_entries,
+                    chapter_id=None,
+                )
+                or None,
+                prompt_instruction=chunk.prompt_instruction,
+            )
+            for chunk in chunks
+        ]
     translated_chunks = _translate_chunks_ordered(
-        chunks=chunks,
+        chunks=enriched_chunks,
         source_language=settings.source_language,
         target_language=settings.target_language,
         translator=translator,
         cache_dir=cache_dir,
         retry_count=retry_count,
         concurrency=concurrency,
+        observer=observer,
     )
 
     return TranslationResult(
@@ -559,6 +1194,8 @@ def _is_preserved_apparatus_block(block: str) -> bool:
         return False
     first_line = stripped.splitlines()[0].strip().lower()
     if first_line in {"# list of illustrations", "# list of tables", "# list of figures"}:
+        return True
+    if re.match(r"^-\s+\[\*\*\d+\.\*\*\]\([^)]+\)", first_line):
         return True
     link_count = stripped.count("](")
     if link_count < 8:
@@ -639,12 +1276,14 @@ def translate_book_chapters(
     settings: RunSettings,
     translator: BaseTranslator,
     cache_dir: Path | None = None,
-    retry_count: int = 3,
+    retry_count: int = 6,
     concurrency: int = 1,
+    observer: TranslationObserver | None = None,
 ) -> BookTranslationResult:
     translated_chapters: list[TranslatedChapter] = []
     translated_markdown_parts: list[str] = []
     chunk_index = 0
+    glossary_entries = settings.glossary_entries or []
 
     for chapter in book.get("chapters", []):
         chapter_source_markdown = _chapter_markdown_for_translation(chapter)
@@ -677,10 +1316,25 @@ def translate_book_chapters(
                 continue
 
             source_chunks = split_markdown_into_chunks(segment_markdown, settings.max_chunk_chars)
-            global_chunks = [
-                TranslationChunk(index=chunk_index + offset, markdown=source_chunk.markdown)
-                for offset, source_chunk in enumerate(source_chunks)
-            ]
+            chapter_id = str(chapter.get("chapter_id") or chapter.get("id") or "") or None
+            global_chunks = []
+            for offset, source_chunk in enumerate(source_chunks):
+                selected = (
+                    select_glossary_entries_for_text(
+                        source_chunk.markdown,
+                        glossary_entries,
+                        chapter_id=chapter_id,
+                    )
+                    if glossary_entries
+                    else []
+                )
+                global_chunks.append(
+                    TranslationChunk(
+                        index=chunk_index + offset,
+                        markdown=source_chunk.markdown,
+                        glossary_entries=selected or None,
+                    )
+                )
             translated_parts.extend(
                 _translate_chunks_ordered(
                     chunks=global_chunks,
@@ -690,6 +1344,7 @@ def translate_book_chapters(
                     cache_dir=cache_dir,
                     retry_count=retry_count,
                     concurrency=concurrency,
+                    observer=observer,
                 )
             )
             chunk_index += len(global_chunks)
