@@ -403,6 +403,34 @@ class BookJobRunner:
 
         return build_output_dir(settings.output_dir, settings.source_pdf)
 
+    def _read_chunk_progress_file(self, job_id: str) -> dict[str, Any]:
+        job_dir = self.repository.job_dir(job_id)
+        progress_paths = sorted(
+            job_dir.glob("artifacts/*/jobs/progress.json"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        if not progress_paths:
+            return {}
+        try:
+            payload = json.loads(progress_paths[0].read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _completion_progress_fields(self, job_id: str) -> dict[str, Any]:
+        chunk_progress = self._read_chunk_progress_file(job_id)
+        fields: dict[str, Any] = {"stage_percent": 100, "overall_percent": 90}
+        if not chunk_progress:
+            return fields
+        progress_fields = self._chunk_progress_fields(chunk_progress, stage="translating")
+        total = int(progress_fields.get("translation_chunks_total") or 0)
+        if total > 0:
+            progress_fields["translation_chunks_completed"] = total
+            progress_fields["stage_percent"] = 100
+        fields.update(progress_fields)
+        return fields
+
     def _run_full_pipeline(
         self,
         job_id: str,
@@ -459,6 +487,7 @@ class BookJobRunner:
                 translation_progress_sink=sync_translation_progress,
                 existing_run_dir=existing_run_dir,
                 require_glossary_ready=require_glossary_ready,
+                resume_translation=existing_run_dir is not None,
             )
             artifacts = self.pipeline_runner(settings, on_stage)
             if current_stage is not None:
@@ -470,7 +499,7 @@ class BookJobRunner:
                 failed_stage=None,
                 error=None,
                 artifacts=artifact_map,
-                progress={"stage_percent": 100, "overall_percent": 90},
+                progress=self._completion_progress_fields(job_id),
             )
             self.repository.append_event(
                 job_id,
@@ -507,15 +536,28 @@ class BookJobRunner:
 
     def resume(self, job_id: str) -> dict[str, Any]:
         snapshot = self.repository.load(job_id)
-        if snapshot["state"] != "failed":
-            raise ValueError(f"Job {job_id} cannot resume from state {snapshot['state']!r}.")
-        self.repository.append_event(
-            job_id,
-            event_type="job_resumed",
-            stage=snapshot.get("failed_stage") or "created",
-            data={},
-        )
-        if snapshot.get("failed_stage") in {"translating", "validating", "pre_review"}:
+        state = snapshot["state"]
+        if state not in {"failed", "translating"}:
+            raise ValueError(f"Job {job_id} cannot resume from state {state!r}.")
+        if state == "failed":
+            self.repository.append_event(
+                job_id,
+                event_type="job_resumed",
+                stage=snapshot.get("failed_stage") or "created",
+                data={},
+            )
+        else:
+            self.repository.append_event(
+                job_id,
+                event_type="job_resumed",
+                stage="translating",
+                data={"reason": "resume_stalled_translation"},
+            )
+        if state == "translating" or snapshot.get("failed_stage") in {
+            "translating",
+            "validating",
+            "pre_review",
+        }:
             run_dir = self._run_output_dir(job_id)
             return self._run_full_pipeline(
                 job_id,
@@ -565,6 +607,8 @@ class BookJobRunner:
     ) -> dict[str, Any]:
         total = max(int(chunk_progress.get("total_chunks", 0)), 0)
         completed = max(int(chunk_progress.get("completed_chunks", 0)), 0)
+        if total:
+            completed = min(completed, total)
         cache_hits = int(chunk_progress.get("cache_hit_chunks", 0))
         retries = int(chunk_progress.get("retrying_chunks", 0))
         failed = int(chunk_progress.get("failed_chunks", 0))

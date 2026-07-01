@@ -23,6 +23,11 @@ from pdf_translator.glossary import (
 from pdf_translator.guardrails import ingest_pdf_guarded
 from pdf_translator.job_control import create_translation_job
 from pdf_translator.jobs import resolve_text_operation
+from pdf_translator.pdf_text_repair import (
+    repair_book_dict,
+    repair_pdf_markdown,
+    write_ingest_quality_report,
+)
 from pdf_translator.models import (
     BookTranslationResult,
     PipelineArtifacts,
@@ -183,12 +188,20 @@ def _load_existing_run_context(
     extra_files: dict[str, str] = {}
     if artifacts.book_json_path.exists():
         book = json.loads(artifacts.book_json_path.read_text(encoding="utf-8"))
+        book = repair_book_dict(book)
+        artifacts.book_json_path.write_text(json.dumps(book, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         extra_files["book_json"] = str(artifacts.book_json_path)
     if artifacts.book_markdown_path.exists():
         extra_files["book_markdown"] = str(artifacts.book_markdown_path)
     translation_input_markdown = ""
     if artifacts.translation_input_markdown_path.exists():
         translation_input_markdown = artifacts.translation_input_markdown_path.read_text(encoding="utf-8")
+    if book is not None:
+        repaired_input = render_translation_input_markdown(book)
+        if repaired_input.strip():
+            translation_input_markdown = repaired_input
+            artifacts.translation_input_markdown_path.write_text(repaired_input, encoding="utf-8")
+            write_ingest_quality_report(run_dir, source_markdown=repaired_input)
     profile: dict[str, Any] = {}
     if artifacts.profile_json_path.exists():
         profile = json.loads(artifacts.profile_json_path.read_text(encoding="utf-8"))
@@ -234,11 +247,11 @@ def _prepare_intake_artifacts(settings: RunSettings) -> tuple[
         encoding="utf-8",
     )
     artifacts.reconstructed_markdown_path.write_text(
-        normalized.reconstructed_markdown,
+        repair_pdf_markdown(normalized.reconstructed_markdown),
         encoding="utf-8",
     )
 
-    translation_input_markdown = normalized.reconstructed_markdown
+    translation_input_markdown = repair_pdf_markdown(normalized.reconstructed_markdown)
     book: dict | None = None
     extra_files: dict[str, str] = {
         "profile_json": str(artifacts.profile_json_path),
@@ -250,6 +263,7 @@ def _prepare_intake_artifacts(settings: RunSettings) -> tuple[
             source_pdf=settings.source_pdf,
             images_dir=book_images_dir,
         )
+        book = repair_book_dict(book)
         if render_translation_input_markdown(book).strip():
             translation_input_markdown = render_translation_input_markdown(book)
         artifacts.book_json_path.write_text(json.dumps(book, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -278,6 +292,7 @@ def _prepare_intake_artifacts(settings: RunSettings) -> tuple[
         translation_input_markdown,
         encoding="utf-8",
     )
+    write_ingest_quality_report(artifacts.output_dir, source_markdown=translation_input_markdown)
 
     return artifacts, normalized, preflight, profile, book, translation_input_markdown, extra_files
 
@@ -514,6 +529,31 @@ def run_translation_pipeline(
         translated.translated_markdown,
         encoding="utf-8",
     )
+    polished_markdown = translated.translated_markdown
+    if (
+        not skip_translation
+        and text_operation == "translate"
+        and settings.target_language.lower().startswith("zh")
+        and book is not None
+    ):
+        try:
+            from pdf_translator.polish import run_polish, scan_polish_candidates
+
+            if scan_polish_candidates(translated.translated_markdown):
+                polish_result = run_polish(
+                    run_dir=artifacts.output_dir,
+                    target_language=settings.target_language,
+                    translator_name=settings.translator,
+                )
+                polished_path = artifacts.output_dir / "translated.polished.md"
+                if polished_path.exists():
+                    polished_markdown = polished_path.read_text(encoding="utf-8")
+                    artifacts.translated_markdown_path.write_text(polished_markdown, encoding="utf-8")
+                    extra_files["translated_polished_markdown"] = str(polished_path)
+                    extra_files["polish_report"] = str(artifacts.output_dir / "polish-report.json")
+        except Exception:
+            polished_markdown = translated.translated_markdown
+    translated = replace(translated, translated_markdown=polished_markdown)
     translated_chapters_payload = _translated_chapters_payload(
         source_path=settings.source_pdf,
         translated_markdown=translated.translated_markdown,

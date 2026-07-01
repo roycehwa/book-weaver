@@ -27,20 +27,48 @@ SCHEMA_PRE_REVIEW = "translation_pre_review_v1"
 SCHEMA_CHAPTER_MARKS = "translation_review_chapter_marks_v1"
 
 CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+LOGIC_SYMBOL_LINE = re.compile(r"[◻◇φ∀∃⊢⊨≤≥]")
 LATIN_WORD_RE = re.compile(r"\b[A-Za-z][A-Za-z'’-]{3,}\b")
 URL_OR_EMAIL_RE = re.compile(r"(?:https?://|www\.)\S+|\S+@\S+")
 MARKDOWN_LINK_DEST_RE = re.compile(r"\]\([^)]+\)")
 ALLOWED_MIXED_LATIN_WORDS = {
+    "analytic",
+    "analyticity",
+    "apriority",
     "appendix",
+    "belief",
+    "bibliography",
     "chapter",
+    "concept",
     "copyright",
     "email",
     "figure",
+    "formal",
+    "formula",
+    "formulae",
     "index",
     "license",
+    "logic",
+    "modal",
+    "modality",
+    "necessity",
     "notes",
+    "operator",
+    "predicate",
     "press",
+    "proposition",
+    "provability",
+    "reference",
+    "references",
+    "semantic",
+    "sentence",
+    "singular",
+    "statement",
+    "syntax",
     "table",
+    "temporal",
+    "theorem",
+    "truth",
 }
 MODEL_REFUSAL_PATTERNS = (
     re.compile(r"未在消息中提供"),
@@ -338,6 +366,8 @@ def _mixed_english_signal(text: str) -> tuple[int, int]:
         line = raw_line.strip()
         if not line or line.startswith(("#", "![", "|", ">", "```")):
             continue
+        if LOGIC_SYMBOL_LINE.search(line):
+            continue
         if not CJK_RE.search(line):
             continue
         cleaned = URL_OR_EMAIL_RE.sub(" ", line)
@@ -410,7 +440,7 @@ def detect_review_items(
             elif source_ascii >= 500 and translated_cjk + int(translated_ascii * 0.35) < source_ascii * 0.16:
                 issue_type = "possibly_incomplete"
                 severity = "high"
-            elif mixed_words >= 3:
+            elif mixed_words >= 6:
                 issue_type = "mixed_english"
                 severity = "medium"
 

@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Any
 
 from pdf_translator.glossary import (
-    finalize_pending_glossary_entries,
     glossary_status,
     load_active_glossary_if_present,
 )
@@ -95,12 +94,106 @@ def glossary_ready_summary(run_dir: Path) -> dict[str, Any]:
 
 
 def begin_translation(run_dir: Path) -> dict[str, Any]:
-    auto_confirm = finalize_pending_glossary_entries(run_dir)
-    return write_workflow(
-        run_dir,
-        stage=STAGE_TRANSLATING,
-        glossary_auto_confirmed=auto_confirm.get("confirmed_count", 0),
+    return write_workflow(run_dir, stage=STAGE_TRANSLATING)
+
+
+_SUGGESTION_FIELD_KEYS = (
+    "target_suggestion",
+    "suggestion_confidence",
+    "suggestion_note",
+    "suggestion_source",
+)
+
+
+def _strip_suggestions_from_candidates(run_dir: Path) -> int:
+    from pdf_translator.glossary import GLOSSARY_SCHEMA, _glossary_dir, _now, _write_json
+
+    glossary_dir = _glossary_dir(run_dir)
+    candidates_path = glossary_dir / "candidates.json"
+    if not candidates_path.is_file():
+        return 0
+    payload = json.loads(candidates_path.read_text(encoding="utf-8"))
+    cleared_count = 0
+    cleared: list[dict[str, Any]] = []
+    for candidate in payload.get("candidates", []):
+        item = dict(candidate)
+        if any(key in item for key in _SUGGESTION_FIELD_KEYS):
+            cleared_count += 1
+        for key in _SUGGESTION_FIELD_KEYS:
+            item.pop(key, None)
+        cleared.append(item)
+    payload["candidates"] = cleared
+    payload["updated_at"] = _now()
+    _write_json(candidates_path, payload)
+    return cleared_count
+
+
+def clear_glossary_suggestions(run_dir: Path) -> dict[str, Any]:
+    """Clear machine suggestions only; keep adopted/rejected decisions."""
+    from pdf_translator.glossary import _glossary_dir
+
+    glossary_dir = _glossary_dir(run_dir)
+    cleared_count = _strip_suggestions_from_candidates(run_dir)
+    for name in ("suggest-running.json", "suggestions.json"):
+        path = glossary_dir / name
+        if path.exists():
+            path.unlink()
+    status = glossary_status(run_dir)
+    return {
+        "cleared_suggestion_count": cleared_count,
+        "candidate_count": status["candidate_count"],
+        "active_count": status["active_count"],
+        "kept_adoptions": True,
+    }
+
+
+def reset_glossary_review(
+    run_dir: Path,
+    *,
+    clear_suggestions: bool = True,
+    clear_policy_annotations: bool = True,
+    decided_by: str = "system",
+) -> dict[str, Any]:
+    """Clear adoption decisions and return workflow to awaiting_glossary."""
+    from pdf_translator.glossary import (
+        GLOSSARY_SCHEMA,
+        _glossary_dir,
+        _write_json,
+        clear_glossary_policy_round_annotations,
+        glossary_status,
     )
+
+    glossary_dir = _glossary_dir(run_dir)
+    _write_json(
+        glossary_dir / "active.json",
+        {"schema": GLOSSARY_SCHEMA, "entries": [], "updated_at": _now()},
+    )
+    decisions_path = glossary_dir / "decisions.jsonl"
+    if decisions_path.exists():
+        decisions_path.write_text("", encoding="utf-8")
+    for name in ("suggest-running.json", "suggestions.json"):
+        path = glossary_dir / name
+        if path.exists():
+            path.unlink()
+    if clear_suggestions:
+        _strip_suggestions_from_candidates(run_dir)
+    cleared_policy = None
+    if clear_policy_annotations:
+        cleared_policy = clear_glossary_policy_round_annotations(run_dir)
+    write_workflow(
+        run_dir,
+        stage=STAGE_AWAITING_GLOSSARY,
+        glossary_review_reset_at=_now(),
+        glossary_review_reset_by=decided_by,
+    )
+    status = glossary_status(run_dir)
+    return {
+        "workflow_stage": STAGE_AWAITING_GLOSSARY,
+        "candidate_count": status["candidate_count"],
+        "active_count": status["active_count"],
+        "cleared_suggestions": clear_suggestions,
+        "cleared_policy_annotations": bool(cleared_policy),
+    }
 
 
 def mark_glossary_ready(run_dir: Path, *, decided_by: str = "user") -> dict[str, Any]:
@@ -115,6 +208,7 @@ def mark_glossary_ready(run_dir: Path, *, decided_by: str = "user") -> dict[str,
         stage=STAGE_GLOSSARY_READY,
         active_term_count=len(active_entries),
         decided_by=decided_by,
+        glossary_finalized_by_user=True,
     )
 
 

@@ -11,7 +11,9 @@ from pdf_translator.glossary_extraction import (
     _metadata_exclusions,
     extract_candidate_phrases,
     extract_connector_phrases,
+    extract_domain_single_words,
     extract_index_phrases,
+    extract_quoted_terms,
     score_glossary_candidate,
 )
 from pdf_translator.glossary_profiles import (
@@ -25,7 +27,16 @@ from pdf_translator.glossary_profiles import (
 GLOSSARY_SCHEMA = "phase_a_glossary_v1"
 EXTRACTION_POLICY_SCHEMA = "phase_a_glossary_extraction_v2"
 LEGACY_EXTRACTION_POLICY_SCHEMA = "phase_a_glossary_extraction_v1"
-DEFAULT_MAX_CANDIDATES = 40
+CANDIDATE_FLOOR = 60
+CANDIDATE_CEILING = 200
+
+
+def compute_max_candidates(book: dict[str, Any]) -> int:
+    """Scale glossary surface limit with book size instead of a fixed cap."""
+    corpus, _ = _book_text_corpus(book)
+    chars = len(corpus)
+    chapters = len(book.get("chapters") or [])
+    return min(CANDIDATE_CEILING, max(CANDIDATE_FLOOR, chars // 6000 + chapters * 4))
 
 
 def _glossary_dir(run_dir: Path) -> Path:
@@ -73,7 +84,7 @@ def detect_glossary_profile_for_run(run_dir: Path) -> dict[str, Any]:
 def extract_glossary_candidates(
     run_dir: Path,
     *,
-    max_candidates: int = DEFAULT_MAX_CANDIDATES,
+    max_candidates: int | None = None,
     profile: str | None = None,
     profile_source: str | None = None,
 ) -> dict[str, Any]:
@@ -81,6 +92,7 @@ def extract_glossary_candidates(
     corpus, chapter_text = _book_text_corpus(book)
     exclusions = _metadata_exclusions(book)
     existing_policy = _load_extraction_policy(run_dir)
+    limit = max_candidates if max_candidates is not None else compute_max_candidates(book)
 
     if profile is None and existing_policy and existing_policy.get("glossary_profile_overridden"):
         profile_id = str(existing_policy["glossary_profile"])
@@ -103,6 +115,9 @@ def extract_glossary_candidates(
         )
         if profile_source:
             resolved_source = profile_source
+        if profile_source == "user":
+            overridden = True
+            resolved_source = "user"
         auto_detection = detect_glossary_profile(book, corpus=corpus)
         detection = {
             **auto_detection,
@@ -131,6 +146,11 @@ def extract_glossary_candidates(
         phrase_sources = list(extract_candidate_phrases(markdown))
         if active_policy.enable_connector_phrases:
             phrase_sources.extend(extract_connector_phrases(markdown))
+        if active_policy.allow_single_word_domain:
+            phrase_sources.extend(
+                extract_domain_single_words(markdown, active_policy.single_word_markers)
+            )
+            phrase_sources.extend(extract_quoted_terms(markdown))
         if active_policy.enable_index_parse and in_index:
             phrase_sources.extend(extract_index_phrases(markdown))
         for phrase in phrase_sources:
@@ -182,18 +202,20 @@ def extract_glossary_candidates(
         )
 
     ranked.sort(key=lambda item: (-float(item["score"]), -int(item["occurrences"]), item["source"]))
-    candidates = ranked[: max(1, max_candidates)]
+    candidates = ranked[: max(1, limit)]
 
     policy = {
         "schema": EXTRACTION_POLICY_SCHEMA,
         "generated_at": _now(),
-        "max_candidates": max_candidates,
-        "profile_policy_version": 1,
+        "max_candidates": limit,
+        "profile_policy_version": 2,
         "principles": list(active_policy.principles),
         "stats": {
             "raw_phrases_seen": len(stats),
+            "eligible": len(ranked),
             "rejected": rejected_count,
             "surfaced": len(candidates),
+            "max_candidates_limit": limit,
         },
         "metadata_exclusions": sorted(exclusions),
         **detection,
@@ -267,6 +289,30 @@ def load_active_entries_for_translation(run_dir: Path) -> list[dict[str, Any]]:
         for entry in active.get("entries", [])
         if entry.get("status") == "active" and str(entry.get("target") or "").strip()
     ]
+
+
+POLICY_ROUND_ANNOTATION_KEYS = (
+    "sensitive_content_risk",
+    "sensitive_content_score",
+    "sensitive_content_signals",
+    "glossary_suggest_strategy",
+    "glossary_suggest_strategy_label",
+)
+
+
+def clear_glossary_policy_round_annotations(run_dir: Path) -> dict[str, Any] | None:
+    """Remove conclusions from prior test rounds; keep extraction profile/settings."""
+    policy_path = _glossary_dir(run_dir) / "extraction-policy.json"
+    if not policy_path.is_file():
+        return None
+    policy = json.loads(policy_path.read_text(encoding="utf-8"))
+    if not isinstance(policy, dict):
+        return None
+    stripped = {key: policy.pop(key) for key in POLICY_ROUND_ANNOTATION_KEYS if key in policy}
+    if stripped:
+        policy["round_annotations_cleared_at"] = _now()
+        _write_json(policy_path, policy)
+    return stripped or None
 
 
 def glossary_manifest_files(run_dir: Path) -> dict[str, str]:
@@ -380,6 +426,23 @@ def _active_entry_by_source(run_dir: Path) -> dict[str, dict[str, Any]]:
         for entry in active.get("entries", [])
         if entry.get("source")
     }
+
+
+def locked_glossary_sources(run_dir: Path) -> set[str]:
+    """Terms that must not receive new machine suggestions."""
+    locked: set[str] = set()
+    for source, entry in _active_entry_by_source(run_dir).items():
+        status = str(entry.get("status") or "")
+        if status == "rejected":
+            locked.add(source)
+            continue
+        if status == "active" and str(entry.get("target") or "").strip():
+            locked.add(source)
+    latest = _latest_decisions_by_source(run_dir)
+    for source, decision in latest.items():
+        if decision.get("status") == "rejected":
+            locked.add(source)
+    return locked
 
 
 def _latest_decisions_by_source(run_dir: Path) -> dict[str, dict[str, Any]]:

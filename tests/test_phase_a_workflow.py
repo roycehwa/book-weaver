@@ -207,7 +207,7 @@ def test_mark_glossary_ready_requires_active_target(tmp_path: Path) -> None:
     require_glossary_ready(run_dir)
 
 
-def test_finalize_pending_glossary_at_translation_start(tmp_path: Path) -> None:
+def test_begin_translation_does_not_auto_confirm_pending_terms(tmp_path: Path) -> None:
     run_dir = tmp_path / "book-run"
     glossary_dir = run_dir / "glossary"
     glossary_dir.mkdir(parents=True)
@@ -248,13 +248,12 @@ def test_finalize_pending_glossary_at_translation_start(tmp_path: Path) -> None:
         status="rejected",
         decided_by="user",
     )
+    mark_glossary_ready(run_dir)
     workflow = begin_translation(run_dir)
     active = load_active_glossary(run_dir)
     by_source = {entry["source"]: entry for entry in active["entries"]}
     assert workflow["stage"] == "translating"
-    assert workflow["glossary_auto_confirmed"] == 1
+    assert "glossary_auto_confirmed" not in workflow
     assert by_source["Shareholder Primacy"]["status"] == "active"
-    assert by_source["Corporate Governance"]["status"] == "active"
-    assert by_source["Corporate Governance"]["target"] == "公司治理"
-    assert by_source["Corporate Governance"]["updated_by"] == "translation_start"
+    assert "Corporate Governance" not in by_source
     assert "Rejected Term" not in by_source

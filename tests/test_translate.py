@@ -781,6 +781,15 @@ def test_minimax_settings_use_default_highspeed_model(monkeypatch: pytest.Monkey
     assert settings.max_tokens == 8192
 
 
+def test_minimax_settings_corrects_openai_style_base_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MINIMAX_API_KEY", "key")
+    monkeypatch.setenv("MINIMAX_BASE_URL", "https://api.minimaxi.com/v1")
+
+    settings = CompatibleAPISettings.from_env("minimax")
+
+    assert settings.base_url == "https://api.minimaxi.com/anthropic/v1/messages"
+
+
 def test_compatible_settings_require_generic_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("LLM_API_KEY", raising=False)
     monkeypatch.delenv("LLM_BASE_URL", raising=False)

@@ -8,6 +8,7 @@ from typing import Any
 HUMANITIES_HISTORY = "humanities_history"
 SOCIAL_ECON_PHILOSOPHY = "social_econ_philosophy"
 SCIENCE_TECH_ENGINEERING = "science_tech_engineering"
+FORMAL_LOGIC_PHILOSOPHY = "formal_logic_philosophy"
 
 DEFAULT_GLOSSARY_PROFILE = SOCIAL_ECON_PHILOSOPHY
 
@@ -15,6 +16,7 @@ GLOSSARY_PROFILE_LABELS: dict[str, str] = {
     HUMANITIES_HISTORY: "人文·历史·艺术",
     SOCIAL_ECON_PHILOSOPHY: "社会·经济·哲学",
     SCIENCE_TECH_ENGINEERING: "科学·技术·工程",
+    FORMAL_LOGIC_PHILOSOPHY: "逻辑·语言哲学",
 }
 
 VALID_GLOSSARY_PROFILES = frozenset(GLOSSARY_PROFILE_LABELS)
@@ -31,6 +33,10 @@ class GlossaryProfilePolicy:
     enable_index_parse: bool
     index_parse_weight: float
     principles: tuple[str, ...]
+    min_accept_score: float = 3.0
+    min_word_count: int = 2
+    allow_single_word_domain: bool = False
+    single_word_markers: frozenset[str] = frozenset()
 
 
 SOCIAL_DOMAIN_MARKERS = frozenset(
@@ -104,6 +110,50 @@ STEM_DOMAIN_MARKERS = frozenset(
     }
 )
 
+LOGIC_DOMAIN_MARKERS = frozenset(
+    {
+        "logic",
+        "logical",
+        "syntax",
+        "semantic",
+        "semantics",
+        "modal",
+        "modality",
+        "truth",
+        "paradox",
+        "predicate",
+        "quantifier",
+        "axiom",
+        "lemma",
+        "theorem",
+        "proof",
+        "validity",
+        "valid",
+        "consistency",
+        "inconsistent",
+        "necessity",
+        "necessary",
+        "possible",
+        "possibility",
+        "implication",
+        "entailment",
+        "reference",
+        "referential",
+        "deflation",
+        "realism",
+        "nominalism",
+        "formal",
+        "formalism",
+        "tarski",
+        "kripke",
+        "frege",
+        "russell",
+        "wittgenstein",
+        "godel",
+        "goedel",
+    }
+)
+
 FRAGMENT_PREFIXES = ("The ", "In ", "On ", "How ", "A ")
 
 GLOSSARY_PROFILES: dict[str, GlossaryProfilePolicy] = {
@@ -151,6 +201,26 @@ GLOSSARY_PROFILES: dict[str, GlossaryProfilePolicy] = {
             "优先术语定义、方法与标准",
             "索引/附录术语加权",
             "叙事人名除非在索引中否则降权",
+        ),
+    ),
+    FORMAL_LOGIC_PHILOSOPHY: GlossaryProfilePolicy(
+        profile_id=FORMAL_LOGIC_PHILOSOPHY,
+        label=GLOSSARY_PROFILE_LABELS[FORMAL_LOGIC_PHILOSOPHY],
+        person_name_penalty=0.5,
+        domain_markers=LOGIC_DOMAIN_MARKERS,
+        fragment_prefix_penalty=2.0,
+        enable_connector_phrases=True,
+        enable_index_parse=True,
+        index_parse_weight=3.5,
+        min_accept_score=2.0,
+        min_word_count=1,
+        allow_single_word_domain=True,
+        single_word_markers=LOGIC_DOMAIN_MARKERS,
+        principles=(
+            "优先逻辑、语义、模态与真理理论术语",
+            "允许高频单词术语（modal、syntax、truth 等）",
+            "索引章与连接词短语加权",
+            "哲学家专名保留但不过度扩张",
         ),
     ),
 }
@@ -233,6 +303,42 @@ DETECTION_KEYWORDS: dict[str, list[str]] = {
         "算法",
         "实验",
     ],
+    FORMAL_LOGIC_PHILOSOPHY: [
+        "logic",
+        "logical",
+        "syntax",
+        "semantic",
+        "semantics",
+        "modal",
+        "modality",
+        "truth",
+        "paradox",
+        "predicate",
+        "quantifier",
+        "axiom",
+        "validity",
+        "consistency",
+        "necessity",
+        "entailment",
+        "reference",
+        "deflationism",
+        "realism",
+        "nominalism",
+        "formal",
+        "tarski",
+        "kripke",
+        "frege",
+        "russell",
+        "wittgenstein",
+        "language",
+        "meaning",
+        "proposition",
+        "逻辑",
+        "语义",
+        "模态",
+        "真理",
+        "悖论",
+    ],
 }
 
 SUBHINT_KEYWORDS: dict[str, list[str]] = {
@@ -298,6 +404,17 @@ def detect_glossary_profile(book: dict[str, Any], *, corpus: str | None = None) 
     if table_like >= 2:
         scores[SCIENCE_TECH_ENGINEERING] += 3
 
+    logic_like = _count_keyword_hits(text, DETECTION_KEYWORDS[FORMAL_LOGIC_PHILOSOPHY])
+    if logic_like >= 4:
+        scores[FORMAL_LOGIC_PHILOSOPHY] += 6
+    metadata = book.get("metadata", {}) if isinstance(book.get("metadata"), dict) else {}
+    title_blob = " ".join(
+        str(metadata.get(key) or "")
+        for key in ("title", "subtitle")
+    ).lower()
+    if any(token in title_blob for token in ("logic", "syntax", "truth", "modal", "paradox", "semantic", "language")):
+        scores[FORMAL_LOGIC_PHILOSOPHY] += 8
+
     ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
     top_profile, top_score = ranked[0]
     second_score = ranked[1][1] if len(ranked) > 1 else 0
@@ -336,8 +453,7 @@ def profile_resolution_from_artifacts(
     if explicit_profile:
         if explicit_profile not in VALID_GLOSSARY_PROFILES:
             raise ValueError(f"Unknown glossary profile: {explicit_profile!r}")
-        overridden = bool(run_dir_policy and run_dir_policy.get("glossary_profile_overridden"))
-        source = "user" if overridden or run_dir_policy else "cli"
+        source = "user" if run_dir_policy else "cli"
         return explicit_profile, source, True
 
     if run_dir_policy:

@@ -18,6 +18,18 @@ DEFAULT_DEEPL_BASE_URL = "https://api.deepl.com"
 DEFAULT_TRANSLATION_CONCURRENCY = 12
 
 
+def normalize_minimax_base_url(base_url: str | None) -> str:
+    """MiniMax translation uses the Anthropic Messages API, not OpenAI /v1 chat."""
+    if not base_url or not str(base_url).strip():
+        return DEFAULT_MINIMAX_BASE_URL
+    normalized = str(base_url).strip().rstrip("/")
+    if normalized.endswith("/anthropic/v1/messages"):
+        return normalized
+    if "minimaxi.com" in normalized and "/anthropic/" not in normalized:
+        return DEFAULT_MINIMAX_BASE_URL
+    return normalized
+
+
 def _load_local_env() -> None:
     for directory in [Path.cwd(), *Path.cwd().parents]:
         env_path = directory / ".env"
@@ -77,7 +89,9 @@ class CompatibleAPISettings:
             return cls(
                 api_key=api_key,
                 model=os.getenv("MINIMAX_MODEL") or os.getenv("LLM_MODEL") or DEFAULT_MINIMAX_MODEL,
-                base_url=os.getenv("MINIMAX_BASE_URL") or os.getenv("LLM_BASE_URL") or DEFAULT_MINIMAX_BASE_URL,
+                base_url=normalize_minimax_base_url(
+                    os.getenv("MINIMAX_BASE_URL") or os.getenv("LLM_BASE_URL")
+                ),
                 max_tokens=int(os.getenv("MINIMAX_MAX_TOKENS") or DEFAULT_MINIMAX_MAX_TOKENS),
             )
 

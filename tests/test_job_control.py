@@ -110,6 +110,27 @@ def test_observer_records_failure_without_losing_prior_success(tmp_path: Path) -
     assert progress["retrying_chunks"] == 1
 
 
+def test_observer_does_not_double_count_same_chunk(tmp_path: Path) -> None:
+    observer = create_translation_job(
+        run_dir=tmp_path,
+        translator="mock",
+        source_language="en",
+        target_language="zh-CN",
+        total_chunks=2,
+        concurrency=1,
+        max_chunk_chars=9000,
+        resume=False,
+    )
+
+    observer.cache_hit(chunk_index=0, input_hash="abc", cache_path=tmp_path / "cache" / "c0.md")
+    observer.attempt_success(chunk_index=0, input_hash="abc", cache_path=tmp_path / "cache" / "c0.md")
+    observer.attempt_success(chunk_index=0, input_hash="abc", cache_path=tmp_path / "cache" / "c0.md")
+
+    progress = load_progress(tmp_path)
+    assert progress["completed_chunks"] == 1
+    assert progress["cache_hit_chunks"] == 1
+
+
 def test_format_progress_line_shows_bar_and_counts() -> None:
     from pdf_translator.job_control import format_progress_bar, format_progress_line
 

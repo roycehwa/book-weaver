@@ -353,6 +353,17 @@ def _assert_translation_quality(
         )
 
 
+def _is_transient_translation_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    if "timeout" in message or "connection" in message or "temporarily" in message:
+        return True
+    if "http 404" in message or "http 429" in message or "http 5" in message:
+        return True
+    if "page not found" in message:
+        return True
+    return False
+
+
 def _translate_chunk_resumable(
     *,
     chunk: TranslationChunk,
@@ -396,7 +407,8 @@ def _translate_chunk_resumable(
 
     last_error: Exception | None = None
     had_sensitive_failure = False
-    for attempt in range(max(1, retry_count)):
+    max_attempts = max(1, retry_count) + 4
+    for attempt in range(max_attempts):
         attempt_no = attempt + 1
         try:
             if observer is not None:
@@ -428,7 +440,7 @@ def _translate_chunk_resumable(
             last_error = exc
             if "new_sensitive" in str(exc).lower():
                 had_sensitive_failure = True
-            retryable = attempt + 1 < max(1, retry_count)
+            retryable = attempt_no < max_attempts
             if allow_sensitive_split and "new_sensitive" in str(exc).lower():
                 retryable = False
                 try:
@@ -465,7 +477,13 @@ def _translate_chunk_resumable(
                     message=str(exc),
                     retryable=retryable,
                 )
-            if attempt + 1 >= max(1, retry_count):
+            if _is_transient_translation_error(exc):
+                time.sleep(min(2 ** min(attempt, 5), 30))
+                if attempt_no < max_attempts:
+                    continue
+            if not _is_transient_translation_error(exc) and attempt_no >= max(1, retry_count):
+                break
+            if attempt_no >= max_attempts:
                 break
             time.sleep(min(2**attempt, 8))
 

@@ -121,6 +121,8 @@ CONNECTOR_PHRASE_RE = re.compile(
     r"\b([A-Z][A-Za-z.'-]+(?:\s+(?:of|and|the)\s+[A-Z][A-Za-z.'-]+)+)\b"
 )
 INDEX_ENTRY_RE = re.compile(r"^([A-Z][^,\n;]{2,80}?)(?:,\s*\d)", re.MULTILINE)
+DOMAIN_WORD_RE = re.compile(r"\b([A-Za-z]{4,})\b")
+QUOTED_TERM_RE = re.compile(r'"([^"]{3,60})"')
 
 
 def _normalize_phrase(value: str) -> str:
@@ -194,6 +196,20 @@ def _is_fragment_phrase(phrase: str) -> bool:
     return phrase.startswith(("The ", "In ", "On ", "How ", "A "))
 
 
+def _allows_single_word_candidate(
+    word: str,
+    *,
+    occurrences: int,
+    policy: GlossaryProfilePolicy,
+) -> bool:
+    if not policy.allow_single_word_domain:
+        return False
+    lowered = word.lower()
+    if lowered in policy.single_word_markers:
+        return occurrences >= 2
+    return word[0].isupper() and occurrences >= 4
+
+
 def score_glossary_candidate(
     phrase: str,
     *,
@@ -209,8 +225,13 @@ def score_glossary_candidate(
     active_policy = policy or GLOSSARY_PROFILES[SOCIAL_ECON_PHILOSOPHY]
     normalized = _normalize_phrase(phrase)
     words = _phrase_words(normalized)
-    if len(words) < 2 or len(normalized) < 5:
-        return 0.0, [], True
+    min_len = 3 if active_policy.allow_single_word_domain and len(words) == 1 else 5
+    if len(words) < active_policy.min_word_count or len(normalized) < min_len:
+        if not (
+            len(words) == 1
+            and _allows_single_word_candidate(words[0], occurrences=occurrences, policy=active_policy)
+        ):
+            return 0.0, [], True
     if normalized in exclusions or normalized in GENERIC_STOP_PHRASES:
         return 0.0, [f"排除：与书名/作者/出版社或通用地名重复（{normalized}）"], True
 
@@ -247,7 +268,11 @@ def score_glossary_candidate(
         reasons.append("含领域词：" + "、".join(markers[:4]))
         profile_boosts.append("domain_marker")
 
-    if len(words) >= 3:
+    if len(words) == 1:
+        score += 2.5
+        reasons.append("逻辑/语义领域单词术语")
+        profile_boosts.append("single_word_domain")
+    elif len(words) >= 3:
         score += 2.0
         reasons.append("多词专名，比两词通用短语更具体")
     elif len(words) == 2:
@@ -284,7 +309,7 @@ def score_glossary_candidate(
         score -= 3.0
         reasons.append("宽泛两词短语，缺乏全书术语特征")
 
-    rejected = score < 3.0
+    rejected = score < active_policy.min_accept_score
     if rejected:
         reasons.append("综合得分过低，不进入候选列表")
     return score, reasons, rejected
@@ -309,6 +334,31 @@ def extract_connector_phrases(text: str) -> list[str]:
         if len(content_words) >= 2 and _is_valid_phrase(phrase):
             seen.add(phrase)
     return sorted(seen)
+
+
+def extract_domain_single_words(text: str, markers: frozenset[str], *, min_occurrences: int = 2) -> list[str]:
+    counts: dict[str, int] = {}
+    for match in DOMAIN_WORD_RE.finditer(text):
+        word = match.group(1)
+        if word.lower() not in markers:
+            continue
+        canonical = word if word[0].isupper() else word.capitalize()
+        counts[canonical] = counts.get(canonical, 0) + 1
+    return sorted(word for word, count in counts.items() if count >= min_occurrences)
+
+
+def extract_quoted_terms(text: str) -> list[str]:
+    phrases: set[str] = set()
+    for match in QUOTED_TERM_RE.finditer(text):
+        phrase = _normalize_phrase(match.group(1).strip(" ."))
+        if len(phrase) < 3:
+            continue
+        words = _phrase_words(phrase)
+        if len(words) >= 2 and _is_valid_phrase(phrase):
+            phrases.add(phrase)
+        elif len(words) == 1 and len(phrase) >= 4:
+            phrases.add(phrase)
+    return sorted(phrases)
 
 
 def extract_index_phrases(text: str) -> list[str]:

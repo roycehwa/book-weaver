@@ -3,12 +3,14 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from pdf_translator.glossary import apply_glossary_decision, extract_glossary_candidates
+from pdf_translator.glossary import apply_glossary_decision, compute_max_candidates, extract_glossary_candidates
 from pdf_translator.glossary_extraction import (
     extract_connector_phrases,
+    extract_domain_single_words,
     score_glossary_candidate,
 )
 from pdf_translator.glossary_profiles import (
+    FORMAL_LOGIC_PHILOSOPHY,
     HUMANITIES_HISTORY,
     SOCIAL_ECON_PHILOSOPHY,
     detect_glossary_profile,
@@ -75,6 +77,39 @@ def _history_book() -> dict:
     }
 
 
+def _logic_book() -> dict:
+    body = (
+        "Modal logic studies necessity and possibility. Truth conditions for modal operators "
+        "raise semantic paradoxes. The liar paradox challenges deflationary theories of truth. "
+        "Syntax and semantics interact in formal proofs. Quantifier scope matters for validity. "
+        "Tarski and Kripke shaped referential semantics. Russell's paradox informed type theory."
+    )
+    chapters = []
+    for index in range(1, 11):
+        chapters.append(
+            {
+                "chapter_id": f"ch-{index:03d}",
+                "title": f"Chapter {index}",
+                "markdown": body + f" Chapter {index} revisits modality and truth.",
+            }
+        )
+    chapters.append(
+        {
+            "chapter_id": "ch-index",
+            "title": "Index",
+            "markdown": "Modal logic, 12-40\nTruth conditions, 88\nLiar paradox, 1-200",
+        }
+    )
+    return {
+        "metadata": {
+            "title": "The Road to Paradox",
+            "subtitle": "Logic, Syntax, and Truth",
+            "author": "Example Author",
+        },
+        "chapters": chapters,
+    }
+
+
 def test_detect_policy_book_profile() -> None:
     detection = detect_glossary_profile(_policy_book())
     assert detection["glossary_profile"] == SOCIAL_ECON_PHILOSOPHY
@@ -86,6 +121,19 @@ def test_detect_history_book_profile() -> None:
     assert detection["glossary_profile"] == HUMANITIES_HISTORY
     assert detection["glossary_profile_label"] == "人文·历史·艺术"
     assert detection["glossary_profile_confidence"] >= 0.5
+
+
+def test_detect_logic_book_profile() -> None:
+    detection = detect_glossary_profile(_logic_book())
+    assert detection["glossary_profile"] == FORMAL_LOGIC_PHILOSOPHY
+    assert detection["glossary_profile_label"] == "逻辑·语言哲学"
+    assert detection["glossary_profile_confidence"] >= 0.5
+
+
+def test_domain_single_word_extraction_for_logic_profile() -> None:
+    text = "Modal logic and modality appear often. Modal operators and truth recur."
+    words = extract_domain_single_words(text, profile_policy(FORMAL_LOGIC_PHILOSOPHY).single_word_markers)
+    assert "Modal" in words or "Truth" in words
 
 
 def test_connector_phrase_extraction() -> None:
@@ -148,10 +196,51 @@ def test_extract_writes_profile_v2_policy(tmp_path: Path) -> None:
     assert policy["schema"] == "phase_a_glossary_extraction_v2"
     assert policy["glossary_profile"] == HUMANITIES_HISTORY
     assert policy["glossary_profile_label"] == "人文·历史·艺术"
+    assert policy["profile_policy_version"] == 2
     sources = [item["source"] for item in result["candidates"]]
     assert "Cultural Revolution" in sources
     assert "Gang of Four" in sources
     assert "In Shanghai" not in sources
+
+
+def test_logic_profile_surfaces_more_domain_terms(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "book.json").write_text(json.dumps(_logic_book()), encoding="utf-8")
+    result = extract_glossary_candidates(run_dir, profile=FORMAL_LOGIC_PHILOSOPHY)
+    sources = {item["source"] for item in result["candidates"]}
+    assert len(sources) >= 8
+    assert any("Modal" in source or "Truth" in source or "Paradox" in source for source in sources)
+
+
+def test_profile_switch_changes_candidate_set(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "book.json").write_text(json.dumps(_logic_book()), encoding="utf-8")
+    logic = extract_glossary_candidates(run_dir, max_candidates=40, profile=FORMAL_LOGIC_PHILOSOPHY)
+    humanities = extract_glossary_candidates(
+        run_dir,
+        max_candidates=40,
+        profile=HUMANITIES_HISTORY,
+        profile_source="user",
+    )
+    logic_sources = {item["source"] for item in logic["candidates"]}
+    humanities_sources = {item["source"] for item in humanities["candidates"]}
+    assert logic_sources != humanities_sources
+
+
+def test_compute_max_candidates_scales_with_book() -> None:
+    small = compute_max_candidates(_policy_book())
+    big = {
+        "chapters": [
+            {"chapter_id": f"ch-{index:03d}", "markdown": "terminology " * 4000}
+            for index in range(1, 26)
+        ]
+    }
+    large = compute_max_candidates(big)
+    assert small >= 60
+    assert large > small
+    assert large <= 200
 
 
 def test_profile_override_preserves_active_entries(tmp_path: Path) -> None:

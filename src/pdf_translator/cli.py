@@ -52,7 +52,12 @@ from pdf_translator.glossary import (
     glossary_status,
 )
 from pdf_translator.glossary_suggestions import suggest_glossary_targets
-from pdf_translator.workflow import glossary_ready_summary, mark_glossary_ready
+from pdf_translator.workflow import (
+    clear_glossary_suggestions,
+    glossary_ready_summary,
+    mark_glossary_ready,
+    reset_glossary_review,
+)
 from pdf_translator.translate import build_translator
 from pdf_translator.validation import run_validation_manifest, write_validation_report
 
@@ -535,9 +540,20 @@ def build_parser() -> argparse.ArgumentParser:
     glossary_extract.add_argument("run_dir", type=Path)
     glossary_extract.add_argument(
         "--profile",
-        choices=["humanities_history", "social_econ_philosophy", "science_tech_engineering"],
+        choices=[
+            "humanities_history",
+            "social_econ_philosophy",
+            "science_tech_engineering",
+            "formal_logic_philosophy",
+        ],
         default=None,
         help="Glossary extraction profile (default: auto-detect or keep user override).",
+    )
+    glossary_extract.add_argument(
+        "--profile-source",
+        choices=["auto", "cli", "user"],
+        default=None,
+        help="How the profile was chosen (user = manual override in workbench).",
     )
     glossary_detect = glossary_sub.add_parser(
         "detect",
@@ -576,6 +592,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     glossary_ready_parser.add_argument("run_dir", type=Path)
     glossary_ready_parser.add_argument("--decided-by", default="user")
+    glossary_reset_parser = glossary_sub.add_parser(
+        "reset-review",
+        help="Clear adopted glossary decisions and return to awaiting_glossary.",
+    )
+    glossary_reset_parser.add_argument("run_dir", type=Path)
+    glossary_reset_parser.add_argument(
+        "--keep-suggestions",
+        action="store_true",
+        help="Keep machine-generated target_suggestion fields on candidates.",
+    )
+    glossary_reset_parser.add_argument(
+        "--keep-policy-annotations",
+        action="store_true",
+        help="Keep sensitive/strategy tags written during prior test rounds.",
+    )
+    glossary_reset_parser.add_argument("--decided-by", default="system")
+    glossary_clear_suggestions_parser = glossary_sub.add_parser(
+        "clear-suggestions",
+        help="Clear machine-generated Chinese suggestions; keep adopted terms.",
+    )
+    glossary_clear_suggestions_parser.add_argument("run_dir", type=Path)
 
     knowledge_parser = subparsers.add_parser(
         "knowledge",
@@ -1159,7 +1196,7 @@ def main() -> None:
                 result = extract_glossary_candidates(
                     run_dir,
                     profile=args.profile,
-                    profile_source="user" if args.profile else None,
+                    profile_source=args.profile_source or ("user" if args.profile else None),
                 )
                 status = glossary_status(run_dir)
                 policy = result.get("policy", {})
@@ -1215,6 +1252,17 @@ def main() -> None:
                 summary = glossary_ready_summary(run_dir)
                 print(f"Glossary ready: {summary['ready_entries']} active terms")
                 print(f"Workflow stage: {workflow['stage']}")
+            elif args.glossary_command == "reset-review":
+                result = reset_glossary_review(
+                    run_dir,
+                    clear_suggestions=not args.keep_suggestions,
+                    clear_policy_annotations=not getattr(args, "keep_policy_annotations", False),
+                    decided_by=args.decided_by,
+                )
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+            elif args.glossary_command == "clear-suggestions":
+                result = clear_glossary_suggestions(run_dir)
+                print(json.dumps(result, ensure_ascii=False, indent=2))
             else:
                 raise ValueError(f"Unsupported glossary command: {args.glossary_command!r}.")
         elif args.command == "knowledge":

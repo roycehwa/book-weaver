@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 import threading
 import time
@@ -21,6 +22,20 @@ def _now() -> float:
 
 def _isoish(timestamp: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(timestamp))
+
+
+def _completed_indices_from_cache(run_dir: Path) -> list[int]:
+    cache_dir = run_dir / "translation-cache"
+    if not cache_dir.is_dir():
+        return []
+    indices: set[int] = set()
+    for path in cache_dir.glob("chunk-*.md"):
+        match = re.match(r"chunk-(\d+)-", path.name)
+        if not match:
+            continue
+        if path.read_text(encoding="utf-8").strip():
+            indices.add(int(match.group(1)))
+    return sorted(indices)
 
 
 def _jobs_dir(run_dir: Path) -> Path:
@@ -228,14 +243,26 @@ class TranslationJobObserver:
     def _load_progress(self) -> dict[str, Any]:
         return load_progress(self.run_dir)
 
+    def _record_chunk_done(self, progress: dict[str, Any], chunk_index: int) -> bool:
+        indices = list(progress.get("completed_chunk_indices") or [])
+        if chunk_index in indices:
+            return False
+        indices.append(int(chunk_index))
+        progress["completed_chunk_indices"] = sorted(indices)
+        progress["completed_chunks"] = len(indices)
+        return True
+
     def _write_progress(self, progress: dict[str, Any]) -> None:
         with self._progress_lock:
             progress = dict(progress)
             progress["updated_at"] = _isoish(_now())
             elapsed = max(_now() - self.started_at, 0.0)
             progress["elapsed_seconds"] = round(elapsed, 3)
-            completed = int(progress.get("completed_chunks", 0))
             total = max(int(progress.get("total_chunks", 0)), 0)
+            completed = min(int(progress.get("completed_chunks", 0)), total) if total else int(
+                progress.get("completed_chunks", 0)
+            )
+            progress["completed_chunks"] = completed
             progress["remaining_chunks"] = max(total - completed - int(progress.get("failed_chunks", 0)), 0)
             if completed > 0:
                 per_chunk = elapsed / completed
@@ -268,8 +295,8 @@ class TranslationJobObserver:
         with self._progress_lock:
             progress = self._load_progress()
             progress["running_chunks"] = max(int(progress.get("running_chunks", 0)) - 1, 0)
-            progress["completed_chunks"] = int(progress.get("completed_chunks", 0)) + 1
             progress["retrying_chunks"] = max(int(progress.get("retrying_chunks", 0)) - 1, 0)
+            self._record_chunk_done(progress, chunk_index)
             self._write_progress(progress)
         self._event(
             "attempt_success",
@@ -309,8 +336,8 @@ class TranslationJobObserver:
     def cache_hit(self, *, chunk_index: int, input_hash: str, cache_path: Path) -> None:
         with self._progress_lock:
             progress = self._load_progress()
-            progress["completed_chunks"] = int(progress.get("completed_chunks", 0)) + 1
-            progress["cache_hit_chunks"] = int(progress.get("cache_hit_chunks", 0)) + 1
+            if self._record_chunk_done(progress, chunk_index):
+                progress["cache_hit_chunks"] = int(progress.get("cache_hit_chunks", 0)) + 1
             self._write_progress(progress)
         self._event("cache_hit", chunk_index=chunk_index, input_hash=input_hash, cache_path=str(cache_path))
 
@@ -357,7 +384,11 @@ def create_translation_job(
     job_id = f"translation-{int(started)}"
     jobs_dir = _jobs_dir(run_dir)
     jobs_dir.mkdir(parents=True, exist_ok=True)
-    _events_path(run_dir).write_text("", encoding="utf-8")
+    events_path = _events_path(run_dir)
+    if resume and events_path.exists():
+        pass
+    else:
+        events_path.write_text("", encoding="utf-8")
     job = {
         "schema": JOB_SCHEMA,
         "job_id": job_id,
@@ -372,6 +403,8 @@ def create_translation_job(
         "max_chunk_chars": max_chunk_chars,
         "resume": resume,
     }
+    completed_indices = _completed_indices_from_cache(run_dir) if resume else []
+    completed = len(completed_indices)
     progress = {
         "schema": PROGRESS_SCHEMA,
         "job_id": job_id,
@@ -381,12 +414,13 @@ def create_translation_job(
         "elapsed_seconds": 0.0,
         "estimated_remaining_seconds": None,
         "total_chunks": total_chunks,
-        "completed_chunks": 0,
-        "remaining_chunks": total_chunks,
+        "completed_chunks": completed,
+        "completed_chunk_indices": completed_indices,
+        "remaining_chunks": max(total_chunks - completed, 0),
         "running_chunks": 0,
         "failed_chunks": 0,
         "retrying_chunks": 0,
-        "cache_hit_chunks": 0,
+        "cache_hit_chunks": completed if resume else 0,
         "invalid_cache_chunks": 0,
     }
     _atomic_write_json(_job_path(run_dir), job)
