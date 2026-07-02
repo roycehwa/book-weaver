@@ -49,3 +49,47 @@ def test_empty_note_is_rejected() -> None:
         assert "empty footnote" in str(exc)
     else:
         raise AssertionError("empty footnote should be rejected")
+
+
+def test_explanatory_cue_is_prose_before_single_author_citation() -> None:
+    source = (
+        "For example, Lüthi, The Sino–Soviet Split; "
+        "Radchenko, Two Suns in the Heavens."
+    )
+
+    note = build_semantic_footnote(page_no=21, marker="9", raw_text=source)
+
+    assert [span["kind"] for span in note["spans"]] == ["prose", "citation"]
+    assert note["spans"][0]["source_text"] == "For example, "
+    assert note["spans"][1]["source_text"].startswith("Lüthi,")
+
+
+def test_short_quoted_foreign_title_is_citation_only() -> None:
+    source = '"Suiyue huimou: zhengrong suiyue cong zheli kaishi."'
+
+    note = build_semantic_footnote(page_no=17, marker="4", raw_text=source)
+
+    assert [span["kind"] for span in note["spans"]] == ["citation"]
+
+
+def test_author_title_list_without_page_number_is_citation_only() -> None:
+    source = (
+        "Bian, The Making of the State Enterprise System in Modern China; "
+        "Kubo, Gendai Chūgoku no genkei no shutsugen."
+    )
+
+    note = build_semantic_footnote(page_no=24, marker="22", raw_text=source)
+
+    assert [span["kind"] for span in note["spans"]] == ["citation"]
+
+
+def test_initial_citation_and_trailing_explanation_are_separate() -> None:
+    source = (
+        "Guojia tongji ju, Zhongguo gongye jingji tongji ziliao, 31. "
+        "The share of state ownership includes public-private cooperatives."
+    )
+
+    note = build_semantic_footnote(page_no=22, marker="14", raw_text=source)
+
+    assert [span["kind"] for span in note["spans"]] == ["citation", "prose"]
+    assert "".join(span["source_text"] for span in note["spans"]) == source

@@ -33,12 +33,13 @@ def stable_semantic_id(kind: str, page_no: int, marker: str, text: str) -> str:
     return f"{kind}-{digest}"
 
 
-_CITATION_START_RE = re.compile(
+_CITATION_CUE_RE = re.compile(
     r"(?ix)"
-    r"(?:"
-    r"(?<=\bsee\s)|(?<=\bsee also\s)|(?<=\bcompare\s)|(?<=\bcf\.\s)"
-    r")"
-    r"(?=[A-ZÀ-ÖØ-Þ][\wÀ-ÖØ-öø-ÿ'’.-]+(?:\s+[A-ZÀ-ÖØ-Þ][\wÀ-ÖØ-öø-ÿ'’.-]+)+)"
+    r"\b(?:"
+    r"see(?:\s+also)?|compare|cf\.|for\s+example|for\s+instance|"
+    r"among\s+others,?\s+see"
+    r")\s*,?\s*"
+    r"(?=[A-ZÀ-ÖØ-Þ][\wÀ-ÖØ-öø-ÿ'’.-]+)"
 )
 _CITATION_SIGNAL_RE = re.compile(
     r"(?ix)"
@@ -47,6 +48,36 @@ _CITATION_SIGNAL_RE = re.compile(
     r"[A-ZÀ-ÖØ-Þ][\wÀ-ÖØ-öø-ÿ'’.-]+,\s+"
     r"[A-ZÀ-ÖØ-Þ])"
 )
+_EXPLANATORY_START_RE = re.compile(
+    r"(?i)^(?:for|while|the|this|these|scholars?|among|detailed|data|"
+    r"information|an?\s+overview|in\s+this)\b"
+)
+_TRAILING_EXPLANATION_RE = re.compile(
+    r"\.\s+(?=(?:The|This|These|It|They|We|I|Such|Until|Although|However|"
+    r"Indeed|Also)\b)"
+)
+
+
+def _has_author_prefix(source_text: str) -> bool:
+    prefix, separator, rest = source_text.strip().partition(",")
+    return bool(
+        separator
+        and 1 <= len(prefix.split()) <= 5
+        and prefix[:1].isupper()
+        and rest.strip()[:1].isupper()
+        and not _EXPLANATORY_START_RE.match(prefix)
+    )
+
+
+def _looks_citation_only(source_text: str) -> bool:
+    stripped = source_text.strip()
+    if len(stripped) >= 2 and stripped[0] in "\"“" and stripped[-1] in "\"”":
+        return True
+    if _EXPLANATORY_START_RE.match(stripped):
+        return False
+    if not _has_author_prefix(stripped):
+        return False
+    return _TRAILING_EXPLANATION_RE.search(stripped) is None
 
 
 def _span(
@@ -76,14 +107,22 @@ def split_note_spans_losslessly(
     page_no: int,
     marker: str,
 ) -> list[dict[str, Any]]:
-    citation_start = _CITATION_START_RE.search(source_text)
-    if citation_start is not None:
-        boundary = citation_start.start()
+    citation_cue = _CITATION_CUE_RE.search(source_text)
+    if citation_cue is not None:
+        boundary = citation_cue.end()
         spans = [
             _span("prose", source_text[:boundary], page_no=page_no, marker=marker, index=0),
             _span("citation", source_text[boundary:], page_no=page_no, marker=marker, index=1),
         ]
-    elif _CITATION_SIGNAL_RE.search(source_text):
+    elif _has_author_prefix(source_text) and (
+        trailing_explanation := _TRAILING_EXPLANATION_RE.search(source_text)
+    ):
+        boundary = trailing_explanation.end()
+        spans = [
+            _span("citation", source_text[:boundary], page_no=page_no, marker=marker, index=0),
+            _span("prose", source_text[boundary:], page_no=page_no, marker=marker, index=1),
+        ]
+    elif _looks_citation_only(source_text):
         spans = [
             _span("citation", source_text, page_no=page_no, marker=marker, index=0)
         ]

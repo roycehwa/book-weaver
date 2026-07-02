@@ -44,6 +44,37 @@ def test_create_translation_job_writes_state_and_progress(tmp_path: Path) -> Non
     assert progress["cache_hit_chunks"] == 0
 
 
+def test_resume_does_not_precount_unvalidated_cache_files(tmp_path: Path) -> None:
+    cache_dir = tmp_path / "translation-cache"
+    cache_dir.mkdir()
+    (cache_dir / "chunk-000000-stalehash.md").write_text(
+        "stale translation",
+        encoding="utf-8",
+    )
+
+    observer = create_translation_job(
+        run_dir=tmp_path,
+        translator="mock",
+        source_language="en",
+        target_language="zh-CN",
+        total_chunks=1,
+        concurrency=1,
+        max_chunk_chars=9000,
+        resume=True,
+    )
+
+    progress = load_progress(tmp_path)
+    assert progress["completed_chunks"] == 0
+    assert progress["cache_hit_chunks"] == 0
+
+    observer.cache_hit(
+        chunk_index=0,
+        input_hash="currenthash",
+        cache_path=cache_dir / "chunk-000000-currenthash.md",
+    )
+    assert load_progress(tmp_path)["cache_hit_chunks"] == 1
+
+
 def test_observer_records_chunk_success_and_progress(tmp_path: Path) -> None:
     observer = create_translation_job(
         run_dir=tmp_path,

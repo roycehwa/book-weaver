@@ -403,7 +403,9 @@ def create_translation_job(
         "max_chunk_chars": max_chunk_chars,
         "resume": resume,
     }
-    completed_indices = _completed_indices_from_cache(run_dir) if resume else []
+    # Cache filenames alone cannot prove validity because the current input hash
+    # is only known when each chunk is processed. Count hits through cache_hit().
+    completed_indices: list[int] = []
     completed = len(completed_indices)
     progress = {
         "schema": PROGRESS_SCHEMA,
