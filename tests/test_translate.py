@@ -161,12 +161,26 @@ def test_known_glossary_drift_is_never_cached_as_success(
 def test_legacy_cache_with_glossary_drift_uses_local_repair(
     tmp_path: Path,
 ) -> None:
-    from pdf_translator.translate import _translate_chunk_resumable
+    from pdf_translator.translate import (
+        _chunk_source_fingerprint,
+        _translate_chunk_resumable,
+    )
 
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
-    (cache_dir / "chunk-000000-legacy.md").write_text(
+    legacy_path = cache_dir / "chunk-000000-legacy.md"
+    legacy_path.write_text(
         "这个邦联与邻国进行了谈判。\n",
+        encoding="utf-8",
+    )
+    legacy_path.with_suffix(".source.json").write_text(
+        json.dumps(
+            {
+                "source_fingerprint": _chunk_source_fingerprint(
+                    "The Swiss Confederation negotiated with its neighbours."
+                )
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -208,6 +222,46 @@ def test_legacy_cache_with_glossary_drift_uses_local_repair(
         and path.read_text(encoding="utf-8").strip() == translated
         for path in cache_dir.glob("chunk-000000-*.md")
     )
+
+
+def test_legacy_cache_is_ignored_when_source_fingerprint_differs(
+    tmp_path: Path,
+) -> None:
+    from pdf_translator.translate import _chunk_source_fingerprint, _translate_chunk_resumable
+
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    legacy_path = cache_dir / "chunk-000000-legacy.md"
+    legacy_path.write_text("完全无关的旧译文。\n", encoding="utf-8")
+    legacy_path.with_suffix(".source.json").write_text(
+        json.dumps(
+            {"source_fingerprint": _chunk_source_fingerprint("Different old source.")}
+        ),
+        encoding="utf-8",
+    )
+
+    class FreshTranslator(BaseTranslator):
+        name = "minimax"
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            assert chunk.prompt_instruction is None
+            return "当前源文本的正确译文。"
+
+    translated = _translate_chunk_resumable(
+        chunk=TranslationChunk(index=0, markdown="Current source text."),
+        source_language="en",
+        target_language="zh-CN",
+        translator=FreshTranslator(),
+        cache_dir=cache_dir,
+        retry_count=1,
+    )
+
+    assert translated == "当前源文本的正确译文。"
 
 
 def test_semantic_footnote_translates_only_explanatory_spans() -> None:

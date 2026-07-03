@@ -203,6 +203,10 @@ def _chunk_input_hash(chunk: TranslationChunk) -> str:
     return hashlib.sha256(digest_input.encode("utf-8")).hexdigest()[:16]
 
 
+def _chunk_source_fingerprint(markdown: str) -> str:
+    return hashlib.sha256(markdown.encode("utf-8")).hexdigest()
+
+
 def _chunk_cache_path(cache_dir: Path, chunk: TranslationChunk) -> Path:
     return cache_dir / f"chunk-{chunk.index:06d}-{_chunk_input_hash(chunk)}.md"
 
@@ -449,9 +453,7 @@ def _persist_chunk_translation(
     input_hash: str,
 ) -> str:
     if cache_path is not None:
-        tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
-        tmp_path.write_text(translated + "\n", encoding="utf-8")
-        tmp_path.replace(cache_path)
+        _write_chunk_cache(cache_path, chunk=chunk, translated=translated)
     if observer is not None:
         observer.attempt_success(
             chunk_index=chunk.index,
@@ -459,6 +461,29 @@ def _persist_chunk_translation(
             cache_path=cache_path,
         )
     return translated
+
+
+def _write_chunk_cache(
+    cache_path: Path,
+    *,
+    chunk: TranslationChunk,
+    translated: str,
+) -> None:
+    tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+    tmp_path.write_text(translated + "\n", encoding="utf-8")
+    tmp_path.replace(cache_path)
+    cache_path.with_suffix(".source.json").write_text(
+        json.dumps(
+            {
+                "schema": "translation_cache_source_v1",
+                "source_fingerprint": _chunk_source_fingerprint(chunk.markdown),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
 
 def _repair_glossary_in_chunk(
@@ -554,6 +579,19 @@ def _translate_chunk_resumable(
                 reverse=True,
             )
             for legacy_path in legacy_paths:
+                source_path = legacy_path.with_suffix(".source.json")
+                if not source_path.exists():
+                    continue
+                try:
+                    source_metadata = json.loads(
+                        source_path.read_text(encoding="utf-8")
+                    )
+                except json.JSONDecodeError:
+                    continue
+                if source_metadata.get(
+                    "source_fingerprint"
+                ) != _chunk_source_fingerprint(chunk.markdown):
+                    continue
                 legacy = sanitize_translation_output(
                     legacy_path.read_text(encoding="utf-8")
                 )
@@ -633,13 +671,13 @@ def _translate_chunk_resumable(
                 target_language=target_language,
                 translator_name=translator.name,
             )
-            if cache_path is not None:
-                tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
-                tmp_path.write_text(translated + "\n", encoding="utf-8")
-                tmp_path.replace(cache_path)
-            if observer is not None:
-                observer.attempt_success(chunk_index=chunk.index, input_hash=input_hash, cache_path=cache_path)
-            return translated
+            return _persist_chunk_translation(
+                chunk=chunk,
+                translated=translated,
+                cache_path=cache_path,
+                observer=observer,
+                input_hash=input_hash,
+            )
         except Exception as exc:
             last_error = exc
             if _is_glossary_quality_error(exc):
@@ -663,13 +701,13 @@ def _translate_chunk_resumable(
                         target_language=target_language,
                         translator_name=translator.name,
                     )
-                    if cache_path is not None:
-                        tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
-                        tmp_path.write_text(translated + "\n", encoding="utf-8")
-                        tmp_path.replace(cache_path)
-                    if observer is not None:
-                        observer.attempt_success(chunk_index=chunk.index, input_hash=input_hash, cache_path=cache_path)
-                    return translated
+                    return _persist_chunk_translation(
+                        chunk=chunk,
+                        translated=translated,
+                        cache_path=cache_path,
+                        observer=observer,
+                        input_hash=input_hash,
+                    )
                 except Exception as split_exc:
                     last_error = split_exc
                     if "new_sensitive" in str(split_exc).lower():
@@ -767,17 +805,13 @@ def _translate_chunk_resumable(
                     translator_name=translator.name,
                     require_glossary=True,
                 )
-                if cache_path is not None:
-                    tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
-                    tmp_path.write_text(repaired + "\n", encoding="utf-8")
-                    tmp_path.replace(cache_path)
-                if observer is not None:
-                    observer.attempt_success(
-                        chunk_index=chunk.index,
-                        input_hash=input_hash,
-                        cache_path=cache_path,
-                    )
-                return repaired
+                return _persist_chunk_translation(
+                    chunk=chunk,
+                    translated=repaired,
+                    cache_path=cache_path,
+                    observer=observer,
+                    input_hash=input_hash,
+                )
             except Exception:
                 pass
     raise ValueError(f"Translation failed for chunk {chunk.index} after {retry_count} attempts: {last_error}") from last_error
@@ -913,9 +947,7 @@ def _try_fallback_translation(
                 require_glossary=True,
             )
             if cache_path is not None:
-                tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
-                tmp_path.write_text(translated + "\n", encoding="utf-8")
-                tmp_path.replace(cache_path)
+                _write_chunk_cache(cache_path, chunk=chunk, translated=translated)
             if fallback.name == "deepl":
                 _deepl_record_usage(source_chars, chunk_index=chunk.index)
             return translated
