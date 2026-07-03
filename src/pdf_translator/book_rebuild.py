@@ -760,6 +760,7 @@ def _page_content_items(
         )
         for block in blocks
         if _format_book_block(block)
+        and block.label not in {"footnote", "page_footer"}
         and not (block.label == "caption" and _normalize_text(block.text) in suppressed_caption_texts)
     ]
     items.extend(figures)
