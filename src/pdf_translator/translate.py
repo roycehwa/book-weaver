@@ -573,8 +573,26 @@ def _translate_chunk_resumable(
                         observer.cache_hit(chunk_index=chunk.index, input_hash=input_hash, cache_path=cache_path)
                     return cached
         else:
+            source_fingerprint = _chunk_source_fingerprint(chunk.markdown)
+            legacy_path_set = set(
+                cache_dir.glob(f"chunk-{chunk.index:06d}-*.md")
+            )
+            for source_metadata_path in cache_dir.glob("chunk-*.source.json"):
+                try:
+                    source_metadata = json.loads(
+                        source_metadata_path.read_text(encoding="utf-8")
+                    )
+                except json.JSONDecodeError:
+                    continue
+                if source_metadata.get("source_fingerprint") != source_fingerprint:
+                    continue
+                translated_path = Path(
+                    str(source_metadata_path)[: -len(".source.json")] + ".md"
+                )
+                if translated_path.exists():
+                    legacy_path_set.add(translated_path)
             legacy_paths = sorted(
-                cache_dir.glob(f"chunk-{chunk.index:06d}-*.md"),
+                legacy_path_set,
                 key=lambda path: path.stat().st_mtime,
                 reverse=True,
             )
@@ -590,7 +608,7 @@ def _translate_chunk_resumable(
                     continue
                 if source_metadata.get(
                     "source_fingerprint"
-                ) != _chunk_source_fingerprint(chunk.markdown):
+                ) != source_fingerprint:
                     continue
                 legacy = sanitize_translation_output(
                     legacy_path.read_text(encoding="utf-8")

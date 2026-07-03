@@ -168,7 +168,7 @@ def test_legacy_cache_with_glossary_drift_uses_local_repair(
 
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
-    legacy_path = cache_dir / "chunk-000000-legacy.md"
+    legacy_path = cache_dir / "chunk-000042-legacy.md"
     legacy_path.write_text(
         "这个邦联与邻国进行了谈判。\n",
         encoding="utf-8",
@@ -218,7 +218,7 @@ def test_legacy_cache_with_glossary_drift_uses_local_repair(
 
     assert translated == "瑞士联邦与邻国进行了谈判。"
     assert any(
-        path.name != "chunk-000000-legacy.md"
+        path.name != "chunk-000042-legacy.md"
         and path.read_text(encoding="utf-8").strip() == translated
         for path in cache_dir.glob("chunk-000000-*.md")
     )
