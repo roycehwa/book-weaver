@@ -274,6 +274,40 @@ def test_mixed_english_flags_untranslated_explanatory_footnote() -> None:
     assert items[0]["issue_type"] == "mixed_english"
 
 
+def test_review_skips_map_frontmatter_with_figure_captions() -> None:
+    from pdf_translator.review import detect_review_items
+
+    map_segment = (
+        "# 地图\n\n"
+        "## 地图\n\n"
+        "![Figure 241.1: Map 1](/tmp/book-images/figure-p0241-01.png)\n\n"
+        "> 地图 1. 1515 年米列（Milliet）与当泽尔（Donzel）的债务人\n\n"
+        "![Figure 241.1: Map 1](/tmp/book-images/figure-p0241-01.png)\n\n"
+        "> 地图 1. 1515年米列（Milliet）和栋泽尔（Donzel）的债务人"
+    )
+    items = detect_review_items(
+        [
+            {
+                "segment_id": "ch-maps:c001",
+                "source_text": map_segment,
+                "translate": True,
+            }
+        ],
+        [
+            {
+                "segment_id": "ch-maps:c001",
+                "translated_text": map_segment,
+            }
+        ],
+        target_language="zh-CN",
+        glossary_entries=[
+            {"source": "Geneva and Savoy", "target": "日内瓦与萨瓦", "status": "active"},
+        ],
+    )
+
+    assert items == []
+
+
 def test_glossary_drift_is_owned_by_system_repair() -> None:
     items = detect_review_items(
         [
@@ -285,6 +319,9 @@ def test_glossary_drift_is_owned_by_system_repair() -> None:
                 "block_index": 1,
                 "source_text": "The Soviet Union shaped policy.",
                 "translate": True,
+                "glossary_entries": [
+                    {"source": "Soviet Union", "target": "苏联", "status": "active"}
+                ],
             }
         ],
         [
@@ -295,13 +332,46 @@ def test_glossary_drift_is_owned_by_system_repair() -> None:
         ],
         target_language="zh-CN",
         glossary_entries=[
-            {"source": "Soviet Union", "target": "苏联", "status": "active"}
+            {"source": "Soviet Union", "target": "苏联", "status": "active"},
+            {"source": "Shareholder Primacy", "target": "股东至上", "status": "active"},
         ],
     )
 
     assert items[0]["issue_type"] == "glossary_drift"
     assert items[0]["responsibility"] == "system"
     assert items[0]["suggested_action"] == "auto_retranslate"
+
+
+def test_glossary_drift_uses_segment_snapshot_terms_only() -> None:
+    items = detect_review_items(
+        [
+            {
+                "segment_id": "ch-001:r001",
+                "source_text": "The Soviet Union shaped policy.",
+                "translate": True,
+                "glossary_entries": [
+                    {"source": "Soviet Union", "target": "苏联", "status": "active"},
+                ],
+            }
+        ],
+        [
+            {
+                "segment_id": "ch-001:r001",
+                "translated_text": "苏维埃联盟影响了政策。",
+            }
+        ],
+        target_language="zh-CN",
+        glossary_entries=[
+            {"source": "Soviet Union", "target": "苏联", "status": "active"},
+            {"source": "Shareholder Primacy", "target": "股东至上", "status": "active"},
+        ],
+    )
+
+    assert len(items) == 1
+    assert items[0]["issue_type"] == "glossary_drift"
+    assert items[0]["evidence"]["missing_glossary_terms"] == [
+        {"source": "Soviet Union", "target": "苏联"}
+    ]
 
 
 def test_review_does_not_infer_glossary_drift_without_translation_snapshot(

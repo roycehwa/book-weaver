@@ -524,18 +524,19 @@ def glossary_terms_missing_in_translation(
     source_text: str,
     translated_text: str,
     entries: list[dict[str, Any]],
+    *,
+    chapter_id: str | None = None,
 ) -> list[dict[str, str]]:
     """Return active glossary targets required by source_text but absent from translated_text."""
     missing: list[dict[str, str]] = []
-    lowered_source = source_text.lower()
-    for entry in entries:
-        if entry.get("status") != "active":
-            continue
+    for entry in select_glossary_entries_for_text(
+        source_text,
+        entries,
+        chapter_id=chapter_id,
+    ):
         source_term = str(entry.get("source") or "").strip()
         target_term = str(entry.get("target") or "").strip()
         if not source_term or not target_term:
-            continue
-        if source_term.lower() not in lowered_source:
             continue
         if target_term not in translated_text:
             missing.append({"source": source_term, "target": target_term})

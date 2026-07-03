@@ -15,7 +15,7 @@ from openai import OpenAI
 import requests
 
 from pdf_translator.chunking import split_markdown_into_chunks
-from pdf_translator.glossary import select_glossary_entries_for_text
+from pdf_translator.glossary import glossary_terms_missing_in_translation, select_glossary_entries_for_text
 from pdf_translator.config import (
     DEFAULT_MINIMAX_MAX_TOKENS,
     CompatibleAPISettings,
@@ -27,8 +27,13 @@ from pdf_translator.config import (
 from pdf_translator.models import BookTranslationResult, TranslatedChapter, TranslationChunk, TranslationResult
 
 
-TRANSLATION_PROMPT_VERSION = "v3-quality-retry"
-SEMANTIC_TRANSLATION_POLICY = "semantic-footnote-v1"
+TRANSLATION_PROMPT_VERSION = "v4-mandatory-glossary"
+FOOTNOTE_TRANSLATION_INSTRUCTION = (
+    "Translate explanatory footnote prose into the target language. "
+    "Preserve bibliographic titles, personal names, archival identifiers, and quoted source titles "
+    "in their original language when translation would reduce citation accuracy."
+)
+SEMANTIC_TRANSLATION_POLICY = FOOTNOTE_TRANSLATION_INSTRUCTION
 SEMANTIC_SPAN_BOUNDARY = "<!--__SEMANTIC_SPAN_BOUNDARY__-->"
 
 
@@ -85,9 +90,7 @@ def build_translation_prompt(
         f"Source language: {source}\n"
         f"Target language: {target_language}\n"
         f"Markdown chunk index: {chunk_index}\n\n"
-        "Translate explanatory footnote prose into the target language. "
-        "Preserve bibliographic titles, personal names, archival identifiers, and quoted source titles "
-        "in their original language when translation would reduce citation accuracy.\n\n"
+        f"{FOOTNOTE_TRANSLATION_INSTRUCTION}\n\n"
         f"{markdown}"
     )
     if glossary_entries:
@@ -95,7 +98,10 @@ def build_translation_prompt(
             f"- {entry['source']} => {entry.get('target') or ''}".rstrip()
             for entry in glossary_entries
         )
-        prompt += f"\n\nUse these glossary terms when relevant:\n{glossary_lines}\n"
+        prompt += (
+            "\n\nMANDATORY GLOSSARY (when a source term appears, use the exact Chinese wording):\n"
+            f"{glossary_lines}\n"
+        )
     if prompt_instruction:
         prompt += f"\n\n{prompt_instruction}\n"
     return prompt
@@ -383,6 +389,19 @@ def _assert_translation_quality(
             f"Translation for chunk {chunk.index} contains a heavily mixed English line "
             f"(suspect_words={suspect_words}, mixed_lines={mixed_lines}, max_line={max_line_suspects})."
         )
+    if chunk.glossary_entries and target_language.lower().startswith("zh"):
+        missing = glossary_terms_missing_in_translation(
+            chunk.markdown,
+            translated,
+            chunk.glossary_entries,
+        )
+        if missing:
+            terms = ", ".join(
+                f"{item['source']} => {item['target']}" for item in missing[:6]
+            )
+            raise ValueError(
+                f"Translation for chunk {chunk.index} missing mandatory glossary terms: {terms}"
+            )
 
 
 def _is_transient_translation_error(exc: Exception) -> bool:

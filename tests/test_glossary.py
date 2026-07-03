@@ -259,4 +259,23 @@ def test_glossary_terms_missing_in_translation_ignores_irrelevant_terms() -> Non
         "Corporate boards shaped policy.",
         "董事会塑造了政策。",
         entries,
+        chapter_id=None,
     ) == []
+
+
+def test_glossary_terms_missing_prefers_longest_non_overlapping_match() -> None:
+    entries = [
+        {"source": "Steel Works", "target": "钢铁厂", "status": "active"},
+        {
+            "source": "Anshan Iron and Steel Works",
+            "target": "鞍钢",
+            "status": "active",
+        },
+    ]
+    missing = glossary_terms_missing_in_translation(
+        "Anshan Iron and Steel Works (Angang), located in Manchuria.",
+        "安山钢铁公司位于满洲。",
+        entries,
+        chapter_id=None,
+    )
+    assert missing == [{"source": "Anshan Iron and Steel Works", "target": "鞍钢"}]

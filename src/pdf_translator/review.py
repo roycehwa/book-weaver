@@ -224,6 +224,7 @@ def build_aligned_review_segments(
             translated_text: str,
             *,
             translate_override: bool | None = None,
+            segment_glossary: list[dict[str, Any]] | None = None,
         ) -> None:
             nonlocal block_index
             block_index += 1
@@ -241,6 +242,8 @@ def build_aligned_review_segments(
                     else bool(translate_override)
                 ),
             }
+            if segment_glossary:
+                base["glossary_entries"] = segment_glossary
             source_segments.append(
                 {
                     **base,
@@ -277,13 +280,18 @@ def build_aligned_review_segments(
                 append_segment(text, text, translate_override=False)
                 continue
             for chunk in split_markdown_into_chunks(text, max_chunk_chars):
+                chunk_terms = glossary_constraints.get(global_chunk_index) or None
                 translation_chunk = TranslationChunk(
                     index=global_chunk_index,
                     markdown=chunk.markdown,
-                    glossary_entries=glossary_constraints.get(global_chunk_index) or None,
+                    glossary_entries=chunk_terms,
                 )
                 translated_text = _read_chunk_cache(cache_dir, translation_chunk)
-                append_segment(chunk.markdown, translated_text)
+                append_segment(
+                    chunk.markdown,
+                    translated_text,
+                    segment_glossary=chunk_terms,
+                )
                 global_chunk_index += 1
 
     return _merge_reading_review_segments(source_segments, translated_segments)
@@ -460,10 +468,22 @@ def _is_non_prose_review_segment(text: str) -> bool:
         return True
     if len(lines) == 1 and lines[0].startswith("!["):
         return True
-    image_or_caption = sum(
-        1 for line in lines if line.startswith("![") or line.lower().startswith(("figure ", "table "))
+    if any("注：" in line and ("脚注" in line or "专有名词" in line) for line in lines):
+        return True
+    image_lines = sum(1 for line in lines if line.startswith("!["))
+    blockquote_captions = sum(1 for line in lines if line.startswith(">"))
+    image_or_caption = image_lines + sum(
+        1 for line in lines if line.lower().startswith(("figure ", "table ", "map "))
     )
     link_destinations = len(MARKDOWN_LINK_DEST_RE.findall(stripped))
+    if re.search(r"^#\s*地图\s*$", stripped, re.MULTILINE):
+        return True
+    if re.search(r"^#\s*maps?\s*$", stripped, re.IGNORECASE | re.MULTILINE):
+        return True
+    if image_lines >= 2 and image_or_caption >= max(2, len(lines) // 2):
+        return True
+    if image_lines >= 1 and blockquote_captions >= 1 and image_or_caption >= max(2, (len(lines) * 2) // 3):
+        return True
     if image_or_caption >= max(1, len(lines) // 2):
         return True
     if link_destinations >= 6 and CJK_RE.search(stripped) is None:
@@ -531,21 +551,33 @@ def detect_review_items(
             issue_type is None
             and text_operation == "translate"
             and target_language.lower().startswith("zh")
-            and glossary_entries
             and translated_text
         ):
-            missing_terms = glossary_terms_missing_in_translation(
-                source_text,
-                translated_text,
-                glossary_entries,
-            )
-            if missing_terms:
-                issue_type = "glossary_drift"
-                severity = "high"
-                evidence = {
-                    **evidence,
-                    "missing_glossary_terms": missing_terms,
-                }
+            segment_glossary = source.get("glossary_entries")
+            if segment_glossary is not None:
+                entries_to_check = segment_glossary
+            elif glossary_entries:
+                entries_to_check = select_glossary_entries_for_text(
+                    source_text,
+                    glossary_entries,
+                    chapter_id=str(source.get("chapter_id") or "") or None,
+                )
+            else:
+                entries_to_check = []
+            if entries_to_check:
+                missing_terms = glossary_terms_missing_in_translation(
+                    source_text,
+                    translated_text,
+                    entries_to_check,
+                    chapter_id=str(source.get("chapter_id") or "") or None,
+                )
+                if missing_terms:
+                    issue_type = "glossary_drift"
+                    severity = "high"
+                    evidence = {
+                        **evidence,
+                        "missing_glossary_terms": missing_terms,
+                    }
 
         if issue_type is None:
             continue

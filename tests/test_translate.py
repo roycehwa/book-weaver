@@ -303,6 +303,23 @@ def test_translation_prompt_defines_footnote_policy() -> None:
     assert "bibliographic titles" in prompt
 
 
+def test_translation_prompt_makes_glossary_mandatory() -> None:
+    from pdf_translator.translate import build_translation_prompt
+
+    prompt = build_translation_prompt(
+        markdown="The Soviet Union shaped policy.",
+        chunk_index=0,
+        source_language="en",
+        target_language="zh-CN",
+        glossary_entries=[
+            {"source": "Soviet Union", "target": "苏联", "status": "active"},
+        ],
+    )
+
+    assert "MANDATORY GLOSSARY" in prompt
+    assert "Soviet Union => 苏联" in prompt
+
+
 class FailingTranslator(BaseTranslator):
     name = "failing"
 
