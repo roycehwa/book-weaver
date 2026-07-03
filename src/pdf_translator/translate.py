@@ -547,6 +547,66 @@ def _translate_chunk_resumable(
                     if observer is not None:
                         observer.cache_hit(chunk_index=chunk.index, input_hash=input_hash, cache_path=cache_path)
                     return cached
+        else:
+            legacy_paths = sorted(
+                cache_dir.glob(f"chunk-{chunk.index:06d}-*.md"),
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )
+            for legacy_path in legacy_paths:
+                legacy = sanitize_translation_output(
+                    legacy_path.read_text(encoding="utf-8")
+                )
+                if not legacy:
+                    continue
+                try:
+                    _assert_translation_quality(
+                        chunk=chunk,
+                        translated=legacy,
+                        target_language=target_language,
+                        translator_name=translator.name,
+                    )
+                    return _persist_chunk_translation(
+                        chunk=chunk,
+                        translated=legacy,
+                        cache_path=cache_path,
+                        observer=observer,
+                        input_hash=input_hash,
+                    )
+                except ValueError as exc:
+                    if not _is_glossary_quality_error(exc):
+                        continue
+                    missing = glossary_terms_missing_in_translation(
+                        chunk.markdown,
+                        legacy,
+                        chunk.glossary_entries or [],
+                    )
+                    try:
+                        repaired = sanitize_translation_output(
+                            _repair_glossary_in_chunk(
+                                chunk=chunk,
+                                translated=legacy,
+                                missing=missing,
+                                source_language=source_language,
+                                target_language=target_language,
+                                translator=translator,
+                            )
+                        )
+                        _assert_translation_quality(
+                            chunk=chunk,
+                            translated=repaired,
+                            target_language=target_language,
+                            translator_name=translator.name,
+                        )
+                    except Exception:
+                        continue
+                    return _persist_chunk_translation(
+                        chunk=chunk,
+                        translated=repaired,
+                        cache_path=cache_path,
+                        observer=observer,
+                        input_hash=input_hash,
+                    )
 
     last_error: Exception | None = None
     had_sensitive_failure = False
