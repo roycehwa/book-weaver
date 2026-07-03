@@ -682,6 +682,39 @@ def _translate_chunk_resumable(
             last_error = exc
             if _is_glossary_quality_error(exc):
                 last_glossary_candidate = translated
+                missing = glossary_terms_missing_in_translation(
+                    chunk.markdown,
+                    translated,
+                    chunk.glossary_entries or [],
+                )
+                if missing:
+                    try:
+                        repaired = sanitize_translation_output(
+                            _repair_glossary_in_chunk(
+                                chunk=chunk,
+                                translated=translated,
+                                missing=missing,
+                                source_language=source_language,
+                                target_language=target_language,
+                                translator=translator,
+                            )
+                        )
+                        _assert_translation_quality(
+                            chunk=chunk,
+                            translated=repaired,
+                            target_language=target_language,
+                            translator_name=translator.name,
+                        )
+                    except Exception:
+                        pass
+                    else:
+                        return _persist_chunk_translation(
+                            chunk=chunk,
+                            translated=repaired,
+                            cache_path=cache_path,
+                            observer=observer,
+                            input_hash=input_hash,
+                        )
             if "new_sensitive" in str(exc).lower():
                 had_sensitive_failure = True
             permanent = _is_permanent_translation_error(exc)

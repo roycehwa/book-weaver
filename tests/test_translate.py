@@ -264,6 +264,56 @@ def test_legacy_cache_is_ignored_when_source_fingerprint_differs(
     assert translated == "当前源文本的正确译文。"
 
 
+def test_first_translation_glossary_drift_is_repaired_immediately(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pdf_translator.translate import _translate_chunk_resumable
+
+    calls: list[TranslationChunk] = []
+
+    class RepairingTranslator(BaseTranslator):
+        name = "minimax"
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            calls.append(chunk)
+            if chunk.prompt_instruction:
+                return "瑞士联邦与邻国进行了谈判。"
+            return "这个邦联与邻国进行了谈判。"
+
+    monkeypatch.setattr(
+        "pdf_translator.translate._resolve_fallback_translator",
+        lambda **_kwargs: None,
+    )
+    translated = _translate_chunk_resumable(
+        chunk=TranslationChunk(
+            index=0,
+            markdown="The Swiss Confederation negotiated with its neighbours.",
+            glossary_entries=[
+                {
+                    "source": "Swiss Confederation",
+                    "target": "瑞士联邦",
+                    "status": "active",
+                }
+            ],
+        ),
+        source_language="en",
+        target_language="zh-CN",
+        translator=RepairingTranslator(),
+        cache_dir=tmp_path,
+        retry_count=6,
+    )
+
+    assert translated == "瑞士联邦与邻国进行了谈判。"
+    assert len(calls) == 2
+    assert calls[1].prompt_instruction is not None
+
+
 def test_semantic_footnote_translates_only_explanatory_spans() -> None:
     class SemanticTranslator(BaseTranslator):
         name = "semantic"
