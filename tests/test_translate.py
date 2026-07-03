@@ -31,6 +31,18 @@ def test_prompt_glossary_appendix_is_removed_before_accepting_translation() -> N
     assert sanitize_translation_output(fixture["translated"]) == fixture["clean"]
 
 
+def test_chinese_prompt_glossary_appendix_is_removed() -> None:
+    from pdf_translator.glossary_convergence import sanitize_translation_output
+
+    translated = (
+        "这是正文译文。\n\n"
+        "强制术语表（当源术语出现时，使用确切的中文措辞）：\n"
+        "- Common Lordships => 共同领主辖地"
+    )
+
+    assert sanitize_translation_output(translated) == "这是正文译文。"
+
+
 def test_translate_markdown_never_persists_prompt_glossary_appendix(
     tmp_path: Path,
 ) -> None:

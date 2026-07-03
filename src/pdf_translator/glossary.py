@@ -477,6 +477,11 @@ def select_glossary_entries_for_text(
     chapter_id: str | None,
     limit: int = 20,
 ) -> list[dict[str, Any]]:
+    text = re.sub(
+        r"!?\[([^\]]*)\]\((?:\\.|[^)])*\)",
+        lambda match: match.group(1),
+        text,
+    )
     selected: list[tuple[int, dict[str, Any]]] = []
     occupied: list[tuple[int, int]] = []
     for entry in sorted(

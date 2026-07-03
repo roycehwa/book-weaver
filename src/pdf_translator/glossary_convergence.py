@@ -5,7 +5,7 @@ import re
 
 _GLOSSARY_HEADING_RE = re.compile(
     r"(?im)^[ \t]*(?:\*\*)?"
-    r"(?:MANDATORY[ \t]+GLOSSARY(?:[^\n]*)?|术语对照(?:[^\n]*)?)"
+    r"(?:MANDATORY[ \t]+GLOSSARY(?:[^\n]*)?|术语对照(?:[^\n]*)?|强制术语表(?:[^\n]*)?)"
     r"(?:\*\*)?[：:]?[ \t]*$"
 )
 _GLOSSARY_MAPPING_RE = re.compile(r"(?m)^[ \t]*[-*][ \t]+.+?(?:=>|→).+$")

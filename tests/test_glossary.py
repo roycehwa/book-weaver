@@ -263,6 +263,32 @@ def test_glossary_terms_missing_in_translation_ignores_irrelevant_terms() -> Non
     ) == []
 
 
+def test_glossary_terms_ignore_markdown_image_destinations() -> None:
+    entries = [
+        {
+            "source": "Geneva and Savoy",
+            "target": "日内瓦与萨瓦",
+            "status": "active",
+        },
+        {
+            "source": "Mathieu Caesar",
+            "target": "马蒂厄·凯撒",
+            "status": "active",
+        },
+    ]
+    source = (
+        "The economy remained stable.\n\n"
+        "![Figure 1](/tmp/The Uncertain World of Geneva and Savoy/"
+        "Mathieu Caesar/figure.png)"
+    )
+
+    assert glossary_terms_missing_in_translation(
+        source,
+        "经济保持稳定。",
+        entries,
+    ) == []
+
+
 def test_glossary_terms_missing_prefers_longest_non_overlapping_match() -> None:
     entries = [
         {"source": "Steel Works", "target": "钢铁厂", "status": "active"},
