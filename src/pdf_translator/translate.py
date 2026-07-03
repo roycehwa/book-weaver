@@ -16,6 +16,7 @@ import requests
 
 from pdf_translator.chunking import split_markdown_into_chunks
 from pdf_translator.glossary import glossary_terms_missing_in_translation, select_glossary_entries_for_text
+from pdf_translator.glossary_convergence import sanitize_translation_output
 from pdf_translator.config import (
     DEFAULT_MINIMAX_MAX_TOKENS,
     CompatibleAPISettings,
@@ -27,7 +28,7 @@ from pdf_translator.config import (
 from pdf_translator.models import BookTranslationResult, TranslatedChapter, TranslationChunk, TranslationResult
 
 
-TRANSLATION_PROMPT_VERSION = "v4-mandatory-glossary"
+TRANSLATION_PROMPT_VERSION = "v5-delimited-glossary-controls"
 FOOTNOTE_TRANSLATION_INSTRUCTION = (
     "Translate explanatory footnote prose into the target language. "
     "Preserve bibliographic titles, personal names, archival identifiers, and quoted source titles "
@@ -86,25 +87,29 @@ def build_translation_prompt(
     prompt_instruction: str | None = None,
 ) -> str:
     source = source_language or "auto-detect"
-    prompt = (
+    controls = (
         f"Source language: {source}\n"
         f"Target language: {target_language}\n"
         f"Markdown chunk index: {chunk_index}\n\n"
-        f"{FOOTNOTE_TRANSLATION_INSTRUCTION}\n\n"
-        f"{markdown}"
+        f"{FOOTNOTE_TRANSLATION_INSTRUCTION}"
     )
     if glossary_entries:
         glossary_lines = "\n".join(
             f"- {entry['source']} => {entry.get('target') or ''}".rstrip()
             for entry in glossary_entries
         )
-        prompt += (
+        controls += (
             "\n\nMANDATORY GLOSSARY (when a source term appears, use the exact Chinese wording):\n"
-            f"{glossary_lines}\n"
+            f"{glossary_lines}"
         )
     if prompt_instruction:
-        prompt += f"\n\n{prompt_instruction}\n"
-    return prompt
+        controls += f"\n\n{prompt_instruction}"
+    return (
+        f"{controls}\n\n"
+        "Return only the translated contents of SOURCE_MARKDOWN. "
+        "Do not repeat control instructions or glossary mappings.\n\n"
+        f"<SOURCE_MARKDOWN>\n{markdown}\n</SOURCE_MARKDOWN>"
+    )
 
 
 def _translation_prompt(
@@ -334,6 +339,7 @@ def _allow_mixed_english_for_target(source: str, translated: str, target_languag
 
 
 def _strip_generated_english_chinese_glosses(source: str, translated: str, target_language: str) -> str:
+    translated = sanitize_translation_output(translated)
     if not target_language.lower().startswith("zh"):
         return translated
     source_count = _english_then_chinese_gloss_count(source)
@@ -383,19 +389,6 @@ def _assert_translation_quality(
             f"(source_glosses={_english_then_chinese_gloss_count(chunk.markdown)}, "
             f"translated_glosses={_english_then_chinese_gloss_count(translated)})."
         )
-    if target_language.lower().startswith("zh") and _ascii_letter_count(chunk.markdown) < 1000 and _cjk_count(translated) >= 160:
-        return
-    suspect_words, mixed_lines, max_line_suspects = _mixed_untranslated_english_signal(translated)
-    if suspect_words >= 18 and mixed_lines >= 2 and not _allow_mixed_english_for_target(chunk.markdown, translated, target_language):
-        raise ValueError(
-            f"Translation for chunk {chunk.index} contains mixed untranslated English "
-            f"(suspect_words={suspect_words}, mixed_lines={mixed_lines}, max_line={max_line_suspects})."
-        )
-    if max_line_suspects >= 10 and not _allow_mixed_english_for_target(chunk.markdown, translated, target_language):
-        raise ValueError(
-            f"Translation for chunk {chunk.index} contains a heavily mixed English line "
-            f"(suspect_words={suspect_words}, mixed_lines={mixed_lines}, max_line={max_line_suspects})."
-        )
     if (
         require_glossary
         and chunk.glossary_entries
@@ -413,6 +406,19 @@ def _assert_translation_quality(
             raise ValueError(
                 f"Translation for chunk {chunk.index} missing mandatory glossary terms: {terms}"
             )
+    if target_language.lower().startswith("zh") and _ascii_letter_count(chunk.markdown) < 1000 and _cjk_count(translated) >= 160:
+        return
+    suspect_words, mixed_lines, max_line_suspects = _mixed_untranslated_english_signal(translated)
+    if suspect_words >= 18 and mixed_lines >= 2 and not _allow_mixed_english_for_target(chunk.markdown, translated, target_language):
+        raise ValueError(
+            f"Translation for chunk {chunk.index} contains mixed untranslated English "
+            f"(suspect_words={suspect_words}, mixed_lines={mixed_lines}, max_line={max_line_suspects})."
+        )
+    if max_line_suspects >= 10 and not _allow_mixed_english_for_target(chunk.markdown, translated, target_language):
+        raise ValueError(
+            f"Translation for chunk {chunk.index} contains a heavily mixed English line "
+            f"(suspect_words={suspect_words}, mixed_lines={mixed_lines}, max_line={max_line_suspects})."
+        )
 
 
 def _is_glossary_quality_error(exc: Exception) -> bool:
@@ -714,26 +720,6 @@ def _translate_chunk_resumable(
                 return repaired
             except Exception:
                 pass
-        accepted = last_glossary_candidate
-        _assert_translation_quality(
-            chunk=chunk,
-            translated=accepted,
-            target_language=target_language,
-            translator_name=translator.name,
-            require_glossary=False,
-        )
-        if cache_path is not None:
-            tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
-            tmp_path.write_text(accepted + "\n", encoding="utf-8")
-            tmp_path.replace(cache_path)
-        if observer is not None:
-            observer.attempt_success(
-                chunk_index=chunk.index,
-                input_hash=input_hash,
-                cache_path=cache_path,
-            )
-        return accepted
-
     raise ValueError(f"Translation failed for chunk {chunk.index} after {retry_count} attempts: {last_error}") from last_error
 
 
@@ -864,7 +850,7 @@ def _try_fallback_translation(
                 translated=translated,
                 target_language=target_language,
                 translator_name=fallback.name,
-                require_glossary=False,
+                require_glossary=True,
             )
             if cache_path is not None:
                 tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")

@@ -17,6 +17,147 @@ from pdf_translator.translate import (
 )
 
 
+def test_prompt_glossary_appendix_is_removed_before_accepting_translation() -> None:
+    from pdf_translator.glossary_convergence import sanitize_translation_output
+
+    fixture_path = (
+        Path(__file__).parent
+        / "fixtures"
+        / "translation"
+        / "glossary_prompt_leak.json"
+    )
+    fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+
+    assert sanitize_translation_output(fixture["translated"]) == fixture["clean"]
+
+
+def test_translate_markdown_never_persists_prompt_glossary_appendix(
+    tmp_path: Path,
+) -> None:
+    class LeakingTranslator(BaseTranslator):
+        name = "leaking"
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            return (
+                "这家国有企业调整了采购政策。\n\n"
+                "MANDATORY GLOSSARY (when a source term appears, use the exact Chinese wording):\n"
+                "- state-owned enterprise => 国有企业"
+            )
+
+    result = translate_markdown(
+        chunks=[
+            TranslationChunk(
+                index=0,
+                markdown="The state-owned enterprise changed its procurement policy.",
+            )
+        ],
+        settings=RunSettings(
+            source_pdf=tmp_path / "source.pdf",
+            output_dir=tmp_path,
+            source_language="en",
+            target_language="zh-CN",
+            translator="mock",
+            max_chunk_chars=9000,
+            glossary_entries=[
+                {
+                    "source": "state-owned enterprise",
+                    "target": "国有企业",
+                    "status": "active",
+                }
+            ],
+        ),
+        translator=LeakingTranslator(),
+        cache_dir=tmp_path,
+    )
+
+    assert result.translated_markdown == "这家国有企业调整了采购政策。\n"
+    assert "MANDATORY GLOSSARY" not in next(tmp_path.glob("chunk-*.md")).read_text(
+        encoding="utf-8"
+    )
+
+
+def test_short_translation_cannot_bypass_mandatory_glossary_validation() -> None:
+    from pdf_translator.translate import _assert_translation_quality
+
+    chunk = TranslationChunk(
+        index=0,
+        markdown="The Swiss Confederation negotiated with its neighbours.",
+        glossary_entries=[
+            {
+                "source": "Swiss Confederation",
+                "target": "瑞士联邦",
+                "status": "active",
+            }
+        ],
+    )
+    fluent_but_drifting = "这个邦联与邻国进行了谈判。" * 20
+
+    with pytest.raises(ValueError, match="Swiss Confederation => 瑞士联邦"):
+        _assert_translation_quality(
+            chunk=chunk,
+            translated=fluent_but_drifting,
+            target_language="zh-CN",
+            translator_name="minimax",
+        )
+
+
+def test_known_glossary_drift_is_never_cached_as_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class AlwaysDriftingTranslator(BaseTranslator):
+        name = "minimax"
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            return "这个邦联与邻国进行了长期而复杂的谈判。" * 20
+
+    settings = RunSettings(
+        source_pdf=tmp_path / "source.pdf",
+        output_dir=tmp_path,
+        source_language="en",
+        target_language="zh-CN",
+        translator="minimax",
+        max_chunk_chars=9000,
+        glossary_entries=[
+            {
+                "source": "Swiss Confederation",
+                "target": "瑞士联邦",
+                "status": "active",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        "pdf_translator.translate._resolve_fallback_translator",
+        lambda **_kwargs: None,
+    )
+
+    with pytest.raises(ValueError, match="missing mandatory glossary terms"):
+        translate_markdown(
+            chunks=[
+                TranslationChunk(
+                    index=0,
+                    markdown="The Swiss Confederation negotiated with its neighbours.",
+                )
+            ],
+            settings=settings,
+            translator=AlwaysDriftingTranslator(),
+            cache_dir=tmp_path / "cache",
+            retry_count=1,
+        )
+
+    assert list((tmp_path / "cache").glob("chunk-*.md")) == []
+
+
 def test_semantic_footnote_translates_only_explanatory_spans() -> None:
     class SemanticTranslator(BaseTranslator):
         name = "semantic"
@@ -318,6 +459,27 @@ def test_translation_prompt_makes_glossary_mandatory() -> None:
 
     assert "MANDATORY GLOSSARY" in prompt
     assert "Soviet Union => 苏联" in prompt
+
+
+def test_translation_prompt_places_controls_before_delimited_source() -> None:
+    from pdf_translator.translate import build_translation_prompt
+
+    source = "The Soviet Union supplied technical assistance."
+    prompt = build_translation_prompt(
+        source,
+        source_language="en",
+        target_language="zh-CN",
+        glossary_entries=[
+            {
+                "source": "Soviet Union",
+                "target": "苏联",
+                "status": "active",
+            }
+        ],
+    )
+
+    assert prompt.index("MANDATORY GLOSSARY") < prompt.index("<SOURCE_MARKDOWN>")
+    assert prompt.endswith(f"<SOURCE_MARKDOWN>\n{source}\n</SOURCE_MARKDOWN>")
 
 
 class FailingTranslator(BaseTranslator):
@@ -1252,15 +1414,16 @@ def test_minimax_translator_uses_anthropic_messages_api(monkeypatch: pytest.Monk
     assert body["model"] == "MiniMax-M2.7-highspeed"
     assert body["max_tokens"] == 2048
     assert captured["headers"].get("anthropic-version") == "2023-06-01"
+    from pdf_translator.translate import build_translation_prompt
+
     assert body["messages"] == [
         {
             "role": "user",
-            "content": (
-                "Source language: en\nTarget language: zh-CN\nMarkdown chunk index: 3\n\n"
-                "Translate explanatory footnote prose into the target language. "
-                "Preserve bibliographic titles, personal names, archival identifiers, and quoted "
-                "source titles in their original language when translation would reduce citation "
-                "accuracy.\n\n# Title\n\nBody."
+            "content": build_translation_prompt(
+                "# Title\n\nBody.",
+                source_language="en",
+                target_language="zh-CN",
+                chunk_index=3,
             ),
         }
     ]
