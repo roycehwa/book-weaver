@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from typing import Any
 
 from pdf_translator.page_integrity import PageIntegrityError, build_page_ledger
@@ -167,3 +168,43 @@ def assert_approved_export_ready(ledger: dict[str, Any]) -> None:
             for key, values in blocking.items()
         )
         raise IntegrityGateError(f"Approved export blocked by integrity failures: {details}")
+
+
+def refresh_review_readiness(
+    ledger: dict[str, Any],
+    *,
+    review_items: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+    review_state: dict[str, Any],
+) -> dict[str, Any]:
+    """Project current review decisions into an existing technical ledger."""
+
+    refreshed = copy.deepcopy(ledger)
+    failures = refreshed.setdefault("failures", {})
+    decisions = review_state.get("decisions")
+    decisions = decisions if isinstance(decisions, dict) else {}
+    unresolved: list[str] = []
+    for item in review_items:
+        segment_id = str(item.get("segment_id") or "")
+        decision = decisions.get(segment_id)
+        decision = decision if isinstance(decision, dict) else {}
+        current_status = str(
+            decision.get("status") or item.get("status") or "open"
+        )
+        if current_status not in {"approved", "resolved", "dismissed"}:
+            unresolved.append(
+                str(
+                    item.get("item_id")
+                    or item.get("review_id")
+                    or segment_id
+                    or "unknown"
+                )
+            )
+    failures["unresolved_review"] = unresolved
+    technical_ready = not any(
+        values for key, values in failures.items() if key != "unresolved_review"
+    )
+    approved_ready = technical_ready and not unresolved
+    refreshed["technical_ready"] = technical_ready
+    refreshed["approved_ready"] = approved_ready
+    refreshed["ready"] = approved_ready
+    return refreshed

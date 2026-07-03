@@ -960,6 +960,14 @@ def _run_review_export(
             if integrity_path.exists()
             else None
         )
+        if integrity_ledger is not None:
+            from pdf_translator.integrity import refresh_review_readiness
+
+            integrity_ledger = refresh_review_readiness(
+                integrity_ledger,
+                review_items=project.get("review_items", []),
+                review_state=project.get("review_state", {}),
+            )
         _validate_approved_review_project(
             project,
             integrity_ledger=integrity_ledger,

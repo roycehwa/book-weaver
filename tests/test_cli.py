@@ -262,6 +262,17 @@ def test_review_export_restores_chapter_notes_before_delivery(tmp_path: Path, mo
     (run_dir / "review_items.json").write_text(json.dumps({"items": []}), encoding="utf-8")
     (run_dir / "review_state.json").write_text(json.dumps({"decisions": {}, "summary": {}}), encoding="utf-8")
     (run_dir / "pre_review.json").write_text(json.dumps({"status": "completed"}), encoding="utf-8")
+    (run_dir / "integrity-ledger.json").write_text(
+        json.dumps(
+            {
+                "technical_ready": True,
+                "approved_ready": False,
+                "ready": False,
+                "failures": {"unresolved_review": ["stale-review-item"]},
+            }
+        ),
+        encoding="utf-8",
+    )
     (run_dir / "translated-chapters.json").write_text(
         json.dumps(
             {

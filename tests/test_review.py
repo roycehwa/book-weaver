@@ -466,6 +466,39 @@ def test_translation_review_skips_preserved_resource_chapters() -> None:
     assert artifacts["review_items"]["items"] == []
 
 
+def test_review_skips_map_resource_ocr_even_when_it_contains_glossary_terms() -> None:
+    items = detect_review_items(
+        [
+            {
+                "segment_id": "ch-map:r001",
+                "chapter_id": "ch-map",
+                "chapter_title": "Maps",
+                "source_text": (
+                    "Common Lordships of Bern and Fribourg\n\n"
+                    "r\n\ne\n\nd\n\n![Map](map.png)"
+                ),
+                "translate": True,
+                "glossary_entries": [
+                    {
+                        "source": "Common Lordships",
+                        "target": "共同领主辖地",
+                        "status": "active",
+                    }
+                ],
+            }
+        ],
+        [
+            {
+                "segment_id": "ch-map:r001",
+                "translated_text": "伯尔尼和弗里堡的领地\n\nr\n\ne\n\nd",
+            }
+        ],
+        target_language="zh-CN",
+    )
+
+    assert items == []
+
+
 def test_review_items_ignore_media_and_image_only_segments() -> None:
     items = detect_review_items(
         [
