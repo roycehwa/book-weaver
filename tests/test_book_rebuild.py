@@ -1002,8 +1002,7 @@ def test_unreadable_control_blob_is_auto_confirmed_without_repetition() -> None:
     assert item["raw_text"] == artifact
 
 
-def test_book_rebuild_promotes_inline_footnote_text_to_footer_band(monkeypatch) -> None:
-    """Footnotes emitted as regular text blocks get a separator before the note block."""
+def test_book_rebuild_detaches_mislabelled_bottom_footnotes(monkeypatch) -> None:
     structured = {
         "body": {"children": [{"$ref": "#/texts/0"}, {"$ref": "#/texts/1"}, {"$ref": "#/texts/2"}]},
         "texts": [
@@ -1030,10 +1029,11 @@ def test_book_rebuild_promotes_inline_footnote_text_to_footer_band(monkeypatch) 
     result = build_book_reconstruction(structured)
     md = result["chapters"][0]["markdown"]
     assert "Main body paragraph" in md
-    assert "First footnote line" in md
-    assert md.index("Main body paragraph") < md.index("---")
-    assert md.index("---") < md.index("First footnote line")
-    assert "> 1 First footnote line" in md
+    assert "First footnote line" not in md
+    assert [note["marker"] for note in result["semantic_content"]["footnotes"]] == [
+        "1",
+        "2",
+    ]
     assert "footnote_line_ratio" in result["metadata"]
     assert 0.0 <= result["metadata"]["footnote_line_ratio"] <= 1.0
     assert result["metadata"]["footnote_load"] in ("typical", "footnote_heavy")

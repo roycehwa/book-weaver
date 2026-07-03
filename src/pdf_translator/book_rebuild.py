@@ -760,7 +760,7 @@ def _page_content_items(
         )
         for block in blocks
         if _format_book_block(block)
-        and block.label not in {"footnote", "page_footer"}
+        and not _is_semantic_footnote_block(block)
         and not (block.label == "caption" and _normalize_text(block.text) in suppressed_caption_texts)
     ]
     items.extend(figures)
@@ -815,7 +815,7 @@ def _semantic_footnotes_from_pages(
     seen: set[str] = set()
     for page_no, blocks in sorted(ordered_pages.items()):
         for block in blocks:
-            if block.label not in {"footnote", "page_footer"}:
+            if not _is_semantic_footnote_block(block):
                 continue
             if block.label == "page_footer" and not _book_page_footer_is_note_like(block.text):
                 continue
@@ -833,6 +833,22 @@ def _semantic_footnotes_from_pages(
                 seen.add(str(note["footnote_id"]))
                 notes.append(note)
     return notes
+
+
+def _is_semantic_footnote_block(block: LayoutBlock) -> bool:
+    if block.label == "footnote":
+        return True
+    if block.label == "page_footer":
+        return _book_page_footer_is_note_like(block.text)
+    return (
+        block.label in {"text", "code"}
+        and (
+            block.top <= 300 and block.bottom <= 220
+            if block.bottom
+            else block.top <= 220
+        )
+        and _text_block_footnote_heavy(block.text)
+    )
 
 
 _SUPERSCRIPT_DIGITS = str.maketrans("0123456789", "⁰¹²³⁴⁵⁶⁷⁸⁹")

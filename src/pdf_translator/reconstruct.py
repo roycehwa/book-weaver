@@ -17,6 +17,7 @@ class LayoutBlock:
     page_no: int
     left: float
     top: float
+    bottom: float = 0.0
 
 
 def _resolve_ref(structured: dict[str, Any], ref: str) -> tuple[str, dict[str, Any]] | None:
@@ -67,6 +68,7 @@ def _extract_text_blocks(structured: dict[str, Any]) -> list[LayoutBlock]:
                 page_no=int(first_prov.get("page_no", 0)),
                 left=float(bbox.get("l", 0.0)),
                 top=float(bbox.get("t", 0.0)),
+                bottom=float(bbox.get("b", 0.0)),
             )
         )
 
