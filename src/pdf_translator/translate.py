@@ -419,6 +419,42 @@ def _is_glossary_quality_error(exc: Exception) -> bool:
     return isinstance(exc, ValueError) and "missing mandatory glossary terms" in str(exc)
 
 
+def _is_untranslated_quality_error(exc: Exception) -> bool:
+    if not isinstance(exc, ValueError):
+        return False
+    message = str(exc).lower()
+    return "looks untranslated" in message or "looks incomplete" in message
+
+
+def _should_try_fallback_translation(exc: Exception | None, *, had_sensitive_failure: bool) -> bool:
+    if had_sensitive_failure:
+        return True
+    if exc is None:
+        return False
+    return _is_untranslated_quality_error(exc) or _is_glossary_quality_error(exc)
+
+
+def _persist_chunk_translation(
+    *,
+    chunk: TranslationChunk,
+    translated: str,
+    cache_path: Path | None,
+    observer: TranslationObserver | None,
+    input_hash: str,
+) -> str:
+    if cache_path is not None:
+        tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+        tmp_path.write_text(translated + "\n", encoding="utf-8")
+        tmp_path.replace(cache_path)
+    if observer is not None:
+        observer.attempt_success(
+            chunk_index=chunk.index,
+            input_hash=input_hash,
+            cache_path=cache_path,
+        )
+    return translated
+
+
 def _repair_glossary_in_chunk(
     *,
     chunk: TranslationChunk,
@@ -595,7 +631,7 @@ def _translate_chunk_resumable(
             time.sleep(min(2**attempt, 8))
 
     fallback_translated: str | None = None
-    if had_sensitive_failure:
+    if _should_try_fallback_translation(last_error, had_sensitive_failure=had_sensitive_failure):
         fallback_translated = _try_fallback_translation(
             chunk=chunk,
             source_language=source_language,
@@ -607,6 +643,36 @@ def _translate_chunk_resumable(
         if observer is not None:
             observer.attempt_success(chunk_index=chunk.index, input_hash=input_hash, cache_path=cache_path)
         return fallback_translated
+
+    if last_error and _is_untranslated_quality_error(last_error):
+        try:
+            split_translated = _translate_sensitive_chunk_parts(
+                chunk=chunk,
+                source_language=source_language,
+                target_language=target_language,
+                translator=translator,
+            )
+            split_translated = _strip_generated_english_chinese_glosses(
+                chunk.markdown,
+                split_translated,
+                target_language,
+            )
+            _assert_translation_quality(
+                chunk=chunk,
+                translated=split_translated,
+                target_language=target_language,
+                translator_name=translator.name,
+                require_glossary=False,
+            )
+            return _persist_chunk_translation(
+                chunk=chunk,
+                translated=split_translated,
+                cache_path=cache_path,
+                observer=observer,
+                input_hash=input_hash,
+            )
+        except Exception:
+            pass
 
     if last_error and _is_glossary_quality_error(last_error) and last_glossary_candidate:
         missing = glossary_terms_missing_in_translation(
@@ -798,6 +864,7 @@ def _try_fallback_translation(
                 translated=translated,
                 target_language=target_language,
                 translator_name=fallback.name,
+                require_glossary=False,
             )
             if cache_path is not None:
                 tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
