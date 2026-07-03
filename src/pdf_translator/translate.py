@@ -114,13 +114,19 @@ def _translation_prompt(
     *,
     quality_retry: str | None = None,
 ) -> str:
-    retry_note = (
-        "\nQuality retry: the previous output failed validation because it was not fully translated. "
-        "Translate every natural-language sentence completely into the target language now. "
-        "Do not return the source text unchanged.\n"
-        if quality_retry
-        else ""
-    )
+    retry_note = ""
+    if quality_retry:
+        if "missing mandatory glossary terms" in quality_retry:
+            retry_note = (
+                f"\nGlossary retry: {quality_retry}\n"
+                "Use the exact mandatory Chinese wording from the glossary for every matching source term.\n"
+            )
+        else:
+            retry_note = (
+                "\nQuality retry: the previous output failed validation because it was not fully translated. "
+                "Translate every natural-language sentence completely into the target language now. "
+                "Do not return the source text unchanged.\n"
+            )
     prompt = build_translation_prompt(
         chunk.markdown,
         source_language=source_language,
@@ -356,6 +362,7 @@ def _assert_translation_quality(
     translated: str,
     target_language: str,
     translator_name: str,
+    require_glossary: bool = True,
 ) -> None:
     if translator_name == "mock":
         return
@@ -389,7 +396,11 @@ def _assert_translation_quality(
             f"Translation for chunk {chunk.index} contains a heavily mixed English line "
             f"(suspect_words={suspect_words}, mixed_lines={mixed_lines}, max_line={max_line_suspects})."
         )
-    if chunk.glossary_entries and target_language.lower().startswith("zh"):
+    if (
+        require_glossary
+        and chunk.glossary_entries
+        and target_language.lower().startswith("zh")
+    ):
         missing = glossary_terms_missing_in_translation(
             chunk.markdown,
             translated,
@@ -402,6 +413,38 @@ def _assert_translation_quality(
             raise ValueError(
                 f"Translation for chunk {chunk.index} missing mandatory glossary terms: {terms}"
             )
+
+
+def _is_glossary_quality_error(exc: Exception) -> bool:
+    return isinstance(exc, ValueError) and "missing mandatory glossary terms" in str(exc)
+
+
+def _repair_glossary_in_chunk(
+    *,
+    chunk: TranslationChunk,
+    translated: str,
+    missing: list[dict[str, str]],
+    source_language: str | None,
+    target_language: str,
+    translator: BaseTranslator,
+) -> str:
+    lines = "\n".join(f"- {item['source']} => {item['target']}" for item in missing)
+    repair_chunk = TranslationChunk(
+        index=chunk.index,
+        markdown=chunk.markdown,
+        glossary_entries=chunk.glossary_entries,
+        prompt_instruction=(
+            "Glossary repair pass. Revise the existing Chinese translation so every listed "
+            "mandatory term appears with the exact Chinese wording when its English source "
+            f"concept appears in the source:\n{lines}\n\n"
+            f"CURRENT TRANSLATION TO REVISE:\n{translated}"
+        ),
+    )
+    return translator.translate_chunk(
+        chunk=repair_chunk,
+        source_language=source_language,
+        target_language=target_language,
+    ).strip()
 
 
 def _is_transient_translation_error(exc: Exception) -> bool:
@@ -465,6 +508,7 @@ def _translate_chunk_resumable(
 
     last_error: Exception | None = None
     had_sensitive_failure = False
+    last_glossary_candidate: str | None = None
     max_attempts = max(1, retry_count) + 4
     for attempt in range(max_attempts):
         attempt_no = attempt + 1
@@ -496,6 +540,8 @@ def _translate_chunk_resumable(
             return translated
         except Exception as exc:
             last_error = exc
+            if _is_glossary_quality_error(exc):
+                last_glossary_candidate = translated
             if "new_sensitive" in str(exc).lower():
                 had_sensitive_failure = True
             permanent = _is_permanent_translation_error(exc)
@@ -561,6 +607,66 @@ def _translate_chunk_resumable(
         if observer is not None:
             observer.attempt_success(chunk_index=chunk.index, input_hash=input_hash, cache_path=cache_path)
         return fallback_translated
+
+    if last_error and _is_glossary_quality_error(last_error) and last_glossary_candidate:
+        missing = glossary_terms_missing_in_translation(
+            chunk.markdown,
+            last_glossary_candidate,
+            chunk.glossary_entries or [],
+        )
+        if missing:
+            try:
+                repaired = _strip_generated_english_chinese_glosses(
+                    chunk.markdown,
+                    _repair_glossary_in_chunk(
+                        chunk=chunk,
+                        translated=last_glossary_candidate,
+                        missing=missing,
+                        source_language=source_language,
+                        target_language=target_language,
+                        translator=translator,
+                    ),
+                    target_language,
+                )
+                _assert_translation_quality(
+                    chunk=chunk,
+                    translated=repaired,
+                    target_language=target_language,
+                    translator_name=translator.name,
+                    require_glossary=True,
+                )
+                if cache_path is not None:
+                    tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+                    tmp_path.write_text(repaired + "\n", encoding="utf-8")
+                    tmp_path.replace(cache_path)
+                if observer is not None:
+                    observer.attempt_success(
+                        chunk_index=chunk.index,
+                        input_hash=input_hash,
+                        cache_path=cache_path,
+                    )
+                return repaired
+            except Exception:
+                pass
+        accepted = last_glossary_candidate
+        _assert_translation_quality(
+            chunk=chunk,
+            translated=accepted,
+            target_language=target_language,
+            translator_name=translator.name,
+            require_glossary=False,
+        )
+        if cache_path is not None:
+            tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+            tmp_path.write_text(accepted + "\n", encoding="utf-8")
+            tmp_path.replace(cache_path)
+        if observer is not None:
+            observer.attempt_success(
+                chunk_index=chunk.index,
+                input_hash=input_hash,
+                cache_path=cache_path,
+            )
+        return accepted
 
     raise ValueError(f"Translation failed for chunk {chunk.index} after {retry_count} attempts: {last_error}") from last_error
 
