@@ -1881,30 +1881,73 @@ def translate_book_chapters(
                     for part in translated_text.split(SEMANTIC_SPAN_BOUNDARY)
                 ]
                 if len(parts) != len(group):
-                    fallback_chunks = [
-                        TranslationChunk(
+                    fallback_groups = (
+                        [group[index : index + 12] for index in range(0, len(group), 12)]
+                        if len(group) > 12
+                        else [[span] for span in group]
+                    )
+                    parts = []
+                    for fallback_group in fallback_groups:
+                        fallback_chunk = TranslationChunk(
                             index=(
                                 chunk_index
                                 + len(semantic_chunks)
                                 + fallback_chunk_count
-                                + index
                             ),
-                            markdown=str(span.get("source_text") or ""),
-                            prompt_instruction=SEMANTIC_TRANSLATION_POLICY,
+                            markdown=(
+                                f"\n\n{SEMANTIC_SPAN_BOUNDARY}\n\n".join(
+                                    str(span.get("source_text") or "")
+                                    for span in fallback_group
+                                )
+                            ),
+                            prompt_instruction=(
+                                f"{SEMANTIC_TRANSLATION_POLICY}. Preserve every "
+                                f"{SEMANTIC_SPAN_BOUNDARY} marker exactly."
+                            ),
                         )
-                        for index, span in enumerate(group)
-                    ]
-                    parts = _translate_chunks_ordered(
-                        chunks=fallback_chunks,
-                        source_language=settings.source_language,
-                        target_language=settings.target_language,
-                        translator=translator,
-                        cache_dir=cache_dir,
-                        retry_count=retry_count,
-                        concurrency=concurrency,
-                        observer=observer,
-                    )
-                    fallback_chunk_count += len(fallback_chunks)
+                        fallback_chunk_count += 1
+                        fallback_text = _translate_chunks_ordered(
+                            chunks=[fallback_chunk],
+                            source_language=settings.source_language,
+                            target_language=settings.target_language,
+                            translator=translator,
+                            cache_dir=cache_dir,
+                            retry_count=retry_count,
+                            concurrency=concurrency,
+                            observer=observer,
+                        )[0]
+                        fallback_parts = [
+                            part.strip()
+                            for part in fallback_text.split(
+                                SEMANTIC_SPAN_BOUNDARY
+                            )
+                        ]
+                        if len(fallback_parts) != len(fallback_group):
+                            individual_chunks = [
+                                TranslationChunk(
+                                    index=(
+                                        chunk_index
+                                        + len(semantic_chunks)
+                                        + fallback_chunk_count
+                                        + index
+                                    ),
+                                    markdown=str(span.get("source_text") or ""),
+                                    prompt_instruction=SEMANTIC_TRANSLATION_POLICY,
+                                )
+                                for index, span in enumerate(fallback_group)
+                            ]
+                            fallback_parts = _translate_chunks_ordered(
+                                chunks=individual_chunks,
+                                source_language=settings.source_language,
+                                target_language=settings.target_language,
+                                translator=translator,
+                                cache_dir=cache_dir,
+                                retry_count=retry_count,
+                                concurrency=concurrency,
+                                observer=observer,
+                            )
+                            fallback_chunk_count += len(individual_chunks)
+                        parts.extend(fallback_parts)
                 for span, part in zip(group, parts):
                     span["translated_text"] = part
             chunk_index += len(semantic_chunks) + fallback_chunk_count

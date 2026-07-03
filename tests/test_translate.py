@@ -533,6 +533,76 @@ def test_semantic_batch_boundary_loss_falls_back_to_individual_spans(
     assert result.chunk_count == 3
 
 
+def test_large_semantic_boundary_loss_retries_in_small_batches(
+    tmp_path: Path,
+) -> None:
+    class SizeSensitiveTranslator(BaseTranslator):
+        name = "size-sensitive"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            self.calls += 1
+            translated = "<!--__SEMANTIC_SPAN_BOUNDARY__-->".join(
+                f"这是第 {index} 条详细的中文说明，用于解释正文中的历史背景与论证。"
+                for index, _part in enumerate(
+                    chunk.markdown.split("<!--__SEMANTIC_SPAN_BOUNDARY__-->")
+                )
+            )
+            if translated.count("<!--__SEMANTIC_SPAN_BOUNDARY__-->") >= 12:
+                return translated.replace(
+                    "<!--__SEMANTIC_SPAN_BOUNDARY__-->",
+                    "",
+                    1,
+                )
+            return translated
+
+    book = {
+        "chapters": [],
+        "semantic_content": {
+            "footnotes": [
+                {
+                    "spans": [
+                        {
+                            "span_id": f"p{index}",
+                            "kind": "prose",
+                            "source_text": f"Explanation {index}.",
+                        }
+                    ]
+                }
+                for index in range(25)
+            ]
+        },
+    }
+    settings = RunSettings(
+        source_pdf=tmp_path / "source.pdf",
+        output_dir=tmp_path,
+        target_language="zh-CN",
+        source_language="en",
+        translator="size-sensitive",
+        max_chunk_chars=9000,
+    )
+    translator = SizeSensitiveTranslator()
+
+    result = translate_book_chapters(book=book, settings=settings, translator=translator)
+
+    assert [
+        note["spans"][0]["translated_text"]
+        for note in result.semantic_content["footnotes"]
+    ] == [
+        f"这是第 {index % 12} 条详细的中文说明，用于解释正文中的历史背景与论证。"
+        for index in range(25)
+    ]
+    assert translator.calls == 4
+    assert result.chunk_count == 4
+
+
 def test_mock_translator_does_not_add_visible_debug_markers() -> None:
     result = translate_markdown(
         chunks=[TranslationChunk(index=16, markdown="Body text.")],
