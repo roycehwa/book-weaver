@@ -74,6 +74,38 @@ def test_reset_clears_policy_annotations(tmp_path: Path) -> None:
     assert updated["glossary_profile"] == "social_econ_philosophy"
 
 
+def test_reset_glossary_review_clears_derived_diagnostics(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    glossary_dir = run_dir / "glossary"
+    jobs_dir = run_dir / "jobs"
+    repair_dir = run_dir / "repair"
+    glossary_dir.mkdir(parents=True)
+    jobs_dir.mkdir()
+    repair_dir.mkdir()
+    (glossary_dir / "active.json").write_text(
+        json.dumps({"schema": "phase_a_glossary_v1", "entries": []}),
+        encoding="utf-8",
+    )
+    (glossary_dir / "candidates.json").write_text(
+        json.dumps({"schema": "phase_a_glossary_v1", "candidates": []}),
+        encoding="utf-8",
+    )
+    (glossary_dir / "decisions.jsonl").write_text("", encoding="utf-8")
+    derived_paths = (
+        run_dir / "pre_review.json",
+        run_dir / "review_items.json",
+        run_dir / "review_state.json",
+        jobs_dir / "glossary-constraints.json",
+        repair_dir / "pending-confirmation.json",
+    )
+    for path in derived_paths:
+        path.write_text("{}", encoding="utf-8")
+
+    reset_glossary_review(run_dir)
+
+    assert all(not path.exists() for path in derived_paths)
+
+
 def test_clear_glossary_suggestions_keeps_adoptions(tmp_path: Path) -> None:
     run_dir = tmp_path / "run"
     run_dir.mkdir()

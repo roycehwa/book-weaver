@@ -1,6 +1,34 @@
 from __future__ import annotations
 
+import re
+
 from pdf_translator.models import TranslationChunk
+
+
+def _split_oversized_block(block: str, max_chars: int) -> list[str]:
+    sentences = [
+        match.group(0).strip()
+        for match in re.finditer(
+            r".+?(?:[.!?。！？]+[\"'”’)]*(?:\s+|$)|$)",
+            block,
+            re.DOTALL,
+        )
+        if match.group(0).strip()
+    ] or [block.strip()]
+    if len(sentences) == 1 and "\n" in block:
+        sentences = [line.strip() for line in block.splitlines() if line.strip()]
+    parts: list[str] = []
+    current = ""
+    for sentence in sentences:
+        candidate = f"{current} {sentence}".strip()
+        if current and len(candidate) > max_chars:
+            parts.append(current)
+            current = sentence
+        else:
+            current = candidate
+    if current:
+        parts.append(current)
+    return parts
 
 
 def split_markdown_into_chunks(markdown: str, max_chars: int) -> list[TranslationChunk]:
@@ -41,23 +69,8 @@ def split_markdown_into_chunks(markdown: str, max_chars: int) -> list[Translatio
             continue
 
         if not chunk_parts and block_size > max_chars:
-            lines_in_block = block.splitlines()
-            running: list[str] = []
-            running_size = 0
-            for line in lines_in_block:
-                line_size = len(line) + 1
-                if running and running_size + line_size > max_chars:
-                    chunks.append(
-                        TranslationChunk(index=index, markdown="\n".join(running).strip())
-                    )
-                    index += 1
-                    running = [line]
-                    running_size = line_size
-                else:
-                    running.append(line)
-                    running_size += line_size
-            if running:
-                chunks.append(TranslationChunk(index=index, markdown="\n".join(running).strip()))
+            for part in _split_oversized_block(block, max_chars):
+                chunks.append(TranslationChunk(index=index, markdown=part))
                 index += 1
             chunk_parts = []
             chunk_size = 0

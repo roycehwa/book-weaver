@@ -7,7 +7,11 @@ import re
 from pathlib import Path
 from typing import Any
 
-from pdf_translator.glossary import glossary_terms_missing_in_translation, load_active_entries_for_translation
+from pdf_translator.glossary import (
+    glossary_terms_missing_in_translation,
+    load_active_entries_for_translation,
+    select_glossary_entries_for_text,
+)
 from pdf_translator.models import TranslationChunk
 from pdf_translator.chunking import split_markdown_into_chunks
 from pdf_translator.translate import (
@@ -197,6 +201,15 @@ def build_aligned_review_segments(
     source_segments: list[dict[str, Any]] = []
     translated_segments: list[dict[str, Any]] = []
     global_chunk_index = 0
+    glossary_constraints: dict[int, list[dict[str, Any]]] = {}
+    constraints_path = cache_dir.parent / "jobs" / "glossary-constraints.json"
+    if constraints_path.exists():
+        payload = json.loads(constraints_path.read_text(encoding="utf-8"))
+        glossary_constraints = {
+            int(item["chunk_index"]): list(item.get("terms") or [])
+            for item in payload.get("chunks", [])
+            if isinstance(item, dict) and item.get("chunk_index") is not None
+        }
 
     for fallback_index, chapter in enumerate(book.get("chapters") or [], 1):
         key = _chapter_key(chapter, fallback_index)
@@ -206,7 +219,12 @@ def build_aligned_review_segments(
         chapter_source_markdown = _chapter_markdown_for_translation(chapter)
         block_index = 0
 
-        def append_segment(source_text: str, translated_text: str) -> None:
+        def append_segment(
+            source_text: str,
+            translated_text: str,
+            *,
+            translate_override: bool | None = None,
+        ) -> None:
             nonlocal block_index
             block_index += 1
             segment_id = f"{key}:c{block_index:03d}"
@@ -217,7 +235,11 @@ def build_aligned_review_segments(
                 "chapter_title": title,
                 "block_index": block_index,
                 "source_location": location,
-                "translate": bool(chapter.get("translate", True)),
+                "translate": (
+                    bool(chapter.get("translate", True))
+                    if translate_override is None
+                    else bool(translate_override)
+                ),
             }
             source_segments.append(
                 {
@@ -252,9 +274,14 @@ def build_aligned_review_segments(
             if not text:
                 continue
             if segment_kind == "media":
+                append_segment(text, text, translate_override=False)
                 continue
             for chunk in split_markdown_into_chunks(text, max_chunk_chars):
-                translation_chunk = TranslationChunk(index=global_chunk_index, markdown=chunk.markdown)
+                translation_chunk = TranslationChunk(
+                    index=global_chunk_index,
+                    markdown=chunk.markdown,
+                    glossary_entries=glossary_constraints.get(global_chunk_index) or None,
+                )
                 translated_text = _read_chunk_cache(cache_dir, translation_chunk)
                 append_segment(chunk.markdown, translated_text)
                 global_chunk_index += 1
@@ -299,6 +326,18 @@ def _merge_reading_review_segments(
             "source_location": active_chapter["source_location"],
             "translation_part_ids": list(part_ids),
             "translate": active_chapter["translate"],
+            "aligned_parts": [
+                {
+                    "part_id": part_id,
+                    "source": source_part,
+                    "translation": translated_part,
+                }
+                for part_id, source_part, translated_part in zip(
+                    part_ids,
+                    source_parts,
+                    translated_parts,
+                )
+            ],
         }
         merged_source.append(
             {
@@ -362,13 +401,24 @@ def _cjk_count(text: str) -> int:
 def _mixed_english_signal(text: str) -> tuple[int, int]:
     suspect_words = 0
     mixed_lines = 0
+    in_notes = False
     for raw_line in text.splitlines():
         line = raw_line.strip()
+        if line == "---":
+            in_notes = True
+            continue
         if not line or line.startswith(("#", "![", "|", ">", "```")):
+            continue
+        if in_notes and _looks_bibliographic_note_line(line):
             continue
         if LOGIC_SYMBOL_LINE.search(line):
             continue
         if not CJK_RE.search(line):
+            if in_notes:
+                words = list(LATIN_WORD_RE.finditer(line))
+                if len(words) >= 6:
+                    mixed_lines += 1
+                    suspect_words += len(words)
             continue
         cleaned = URL_OR_EMAIL_RE.sub(" ", line)
         cleaned = MARKDOWN_LINK_DEST_RE.sub("]", cleaned)
@@ -390,6 +440,37 @@ def _mixed_english_signal(text: str) -> tuple[int, int]:
     return suspect_words, mixed_lines
 
 
+def _looks_bibliographic_note_line(line: str) -> bool:
+    if not re.match(r"^\s*(?:\d+|[*†‡])", line):
+        return False
+    citation_markers = re.findall(
+        r"(?:[\"“”][^\"“”]{3,}[\"“”]|\b(?:press|university|journal|review|vol\.|no\.|pp\.)\b|\b(?:1[5-9]\d{2}|20\d{2})\b)",
+        line,
+        re.IGNORECASE,
+    )
+    return bool(citation_markers)
+
+
+def _is_non_prose_review_segment(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return True
+    lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+    if not lines:
+        return True
+    if len(lines) == 1 and lines[0].startswith("!["):
+        return True
+    image_or_caption = sum(
+        1 for line in lines if line.startswith("![") or line.lower().startswith(("figure ", "table "))
+    )
+    link_destinations = len(MARKDOWN_LINK_DEST_RE.findall(stripped))
+    if image_or_caption >= max(1, len(lines) // 2):
+        return True
+    if link_destinations >= 6 and CJK_RE.search(stripped) is None:
+        return True
+    return False
+
+
 def detect_review_items(
     source_segments: list[dict[str, Any]],
     translated_segments: list[dict[str, Any]],
@@ -409,6 +490,8 @@ def detect_review_items(
         evidence: dict[str, Any] = {}
 
         source_text = str(source.get("source_text") or "").strip()
+        if _is_non_prose_review_segment(source_text):
+            continue
         if not bool(source.get("translate", True)) and text_operation == "translate":
             continue
         if not translated_text:
@@ -440,7 +523,7 @@ def detect_review_items(
             elif source_ascii >= 500 and translated_cjk + int(translated_ascii * 0.35) < source_ascii * 0.16:
                 issue_type = "possibly_incomplete"
                 severity = "high"
-            elif mixed_words >= 6:
+            elif mixed_words >= 4:
                 issue_type = "mixed_english"
                 severity = "medium"
 
@@ -479,6 +562,14 @@ def detect_review_items(
                 "block_index": source.get("block_index"),
                 "source_location": source.get("source_location", {}),
                 "evidence": evidence,
+                **(
+                    {
+                        "responsibility": "system",
+                        "suggested_action": "auto_retranslate",
+                    }
+                    if issue_type == "glossary_drift"
+                    else {}
+                ),
             }
         )
     return items
@@ -586,7 +677,7 @@ def build_review_artifacts(
             translated_chapters,
             target_language=target_language,
         )
-    glossary_entries = load_active_entries_for_translation(run_dir) if run_dir is not None else []
+    glossary_entries = _load_translation_glossary_constraints(run_dir)
     review_items = detect_review_items(
         segments,
         translated_segments_list,
@@ -594,6 +685,62 @@ def build_review_artifacts(
         text_operation=text_operation,
         glossary_entries=glossary_entries or None,
     )
+    semantic_content = book.get("semantic_content")
+    if isinstance(semantic_content, dict):
+        for record in semantic_content.get("ocr_quarantine", []):
+            if not isinstance(record, dict):
+                continue
+            if record.get("resolution") in {"confirmed_noise", "restored_to_reading"}:
+                continue
+            quarantine_id = str(
+                record.get("quarantine_id") or record.get("block_id") or "unknown"
+            )
+            system_segment_id = f"system:ocr:{quarantine_id}"
+            source_location = {"page": record.get("source_page")}
+            segments.append(
+                {
+                    "segment_id": system_segment_id,
+                    "chapter_id": "system-ocr-quarantine",
+                    "chapter_index": 0,
+                    "chapter_title": "OCR 隔离",
+                    "block_index": len(segments),
+                    "source_text": str(record.get("raw_text") or ""),
+                    "source_location": source_location,
+                    "translate": False,
+                    "responsibility": "system",
+                }
+            )
+            translated_segments_list.append(
+                {
+                    "segment_id": system_segment_id,
+                    "chapter_id": "system-ocr-quarantine",
+                    "chapter_index": 0,
+                    "chapter_title": "OCR 隔离",
+                    "block_index": len(translated_segments_list),
+                    "translated_text": "",
+                    "source_location": source_location,
+                    "translate": False,
+                    "responsibility": "system",
+                }
+            )
+            review_items.append(
+                {
+                    "item_id": system_segment_id,
+                    "segment_id": system_segment_id,
+                    "issue_type": "suspect_ocr",
+                    "severity": "high",
+                    "status": "open",
+                    "responsibility": "system",
+                    "suggested_action": "inspect_source_evidence",
+                    "source_location": source_location,
+                    "evidence": {
+                        "raw_text": record.get("raw_text"),
+                        "reason_codes": record.get("reason_codes", []),
+                        "score": record.get("score"),
+                        "asset": record.get("evidence_asset"),
+                    },
+                }
+            )
     pre_review = build_pre_review_report(
         segments,
         review_items,
@@ -625,6 +772,29 @@ def build_review_artifacts(
             "marks": [],
         },
     }
+
+
+def _load_translation_glossary_constraints(
+    run_dir: Path | None,
+) -> list[dict[str, Any]]:
+    if run_dir is None:
+        return []
+    path = run_dir / "jobs" / "glossary-constraints.json"
+    if not path.exists():
+        return []
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    entries: dict[tuple[str, str], dict[str, Any]] = {}
+    for chunk in payload.get("chunks", []):
+        for term in chunk.get("terms", []):
+            source = str(term.get("source") or "").strip()
+            target = str(term.get("target") or "").strip()
+            if source and target:
+                entries[(source, target)] = {
+                    "source": source,
+                    "target": target,
+                    "status": "active",
+                }
+    return list(entries.values())
 
 
 def _payload_segments(payload_or_segments: Any) -> list[dict[str, Any]]:
@@ -662,12 +832,17 @@ def apply_review_state(translated_segments_payload: Any, review_state: dict[str,
     return segments
 
 
-def _rewrite_prompt(source_text: str, current_translation: str, reviewer_comment: str) -> str:
+def _rewrite_prompt(
+    source_text: str,
+    current_translation: str,
+    reviewer_comment: str,
+    glossary_entries: list[dict[str, Any]] | None = None,
+) -> str:
     source = source_text.strip()
     comment = reviewer_comment.strip()
     current = current_translation.strip()
     current_section = current if current else "(none — translate the source text from scratch)"
-    return (
+    prompt = (
         "Rewrite this translation according to the reviewer instruction.\n"
         "Return only the revised target-language text. Do not include explanations or placeholders.\n\n"
         "SOURCE TEXT:\n"
@@ -677,6 +852,13 @@ def _rewrite_prompt(source_text: str, current_translation: str, reviewer_comment
         "REVIEWER INSTRUCTION:\n"
         f"{comment}"
     )
+    if glossary_entries:
+        glossary_lines = "\n".join(
+            f"- {entry['source']} => {entry['target']}"
+            for entry in glossary_entries
+        )
+        prompt += f"\n\nMANDATORY GLOSSARY:\n{glossary_lines}"
+    return prompt
 
 
 def _cjk_count(text: str) -> int:
@@ -750,6 +932,7 @@ def rewrite_review_requests(
     state = dict(project["review_state"])
     decisions = state.setdefault("decisions", {})
     rewritten_count = 0
+    active_glossary = load_active_entries_for_translation(run_dir)
 
     for current_segment_id, decision in list(decisions.items()):
         if segment_id is not None and current_segment_id != segment_id:
@@ -767,6 +950,11 @@ def rewrite_review_requests(
             continue
         source_text = str(source.get("source_text") or "").strip()
         current_translation = str(translated.get("translated_text") or "").strip()
+        relevant_glossary = select_glossary_entries_for_text(
+            source_text,
+            active_glossary,
+            chapter_id=str(source.get("chapter_id") or "") or None,
+        )
         if not source_text:
             decision["rewrite_error"] = "Source text is empty; cannot model-rewrite this segment."
             continue
@@ -780,16 +968,74 @@ def rewrite_review_requests(
                 target_language=target_language,
             )
         else:
-            prompt = _rewrite_prompt(source_text, current_translation, reviewer_comment)
+            prompt = _rewrite_prompt(
+                source_text,
+                current_translation,
+                reviewer_comment,
+                relevant_glossary,
+            )
             candidate = translator.translate_chunk(
-                TranslationChunk(index=rewritten_count, markdown=prompt),
+                TranslationChunk(
+                    index=rewritten_count,
+                    markdown=prompt,
+                    glossary_entries=relevant_glossary or None,
+                ),
                 source_language=source_language or "en",
                 target_language=target_language,
             ).strip()
+            missing_terms = glossary_terms_missing_in_translation(
+                source_text,
+                candidate,
+                relevant_glossary,
+            )
+            if missing_terms:
+                retry_instruction = (
+                    reviewer_comment
+                    + "\n上一版未遵守以下强制术语，请完整重译并逐项使用："
+                    + "；".join(
+                        f"{item['source']} => {item['target']}"
+                        for item in missing_terms
+                    )
+                )
+                retry_prompt = _rewrite_prompt(
+                    source_text,
+                    candidate,
+                    retry_instruction,
+                    relevant_glossary,
+                )
+                candidate = translator.translate_chunk(
+                    TranslationChunk(
+                        index=rewritten_count,
+                        markdown=retry_prompt,
+                        glossary_entries=relevant_glossary or None,
+                    ),
+                    source_language=source_language or "en",
+                    target_language=target_language,
+                ).strip()
+                if glossary_terms_missing_in_translation(
+                    source_text,
+                    candidate,
+                    relevant_glossary,
+                ):
+                    remaining_terms = glossary_terms_missing_in_translation(
+                        source_text,
+                        candidate,
+                        relevant_glossary,
+                    )
+                    decision["rewrite_error"] = (
+                        "Model rewrite did not satisfy mandatory glossary constraints."
+                    )
+                    decision["rewrite_error_details"] = {
+                        "missing_glossary_terms": remaining_terms,
+                    }
+                    decision["rewrite_candidate"] = candidate
+                    continue
         if not _is_valid_rewrite_candidate(source_text, candidate, target_language):
             decision["rewrite_error"] = "Model returned an invalid rewrite candidate; segment remains open."
             continue
         decision.pop("rewrite_error", None)
+        decision.pop("rewrite_error_details", None)
+        decision.pop("rewrite_candidate", None)
         decision["status"] = "candidate"
         decision["approved_text"] = candidate
         decision["model_generated_at"] = utc_now()
@@ -862,6 +1108,36 @@ def translated_segments_to_chapters(translated_segments_payload: Any) -> list[di
             }
         )
     return chapters
+
+
+def merge_reviewed_chapters_with_resources(
+    reviewed_chapters: list[dict[str, Any]],
+    book: dict[str, Any],
+) -> list[dict[str, Any]]:
+    covered_pages = {
+        int(page)
+        for chapter in reviewed_chapters
+        for page in chapter.get("source_pages", [])
+    }
+    resources = [
+        dict(chapter)
+        for chapter in book.get("chapters", [])
+        if chapter.get("resource_only")
+        and chapter.get("preserve_original")
+        and not covered_pages.intersection(
+            int(page) for page in chapter.get("source_pages", [])
+        )
+    ]
+    merged = [dict(chapter) for chapter in reviewed_chapters] + resources
+    merged.sort(
+        key=lambda chapter: (
+            int(chapter.get("page_start") or 0),
+            int(chapter.get("index") or 0),
+        )
+    )
+    for index, chapter in enumerate(merged, 1):
+        chapter["index"] = index
+    return merged
 
 
 def restore_review_chapter_apparatus(
@@ -1098,13 +1374,19 @@ def write_versioned_outputs(
     version_name: str,
     target_language: str,
     translated_segments: Any,
+    translated_markdown_override: str | None = None,
     parent_version: str | None = None,
+    approval_status: str = "draft",
 ) -> dict[str, str]:
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", version_name):
         raise ValueError("Unsafe review version name. Use letters, numbers, dots, underscores, or dashes.")
     version_dir = run_dir / "versions" / version_name
     version_dir.mkdir(parents=True, exist_ok=True)
-    translated_markdown = translated_segments_to_markdown(translated_segments)
+    translated_markdown = (
+        translated_markdown_override
+        if translated_markdown_override is not None
+        else translated_segments_to_markdown(translated_segments)
+    )
     translated_markdown_path = version_dir / "translated.md"
     translated_segments_path = version_dir / "translated_segments.json"
     manifest_path = version_dir / "version-manifest.json"
@@ -1128,6 +1410,7 @@ def write_versioned_outputs(
                 "schema": "translation_review_version_v1",
                 "version": version_name,
                 "parent_version": parent_version,
+                "approval_status": approval_status,
                 "target_language": target_language,
                 "created_at": utc_now(),
                 "files": {

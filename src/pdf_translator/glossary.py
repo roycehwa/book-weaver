@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,8 @@ from pdf_translator.glossary_extraction import (
     extract_index_phrases,
     extract_quoted_terms,
     score_glossary_candidate,
+    canonical_source_key,
+    canonical_source_term,
 )
 from pdf_translator.glossary_profiles import (
     GLOSSARY_PROFILE_LABELS,
@@ -154,25 +157,36 @@ def extract_glossary_candidates(
         if active_policy.enable_index_parse and in_index:
             phrase_sources.extend(extract_index_phrases(markdown))
         for phrase in phrase_sources:
+            canonical_term = canonical_source_term(phrase)
+            canonical_key = canonical_source_key(phrase)
+            if not canonical_key:
+                continue
             entry = stats.setdefault(
-                phrase,
+                canonical_key,
                 {
+                    "source": canonical_term,
+                    "variants": set(),
                     "occurrences": 0,
                     "chapters": set(),
                     "in_index": False,
                 },
             )
+            entry["variants"].add(phrase)
             entry["occurrences"] += _count_occurrences(markdown, phrase)
             entry["chapters"].add(chapter_id)
             entry["in_index"] = entry["in_index"] or in_index
 
     # Re-count across full corpus for accuracy (chapter-local counts can undercount).
-    for phrase, entry in stats.items():
-        entry["occurrences"] = _count_occurrences(corpus, phrase)
+    for entry in stats.values():
+        entry["occurrences"] = sum(
+            _count_occurrences(corpus, variant)
+            for variant in entry["variants"]
+        )
 
     ranked: list[dict[str, Any]] = []
     rejected_count = 0
-    for phrase, entry in stats.items():
+    for entry in stats.values():
+        phrase = str(entry["source"])
         score, reasons, rejected = score_glossary_candidate(
             phrase,
             occurrences=int(entry["occurrences"]),
@@ -263,8 +277,9 @@ def load_candidates(run_dir: Path) -> list[dict[str, Any]]:
 
 
 def candidate_for_source(run_dir: Path, source: str) -> dict[str, Any] | None:
+    source_key = canonical_source_key(source)
     for candidate in load_candidates(run_dir):
-        if candidate.get("source") == source:
+        if canonical_source_key(str(candidate.get("source") or "")) == source_key:
             return candidate
     return None
 
@@ -285,10 +300,83 @@ def load_active_entries_for_translation(run_dir: Path) -> list[dict[str, Any]]:
     if not active:
         return []
     return [
-        entry
+        {
+            **entry,
+            "source": canonical_source_term(str(entry.get("source") or "")),
+        }
         for entry in active.get("entries", [])
         if entry.get("status") == "active" and str(entry.get("target") or "").strip()
     ]
+
+
+def migrate_glossary_variants(run_dir: Path) -> dict[str, int]:
+    glossary_dir = _glossary_dir(run_dir)
+    active_path = glossary_dir / "active.json"
+    merged_count = 0
+    if active_path.exists():
+        active = json.loads(active_path.read_text(encoding="utf-8"))
+        by_key: dict[str, dict[str, Any]] = {}
+        for raw_entry in active.get("entries", []):
+            entry = dict(raw_entry)
+            key = canonical_source_key(str(entry.get("source") or ""))
+            if not key:
+                continue
+            entry["source"] = canonical_source_term(str(entry.get("source") or ""))
+            current = by_key.get(key)
+            if current is None:
+                by_key[key] = entry
+                continue
+            merged_count += 1
+            current_is_user = current.get("updated_by") == "user"
+            entry_is_user = entry.get("updated_by") == "user"
+            if entry_is_user and not current_is_user:
+                by_key[key] = entry
+        active["entries"] = sorted(by_key.values(), key=lambda item: str(item["source"]).casefold())
+        active["updated_at"] = _now()
+        _write_json(active_path, active)
+
+    candidates_path = glossary_dir / "candidates.json"
+    candidate_merged_count = 0
+    if candidates_path.exists():
+        payload = json.loads(candidates_path.read_text(encoding="utf-8"))
+        candidates_by_key: dict[str, dict[str, Any]] = {}
+        for raw_candidate in payload.get("candidates", []):
+            candidate = dict(raw_candidate)
+            key = canonical_source_key(str(candidate.get("source") or ""))
+            if not key:
+                continue
+            candidate["source"] = canonical_source_term(str(candidate.get("source") or ""))
+            current = candidates_by_key.get(key)
+            if current is None:
+                candidates_by_key[key] = candidate
+                continue
+            candidate_merged_count += 1
+            preferred = max(
+                (current, candidate),
+                key=lambda item: (
+                    bool(item.get("target_suggestion")),
+                    float(item.get("score") or 0),
+                ),
+            )
+            preferred["evidence"] = sorted(
+                set(current.get("evidence") or []) | set(candidate.get("evidence") or [])
+            )
+            preferred["chapter_count"] = len(preferred["evidence"])
+            preferred["occurrences"] = max(
+                int(current.get("occurrences") or 0),
+                int(candidate.get("occurrences") or 0),
+            )
+            candidates_by_key[key] = preferred
+        payload["candidates"] = sorted(
+            candidates_by_key.values(),
+            key=lambda item: (-float(item.get("score") or 0), str(item["source"]).casefold()),
+        )
+        _write_json(candidates_path, payload)
+
+    return {
+        "merged_count": merged_count,
+        "candidate_merged_count": candidate_merged_count,
+    }
 
 
 POLICY_ROUND_ANNOTATION_KEYS = (
@@ -351,7 +439,13 @@ def apply_glossary_decision(
         else {"schema": GLOSSARY_SCHEMA, "entries": []}
     )
     candidate = candidate_for_source(run_dir, source)
-    entries = [entry for entry in active.get("entries", []) if entry.get("source") != source]
+    source = canonical_source_term(source)
+    source_key = canonical_source_key(source)
+    entries = [
+        entry
+        for entry in active.get("entries", [])
+        if canonical_source_key(str(entry.get("source") or "")) != source_key
+    ]
     entry = {
         "source": source,
         "target": target,
@@ -383,16 +477,47 @@ def select_glossary_entries_for_text(
     chapter_id: str | None,
     limit: int = 20,
 ) -> list[dict[str, Any]]:
-    selected = []
-    lowered = text.lower()
-    for entry in entries:
+    selected: list[tuple[int, dict[str, Any]]] = []
+    occupied: list[tuple[int, int]] = []
+    for entry in sorted(
+        entries,
+        key=lambda item: len(str(item.get("source") or "")),
+        reverse=True,
+    ):
         if entry.get("status") != "active":
             continue
-        source = str(entry.get("source") or "")
-        evidence = set(entry.get("evidence") or [])
-        if source.lower() in lowered or (chapter_id is not None and chapter_id in evidence):
-            selected.append(entry)
-    return selected[:limit]
+        source = str(entry.get("source") or "").strip()
+        if not source:
+            continue
+        matches = list(re.finditer(re.escape(source), text, flags=re.IGNORECASE))
+        available = next(
+            (
+                match.span()
+                for match in matches
+                if _is_complete_source_term_match(text, match.start(), match.end())
+                if not any(
+                    match.start() < end and match.end() > start
+                    for start, end in occupied
+                )
+            ),
+            None,
+        )
+        if available is None:
+            continue
+        occupied.append(available)
+        selected.append((available[0], entry))
+    selected.sort(key=lambda item: item[0])
+    return [entry for _, entry in selected[:limit]]
+
+
+def _is_complete_source_term_match(text: str, start: int, end: int) -> bool:
+    before = text[max(0, start - 40):start]
+    after = text[end:end + 40]
+    if re.search(r"[A-Z][A-Za-z'’-]*[–—-]\s*$", before):
+        return False
+    if re.match(r"^\s*(?:[–—-]\s*)?(?:[A-Z][A-Za-z'’-]*|[IVX]+)\b", after):
+        return False
+    return True
 
 
 def glossary_terms_missing_in_translation(

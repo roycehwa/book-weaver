@@ -244,6 +244,10 @@ class TranslationJobObserver:
         return load_progress(self.run_dir)
 
     def _record_chunk_done(self, progress: dict[str, Any], chunk_index: int) -> bool:
+        progress["total_chunks"] = max(
+            int(progress.get("total_chunks", 0)),
+            int(chunk_index) + 1,
+        )
         indices = list(progress.get("completed_chunk_indices") or [])
         if chunk_index in indices:
             return False
@@ -286,6 +290,10 @@ class TranslationJobObserver:
     def attempt_start(self, *, chunk_index: int, input_hash: str, attempt: int) -> None:
         with self._progress_lock:
             progress = self._load_progress()
+            progress["total_chunks"] = max(
+                int(progress.get("total_chunks", 0)),
+                int(chunk_index) + 1,
+            )
             progress["running_chunks"] = int(progress.get("running_chunks", 0)) + 1
             progress["status"] = "running"
             self._write_progress(progress)
@@ -359,9 +367,14 @@ class TranslationJobObserver:
             progress = self._load_progress()
             progress["status"] = status
             progress["running_chunks"] = 0
+            if status == "completed":
+                actual_total = len(progress.get("completed_chunk_indices") or [])
+                progress["total_chunks"] = actual_total
             self._write_progress(progress)
             job = json.loads(_job_path(self.run_dir).read_text(encoding="utf-8"))
             job["status"] = status
+            if status == "completed":
+                job["total_chunks"] = actual_total
             job["finished_at"] = _isoish(_now())
             _atomic_write_json(_job_path(self.run_dir), job)
         self._event("job_finished", status=status)

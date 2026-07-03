@@ -8,8 +8,10 @@ from pdf_translator.review import (
     build_aligned_review_segments,
     build_review_artifacts,
     create_review_state,
+    detect_review_items,
     review_project_from_run,
     rewrite_review_requests,
+    merge_reviewed_chapters_with_resources,
     translated_segments_to_chapters,
     write_versioned_outputs,
     _is_valid_rewrite_candidate,
@@ -17,6 +19,43 @@ from pdf_translator.review import (
     _looks_like_model_refusal,
     _rewrite_prompt,
 )
+
+
+def test_build_review_artifacts_adds_system_owned_ocr_issue(tmp_path: Path) -> None:
+    book = {
+        "chapters": [],
+        "semantic_content": {
+            "ocr_quarantine": [
+                {
+                    "quarantine_id": "ocr-quarantine-a",
+                    "source_page": 6,
+                    "raw_text": "1:79. 2- 80 - - 3291/.",
+                    "reason_codes": ["symbol_density", "fragmented_tokens"],
+                    "score": 0.9,
+                    "disposition": "suspect_ocr",
+                    "evidence_asset": "assets/page-0006.png",
+                }
+            ]
+        },
+    }
+
+    artifacts = build_review_artifacts(
+        source_path=tmp_path / "source.pdf",
+        target_language="zh-CN",
+        book=book,
+        translated_chapters=[],
+    )
+
+    item = artifacts["review_items"]["items"][0]
+    assert item["issue_type"] == "suspect_ocr"
+    assert item["responsibility"] == "system"
+    assert item["source_location"]["page"] == 6
+    assert item["evidence"]["asset"] == "assets/page-0006.png"
+    assert "/Users/" not in json.dumps(item)
+    system_segment = artifacts["segments"]["segments"][0]
+    assert system_segment["segment_id"] == item["segment_id"]
+    assert system_segment["source_text"].startswith("1:79")
+    assert system_segment["translate"] is False
 from pdf_translator.translate import _chunk_cache_path
 from pdf_translator.models import TranslationChunk
 
@@ -182,6 +221,137 @@ def test_preserve_review_uses_content_integrity_checks_not_translation_checks() 
     assert artifacts["pre_review"]["flagged_segments"] == 0
 
 
+def test_mixed_english_ignores_bibliographic_text_in_footnotes() -> None:
+    items = detect_review_items(
+        [
+            {
+                "segment_id": "ch-001:r001",
+                "chapter_id": "ch-001",
+                "chapter_index": 1,
+                "chapter_title": "History",
+                "block_index": 1,
+                "source_text": (
+                    "The translated body explains the argument in detail.\n\n---\n\n"
+                    "24 William Byrd, \"The Anshan Iron and Steel Company,\" 327."
+                ),
+                "translate": True,
+            }
+        ],
+        [
+            {
+                "segment_id": "ch-001:r001",
+                "translated_text": (
+                    "正文已经完整翻译并详细说明了论点。\n\n---\n\n"
+                    "24 参见 William Byrd, \"The Anshan Iron and Steel Company,\" "
+                    "Cambridge University Press, 327."
+                ),
+            }
+        ],
+        target_language="zh-CN",
+    )
+
+    assert items == []
+
+
+def test_mixed_english_flags_untranslated_explanatory_footnote() -> None:
+    items = detect_review_items(
+        [
+            {
+                "segment_id": "ch-001:r001",
+                "source_text": "正文。\n\n---\n\n24 This footnote explains the historical context in full.",
+                "translate": True,
+            }
+        ],
+        [
+            {
+                "segment_id": "ch-001:r001",
+                "translated_text": "正文已翻译。\n\n---\n\n24 This footnote explains the historical context in full.",
+            }
+        ],
+        target_language="zh-CN",
+    )
+
+    assert items[0]["issue_type"] == "mixed_english"
+
+
+def test_glossary_drift_is_owned_by_system_repair() -> None:
+    items = detect_review_items(
+        [
+            {
+                "segment_id": "ch-001:r001",
+                "chapter_id": "ch-001",
+                "chapter_index": 1,
+                "chapter_title": "History",
+                "block_index": 1,
+                "source_text": "The Soviet Union shaped policy.",
+                "translate": True,
+            }
+        ],
+        [
+            {
+                "segment_id": "ch-001:r001",
+                "translated_text": "苏维埃联盟影响了政策。",
+            }
+        ],
+        target_language="zh-CN",
+        glossary_entries=[
+            {"source": "Soviet Union", "target": "苏联", "status": "active"}
+        ],
+    )
+
+    assert items[0]["issue_type"] == "glossary_drift"
+    assert items[0]["responsibility"] == "system"
+    assert items[0]["suggested_action"] == "auto_retranslate"
+
+
+def test_review_does_not_infer_glossary_drift_without_translation_snapshot(
+    tmp_path: Path,
+) -> None:
+    glossary_dir = tmp_path / "glossary"
+    glossary_dir.mkdir()
+    (glossary_dir / "active.json").write_text(
+        json.dumps(
+            {
+                "schema": "phase_a_glossary_v1",
+                "entries": [
+                    {"source": "Soviet Union", "target": "苏联", "status": "active"}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    book = {
+        "chapters": [
+            {
+                "index": 1,
+                "chapter_id": "ch-001",
+                "title": "History",
+                "markdown": "The Soviet Union shaped policy.",
+            }
+        ]
+    }
+
+    artifacts = build_review_artifacts(
+        source_path=Path("book.pdf"),
+        target_language="zh-CN",
+        book=book,
+        translated_chapters=[
+            {
+                "index": 1,
+                "chapter_id": "ch-001",
+                "title": "History",
+                "markdown": "苏维埃联盟影响了政策。",
+            }
+        ],
+        run_dir=tmp_path,
+    )
+
+    assert not any(
+        item["issue_type"] == "glossary_drift"
+        for item in artifacts["review_items"]["items"]
+    )
+
+
 def test_translation_review_skips_preserved_resource_chapters() -> None:
     book = {
         "chapters": [
@@ -224,6 +394,32 @@ def test_translation_review_skips_preserved_resource_chapters() -> None:
     )
 
     assert artifacts["review_items"]["items"] == []
+
+
+def test_review_items_ignore_media_and_image_only_segments() -> None:
+    items = detect_review_items(
+        [
+            {
+                "segment_id": "ch-001:r001",
+                "chapter_id": "ch-001",
+                "chapter_index": 1,
+                "chapter_title": "Figures",
+                "block_index": 1,
+                "source_text": "![Figure 36.1: Figure on page 36](book-images/figure-p0036-01.png)",
+                "translate": True,
+            }
+        ],
+        [
+            {
+                "segment_id": "ch-001:r001",
+                "translated_text": "![Figure 36.1: Figure on page 36](book-images/figure-p0036-01.png)",
+            }
+        ],
+        target_language="zh-CN",
+        text_operation="translate",
+    )
+
+    assert items == []
 
 
 def test_review_chapter_marks_split_outline(tmp_path: Path) -> None:
@@ -345,6 +541,32 @@ def test_write_versioned_outputs_preserves_parent_and_manifest(tmp_path: Path) -
     assert "第三段。" in translated_md
 
 
+def test_write_versioned_outputs_records_approval_status(tmp_path: Path) -> None:
+    version = write_versioned_outputs(
+        run_dir=tmp_path,
+        version_name="final",
+        target_language="zh-CN",
+        translated_segments=[],
+        approval_status="approved",
+    )
+
+    manifest = json.loads(Path(version["manifest_path"]).read_text(encoding="utf-8"))
+    assert manifest["approval_status"] == "approved"
+
+
+def test_write_versioned_outputs_accepts_complete_delivery_markdown(tmp_path: Path) -> None:
+    version = write_versioned_outputs(
+        run_dir=tmp_path,
+        version_name="complete",
+        target_language="zh-CN",
+        translated_segments=[],
+        translated_markdown_override="# Reviewed\n\n译文\n\n![Original page 2](p2.png)\n",
+    )
+
+    translated = Path(version["translated_markdown_path"]).read_text(encoding="utf-8")
+    assert "Original page 2" in translated
+
+
 def test_write_versioned_outputs_rejects_unsafe_version_name(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="version"):
         write_versioned_outputs(
@@ -372,6 +594,40 @@ def test_translated_segments_to_chapters_preserves_chapter_metadata() -> None:
     assert chapters[0]["title"] == "Introduction"
     assert chapters[0]["markdown"] == "第一段。\n\n第二段。\n"
     assert chapters[1]["chapter_id"] == "ch-002-body"
+
+
+def test_merge_reviewed_chapters_adds_only_uncovered_resources() -> None:
+    reviewed = [
+        {
+            "chapter_id": "body",
+            "page_start": 1,
+            "source_pages": [1],
+            "markdown": "译文",
+        }
+    ]
+    book = {
+        "chapters": [
+            {
+                "chapter_id": "body",
+                "page_start": 1,
+                "source_pages": [1],
+                "markdown": "Source",
+            },
+            {
+                "chapter_id": "index",
+                "page_start": 2,
+                "source_pages": [2],
+                "markdown": "![Original page 2](/tmp/p2.png)",
+                "resource_only": True,
+                "preserve_original": True,
+            },
+        ]
+    }
+
+    merged = merge_reviewed_chapters_with_resources(reviewed, book)
+
+    assert [chapter["source_pages"] for chapter in merged] == [[1], [2]]
+    assert merged[1]["preserve_original"] is True
 
 
 def test_review_project_from_run_loads_json_contract(tmp_path: Path) -> None:
@@ -499,6 +755,84 @@ def test_rewrite_review_requests_skips_invalid_candidate_for_missing_translation
     assert decision["rewrite_error"]
 
 
+def test_rewrite_review_requests_injects_and_validates_active_glossary(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    artifacts = build_review_artifacts(
+        source_path=Path("book.epub"),
+        target_language="zh-CN",
+        book={
+            "chapters": [
+                {
+                    "index": 1,
+                    "chapter_id": "ch-001",
+                    "title": "History",
+                    "markdown": "The Soviet Union shaped policy.",
+                }
+            ]
+        },
+        translated_chapters=[
+            {
+                "index": 1,
+                "chapter_id": "ch-001",
+                "title": "History",
+                "markdown": "苏维埃联盟影响了政策。",
+            }
+        ],
+    )
+    artifacts["review_state"]["decisions"] = {
+        "ch-001:s001": {
+            "status": "open",
+            "action": "model_rewrite",
+            "reviewer_comment": "请重新翻译。",
+        }
+    }
+    for name, payload in artifacts.items():
+        (run_dir / f"{name}.json").write_text(
+            json.dumps(payload, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    glossary_dir = run_dir / "glossary"
+    glossary_dir.mkdir()
+    (glossary_dir / "active.json").write_text(
+        json.dumps(
+            {
+                "schema": "phase_a_glossary_v1",
+                "entries": [
+                    {"source": "Soviet Union", "target": "苏联", "status": "active"}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class GlossaryAwareTranslator:
+        name = "glossary-aware"
+
+        def __init__(self) -> None:
+            self.prompts: list[str] = []
+
+        def translate_chunk(self, chunk, source_language: str | None, target_language: str) -> str:
+            self.prompts.append(chunk.markdown)
+            if len(self.prompts) == 1:
+                return "苏维埃联盟影响了政策。"
+            return "苏联影响了政策。"
+
+    translator = GlossaryAwareTranslator()
+    result = rewrite_review_requests(
+        run_dir=run_dir,
+        translator=translator,
+        source_language="en",
+        target_language="zh-CN",
+    )
+
+    assert result["rewritten_count"] == 1
+    assert len(translator.prompts) == 2
+    assert "Soviet Union => 苏联" in translator.prompts[0]
+    state = json.loads((run_dir / "review_state.json").read_text(encoding="utf-8"))
+    assert state["decisions"]["ch-001:s001"]["approved_text"] == "苏联影响了政策。"
+
+
 def test_build_aligned_review_segments_pairs_translation_cache(tmp_path: Path) -> None:
     from pdf_translator.chunking import split_markdown_into_chunks
     from pdf_translator.translate import _chapter_markdown_for_translation, _split_markdown_media_segments
@@ -532,6 +866,105 @@ def test_build_aligned_review_segments_pairs_translation_cache(tmp_path: Path) -
     assert "This is a long English paragraph" in intro["source_text"]
     assert "中文译文" in translated["translated_text"]
     assert "This is a long English paragraph" not in translated["translated_text"]
+
+
+def test_build_aligned_review_segments_uses_persisted_glossary_constraints_for_cache_key(
+    tmp_path: Path,
+) -> None:
+    from pdf_translator.chunking import split_markdown_into_chunks
+    from pdf_translator.translate import _chapter_markdown_for_translation, _split_markdown_media_segments
+
+    cache_dir = tmp_path / "translation-cache"
+    cache_dir.mkdir()
+    jobs_dir = tmp_path / "jobs"
+    jobs_dir.mkdir()
+    book = sample_book()
+    chapter_markdown = _chapter_markdown_for_translation(book["chapters"][0])
+    text = next(
+        segment_markdown
+        for segment_kind, segment_markdown in _split_markdown_media_segments(chapter_markdown)
+        if segment_kind == "text"
+    )
+    chunk = split_markdown_into_chunks(text, 9000)[0]
+    glossary_entries = [{"source": "steelworks", "target": "钢铁厂"}]
+    constrained_chunk = TranslationChunk(
+        index=0,
+        markdown=chunk.markdown,
+        glossary_entries=glossary_entries,
+    )
+    _chunk_cache_path(cache_dir, constrained_chunk).write_text(
+        "这是带术语约束缓存中的完整中文译文。\n",
+        encoding="utf-8",
+    )
+    (cache_dir / "chunk-000000-stale-cache.md").write_text(
+        "不应读取的旧缓存。\n",
+        encoding="utf-8",
+    )
+    (jobs_dir / "glossary-constraints.json").write_text(
+        json.dumps(
+            {
+                "schema": "translation_glossary_constraints_v1",
+                "chunks": [{"chunk_index": 0, "terms": glossary_entries}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    _source_segments, translated_segments = build_aligned_review_segments(
+        book,
+        source_path=Path("book.pdf"),
+        target_language="zh-CN",
+        cache_dir=cache_dir,
+        max_chunk_chars=9000,
+    )
+
+    assert any(
+        "完整中文译文" in segment["translated_text"]
+        for segment in translated_segments
+    )
+
+
+def test_aligned_review_segments_keep_media_and_part_pairs(tmp_path: Path) -> None:
+    cache_dir = tmp_path / "translation-cache"
+    cache_dir.mkdir()
+    book = {
+        "chapters": [
+            {
+                "index": 1,
+                "chapter_id": "ch-001",
+                "title": "Figures",
+                "markdown": (
+                    "![Figure 1](figure.png)\n\n"
+                    "> Figure 1 Industrial output.\n\n"
+                    "Body paragraph."
+                ),
+            }
+        ]
+    }
+    from pdf_translator.chunking import split_markdown_into_chunks
+    text = "> Figure 1 Industrial output.\n\nBody paragraph."
+    chunk = split_markdown_into_chunks(text, 9000)[0]
+    _chunk_cache_path(cache_dir, TranslationChunk(index=0, markdown=chunk.markdown)).write_text(
+        "> 图1 工业产出。\n\n正文段落。\n",
+        encoding="utf-8",
+    )
+
+    source_segments, _ = build_aligned_review_segments(
+        book,
+        source_path=Path("book.pdf"),
+        target_language="zh-CN",
+        cache_dir=cache_dir,
+        max_chunk_chars=9000,
+    )
+
+    segment = source_segments[0]
+    parts = segment["aligned_parts"]
+    media_index = next(
+        index for index, part in enumerate(parts)
+        if part["source"].startswith("![Figure 1]")
+    )
+    assert parts[media_index]["translation"].startswith("![Figure 1]")
+    assert "Figure 1 Industrial output" in parts[media_index + 1]["source"]
 
 
 def test_read_chunk_cache_falls_back_to_index_only_filename(tmp_path: Path) -> None:

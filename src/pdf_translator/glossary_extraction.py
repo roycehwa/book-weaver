@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -129,6 +130,19 @@ def _normalize_phrase(value: str) -> str:
     return " ".join(value.split())
 
 
+def canonical_source_term(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", value)
+    normalized = normalized.translate(str.maketrans({"’": "'", "‘": "'", "“": '"', "”": '"'}))
+    normalized = re.sub(r"\b([IVX]{1,6})(and|or|the|his|her|was|is|in|of)\b", r"\1 \2", normalized)
+    normalized = re.sub(r"\b([IVX]{1,6})([a-z]{2,})\b", r"\1 \2", normalized)
+    normalized = re.sub(r"([a-z])([A-Z])", r"\1 \2", normalized)
+    return _normalize_phrase(normalized).rstrip(" '\".,;:!?…")
+
+
+def canonical_source_key(value: str) -> str:
+    return canonical_source_term(value).casefold()
+
+
 def _phrase_words(phrase: str) -> list[str]:
     return [word for word in re.split(r"\s+", phrase.strip()) if word]
 
@@ -193,7 +207,9 @@ def _is_valid_phrase(phrase: str) -> bool:
 
 
 def _is_fragment_phrase(phrase: str) -> bool:
-    return phrase.startswith(("The ", "In ", "On ", "How ", "A "))
+    return phrase.startswith(
+        ("The ", "In ", "On ", "How ", "A ", "That ", "Within ", "Between ", "From ", "For ")
+    )
 
 
 def _allows_single_word_candidate(

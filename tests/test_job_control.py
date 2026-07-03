@@ -104,6 +104,63 @@ def test_observer_records_chunk_success_and_progress(tmp_path: Path) -> None:
     assert any('"event": "cache_hit"' in line for line in events)
 
 
+def test_observer_expands_total_for_dynamic_fallback_chunk(tmp_path: Path) -> None:
+    observer = create_translation_job(
+        run_dir=tmp_path,
+        translator="mock",
+        source_language="en",
+        target_language="zh-CN",
+        total_chunks=2,
+        concurrency=1,
+        max_chunk_chars=9000,
+        resume=False,
+    )
+
+    observer.attempt_start(chunk_index=4, input_hash="fallback", attempt=1)
+    observer.attempt_success(
+        chunk_index=4,
+        input_hash="fallback",
+        cache_path=tmp_path / "translation-cache" / "fallback.md",
+    )
+
+    progress = load_progress(tmp_path)
+    assert progress["total_chunks"] == 5
+    assert progress["completed_chunks"] == 1
+    assert progress["remaining_chunks"] == 4
+
+
+def test_completed_job_reconciles_estimate_to_actual_chunk_count(
+    tmp_path: Path,
+) -> None:
+    observer = create_translation_job(
+        run_dir=tmp_path,
+        translator="mock",
+        source_language="en",
+        target_language="zh-CN",
+        total_chunks=3,
+        concurrency=1,
+        max_chunk_chars=9000,
+        resume=False,
+    )
+    observer.cache_hit(
+        chunk_index=0,
+        input_hash="a",
+        cache_path=tmp_path / "translation-cache" / "a.md",
+    )
+    observer.cache_hit(
+        chunk_index=1,
+        input_hash="b",
+        cache_path=tmp_path / "translation-cache" / "b.md",
+    )
+
+    observer.finish(status="completed")
+
+    progress = load_progress(tmp_path)
+    assert progress["total_chunks"] == 2
+    assert progress["completed_chunks"] == 2
+    assert progress["remaining_chunks"] == 0
+
+
 def test_observer_records_failure_without_losing_prior_success(tmp_path: Path) -> None:
     observer = create_translation_job(
         run_dir=tmp_path,

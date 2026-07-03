@@ -98,3 +98,39 @@ def test_missing_explanatory_translation_is_blocking_but_citation_is_not() -> No
 
     assert ledger["failures"]["missing_translations"] == ["prose-a"]
     assert "citation-a" not in ledger["failures"]["missing_translations"]
+
+
+def test_footnote_without_backlink_is_blocking() -> None:
+    book = _complete_book()
+    book["semantic_content"]["footnotes"][0]["backlinks"] = []
+
+    ledger = build_integrity_ledger(book)
+
+    assert ledger["failures"]["broken_footnote_links"] == ["footnote-a"]
+    assert ledger["dimensions"]["footnote_links"]["total"] == 1
+    assert ledger["dimensions"]["footnote_links"]["ratio"] == 0.0
+    assert ledger["ready"] is False
+
+
+def test_standalone_table_note_does_not_require_backlink() -> None:
+    book = _complete_book()
+    note = book["semantic_content"]["footnotes"][0]
+    note["backlinks"] = []
+    note["standalone"] = True
+
+    ledger = build_integrity_ledger(book)
+
+    assert ledger["failures"]["broken_footnote_links"] == []
+    assert ledger["dimensions"]["footnote_links"]["ratio"] == 1.0
+
+
+def test_open_review_blocks_approval_but_not_technical_readiness() -> None:
+    ledger = build_integrity_ledger(
+        _complete_book(),
+        review_items=[{"item_id": "review-a", "status": "open"}],
+    )
+
+    assert ledger["technical_ready"] is True
+    assert ledger["approved_ready"] is False
+    assert ledger["ready"] is False
+    assert ledger["failures"]["unresolved_review"] == ["review-a"]

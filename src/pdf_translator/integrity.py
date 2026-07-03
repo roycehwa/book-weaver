@@ -51,9 +51,11 @@ def build_integrity_ledger(
     semantic = semantic if isinstance(semantic, dict) else {}
     translatable_spans: list[dict[str, Any]] = []
     all_backlinks: list[str] = []
+    semantic_notes: list[dict[str, Any]] = []
     for note in semantic.get("footnotes", []):
         if not isinstance(note, dict):
             continue
+        semantic_notes.append(note)
         all_backlinks.extend(str(value) for value in note.get("backlinks", []))
         for span in note.get("spans", []):
             if isinstance(span, dict) and span.get("kind") == "prose":
@@ -80,6 +82,11 @@ def build_integrity_ledger(
     failures["broken_footnote_links"].extend(
         str(value) for value in epub_validation.get("unresolved_hrefs", [])
     )
+    failures["broken_footnote_links"].extend(
+        str(note.get("footnote_id") or "unknown")
+        for note in semantic_notes
+        if not note.get("backlinks") and not bool(note.get("standalone"))
+    )
     failures["absolute_paths"].extend(
         str(value) for value in epub_validation.get("absolute_paths", [])
     )
@@ -97,7 +104,11 @@ def build_integrity_ledger(
         [asset for asset in book.get("assets", []) if isinstance(asset, dict)]
     )
     asset_missing = len(failures["missing_assets"])
-    link_total = len(all_backlinks)
+    link_total = sum(
+        max(1, len(note.get("backlinks", [])))
+        for note in semantic_notes
+        if not bool(note.get("standalone"))
+    )
     link_missing = len(failures["broken_footnote_links"])
     dimensions = {
         "pages": {
@@ -124,11 +135,21 @@ def build_integrity_ledger(
             "ratio": _ratio(max(link_total - link_missing, 0), link_total),
         },
     }
+    technical_failures = {
+        key: values
+        for key, values in failures.items()
+        if key != "unresolved_review"
+    }
+    technical_ready = not any(technical_failures.values())
+    approved_ready = technical_ready and not failures["unresolved_review"]
     return {
         "schema": "integrity_ledger_v1",
         "dimensions": dimensions,
         "failures": failures,
-        "ready": not any(failures.values()),
+        "technical_ready": technical_ready,
+        "approved_ready": approved_ready,
+        # Backward-compatible alias: "ready" always means approved export ready.
+        "ready": approved_ready,
     }
 
 

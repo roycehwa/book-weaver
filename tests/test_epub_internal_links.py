@@ -192,3 +192,24 @@ def test_render_epub_keeps_uncited_note_without_broken_backlink(tmp_path: Path) 
 
     validation = validate_epub_internal_hrefs(out)
     assert validation["unresolved_internal_hrefs"] == 0
+
+
+def test_validation_reports_absolute_host_paths_in_package(tmp_path: Path) -> None:
+    out = tmp_path / "absolute.epub"
+    render_epub_from_book(
+        book={"chapters": []},
+        translated_chapters=[
+            {
+                "index": 1,
+                "title": "Chapter",
+                "markdown": "Internal evidence path: /Users/example/book/page-0006.png",
+            }
+        ],
+        output_path=out,
+        title="Absolute Path",
+    )
+
+    validation = validate_epub_internal_hrefs(out)
+
+    assert validation["absolute_paths"]
+    assert validation["absolute_paths"][0]["member"].endswith(".xhtml")

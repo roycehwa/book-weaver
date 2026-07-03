@@ -8,9 +8,42 @@ from pdf_translator.glossary import (
     extract_glossary_candidates,
     glossary_status,
     glossary_terms_missing_in_translation,
+    load_active_entries_for_translation,
     load_active_glossary,
     select_glossary_entries_for_text,
+    migrate_glossary_variants,
 )
+
+
+def test_load_active_entries_canonicalizes_legacy_ocr_spacing(tmp_path: Path) -> None:
+    (tmp_path / "glossary").mkdir()
+    (tmp_path / "glossary" / "active.json").write_text(
+        json.dumps(
+            {
+                "schema": "phase_a_glossary_v1",
+                "entries": [
+                    {
+                        "source": "Charles IIand",
+                        "target": "查理二世与",
+                        "status": "active",
+                    },
+                    {
+                        "source": "DeLa Mare",
+                        "target": "德拉马尔",
+                        "status": "active",
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    entries = load_active_entries_for_translation(tmp_path)
+
+    assert [entry["source"] for entry in entries] == [
+        "Charles II and",
+        "De La Mare",
+    ]
 
 
 def test_extract_glossary_candidates_writes_candidates_and_active(tmp_path: Path) -> None:
@@ -65,6 +98,73 @@ def test_apply_glossary_decision_updates_active_and_decision_log(tmp_path: Path)
     assert '"event": "glossary_decision"' in log
 
 
+def test_apply_glossary_decision_replaces_punctuation_variant(tmp_path: Path) -> None:
+    (tmp_path / "glossary").mkdir()
+    (tmp_path / "glossary" / "active.json").write_text(
+        json.dumps(
+            {
+                "schema": "phase_a_glossary_v1",
+                "entries": [
+                    {
+                        "source": "Soviet Union'",
+                        "target": "苏维埃联盟",
+                        "status": "active",
+                        "updated_by": "machine",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    apply_glossary_decision(
+        tmp_path,
+        source="Soviet Union",
+        target="苏联",
+        term_type="concept",
+        status="active",
+        decided_by="user",
+    )
+
+    active = load_active_glossary(tmp_path)
+    assert len(active["entries"]) == 1
+    assert active["entries"][0]["source"] == "Soviet Union"
+    assert active["entries"][0]["target"] == "苏联"
+    assert active["entries"][0]["updated_by"] == "user"
+
+
+def test_migrate_glossary_variants_prefers_user_decision(tmp_path: Path) -> None:
+    glossary_dir = tmp_path / "glossary"
+    glossary_dir.mkdir()
+    (glossary_dir / "active.json").write_text(
+        json.dumps(
+            {
+                "schema": "phase_a_glossary_v1",
+                "entries": [
+                    {
+                        "source": "Soviet Union'",
+                        "target": "苏维埃联盟",
+                        "status": "active",
+                        "updated_by": "machine",
+                    },
+                    {
+                        "source": "Soviet Union",
+                        "target": "苏联",
+                        "status": "active",
+                        "updated_by": "user",
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = migrate_glossary_variants(tmp_path)
+
+    assert result["merged_count"] == 1
+    assert load_active_glossary(tmp_path)["entries"][0]["target"] == "苏联"
+
+
 def test_select_glossary_entries_for_text_uses_relevant_active_terms() -> None:
     entries = [
         {"source": "Yellow Emperor", "target": "黄帝", "status": "active", "evidence": ["ch-001"]},
@@ -75,6 +175,37 @@ def test_select_glossary_entries_for_text_uses_relevant_active_terms() -> None:
     selected = select_glossary_entries_for_text("The Yellow Emperor speaks.", entries, chapter_id="ch-001", limit=2)
 
     assert [entry["source"] for entry in selected] == ["Yellow Emperor"]
+
+
+def test_select_glossary_entries_prefers_longest_overlapping_term() -> None:
+    entries = [
+        {"source": "World War", "target": "世界大战", "status": "active"},
+        {"source": "World War II", "target": "第二次世界大战", "status": "active"},
+        {"source": "Unused Term", "target": "未使用", "status": "active", "evidence": ["ch-001"]},
+    ]
+
+    selected = select_glossary_entries_for_text(
+        "After World War II, policy changed.",
+        entries,
+        chapter_id="ch-001",
+    )
+
+    assert [entry["source"] for entry in selected] == ["World War II"]
+
+
+def test_select_glossary_entries_rejects_fragment_of_longer_proper_name() -> None:
+    entries = [
+        {"source": "Second Sino", "target": "第二次中日战争", "status": "active"},
+        {"source": "Japanese War", "target": "日本战争", "status": "active"},
+    ]
+
+    selected = select_glossary_entries_for_text(
+        "The Second Sino–Japanese War changed the region.",
+        entries,
+        chapter_id="ch-001",
+    )
+
+    assert selected == []
 
 
 def test_glossary_status_reports_counts(tmp_path: Path) -> None:

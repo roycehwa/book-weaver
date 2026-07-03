@@ -11,9 +11,229 @@ from pdf_translator.translate import (
     MiniMaxAnthropicTranslator,
     MockTranslator,
     build_translator,
+    translate_semantic_footnote,
     translate_book_chapters,
     translate_markdown,
 )
+
+
+def test_semantic_footnote_translates_only_explanatory_spans() -> None:
+    class SemanticTranslator(BaseTranslator):
+        name = "semantic"
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            return "关于这一论点，参见"
+
+    citation = "Charles Tilly, Coercion, Capital, and European States, pp. 20–22."
+    note = {
+        "footnote_id": "footnote-a",
+        "spans": [
+            {
+                "span_id": "prose-a",
+                "kind": "prose",
+                "source_text": "For the argument, see ",
+                "translatable": True,
+            },
+            {
+                "span_id": "citation-a",
+                "kind": "citation",
+                "source_text": citation,
+                "translatable": False,
+            },
+        ],
+    }
+
+    translated = translate_semantic_footnote(
+        note,
+        translator=SemanticTranslator(),
+        source_language="en",
+        target_language="zh-CN",
+    )
+
+    assert translated["spans"][0]["translated_text"] == "关于这一论点，参见"
+    assert translated["spans"][1]["translated_text"] == citation
+
+
+def test_translate_book_chapters_returns_translated_semantic_content(tmp_path: Path) -> None:
+    class SemanticTranslator(BaseTranslator):
+        name = "semantic"
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            return "译：" + chunk.markdown
+
+    book = {
+        "chapters": [],
+        "semantic_content": {
+            "schema": "semantic_content_v1",
+            "footnotes": [
+                {
+                    "footnote_id": "footnote-a",
+                    "spans": [
+                        {
+                            "span_id": "prose-a",
+                            "kind": "prose",
+                            "source_text": "Explanatory text.",
+                            "translatable": True,
+                        },
+                        {
+                            "span_id": "citation-a",
+                            "kind": "citation",
+                            "source_text": "Book Title, p. 4.",
+                            "translatable": False,
+                        },
+                    ],
+                }
+            ],
+            "ocr_quarantine": [],
+            "evidence_assets": [],
+        },
+    }
+    settings = RunSettings(
+        source_pdf=tmp_path / "source.pdf",
+        output_dir=tmp_path,
+        target_language="zh-CN",
+        source_language="en",
+        translator="semantic",
+        max_chunk_chars=1000,
+    )
+
+    result = translate_book_chapters(
+        book=book,
+        settings=settings,
+        translator=SemanticTranslator(),
+        cache_dir=tmp_path / "translation-cache",
+    )
+
+    spans = result.semantic_content["footnotes"][0]["spans"]
+    assert spans[0]["translated_text"] == "译：Explanatory text."
+    assert spans[1]["translated_text"] == "Book Title, p. 4."
+    assert result.chunk_count == 1
+
+
+def test_semantic_prose_spans_are_batched_without_mixing_boundaries(
+    tmp_path: Path,
+) -> None:
+    class BatchTranslator(BaseTranslator):
+        name = "batch"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            self.calls += 1
+            return chunk.markdown.replace("First explanation.", "第一段。").replace(
+                "Second explanation.", "第二段。"
+            )
+
+    book = {
+        "chapters": [],
+        "semantic_content": {
+            "footnotes": [
+                {
+                    "footnote_id": "a",
+                    "spans": [
+                        {"span_id": "p1", "kind": "prose", "source_text": "First explanation."}
+                    ],
+                },
+                {
+                    "footnote_id": "b",
+                    "spans": [
+                        {"span_id": "p2", "kind": "prose", "source_text": "Second explanation."}
+                    ],
+                },
+            ]
+        },
+    }
+    settings = RunSettings(
+        source_pdf=tmp_path / "source.pdf",
+        output_dir=tmp_path,
+        target_language="zh-CN",
+        source_language="en",
+        translator="batch",
+        max_chunk_chars=1000,
+    )
+    translator = BatchTranslator()
+
+    result = translate_book_chapters(book=book, settings=settings, translator=translator)
+
+    spans = [
+        note["spans"][0]["translated_text"]
+        for note in result.semantic_content["footnotes"]
+    ]
+    assert spans == ["第一段。", "第二段。"]
+    assert translator.calls == 1
+    assert result.chunk_count == 1
+
+
+def test_semantic_batch_boundary_loss_falls_back_to_individual_spans(
+    tmp_path: Path,
+) -> None:
+    class BoundaryDroppingTranslator(BaseTranslator):
+        name = "boundary-drop"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            self.calls += 1
+            translated = chunk.markdown.replace("First.", "第一。").replace(
+                "Second.", "第二。"
+            )
+            if "<!--__SEMANTIC_SPAN_BOUNDARY__-->" in translated:
+                return translated.replace(
+                    "<!--__SEMANTIC_SPAN_BOUNDARY__-->",
+                    "",
+                    1,
+                )
+            return translated
+
+    book = {
+        "chapters": [],
+        "semantic_content": {
+            "footnotes": [
+                {"spans": [{"span_id": "p1", "kind": "prose", "source_text": "First."}]},
+                {"spans": [{"span_id": "p2", "kind": "prose", "source_text": "Second."}]},
+            ]
+        },
+    }
+    settings = RunSettings(
+        source_pdf=tmp_path / "source.pdf",
+        output_dir=tmp_path,
+        target_language="zh-CN",
+        source_language="en",
+        translator="boundary-drop",
+        max_chunk_chars=1000,
+    )
+    translator = BoundaryDroppingTranslator()
+
+    result = translate_book_chapters(book=book, settings=settings, translator=translator)
+
+    assert [
+        note["spans"][0]["translated_text"]
+        for note in result.semantic_content["footnotes"]
+    ] == ["第一。", "第二。"]
+    assert translator.calls == 3
+    assert result.chunk_count == 3
 
 
 def test_mock_translator_does_not_add_visible_debug_markers() -> None:
@@ -32,6 +252,55 @@ def test_mock_translator_does_not_add_visible_debug_markers() -> None:
 
     assert result.translated_markdown == "Body text.\n"
     assert "mock translation chunk" not in result.translated_markdown
+
+
+def test_permanent_token_plan_limit_is_not_retried(tmp_path: Path) -> None:
+    class QuotaTranslator(BaseTranslator):
+        name = "quota"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            self.calls += 1
+            raise ValueError("rate_limit_error: Token Plan 速率限制 (2062)")
+
+    translator = QuotaTranslator()
+    with pytest.raises(ValueError, match="2062"):
+        translate_markdown(
+            chunks=[TranslationChunk(index=0, markdown="Source prose.")],
+            settings=RunSettings(
+                source_pdf=tmp_path / "source.pdf",
+                output_dir=tmp_path,
+                target_language="zh-CN",
+                source_language="en",
+                translator="quota",
+                max_chunk_chars=1000,
+            ),
+            translator=translator,
+            retry_count=6,
+        )
+
+    assert translator.calls == 1
+
+
+def test_translation_prompt_defines_footnote_policy() -> None:
+    from pdf_translator.translate import build_translation_prompt
+
+    prompt = build_translation_prompt(
+        markdown="24 William Byrd, explanatory prose.",
+        chunk_index=0,
+        source_language="en",
+        target_language="zh-CN",
+    )
+
+    assert "Translate explanatory footnote prose" in prompt
+    assert "bibliographic titles" in prompt
 
 
 class FailingTranslator(BaseTranslator):
@@ -64,6 +333,49 @@ def test_mock_translator_does_not_add_visible_markers(tmp_path: Path) -> None:
 
     assert "mock translation chunk" not in result.translated_markdown
     assert result.translated_markdown == "# Title\n\nBody.\n"
+
+
+def test_translate_markdown_records_injected_glossary_constraints(tmp_path: Path) -> None:
+    settings = RunSettings(
+        source_pdf=tmp_path / "source.pdf",
+        output_dir=tmp_path,
+        target_language="zh-CN",
+        source_language="en",
+        translator="mock",
+        max_chunk_chars=1000,
+        glossary_entries=[
+            {
+                "source": "Soviet Union",
+                "target": "苏联",
+                "status": "active",
+                "evidence": [],
+            }
+        ],
+    )
+
+    translate_markdown(
+        chunks=[TranslationChunk(index=0, markdown="The Soviet Union shaped policy.")],
+        settings=settings,
+        translator=MockTranslator(),
+    )
+
+    snapshot = json.loads(
+        (tmp_path / "jobs" / "glossary-constraints.json").read_text(encoding="utf-8")
+    )
+    assert snapshot["schema"] == "translation_glossary_constraints_v1"
+    assert snapshot["chunks"] == [
+        {
+            "chunk_index": 0,
+            "terms": [
+                {
+                    "source": "Soviet Union",
+                    "target": "苏联",
+                    "status": "active",
+                    "evidence": [],
+                }
+            ],
+        }
+    ]
 
 
 def test_translate_markdown_reuses_cached_chunk(tmp_path: Path) -> None:
@@ -178,7 +490,7 @@ def test_translate_markdown_splits_minimax_sensitive_chunk(tmp_path: Path) -> No
     assert "拆分后生成" in result.translated_markdown
 
 
-def test_translate_book_preserves_numbered_citation_blocks() -> None:
+def test_translate_book_sends_numbered_citation_blocks_for_translation() -> None:
     class CountingTranslator(BaseTranslator):
         name = "realish"
 
@@ -225,8 +537,7 @@ def test_translate_book_preserves_numbered_citation_blocks() -> None:
     )
 
     assert len(translator.sources) == 1
-    assert citation not in translator.sources[0]
-    assert citation in result.translated_chapters[0].markdown
+    assert citation in translator.sources[0]
 
 
 def test_translate_markdown_retries_untranslated_chinese_output(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -728,13 +1039,28 @@ def test_translate_book_chapters_restores_media_blocks_after_translation(tmp_pat
     assert "PRESERVE_ORIGINAL_BLOCK" not in result.translated_markdown
 
 
-def test_translate_book_chapters_preserves_link_heavy_lists_without_model_call(tmp_path: Path) -> None:
+def test_translate_book_chapters_keeps_list_of_illustrations_as_preserved_apparatus(tmp_path: Path) -> None:
+    class EchoTranslator(BaseTranslator):
+        name = "echo"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            self.calls += 1
+            return "译文：" + chunk.markdown
+
     settings = RunSettings(
         source_pdf=tmp_path / "source.epub",
         output_dir=tmp_path,
         target_language="zh-CN",
         source_language="en",
-        translator="failing",
+        translator="echo",
         max_chunk_chars=1000,
     )
     links = "".join(f"[Figure {index}](OEBPS/part.xhtml#fig-{index})" for index in range(20))
@@ -748,11 +1074,58 @@ def test_translate_book_chapters_preserves_link_heavy_lists_without_model_call(t
             }
         ]
     }
+    translator = EchoTranslator()
 
-    result = translate_book_chapters(book=book, settings=settings, translator=FailingTranslator())
+    result = translate_book_chapters(book=book, settings=settings, translator=translator)
 
+    assert translator.calls == 0
     assert "Figure 19" in result.translated_markdown
-    assert "OEBPS/part.xhtml#fig-19" in result.translated_markdown
+
+
+def test_translate_book_chapters_translates_numbered_note_lists(tmp_path: Path) -> None:
+    class EchoTranslator(BaseTranslator):
+        name = "echo"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            self.calls += 1
+            return "译文：" + chunk.markdown
+
+    settings = RunSettings(
+        source_pdf=tmp_path / "source.epub",
+        output_dir=tmp_path,
+        target_language="zh-CN",
+        source_language="en",
+        translator="echo",
+        max_chunk_chars=1000,
+    )
+    notes = (
+        "- [**1.**](OPS/chapter.xhtml#note-1) The first note keeps bibliographic context.\n"
+        "- [**2.**](OPS/chapter.xhtml#note-2) The second note explains chronology."
+    )
+    book = {
+        "chapters": [
+            {
+                "index": 1,
+                "title": "Notes Section",
+                "markdown": notes,
+                "translate": True,
+            }
+        ]
+    }
+    translator = EchoTranslator()
+
+    result = translate_book_chapters(book=book, settings=settings, translator=translator)
+
+    assert translator.calls >= 1
+    assert "译文：" in result.translated_markdown
 
 
 def test_minimax_settings_use_provider_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -865,7 +1238,13 @@ def test_minimax_translator_uses_anthropic_messages_api(monkeypatch: pytest.Monk
     assert body["messages"] == [
         {
             "role": "user",
-            "content": "Source language: en\nTarget language: zh-CN\nMarkdown chunk index: 3\n\n# Title\n\nBody.",
+            "content": (
+                "Source language: en\nTarget language: zh-CN\nMarkdown chunk index: 3\n\n"
+                "Translate explanatory footnote prose into the target language. "
+                "Preserve bibliographic titles, personal names, archival identifiers, and quoted "
+                "source titles in their original language when translation would reduce citation "
+                "accuracy.\n\n# Title\n\nBody."
+            ),
         }
     ]
 

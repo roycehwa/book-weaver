@@ -180,6 +180,15 @@ def reset_glossary_review(
     cleared_policy = None
     if clear_policy_annotations:
         cleared_policy = clear_glossary_policy_round_annotations(run_dir)
+    derived_paths = (
+        run_dir / "pre_review.json",
+        run_dir / "review_items.json",
+        run_dir / "review_state.json",
+        run_dir / "jobs" / "glossary-constraints.json",
+        run_dir / "repair" / "pending-confirmation.json",
+    )
+    for path in derived_paths:
+        path.unlink(missing_ok=True)
     write_workflow(
         run_dir,
         stage=STAGE_AWAITING_GLOSSARY,

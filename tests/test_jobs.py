@@ -169,9 +169,11 @@ def test_job_runner_reaches_review_ready_and_maps_artifacts(tmp_path: Path) -> N
         manifest = output_dir / "manifest.json"
         translated = output_dir / "translated.md"
         review_items = output_dir / "review_items.json"
+        page_ledger = output_dir / "page-ledger.json"
         manifest.write_text("{}", encoding="utf-8")
         translated.write_text("translated", encoding="utf-8")
         review_items.write_text("{}", encoding="utf-8")
+        page_ledger.write_text("{}", encoding="utf-8")
         on_stage("ingesting", {"stage_percent": 100, "source_language": "en"})
         on_stage("reconstructing", {"stage_percent": 100})
         on_stage("preserving", {"stage_percent": 100, "text_operation": "preserve"})
@@ -190,6 +192,7 @@ def test_job_runner_reaches_review_ready_and_maps_artifacts(tmp_path: Path) -> N
     assert completed["artifacts"]["manifest"]["href"] == "artifacts/source/manifest.json"
     assert completed["artifacts"]["translated_markdown"]["href"] == "artifacts/source/translated.md"
     assert completed["artifacts"]["review_items"]["href"] == "artifacts/source/review_items.json"
+    assert completed["artifacts"]["page_ledger"]["href"] == "artifacts/source/page-ledger.json"
     assert [event["type"] for event in repository.list_events(created["job_id"])] == [
         "job_created",
         "stage_started",
@@ -255,6 +258,86 @@ def test_job_runner_records_failure_and_resume_uses_existing_job(tmp_path: Path)
     assert "job_resumed" in [
         event["type"] for event in repository.list_events(created["job_id"])
     ]
+
+
+def test_job_runner_persists_canonical_polish_outcome(tmp_path: Path) -> None:
+    source = tmp_path / "source.pdf"
+    source.write_bytes(b"%PDF")
+    repository = JobRepository(tmp_path / "jobs")
+    created = repository.create(source_path=source, translator="mock")
+
+    def fake_pipeline(settings, on_stage):
+        on_stage("translating", {"stage_percent": 100, "text_operation": "translate"})
+        on_stage("polishing", {"stage_percent": 0})
+        on_stage("polishing", {"stage_percent": 100, "polish_outcome": "no_candidates"})
+        on_stage("pre_review", {"stage_percent": 100})
+        output_dir = settings.output_dir / source.stem
+        output_dir.mkdir(parents=True, exist_ok=True)
+        manifest = output_dir / "manifest.json"
+        translated = output_dir / "translated.md"
+        manifest.write_text("{}", encoding="utf-8")
+        translated.write_text("translated", encoding="utf-8")
+        return _pipeline_artifacts(output_dir, manifest, translated)
+
+    completed = BookJobRunner(repository, pipeline_runner=fake_pipeline).run(created["job_id"])
+
+    assert completed["progress"]["polish_outcome"] == "no_candidates"
+    polish_events = [
+        event
+        for event in repository.list_events(created["job_id"])
+        if event["stage"] == "polishing"
+    ]
+    assert polish_events[-1]["type"] == "stage_completed"
+    assert polish_events[-1]["data"]["polish_outcome"] == "no_candidates"
+
+
+def test_job_runner_records_polish_failure_as_failed_stage(tmp_path: Path) -> None:
+    source = tmp_path / "source.pdf"
+    source.write_bytes(b"%PDF")
+    repository = JobRepository(tmp_path / "jobs")
+    created = repository.create(source_path=source, translator="mock")
+
+    def fake_pipeline(_settings, on_stage):
+        on_stage("polishing", {"stage_percent": 0})
+        raise RuntimeError("polish provider unavailable")
+
+    runner = BookJobRunner(repository, pipeline_runner=fake_pipeline)
+    with pytest.raises(RuntimeError, match="polish provider unavailable"):
+        runner.run(created["job_id"])
+
+    failed = repository.load(created["job_id"])
+    assert failed["state"] == "failed"
+    assert failed["failed_stage"] == "polishing"
+    assert failed["progress"]["polish_outcome"] == "failed"
+
+
+def test_job_runner_resumes_polish_failure_from_existing_run(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "source.pdf"
+    source.write_bytes(b"%PDF")
+    repository = JobRepository(tmp_path / "jobs")
+    created = repository.create(source_path=source, translator="mock")
+    repository.update(
+        created["job_id"],
+        state="failed",
+        failed_stage="polishing",
+        progress={"polish_outcome": "failed"},
+    )
+    runner = BookJobRunner(repository, pipeline_runner=lambda *_args: None)
+    runner._uses_default_pipeline = True
+    run_dir = tmp_path / "existing-run"
+    monkeypatch.setattr(runner, "_run_output_dir", lambda _job_id: run_dir)
+    calls: list[tuple[str, Path | None, bool]] = []
+
+    def fake_full_pipeline(job_id, *, existing_run_dir=None, require_glossary_ready=False):
+        calls.append((job_id, existing_run_dir, require_glossary_ready))
+        return {"state": "awaiting_human_review"}
+
+    monkeypatch.setattr(runner, "_run_full_pipeline", fake_full_pipeline)
+
+    result = runner.resume(created["job_id"])
+
+    assert result["state"] == "awaiting_human_review"
+    assert calls == [(created["job_id"], run_dir, True)]
 
 
 def test_job_runner_marks_invalid_source_non_retryable(tmp_path: Path) -> None:

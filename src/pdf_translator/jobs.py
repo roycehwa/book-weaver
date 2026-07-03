@@ -24,6 +24,7 @@ JOB_STATES = frozenset(
         "reconstructing",
         "awaiting_glossary",
         "translating",
+        "polishing",
         "preserving",
         "validating",
         "pre_review",
@@ -273,6 +274,7 @@ class BookJobRunner:
         "reconstructing": 15,
         "awaiting_glossary": 20,
         "translating": 25,
+        "polishing": 70,
         "preserving": 25,
         "validating": 75,
         "pre_review": 85,
@@ -440,13 +442,14 @@ class BookJobRunner:
     ) -> dict[str, Any]:
         snapshot = self.repository.load(job_id)
         current_stage: str | None = None
+        current_stage_data: dict[str, Any] = {}
 
         def on_stage(stage: str, data: dict[str, Any]) -> None:
-            nonlocal current_stage
+            nonlocal current_stage, current_stage_data
             if stage not in JOB_STATES or stage in {"created", "failed", "completed"}:
                 raise ValueError(f"Unsupported pipeline job stage: {stage!r}.")
             if current_stage is not None and current_stage != stage:
-                self._complete_stage(job_id, current_stage)
+                self._complete_stage(job_id, current_stage, current_stage_data)
             if current_stage != stage:
                 self.repository.append_event(
                     job_id,
@@ -455,6 +458,7 @@ class BookJobRunner:
                     data={},
                 )
             current_stage = stage
+            current_stage_data = dict(data)
             resolved: dict[str, Any] = {}
             if "source_language" in data:
                 resolved["source_language"] = data["source_language"]
@@ -469,6 +473,13 @@ class BookJobRunner:
                     "overall_percent": self._OVERALL_PERCENT.get(stage, 0),
                 },
             }
+            if stage == "polishing" and data.get("polish_outcome") in {
+                "applied",
+                "no_candidates",
+                "waived",
+                "failed",
+            }:
+                changes["progress"]["polish_outcome"] = data["polish_outcome"]
             if resolved:
                 changes["resolved"] = resolved
             self.repository.update(job_id, **changes)
@@ -488,10 +499,15 @@ class BookJobRunner:
                 existing_run_dir=existing_run_dir,
                 require_glossary_ready=require_glossary_ready,
                 resume_translation=existing_run_dir is not None,
+                canonical_chapters_path=(
+                    self.repository.job_dir(job_id) / "artifacts" / "canonical-chapters.json"
+                    if (self.repository.job_dir(job_id) / "artifacts" / "canonical-chapters.json").is_file()
+                    else None
+                ),
             )
             artifacts = self.pipeline_runner(settings, on_stage)
             if current_stage is not None:
-                self._complete_stage(job_id, current_stage)
+                self._complete_stage(job_id, current_stage, current_stage_data)
             artifact_map = self._artifact_map(job_id, artifacts)
             completed = self.repository.update(
                 job_id,
@@ -515,6 +531,7 @@ class BookJobRunner:
             details = {"stage": failed_stage}
             if reason:
                 details["reason"] = reason
+            failure_progress = {"polish_outcome": "failed"} if failed_stage == "polishing" else {}
             self.repository.update(
                 job_id,
                 state="failed",
@@ -525,6 +542,7 @@ class BookJobRunner:
                     "retryable": retryable,
                     "details": details,
                 },
+                progress=failure_progress,
             )
             self.repository.append_event(
                 job_id,
@@ -555,6 +573,7 @@ class BookJobRunner:
             )
         if state == "translating" or snapshot.get("failed_stage") in {
             "translating",
+            "polishing",
             "validating",
             "pre_review",
         }:
@@ -584,19 +603,33 @@ class BookJobRunner:
             ingest_timeout_seconds=request.get("ingest_timeout_seconds"),
         )
 
-    def _complete_stage(self, job_id: str, stage: str) -> None:
+    def _complete_stage(
+        self,
+        job_id: str,
+        stage: str,
+        data: dict[str, Any] | None = None,
+    ) -> None:
+        completion_data = dict(data or {})
+        progress = {
+            "stage_percent": 100,
+            "overall_percent": self._OVERALL_PERCENT.get(stage, 0),
+        }
+        if stage == "polishing" and completion_data.get("polish_outcome") in {
+            "applied",
+            "no_candidates",
+            "waived",
+            "failed",
+        }:
+            progress["polish_outcome"] = completion_data["polish_outcome"]
         self.repository.update(
             job_id,
-            progress={
-                "stage_percent": 100,
-                "overall_percent": self._OVERALL_PERCENT.get(stage, 0),
-            },
+            progress=progress,
         )
         self.repository.append_event(
             job_id,
             event_type="stage_completed",
             stage=stage,
-            data={},
+            data=completion_data,
         )
 
     @staticmethod
@@ -648,6 +681,7 @@ class BookJobRunner:
             {
                 "translated_chapters": output_dir / "translated-chapters.json",
                 "chapter_report": output_dir / "chapter-report.json",
+                "page_ledger": output_dir / "page-ledger.json",
                 "segments": output_dir / "segments.json",
                 "translated_segments": output_dir / "translated-segments.json",
                 "review_items": output_dir / "review_items.json",

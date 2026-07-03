@@ -1,7 +1,10 @@
 from pathlib import Path
 import json
 
+import pytest
+
 from pdf_translator import pipeline as pipeline_module
+from pdf_translator import polish as polish_module
 from pdf_translator.config import RunSettings
 from pdf_translator.models import NormalizedDocument
 from pdf_translator.pipeline import build_artifacts, safe_delivery_file_stem
@@ -93,6 +96,14 @@ def test_run_intake_pipeline_writes_bookir_without_translation_cache(tmp_path: P
     assert manifest["translation"]["mode"] == "not_requested"
     assert manifest["files"]["book_json"].endswith("book.json")
     assert artifacts.book_json_path and artifacts.book_json_path.exists()
+    page_ledger_path = artifacts.output_dir / "page-ledger.json"
+    assert page_ledger_path.exists()
+    page_ledger = json.loads(page_ledger_path.read_text(encoding="utf-8"))
+    assert page_ledger["summary"]["required_coverage_ratio"] == 1.0
+    integrity_ledger_path = artifacts.output_dir / "integrity-ledger.json"
+    assert integrity_ledger_path.exists()
+    integrity_ledger = json.loads(integrity_ledger_path.read_text(encoding="utf-8"))
+    assert integrity_ledger["schema"] == "integrity_ledger_v1"
     assert not (artifacts.output_dir / "translation-cache").exists()
 
 
@@ -148,6 +159,53 @@ def test_translate_pipeline_writes_review_artifacts_for_real_translation(tmp_pat
     assert review_state["schema"] == "translation_review_state_v1"
 
 
+def test_translate_pipeline_records_no_candidates_polish_outcome(tmp_path: Path, monkeypatch) -> None:
+    _patch_intake_dependencies(monkeypatch)
+    monkeypatch.setattr(polish_module, "scan_polish_candidates", lambda _text: [])
+    stages: list[tuple[str, dict[str, object]]] = []
+    settings = RunSettings(
+        source_pdf=tmp_path / "english-book.epub",
+        output_dir=tmp_path / "runs",
+        target_language="zh-CN",
+        source_language="en",
+        translator="mock",
+        max_chunk_chars=9000,
+        profile_name="book",
+        output_format="none",
+    )
+
+    pipeline_module.run_translation_pipeline(
+        settings,
+        lambda stage, data: stages.append((stage, data)),
+    )
+
+    assert ("polishing", {"stage_percent": 0}) in stages
+    assert ("polishing", {"stage_percent": 100, "polish_outcome": "no_candidates"}) in stages
+
+
+def test_translate_pipeline_does_not_hide_polish_failure(tmp_path: Path, monkeypatch) -> None:
+    _patch_intake_dependencies(monkeypatch)
+    monkeypatch.setattr(polish_module, "scan_polish_candidates", lambda _text: [object()])
+
+    def fail_polish(**_kwargs):
+        raise RuntimeError("polish provider unavailable")
+
+    monkeypatch.setattr(polish_module, "run_polish", fail_polish)
+    settings = RunSettings(
+        source_pdf=tmp_path / "english-book.epub",
+        output_dir=tmp_path / "runs",
+        target_language="zh-CN",
+        source_language="en",
+        translator="mock",
+        max_chunk_chars=9000,
+        profile_name="book",
+        output_format="none",
+    )
+
+    with pytest.raises(RuntimeError, match="polish provider unavailable"):
+        pipeline_module.run_translation_pipeline(settings)
+
+
 def test_translate_pipeline_writes_translation_job_files(tmp_path: Path, monkeypatch) -> None:
     _patch_intake_dependencies(monkeypatch)
     settings = RunSettings(
@@ -167,6 +225,8 @@ def test_translate_pipeline_writes_translation_job_files(tmp_path: Path, monkeyp
     for key in ["translation_job", "translation_progress", "translation_events"]:
         assert key in manifest["files"]
         assert Path(manifest["files"][key]).exists()
+    assert (artifacts.output_dir / "jobs" / "glossary-constraints.json").exists()
+    assert not (settings.output_dir / "jobs" / "glossary-constraints.json").exists()
 
     progress = json.loads(Path(manifest["files"]["translation_progress"]).read_text(encoding="utf-8"))
     assert progress["status"] == "completed"

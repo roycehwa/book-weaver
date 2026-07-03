@@ -42,11 +42,14 @@ def verify_run(run_dir: Path) -> list[str]:
     failures = ledger.get("failures")
     failures = failures if isinstance(failures, dict) else {}
     for key, values in failures.items():
+        if key == "unresolved_review":
+            continue
         if not isinstance(values, list) or not values:
             continue
         preview = ", ".join(str(value) for value in values[:8])
         errors.append(f"{key}: {preview}")
-    if ledger.get("ready") is not True and not errors:
+    technical_ready = ledger.get("technical_ready", ledger.get("ready"))
+    if technical_ready is not True and not errors:
         errors.append("integrity ledger is not ready")
     return errors
 

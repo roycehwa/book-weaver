@@ -38,12 +38,15 @@ from pdf_translator.profile import build_document_profile
 from pdf_translator.render import render_pdf_from_markdown
 from pdf_translator.review import (
     apply_review_state,
+    merge_reviewed_chapters_with_resources,
     review_project_from_run,
+    restore_review_chapter_apparatus,
     rewrite_review_requests,
     summarize_review_state,
     translated_segments_to_chapters,
     write_versioned_outputs,
 )
+from pdf_translator.review_migration import migrate_legacy_review_run
 from pdf_translator.epub import render_epub_from_book, validate_epub_internal_hrefs
 from pdf_translator.glossary import (
     apply_glossary_decision,
@@ -816,6 +819,129 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _review_image_roots(run_dir: Path, manifest: dict[str, object]) -> list[Path]:
+    candidates: list[Path] = []
+    files = manifest.get("files")
+    if isinstance(files, dict):
+        configured = files.get("images_dir")
+        if isinstance(configured, str) and configured.strip():
+            candidates.append(Path(configured).expanduser())
+    candidates.extend([run_dir / "book-images", run_dir / "images"])
+
+    roots: list[Path] = []
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved.is_dir() and resolved not in roots:
+            roots.append(resolved)
+    return roots
+
+
+def _uncovered_book_pages(book: dict[str, object]) -> list[int]:
+    raw_pages = book.get("pages")
+    raw_chapters = book.get("chapters")
+    if not isinstance(raw_pages, list) or not isinstance(raw_chapters, list):
+        return []
+    covered = {
+        int(page_no)
+        for chapter in raw_chapters
+        if isinstance(chapter, dict)
+        for page_no in chapter.get("source_pages", [])
+        if isinstance(page_no, int)
+    }
+    content_pages = {
+        int(page["page_no"])
+        for page in raw_pages
+        if isinstance(page, dict)
+        and isinstance(page.get("page_no"), int)
+        and (
+            page.get("has_content") is True
+            or (
+                "has_content" not in page
+                and (
+                    page.get("page_kind") != "visual_only"
+                    or int(page.get("figure_count") or 0) > 0
+                    or int(page.get("table_count") or 0) > 0
+                )
+            )
+        )
+    }
+    return sorted(content_pages - covered)
+
+
+def _load_complete_review_book(
+    run_dir: Path,
+    manifest: dict[str, object],
+) -> dict[str, object]:
+    book: dict[str, object] = {
+        "metadata": {"schema": "review_export_fallback"},
+        "chapters": [],
+    }
+    book_path = run_dir / "book.json"
+    if book_path.exists():
+        book = json.loads(book_path.read_text(encoding="utf-8"))
+    semantic_content = book.get("semantic_content")
+    needs_contract_migration = (
+        not isinstance(semantic_content, dict)
+        or semantic_content.get("schema") != "semantic_content_v1"
+        or not (run_dir / "integrity-ledger.json").exists()
+    )
+    normalized_value = (manifest.get("files") or {}).get("normalized_json")
+    normalized_path = (
+        Path(str(normalized_value)).expanduser().resolve()
+        if normalized_value
+        else run_dir / "normalized.json"
+    )
+    can_rebuild = normalized_path.exists() and (run_dir / "review_state.json").exists()
+    if _uncovered_book_pages(book) or (needs_contract_migration and can_rebuild):
+        migrate_legacy_review_run(run_dir)
+        book = json.loads(book_path.read_text(encoding="utf-8"))
+    uncovered_pages = _uncovered_book_pages(book)
+    if uncovered_pages:
+        preview = ", ".join(str(page) for page in uncovered_pages[:12])
+        raise ValueError(
+            "Review export blocked: source pages are missing from the book model "
+            f"({len(uncovered_pages)} pages; first: {preview})."
+        )
+    return book
+
+
+def _validate_approved_review_project(
+    project: dict[str, object],
+    *,
+    integrity_ledger: dict[str, object] | None = None,
+) -> None:
+    translated_segments = apply_review_state(
+        project.get("translated_segments", []),
+        project.get("review_state", {}),
+    )
+    missing = [
+        str(segment.get("segment_id") or "")
+        for segment in translated_segments
+        if bool(segment.get("translate", True))
+        and not str(segment.get("translated_text") or "").strip()
+    ]
+    if missing:
+        preview = ", ".join(missing[:8])
+        raise ValueError(
+            "Approved review export blocked: missing translated content "
+            f"for {len(missing)} segments (first: {preview})."
+        )
+    summary = summarize_review_state(
+        project.get("review_items", []),
+        project.get("review_state", {}),
+    )
+    open_items = int(summary.get("open_items") or 0)
+    if open_items:
+        raise ValueError(
+            "Approved review export blocked: unresolved review items remain "
+            f"({open_items})."
+        )
+    if integrity_ledger is not None:
+        from pdf_translator.integrity import assert_approved_export_ready
+
+        assert_approved_export_ready(integrity_ledger)
+
+
 def _run_review_export(
     *,
     run_dir: Path,
@@ -827,12 +953,57 @@ def _run_review_export(
 ) -> dict[str, object]:
     run_dir = run_dir.expanduser().resolve()
     project = review_project_from_run(run_dir)
+    if approve:
+        integrity_path = run_dir / "integrity-ledger.json"
+        integrity_ledger = (
+            json.loads(integrity_path.read_text(encoding="utf-8"))
+            if integrity_path.exists()
+            else None
+        )
+        _validate_approved_review_project(
+            project,
+            integrity_ledger=integrity_ledger,
+        )
     applied_segments = apply_review_state(project["translated_segments"], project["review_state"])
+    manifest = {}
+    manifest_path = run_dir / "manifest.json"
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    source_name = Path(str(manifest.get("source_pdf") or run_dir.name)).stem
+    reviewed_chapters = translated_segments_to_chapters(applied_segments)
+    translated_chapters_path = (manifest.get("files") or {}).get("translated_chapters")
+    if isinstance(translated_chapters_path, str) and translated_chapters_path.strip():
+        translated_chapters_file = Path(translated_chapters_path).expanduser().resolve()
+        if translated_chapters_file.exists():
+            base_translated = json.loads(translated_chapters_file.read_text(encoding="utf-8"))
+            reviewed_chapters = restore_review_chapter_apparatus(reviewed_chapters, base_translated)
+    book = _load_complete_review_book(run_dir, manifest)
+    if not book.get("chapters"):
+        book = {
+            "metadata": {"schema": "review_export_fallback"},
+            "chapters": reviewed_chapters,
+        }
+    delivery_chapters = merge_reviewed_chapters_with_resources(
+        reviewed_chapters,
+        book,
+    )
+    delivery_markdown_parts: list[str] = []
+    for chapter in delivery_chapters:
+        body = str(chapter.get("markdown") or "").strip()
+        title = str(chapter.get("title") or "").strip()
+        if title and body and not body.startswith("#"):
+            body = f"# {title}\n\n{body}"
+        if body:
+            delivery_markdown_parts.append(body)
+    delivery_markdown = "\n\n".join(delivery_markdown_parts).strip() + "\n"
+    image_roots = _review_image_roots(run_dir, manifest)
+
     version = write_versioned_outputs(
         run_dir=run_dir,
         version_name=version_name,
         target_language=target_language,
         translated_segments=applied_segments,
+        translated_markdown_override=delivery_markdown,
         parent_version=parent_version,
         approval_status="approved" if approve else "draft",
     )
@@ -841,18 +1012,6 @@ def _run_review_export(
     translated_markdown = translated_markdown_path.read_text(encoding="utf-8")
     rendered_files: dict[str, object] = {}
 
-    manifest = {}
-    manifest_path = run_dir / "manifest.json"
-    if manifest_path.exists():
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    source_name = Path(str(manifest.get("source_pdf") or run_dir.name)).stem
-    book = {
-        "metadata": {"schema": "review_export_fallback"},
-        "chapters": translated_segments_to_chapters(applied_segments),
-    }
-    if (run_dir / "book.json").exists():
-        book = json.loads((run_dir / "book.json").read_text(encoding="utf-8"))
-
     delivery_stem = safe_delivery_file_stem(Path(source_name), target_language)
     if output_format in {"pdf", "both"}:
         pdf_path = version_dir / f"{delivery_stem}.pdf"
@@ -860,16 +1019,18 @@ def _run_review_export(
             title=f"{source_name} ({target_language})",
             markdown_text=translated_markdown,
             output_path=pdf_path,
+            images_dir=image_roots[0] if image_roots else None,
         )
         rendered_files["translated_pdf"] = str(pdf_path)
     if output_format in {"epub", "both"}:
         epub_path = version_dir / f"{delivery_stem}.epub"
         render_epub_from_book(
             book=book,
-            translated_chapters=translated_segments_to_chapters(applied_segments),
+            translated_chapters=delivery_chapters,
             output_path=epub_path,
             title=f"{source_name} ({target_language})",
             language=target_language,
+            image_roots=image_roots,
         )
         rendered_files["translated_epub"] = str(epub_path)
         rendered_files["epub_href_validation"] = validate_epub_internal_hrefs(epub_path)

@@ -25,3 +25,16 @@ def test_split_markdown_splits_large_block_linewise() -> None:
 
     assert len(chunks) > 1
     assert all(len(chunk.markdown) <= 30 for chunk in chunks)
+
+
+def test_split_markdown_splits_oversized_paragraph_at_sentence_boundaries() -> None:
+    markdown = (
+        "First complete sentence. Second complete sentence. "
+        "Third complete sentence. Fourth complete sentence."
+    )
+
+    chunks = split_markdown_into_chunks(markdown, max_chars=55)
+
+    assert len(chunks) > 1
+    assert all(chunk.markdown.endswith(".") for chunk in chunks)
+    assert "".join(chunk.markdown for chunk in chunks).replace(" ", "") == markdown.replace(" ", "")

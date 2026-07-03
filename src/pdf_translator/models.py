@@ -56,6 +56,7 @@ class BookTranslationResult:
     translator: str
     chunk_count: int
     warnings: list[str] = field(default_factory=list)
+    semantic_content: dict | None = None
 
 
 @dataclass(slots=True)

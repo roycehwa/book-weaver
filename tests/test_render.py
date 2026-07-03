@@ -2,8 +2,22 @@ from pathlib import Path
 
 from PIL import Image as PILImage
 import pypdfium2 as pdfium
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 
-from pdf_translator.render import _estimate_column_widths, render_pdf_from_markdown
+from pdf_translator.render import (
+    BASE_FONT,
+    _estimate_column_widths,
+    _register_fonts,
+    _resolve_image_path,
+    render_pdf_from_markdown,
+)
+
+
+def test_pdf_uses_embedded_truetype_font_for_portable_cjk_rendering() -> None:
+    _register_fonts()
+
+    assert isinstance(pdfmetrics.getFont(BASE_FONT), TTFont)
 
 
 def test_render_pdf_from_markdown_creates_output(tmp_path: Path) -> None:
@@ -49,6 +63,20 @@ def test_render_pdf_resolves_relative_image_from_images_dir(tmp_path: Path) -> N
 
     assert output.exists()
     assert output.stat().st_size > 0
+
+
+def test_render_pdf_recovers_stale_absolute_image_by_filename(tmp_path: Path) -> None:
+    images_dir = tmp_path / "book-images"
+    images_dir.mkdir()
+    image = images_dir / "figure.png"
+    PILImage.new("RGB", (120, 80), color=(64, 64, 64)).save(image)
+
+    resolved = _resolve_image_path(
+        str(tmp_path / "stale run" / "book-images" / "figure.png"),
+        images_dir=images_dir,
+    )
+
+    assert resolved == image
 
 
 def test_render_pdf_fits_wide_table_to_page(tmp_path: Path) -> None:
@@ -114,6 +142,63 @@ def test_render_pdf_adds_page_break_before_top_level_heading(tmp_path: Path) -> 
 
     doc = pdfium.PdfDocument(output)
     assert len(doc) >= 2
+
+
+def test_render_pdf_handles_malformed_footnote_links(tmp_path: Path) -> None:
+    output = tmp_path / "footnote_link.pdf"
+    markdown_text = (
+        'Body text with citation '
+        '<a href="Seow," title=\'Socialist Drive";Yamamoto, "Shinkyō">^58</a> '
+        "continues here.\n"
+    )
+    render_pdf_from_markdown(
+        title="Footnote link",
+        markdown_text=markdown_text,
+        output_path=output,
+    )
+
+    assert output.exists()
+    assert output.stat().st_size > 0
+
+
+def test_render_pdf_continues_long_footnote_without_truncation(tmp_path: Path) -> None:
+    output = tmp_path / "long-footnote.pdf"
+    words = [f"note{i:04d}" for i in range(900)]
+    render_pdf_from_markdown(
+        title="Long footnote",
+        markdown_text="Body text.\n\n> 1 " + " ".join(words),
+        output_path=output,
+    )
+
+    doc = pdfium.PdfDocument(output)
+    extracted = "\n".join(
+        doc[index].get_textpage().get_text_range() for index in range(len(doc))
+    )
+    assert "note0000" in extracted
+    assert "note0899" in extracted
+    assert "[additional footnotes overflow this page]" not in extracted
+    assert len(doc) >= 2
+
+
+def test_footnote_continuation_does_not_create_blank_page_before_next_body(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "continued-then-body.pdf"
+    words = " ".join(f"continued{i:04d}" for i in range(900))
+    render_pdf_from_markdown(
+        title="Continuation order",
+        markdown_text=f"# One\n\nBody one.\n\n> 1 {words}\n\n# Two\n\nBody two.",
+        output_path=output,
+    )
+
+    doc = pdfium.PdfDocument(output)
+    page_texts = [
+        doc[index].get_textpage().get_text_range().strip() for index in range(len(doc))
+    ]
+    assert all(page_texts)
+    assert next(index for index, text in enumerate(page_texts) if "continued0899" in text) < next(
+        index for index, text in enumerate(page_texts) if "Body two." in text
+    )
 
 
 def test_estimate_column_widths_uses_content_weight() -> None:

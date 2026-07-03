@@ -1,9 +1,207 @@
 import pdf_translator.book_rebuild as book_rebuild
-from pdf_translator.book_rebuild import build_book_reconstruction
+from pdf_translator.book_rebuild import apply_canonical_chapter_plan, build_book_reconstruction
 
 
 def _prov(page_no: int, left: float, top: float) -> list[dict]:
     return [{"page_no": page_no, "bbox": {"l": left, "t": top}}]
+
+
+def test_apply_canonical_chapter_plan_replaces_automatic_titles_and_preserves_pages() -> None:
+    book = {
+        "metadata": {"chapter_source": "pdf_outline"},
+        "chapters": [
+            {
+                "title": "Running Header",
+                "source_pages": [1, 2, 3],
+                "trace_markdown": (
+                    "[[page: 1]]\nFront matter.\n\n"
+                    "[[page: 2]]\nFirst body page.\n\n"
+                    "[[page: 3]]\nSecond body page."
+                ),
+                "markdown": "Front matter.\n\nFirst body page.\n\nSecond body page.",
+            }
+        ],
+        "pages": [
+            {"page_no": 1, "has_content": True},
+            {"page_no": 2, "has_content": True},
+            {"page_no": 3, "has_content": True},
+        ],
+    }
+    canonical = {
+        "chapters": [
+            {
+                "title": "Confirmed Chapter",
+                "page_start": 2,
+                "page_end": 3,
+                "source_pages": [2, 3],
+            }
+        ]
+    }
+
+    result = apply_canonical_chapter_plan(book, canonical)
+
+    assert result["metadata"]["chapter_source"] == "user_confirmed_canonical"
+    assert [chapter["title"] for chapter in result["chapters"]] == [
+        "Front Matter",
+        "Confirmed Chapter",
+    ]
+    assert result["chapters"][0]["toc"] is False
+    assert result["chapters"][1]["toc"] is True
+    assert "First body page." in result["chapters"][1]["markdown"]
+    assert {page for chapter in result["chapters"] for page in chapter["source_pages"]} == {1, 2, 3}
+
+
+def test_apply_canonical_chapter_plan_preserves_asset_only_pages() -> None:
+    book = {
+        "metadata": {"chapter_source": "pdf_outline"},
+        "chapters": [
+            {
+                "title": "Body",
+                "source_pages": [1],
+                "trace_markdown": "[[page: 1]]\nBody text.",
+                "markdown": "Body text.",
+            }
+        ],
+        "pages": [
+            {"page_no": 1, "has_content": True, "figure_count": 0, "table_count": 0},
+            {"page_no": 2, "has_content": True, "figure_count": 0, "table_count": 1},
+            {"page_no": 3, "has_content": False, "figure_count": 0, "table_count": 0},
+        ],
+        "assets": [
+            {
+                "kind": "table",
+                "page_no": 2,
+                "path": "/tmp/table-p0002-01.png",
+                "text": "![Table 2.1](/tmp/table-p0002-01.png)",
+            }
+        ],
+    }
+    canonical = {
+        "chapters": [
+            {"title": "Confirmed", "page_start": 1, "page_end": 1, "source_pages": [1]}
+        ]
+    }
+
+    result = apply_canonical_chapter_plan(book, canonical)
+
+    assert result["chapters"][-1]["source_pages"] == [2]
+    assert "table-p0002-01.png" in result["chapters"][-1]["markdown"]
+    assert all(3 not in chapter["source_pages"] for chapter in result["chapters"])
+
+
+def test_canonical_plan_preserves_unplanned_resource_pages() -> None:
+    book = {
+        "chapters": [
+            {
+                "title": "Index",
+                "source_pages": [8, 9],
+                "trace_markdown": (
+                    "[[page: 8]]\n\n![Original page 8](/tmp/p8.png)\n\n"
+                    "[[page: 9]]\n\n![Original page 9](/tmp/p9.png)"
+                ),
+                "preserve_original": True,
+                "resource_only": True,
+                "translate": False,
+            }
+        ],
+        "pages": [
+            {"page_no": 8, "has_content": True},
+            {"page_no": 9, "has_content": True},
+        ],
+    }
+    canonical = {
+        "chapters": [
+            {
+                "title": "Confirmed Index",
+                "source_pages": [8],
+                "page_start": 8,
+                "page_end": 8,
+            }
+        ]
+    }
+
+    result = apply_canonical_chapter_plan(book, canonical)
+    supplemental = result["chapters"][-1]
+
+    assert supplemental["source_pages"] == [9]
+    assert supplemental["preserve_original"] is True
+    assert supplemental["translate"] is False
+    assert "Original page 9" in supplemental["markdown"]
+
+
+def test_canonical_plan_does_not_merge_resource_and_content_pages() -> None:
+    book = {
+        "chapters": [
+            {
+                "title": "Front Matter",
+                "source_pages": [1],
+                "trace_markdown": "[[page: 1]]\n\nFront matter.",
+                "translate": True,
+            },
+            {
+                "title": "Contents",
+                "source_pages": [2],
+                "trace_markdown": "[[page: 2]]\n\n![Original page 2](/tmp/p2.png)",
+                "preserve_original": True,
+                "resource_only": True,
+                "translate": False,
+            },
+            {
+                "title": "Chapter",
+                "source_pages": [3],
+                "trace_markdown": "[[page: 3]]\n\nChapter body.",
+                "translate": True,
+            },
+        ],
+        "pages": [
+            {"page_no": 1, "has_content": True},
+            {"page_no": 2, "has_content": True},
+            {"page_no": 3, "has_content": True},
+        ],
+    }
+    canonical = {
+        "chapters": [
+            {
+                "title": "Confirmed Chapter",
+                "source_pages": [3],
+                "page_start": 3,
+                "page_end": 3,
+            }
+        ]
+    }
+
+    result = apply_canonical_chapter_plan(book, canonical)
+    page_two_chapter = next(
+        chapter for chapter in result["chapters"] if chapter["source_pages"] == [2]
+    )
+
+    assert page_two_chapter["preserve_original"] is True
+    assert page_two_chapter["translate"] is False
+
+
+def test_preserved_page_images_keep_trace_markers(tmp_path, monkeypatch) -> None:
+    chapters = [
+        {
+            "title": "Index",
+            "source_pages": [10, 11],
+            "preserve_original": True,
+        }
+    ]
+    monkeypatch.setattr(
+        book_rebuild,
+        "_render_pdf_page_image",
+        lambda _source, _images, page: tmp_path / f"page-{page}.png",
+    )
+
+    book_rebuild._replace_preserved_apparatus_with_page_images(
+        chapters,
+        source_pdf=tmp_path / "source.pdf",
+        images_dir=tmp_path,
+    )
+
+    assert "[[page: 10]]" in chapters[0]["trace_markdown"]
+    assert "[[page: 11]]" in chapters[0]["trace_markdown"]
+    assert "[[page:" not in chapters[0]["markdown"]
 
 
 def test_book_rebuild_preserves_skipped_outline_sections_untranslated(monkeypatch) -> None:
@@ -288,7 +486,8 @@ def test_book_rebuild_preserves_pdf_back_matter_as_original_page_images(monkeypa
     assert notes["translate"] is False
     assert notes["resource_only"] is True
     assert notes["toc"] is False
-    assert f"![Original page 3]({page_image.as_posix()})" in notes["markdown"]
+    assert f"![Original page 3]({page_image.name})" in notes["markdown"]
+    assert str(tmp_path) not in notes["markdown"]
     assert "densely formatted note" not in notes["markdown"]
 
 
@@ -330,7 +529,7 @@ def test_book_rebuild_dedupes_adjacent_duplicate_headings() -> None:
     assert "Subtitle body." in result["full_markdown"]
 
 
-def test_book_rebuild_skips_toc_and_splits_chapters() -> None:
+def test_book_rebuild_preserves_toc_outside_reader_navigation_and_splits_chapters() -> None:
     structured = {
         "body": {
             "children": [{"$ref": f"#/texts/{index}"} for index in range(11)]
@@ -353,16 +552,18 @@ def test_book_rebuild_skips_toc_and_splits_chapters() -> None:
 
     result = build_book_reconstruction(structured)
 
-    assert result["chapter_count"] == 2
+    assert result["chapter_count"] == 3
     assert result["pages"][0]["page_kind"] == "toc"
-    assert result["chapters"][0]["title"] == "Chapter 1: A Beginning"
-    assert result["chapters"][0]["chapter_id"] == "ch-001-chapter-1-a-beginning"
-    assert result["chapters"][0]["page_start"] == 2
-    assert result["chapters"][0]["page_end"] == 3
-    assert result["chapters"][1]["title"] == "Chapter 2: Another Start"
+    assert result["chapters"][0]["title"] == "Contents"
+    assert result["chapters"][0]["toc"] is False
+    assert result["chapters"][1]["title"] == "Chapter 1: A Beginning"
+    assert result["chapters"][1]["chapter_id"] == "ch-002-chapter-1-a-beginning"
+    assert result["chapters"][1]["page_start"] == 2
+    assert result["chapters"][1]["page_end"] == 3
+    assert result["chapters"][2]["title"] == "Chapter 2: Another Start"
     assert "# Chapter 1: A Beginning" in result["full_markdown"]
-    assert "[[page: 2]]" not in result["chapters"][0]["markdown"]
-    assert "[[page: 2]]" in result["chapters"][0]["trace_markdown"]
+    assert "[[page: 2]]" not in result["chapters"][1]["markdown"]
+    assert "[[page: 2]]" in result["chapters"][1]["trace_markdown"]
 
 
 def test_book_rebuild_places_docling_footnotes_after_page_body() -> None:
@@ -372,7 +573,7 @@ def test_book_rebuild_places_docling_footnotes_after_page_body() -> None:
         },
         "texts": [
             {"label": "section_header", "text": "Chapter 1", "prov": _prov(1, 40, 760)},
-            {"label": "text", "text": "Left column body.", "prov": _prov(1, 40, 650)},
+            {"label": "text", "text": "Left column body.[^1]", "prov": _prov(1, 40, 650)},
             {"label": "footnote", "text": "1 Left column note.", "prov": _prov(1, 40, 180)},
             {"label": "text", "text": "Right column body.", "prov": _prov(1, 320, 650)},
         ],
@@ -386,6 +587,67 @@ def test_book_rebuild_places_docling_footnotes_after_page_body() -> None:
     assert markdown.index("Left column body.") < markdown.index("Right column body.")
     assert markdown.index("Right column body.") < markdown.index("1 Left column note.")
     assert "---" in markdown
+    assert "> 1 Left column note." in markdown
+    semantic = result["semantic_content"]
+    assert semantic["schema"] == "semantic_content_v1"
+    assert len(semantic["footnotes"]) == 1
+    assert semantic["footnotes"][0]["marker"] == "1"
+    assert semantic["footnotes"][0]["source_page"] == 1
+    assert semantic["footnotes"][0]["source_text"] == "Left column note."
+    assert semantic["footnotes"][0]["backlinks"][0]["marker"] == "1"
+    assert semantic["footnotes"][0]["backlinks"][0]["chapter_id"] == result["chapters"][0]["chapter_id"]
+
+
+def test_book_rebuild_links_plain_pdf_footnote_marker_after_punctuation() -> None:
+    structured = {
+        "body": {"children": [{"$ref": "#/texts/0"}, {"$ref": "#/texts/1"}]},
+        "texts": [
+            {
+                "label": "text",
+                "text": "The body sentence ends here. 3 The next sentence continues.",
+                "prov": _prov(1, 40, 580),
+            },
+            {
+                "label": "footnote",
+                "text": "3 Author, Foreign Book Title, 42.",
+                "prov": _prov(1, 40, 120),
+            },
+        ],
+        "pictures": [],
+        "tables": [],
+    }
+
+    result = build_book_reconstruction(structured)
+
+    note = result["semantic_content"]["footnotes"][0]
+    assert len(note["backlinks"]) == 1
+    assert note["backlinks"][0]["marker"] == "3"
+
+
+def test_book_rebuild_links_footnote_carried_to_following_page() -> None:
+    structured = {
+        "body": {"children": [{"$ref": "#/texts/0"}, {"$ref": "#/texts/1"}]},
+        "texts": [
+            {
+                "label": "text",
+                "text": "The reference appears on this page.10 The discussion continues.",
+                "prov": _prov(1, 40, 580),
+            },
+            {
+                "label": "footnote",
+                "text": "10 Author, Foreign Article Title, 42.",
+                "prov": _prov(2, 40, 120),
+            },
+        ],
+        "pictures": [],
+        "tables": [],
+    }
+
+    result = build_book_reconstruction(structured)
+
+    note = result["semantic_content"]["footnotes"][0]
+    assert note["source_page"] == 2
+    assert note["backlinks"][0]["source_page"] == 1
 
 
 def test_book_rebuild_falls_back_to_single_untitled_section() -> None:
@@ -572,7 +834,7 @@ def test_book_rebuild_removes_control_chars_and_formula_fragments() -> None:
     assert "x < y" in result["full_markdown"]
 
 
-def test_book_rebuild_skips_references_and_index_pages() -> None:
+def test_book_rebuild_preserves_references_and_index_pages() -> None:
     structured = {
         "body": {
             "children": [{"$ref": f"#/texts/{index}"} for index in range(14)]
@@ -599,9 +861,13 @@ def test_book_rebuild_skips_references_and_index_pages() -> None:
 
     result = build_book_reconstruction(structured)
 
-    assert result["chapter_count"] == 1
-    assert "References" not in result["full_markdown"]
-    assert "Alpha, 1, 2" not in result["full_markdown"]
+    assert result["chapter_count"] == 3
+    assert "References" in result["full_markdown"]
+    assert "Alpha, 1, 2" in result["full_markdown"]
+    assert result["chapters"][1]["toc"] is False
+    assert result["chapters"][2]["toc"] is False
+    assert result["metadata"]["uncovered_content_pages"] == []
+    assert result["metadata"]["content_page_coverage_ratio"] == 1.0
     assert [page["page_kind"] for page in result["pages"]] == ["body", "references", "index"]
 
 
@@ -658,7 +924,84 @@ def test_book_rebuild_retains_note_like_page_footer_after_body(monkeypatch) -> N
     assert "Second footnote line" in md
     assert md.index("Main body paragraph") < md.index("First footnote line")
     assert "\n\n---\n\n" in md
+    assert "> 1 First footnote line" in md
     assert "12" not in md
+
+
+def test_book_rebuild_quarantines_ocr_garbage_before_noise_filtering() -> None:
+    garbage = "1:79. 2- 80 - - 3291/. 32 / 82.0/ 2 /892: 8/99"
+    structured = {
+        "body": {
+            "children": [{"$ref": f"#/texts/{index}"} for index in range(3)]
+        },
+        "texts": [
+            {"label": "section_header", "text": "Chapter 1", "prov": _prov(1, 40, 760)},
+            {
+                "label": "text",
+                "text": "Main body paragraph remains readable.",
+                "prov": _prov(1, 40, 580),
+            },
+            {"label": "page_footer", "text": garbage, "prov": _prov(1, 40, 80)},
+        ],
+        "pictures": [],
+        "tables": [],
+    }
+
+    result = build_book_reconstruction(structured)
+
+    assert garbage not in result["full_markdown"]
+    quarantine = result["semantic_content"]["ocr_quarantine"]
+    assert len(quarantine) == 1
+    assert quarantine[0]["raw_text"] == garbage
+    assert quarantine[0]["source_page"] == 1
+    assert quarantine[0]["disposition"] == "suspect_ocr"
+    assert "footer_overlap" in quarantine[0]["reason_codes"]
+
+
+def test_repeated_control_character_artifact_is_auto_confirmed_as_noise() -> None:
+    artifact = "\x13\x06\x0c\x0b\x11\x08\x07\x01\x0f\x0e"
+    structured = {
+        "body": {
+            "children": [{"$ref": f"#/texts/{index}"} for index in range(6)]
+        },
+        "texts": [
+            {"label": "text", "text": f"Readable page {page}.", "prov": _prov(page, 40, 580)}
+            for page in range(1, 4)
+        ]
+        + [
+            {"label": "text", "text": artifact, "prov": _prov(page, 40, 80)}
+            for page in range(1, 4)
+        ],
+        "pictures": [],
+        "tables": [],
+    }
+
+    result = build_book_reconstruction(structured)
+    quarantine = result["semantic_content"]["ocr_quarantine"]
+
+    assert len(quarantine) == 3
+    assert all(item["resolution"] == "confirmed_noise" for item in quarantine)
+    assert all(item["auto_resolution"] == "repeated_control_artifact" for item in quarantine)
+
+
+def test_unreadable_control_blob_is_auto_confirmed_without_repetition() -> None:
+    artifact = "1::79\x0b .\x192-\x1980 \x05\x04-\x05\x04\x05\x08"
+    structured = {
+        "body": {"children": [{"$ref": "#/texts/0"}, {"$ref": "#/texts/1"}]},
+        "texts": [
+            {"label": "text", "text": "Readable body.", "prov": _prov(1, 40, 580)},
+            {"label": "text", "text": artifact, "prov": _prov(1, 40, 80)},
+        ],
+        "pictures": [],
+        "tables": [],
+    }
+
+    result = build_book_reconstruction(structured)
+    item = result["semantic_content"]["ocr_quarantine"][0]
+
+    assert item["resolution"] == "confirmed_noise"
+    assert item["auto_resolution"] == "unreadable_control_artifact"
+    assert item["raw_text"] == artifact
 
 
 def test_book_rebuild_promotes_inline_footnote_text_to_footer_band(monkeypatch) -> None:
@@ -692,6 +1035,7 @@ def test_book_rebuild_promotes_inline_footnote_text_to_footer_band(monkeypatch) 
     assert "First footnote line" in md
     assert md.index("Main body paragraph") < md.index("---")
     assert md.index("---") < md.index("First footnote line")
+    assert "> 1 First footnote line" in md
     assert "footnote_line_ratio" in result["metadata"]
     assert 0.0 <= result["metadata"]["footnote_line_ratio"] <= 1.0
     assert result["metadata"]["footnote_load"] in ("typical", "footnote_heavy")

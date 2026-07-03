@@ -1,6 +1,16 @@
+from pathlib import Path
+import json
+
 import pytest
 
-from pdf_translator.cli import build_parser
+import pdf_translator.cli as cli_module
+from pdf_translator.cli import (
+    _load_complete_review_book,
+    _review_image_roots,
+    _uncovered_book_pages,
+    _validate_approved_review_project,
+    build_parser,
+)
 
 
 def test_public_cli_book_and_magazine_profiles_only() -> None:
@@ -41,6 +51,249 @@ def test_public_cli_accepts_intake_command() -> None:
     assert args.source_lang == "zh-CN"
     assert args.profile == "book"
     assert args.max_chunk_chars == 7000
+
+
+def test_review_export_discovers_manifest_and_run_image_roots(tmp_path: Path) -> None:
+    manifest_images = tmp_path / "external-images"
+    manifest_images.mkdir()
+    (tmp_path / "book-images").mkdir()
+    (tmp_path / "images").mkdir()
+
+    roots = _review_image_roots(
+        tmp_path,
+        {"files": {"images_dir": str(manifest_images)}},
+    )
+
+    assert roots == [
+        manifest_images.resolve(),
+        (tmp_path / "book-images").resolve(),
+        (tmp_path / "images").resolve(),
+    ]
+
+
+def test_review_export_detects_pages_missing_from_book_chapters() -> None:
+    book = {
+        "pages": [
+            {"page_no": 1, "page_kind": "body", "has_content": True},
+            {"page_no": 2, "page_kind": "notes_heavy", "has_content": True},
+        ],
+        "chapters": [{"source_pages": [1]}],
+    }
+
+    assert _uncovered_book_pages(book) == [2]
+
+
+def test_approved_review_export_rejects_missing_translation() -> None:
+    project = {
+        "segments": [
+            {
+                "segment_id": "ch-001:r001",
+                "source_text": "Substantive source text.",
+                "translate": True,
+            }
+        ],
+        "translated_segments": [
+            {
+                "segment_id": "ch-001:r001",
+                "translated_text": "",
+                "translate": True,
+            }
+        ],
+        "review_items": [],
+        "review_state": {"decisions": {}},
+    }
+
+    with pytest.raises(ValueError, match="missing translated content"):
+        _validate_approved_review_project(project)
+
+
+def test_approved_review_export_rejects_open_review_items() -> None:
+    project = {
+        "segments": [
+            {
+                "segment_id": "ch-001:r001",
+                "source_text": "Source text.",
+                "translate": True,
+            }
+        ],
+        "translated_segments": [
+            {
+                "segment_id": "ch-001:r001",
+                "translated_text": "译文。",
+                "translate": True,
+            }
+        ],
+        "review_items": [{"segment_id": "ch-001:r001", "status": "open"}],
+        "review_state": {"decisions": {}},
+    }
+
+    with pytest.raises(ValueError, match="unresolved review items"):
+        _validate_approved_review_project(project)
+
+
+def test_approved_review_export_rejects_integrity_ledger_failure() -> None:
+    project = {
+        "translated_segments": [],
+        "review_state": {},
+        "review_items": [],
+    }
+    ledger = {
+        "ready": False,
+        "failures": {
+            "absolute_paths": ["OEBPS/chapters/001.xhtml"],
+        },
+    }
+
+    with pytest.raises(ValueError, match="absolute_paths"):
+        _validate_approved_review_project(project, integrity_ledger=ledger)
+
+
+def test_review_export_migrates_legacy_book_before_delivery(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    manifest = {"source_pdf": str(tmp_path / "source.pdf")}
+    (run_dir / "book.json").write_text(
+        json.dumps(
+            {
+                "pages": [
+                    {"page_no": 1, "has_content": True},
+                    {"page_no": 2, "has_content": True},
+                ],
+                "chapters": [{"chapter_id": "body", "source_pages": [1]}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    migrated: list[Path] = []
+
+    def fake_migrate(path: Path):
+        migrated.append(path)
+        (path / "book.json").write_text(
+            json.dumps(
+                {
+                    "pages": [
+                        {"page_no": 1, "has_content": True},
+                        {"page_no": 2, "has_content": True},
+                    ],
+                    "chapters": [
+                        {"chapter_id": "body", "source_pages": [1]},
+                        {
+                            "chapter_id": "resource",
+                            "source_pages": [2],
+                            "resource_only": True,
+                            "preserve_original": True,
+                        },
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return {"migrated": True}
+
+    monkeypatch.setattr(cli_module, "migrate_legacy_review_run", fake_migrate)
+
+    book = _load_complete_review_book(run_dir, manifest)
+
+    assert migrated == [run_dir.resolve()]
+    assert _uncovered_book_pages(book) == []
+
+
+def test_review_export_restores_chapter_notes_before_delivery(tmp_path: Path, monkeypatch) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    source_pdf = tmp_path / "source.pdf"
+    source_pdf.write_bytes(b"%PDF")
+    (run_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "source_pdf": str(source_pdf),
+                "files": {"translated_chapters": str(run_dir / "translated-chapters.json")},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "book.json").write_text(
+        json.dumps(
+            {
+                "pages": [{"page_no": 1, "has_content": True}],
+                "chapters": [{"chapter_id": "ch-001", "source_pages": [1]}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "segments.json").write_text(
+        json.dumps(
+            {
+                "segments": [
+                    {
+                        "segment_id": "ch-001:r001",
+                        "chapter_id": "ch-001",
+                        "chapter_index": 1,
+                        "chapter_title": "Chapter",
+                        "block_index": 1,
+                        "source_text": "Body",
+                        "translate": True,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "translated_segments.json").write_text(
+        json.dumps(
+            {
+                "segments": [
+                    {
+                        "segment_id": "ch-001:r001",
+                        "chapter_id": "ch-001",
+                        "chapter_index": 1,
+                        "chapter_title": "Chapter",
+                        "block_index": 1,
+                        "translated_text": "审阅正文",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "review_items.json").write_text(json.dumps({"items": []}), encoding="utf-8")
+    (run_dir / "review_state.json").write_text(json.dumps({"decisions": {}, "summary": {}}), encoding="utf-8")
+    (run_dir / "pre_review.json").write_text(json.dumps({"status": "completed"}), encoding="utf-8")
+    (run_dir / "translated-chapters.json").write_text(
+        json.dumps(
+            {
+                "chapters": [
+                    {
+                        "index": 1,
+                        "chapter_id": "ch-001",
+                        "title": "Chapter",
+                        "markdown": "# Chapter\n\nBase body.\n\n### Notes\n\n- [**1.**](OPS/c01.xhtml#R_c01-note-0001) Preserved note.",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(cli_module, "render_epub_from_book", lambda **kwargs: kwargs["output_path"].write_text("epub", encoding="utf-8"))
+    monkeypatch.setattr(cli_module, "validate_epub_internal_hrefs", lambda _path: {"resolved_ratio": 1.0})
+    monkeypatch.setattr(cli_module, "render_pdf_from_markdown", lambda **kwargs: kwargs["output_path"].write_text("pdf", encoding="utf-8"))
+
+    result = cli_module._run_review_export(
+        run_dir=run_dir,
+        version_name="v-notes",
+        parent_version=None,
+        target_language="zh-CN",
+        output_format="epub",
+        approve=True,
+    )
+
+    translated = Path(result["version"]["translated_markdown_path"]).read_text(encoding="utf-8")
+    assert "审阅正文" in translated
+    assert "Preserved note" in translated
 
 
 def test_public_cli_accepts_polish_command() -> None:

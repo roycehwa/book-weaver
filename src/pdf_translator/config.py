@@ -153,3 +153,4 @@ class RunSettings:
     glossary_entries: list[dict[str, Any]] | None = None
     existing_run_dir: Path | None = None
     require_glossary_ready: bool = False
+    canonical_chapters_path: Path | None = None

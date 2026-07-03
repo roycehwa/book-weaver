@@ -9,7 +9,7 @@ from pathlib import Path
 import re
 from typing import Any
 
-from pdf_translator.book_rebuild import build_book_reconstruction
+from pdf_translator.book_rebuild import apply_canonical_chapter_plan, build_book_reconstruction
 from pdf_translator.book_views import render_book_markdown, render_translation_input_markdown
 from pdf_translator.chunking import split_markdown_into_chunks
 from pdf_translator.config import RunSettings
@@ -34,12 +34,15 @@ from pdf_translator.models import (
     TranslatedChapter,
     TranslationResult,
 )
+from pdf_translator.page_integrity import build_page_ledger
+from pdf_translator.integrity import build_integrity_ledger
 from pdf_translator.profile import build_document_profile
 from pdf_translator.render import render_pdf_from_markdown
 from pdf_translator.review import build_review_artifacts, write_review_artifacts
 from pdf_translator.translate import (
     build_translator,
     estimate_translation_chunk_count,
+    estimate_semantic_translation_chunk_count,
     translate_book_chapters,
     translate_markdown,
     _chapter_markdown_for_translation,
@@ -135,6 +138,38 @@ def _build_chapter_report(book: dict, *, max_chunk_chars: int) -> dict:
     }
 
 
+def _write_page_ledger(run_dir: Path, book: dict[str, Any]) -> Path:
+    ledger = build_page_ledger(book)
+    path = run_dir / "page-ledger.json"
+    path.write_text(
+        json.dumps(ledger, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _write_integrity_ledger(
+    run_dir: Path,
+    book: dict[str, Any],
+    *,
+    epub_validation: dict[str, Any] | None = None,
+    pdf_validation: dict[str, Any] | None = None,
+    review_items: list[dict[str, Any]] | tuple[dict[str, Any], ...] = (),
+) -> Path:
+    ledger = build_integrity_ledger(
+        book,
+        epub_validation=epub_validation,
+        pdf_validation=pdf_validation,
+        review_items=review_items,
+    )
+    path = run_dir / "integrity-ledger.json"
+    path.write_text(
+        json.dumps(ledger, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
 def _fallback_book_from_markdown(source_path: Path, markdown: str) -> dict:
     return {
         "metadata": {"schema": "markdown_fallback", "schema_version": 1},
@@ -189,8 +224,17 @@ def _load_existing_run_context(
     if artifacts.book_json_path.exists():
         book = json.loads(artifacts.book_json_path.read_text(encoding="utf-8"))
         book = repair_book_dict(book)
+        if settings.canonical_chapters_path is not None:
+            canonical = json.loads(
+                settings.canonical_chapters_path.expanduser().resolve().read_text(encoding="utf-8")
+            )
+            book = apply_canonical_chapter_plan(book, canonical)
+        page_ledger_path = _write_page_ledger(run_dir, book)
+        integrity_ledger_path = _write_integrity_ledger(run_dir, book)
         artifacts.book_json_path.write_text(json.dumps(book, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         extra_files["book_json"] = str(artifacts.book_json_path)
+        extra_files["page_ledger"] = str(page_ledger_path)
+        extra_files["integrity_ledger"] = str(integrity_ledger_path)
     if artifacts.book_markdown_path.exists():
         extra_files["book_markdown"] = str(artifacts.book_markdown_path)
     translation_input_markdown = ""
@@ -201,6 +245,13 @@ def _load_existing_run_context(
         if repaired_input.strip():
             translation_input_markdown = repaired_input
             artifacts.translation_input_markdown_path.write_text(repaired_input, encoding="utf-8")
+            if artifacts.book_markdown_path is not None:
+                artifacts.book_markdown_path.write_text(render_book_markdown(book), encoding="utf-8")
+            if artifacts.book_trace_markdown_path is not None:
+                artifacts.book_trace_markdown_path.write_text(
+                    render_book_markdown(book, include_trace=True),
+                    encoding="utf-8",
+                )
             write_ingest_quality_report(run_dir, source_markdown=repaired_input)
     profile: dict[str, Any] = {}
     if artifacts.profile_json_path.exists():
@@ -264,6 +315,8 @@ def _prepare_intake_artifacts(settings: RunSettings) -> tuple[
             images_dir=book_images_dir,
         )
         book = repair_book_dict(book)
+        page_ledger_path = _write_page_ledger(output_dir, book)
+        integrity_ledger_path = _write_integrity_ledger(output_dir, book)
         if render_translation_input_markdown(book).strip():
             translation_input_markdown = render_translation_input_markdown(book)
         artifacts.book_json_path.write_text(json.dumps(book, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -285,6 +338,8 @@ def _prepare_intake_artifacts(settings: RunSettings) -> tuple[
         extra_files["book_markdown"] = str(artifacts.book_markdown_path)
         extra_files["book_trace_markdown"] = str(artifacts.book_trace_markdown_path)
         extra_files["chapter_report"] = str(chapter_report_path)
+        extra_files["page_ledger"] = str(page_ledger_path)
+        extra_files["integrity_ledger"] = str(integrity_ledger_path)
         extra_files["book_images_dir"] = str(book_images_dir)
         extra_files["chapters_dir"] = str(chapters_dir)
 
@@ -311,7 +366,7 @@ def _estimated_translation_total(
             continue
         chapter_markdown = _chapter_markdown_for_translation(chapter)
         total += estimate_translation_chunk_count(chapter_markdown, max_chunk_chars)
-    return total
+    return total + estimate_semantic_translation_chunk_count(book, max_chunk_chars)
 
 
 def _book_without_translation(book: dict, settings: RunSettings) -> BookTranslationResult:
@@ -524,19 +579,15 @@ def run_translation_pipeline(
         else:
             observer.finish(status="completed")
 
-    enter_stage("validating")
     artifacts.translated_markdown_path.write_text(
         translated.translated_markdown,
         encoding="utf-8",
     )
     polished_markdown = translated.translated_markdown
-    if (
-        not skip_translation
-        and text_operation == "translate"
-        and settings.target_language.lower().startswith("zh")
-        and book is not None
-    ):
-        try:
+    if not skip_translation and text_operation == "translate":
+        enter_stage("polishing")
+        polish_outcome = "no_candidates"
+        if settings.target_language.lower().startswith("zh") and book is not None:
             from pdf_translator.polish import run_polish, scan_polish_candidates
 
             if scan_polish_candidates(translated.translated_markdown):
@@ -551,8 +602,15 @@ def run_translation_pipeline(
                     artifacts.translated_markdown_path.write_text(polished_markdown, encoding="utf-8")
                     extra_files["translated_polished_markdown"] = str(polished_path)
                     extra_files["polish_report"] = str(artifacts.output_dir / "polish-report.json")
-        except Exception:
-            polished_markdown = translated.translated_markdown
+                polish_outcome = (
+                    "applied" if polish_result.accepted_count > 0 else "no_candidates"
+                )
+        if on_stage is not None:
+            on_stage(
+                "polishing",
+                {"stage_percent": 100, "polish_outcome": polish_outcome},
+            )
+    enter_stage("validating")
     translated = replace(translated, translated_markdown=polished_markdown)
     translated_chapters_payload = _translated_chapters_payload(
         source_path=settings.source_pdf,
@@ -565,8 +623,20 @@ def run_translation_pipeline(
         encoding="utf-8",
     )
     extra_files["translated_chapters"] = str(translated_chapters_path)
+    if translated.semantic_content is not None:
+        translated_semantic_path = artifacts.output_dir / "translated-semantic-content.json"
+        translated_semantic_path.write_text(
+            json.dumps(translated.semantic_content, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        extra_files["translated_semantic_content"] = str(translated_semantic_path)
     enter_stage("pre_review")
     review_source_book = book or _fallback_book_from_markdown(settings.source_pdf, translation_input_markdown)
+    if translated.semantic_content is not None:
+        review_source_book = dict(review_source_book)
+        review_source_book["semantic_content"] = translated.semantic_content
+    if book is not None:
+        _write_page_ledger(artifacts.output_dir, review_source_book)
     review_artifacts = build_review_artifacts(
         source_path=settings.source_pdf,
         target_language=translated.target_language,
@@ -579,6 +649,7 @@ def run_translation_pipeline(
     )
     extra_files.update(write_review_artifacts(artifacts.output_dir, review_artifacts))
     rendered_files: dict[str, str] = {}
+    epub_validation: dict[str, Any] | None = None
     if settings.output_format in {"pdf", "both"}:
         render_pdf_from_markdown(
             title=f"{settings.source_pdf.stem} ({translated.target_language})",
@@ -599,6 +670,9 @@ def run_translation_pipeline(
                 }
             ],
         }
+        if translated.semantic_content is not None:
+            epub_book = dict(epub_book)
+            epub_book["semantic_content"] = translated.semantic_content
         epub_chapters = translated_chapters or [
             {
                 "index": 1,
@@ -615,7 +689,19 @@ def run_translation_pipeline(
             language=translated.target_language,
         )
         rendered_files["translated_epub"] = str(artifacts.translated_epub_path)
-        rendered_files["epub_href_validation"] = validate_epub_internal_hrefs(artifacts.translated_epub_path)
+        epub_validation = validate_epub_internal_hrefs(artifacts.translated_epub_path)
+        rendered_files["epub_href_validation"] = epub_validation
+
+    integrity_book = dict(review_source_book)
+    if translated.semantic_content is not None:
+        integrity_book["semantic_content"] = translated.semantic_content
+    integrity_ledger_path = _write_integrity_ledger(
+        artifacts.output_dir,
+        integrity_book,
+        epub_validation=epub_validation,
+        review_items=review_artifacts["review_items"]["items"],
+    )
+    extra_files["integrity_ledger"] = str(integrity_ledger_path)
 
     extra_files.update(glossary_manifest_files(artifacts.output_dir))
     workflow_path = artifacts.output_dir / "workflow.json"

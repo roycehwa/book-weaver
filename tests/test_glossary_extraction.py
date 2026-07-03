@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from pdf_translator.glossary import extract_glossary_candidates
+from pdf_translator.glossary_extraction import canonical_source_key
 
 
 def test_extract_filters_book_title_and_surfaces_policy_terms(tmp_path: Path) -> None:
@@ -72,3 +73,72 @@ def test_extraction_policy_file_written(tmp_path: Path) -> None:
     assert policy["schema"] == "phase_a_glossary_extraction_v2"
     assert policy.get("glossary_profile") == "social_econ_philosophy"
     assert policy["stats"]["surfaced"] >= 1
+
+
+def test_extract_merges_trailing_apostrophe_variants(tmp_path: Path) -> None:
+    assert canonical_source_key("Soviet Union") == canonical_source_key("Soviet Union'")
+    assert canonical_source_key("Soviet Union") == canonical_source_key("Soviet Union’")
+
+    book = {
+        "metadata": {"title": "Industrial History"},
+        "chapters": [
+            {
+                "chapter_id": "ch-001",
+                "markdown": (
+                    "Soviet Union shaped policy. Soviet Union' policy changed. "
+                    "Soviet Union’ influence remained. Soviet Union shaped planning."
+                ),
+            }
+        ],
+    }
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "book.json").write_text(json.dumps(book), encoding="utf-8")
+
+    result = extract_glossary_candidates(run_dir, max_candidates=20)
+    matches = [
+        item
+        for item in result["candidates"]
+        if item["source"].rstrip("'’") == "Soviet Union"
+    ]
+
+    assert len(matches) == 1
+    assert matches[0]["source"] == "Soviet Union"
+
+
+def test_canonical_source_key_splits_roman_connector_glue() -> None:
+    assert canonical_source_key("Charles IIandhis") == canonical_source_key("Charles II andhis")
+    assert canonical_source_key("Charles IIand") == canonical_source_key("Charles II and")
+
+
+def test_extract_filters_fragment_lead_phrases(tmp_path: Path) -> None:
+    book = {
+        "metadata": {"title": "Sample Book"},
+        "chapters": [
+            {
+                "chapter_id": "ch-001",
+                "markdown": (
+                    "Within the Sabaudian network the conflict escalated. "
+                    "Between Pulpit and Reformation this appears repeatedly. "
+                    "Charles IIandhis advisors dominated court politics."
+                ),
+            },
+            {
+                "chapter_id": "ch-002",
+                "markdown": (
+                    "Within the Sabaudian network remained unstable. "
+                    "Charles IIandhis advisors appeared again."
+                ),
+            },
+        ],
+    }
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "book.json").write_text(json.dumps(book), encoding="utf-8")
+
+    result = extract_glossary_candidates(run_dir, max_candidates=20)
+    sources = [item["source"] for item in result["candidates"]]
+
+    assert "Within the Sabaudian" not in sources
+    assert "Between Pulpit" not in sources
+    assert all("IIand" not in source for source in sources)

@@ -165,10 +165,22 @@ def _chapter_payload(chapter) -> dict:
 def _markdown_to_body_html(markdown_text: str) -> str:
     markdown_text = CONTROL_CHARS_RE.sub(" ", markdown_text)
     markdown_text = RAW_HTML_TAG_RE.sub(lambda match: escape(match.group(0)), markdown_text)
-    html = markdown(markdown_text, extensions=["tables", "fenced_code", "sane_lists"])
+    html = markdown(
+        markdown_text,
+        extensions=["tables", "fenced_code", "sane_lists", "footnotes"],
+    )
     soup = BeautifulSoup(html, "html.parser")
     _annotate_worksheet_tables(soup)
     _compact_trailing_note_cluster(soup)
+    ids = {
+        str(tag.get("id"))
+        for tag in soup.find_all(attrs={"id": True})
+        if tag.get("id")
+    }
+    for anchor in soup.find_all("a", class_="footnote-backref"):
+        href = anchor.get("href")
+        if isinstance(href, str) and href.startswith("#") and href[1:] not in ids:
+            anchor.decompose()
     return "".join(str(child) for child in soup.contents)
 
 
@@ -224,6 +236,85 @@ def _compact_trailing_note_cluster(soup: BeautifulSoup) -> None:
         child.extract()
         section.append(child)
     soup.append(section)
+
+
+def _inject_semantic_footnotes(
+    body_html: str,
+    *,
+    chapter: dict,
+    semantic_content: dict | None,
+) -> str:
+    if not isinstance(semantic_content, dict):
+        return body_html
+    chapter_id = str(chapter.get("chapter_id") or "")
+    source_pages = {
+        int(page)
+        for page in chapter.get("source_pages", [])
+        if isinstance(page, int)
+    }
+    selected: list[tuple[dict, list[dict]]] = []
+    for note in semantic_content.get("footnotes", []):
+        if not isinstance(note, dict):
+            continue
+        backlinks = [
+            backlink
+            for backlink in note.get("backlinks", [])
+            if isinstance(backlink, dict)
+            and (
+                str(backlink.get("chapter_id") or "") == chapter_id
+                or int(note.get("source_page") or 0) in source_pages
+            )
+        ]
+        if backlinks or (
+            bool(note.get("standalone"))
+            and int(note.get("source_page") or 0) in source_pages
+        ):
+            selected.append((note, backlinks))
+    if not selected:
+        return body_html
+
+    soup = BeautifulSoup(body_html, "html.parser")
+    refs = soup.new_tag("p")
+    refs["class"] = "semantic-footnote-refs"
+    section = soup.new_tag("section")
+    section["class"] = "chapter-notes"
+    section["epub:type"] = "footnotes"
+    heading = soup.new_tag("h2")
+    heading.string = "本章注释"
+    section.append(heading)
+    for note, backlinks in selected:
+        note_id = str(note.get("footnote_id") or "")
+        target_id = f"fn-{note_id}"
+        marker = str(note.get("marker") or "")
+        for backlink in backlinks:
+            reference_id = str(backlink.get("reference_id") or f"fnref-{note_id}")
+            anchor = soup.new_tag("a", href=f"#{target_id}")
+            anchor["id"] = reference_id
+            anchor["epub:type"] = "noteref"
+            anchor["role"] = "doc-noteref"
+            anchor.string = str(backlink.get("marker") or marker)
+            refs.append(anchor)
+        aside = soup.new_tag("aside")
+        aside["id"] = target_id
+        aside["epub:type"] = "footnote"
+        aside["role"] = "doc-footnote"
+        paragraph = soup.new_tag("p")
+        paragraph.string = "".join(
+            str(span.get("translated_text") or span.get("source_text") or "")
+            for span in note.get("spans", [])
+            if isinstance(span, dict)
+        )
+        aside.append(paragraph)
+        for backlink in backlinks:
+            reference_id = str(backlink.get("reference_id") or f"fnref-{note_id}")
+            back = soup.new_tag("a", href=f"#{reference_id}")
+            back["class"] = "footnote-backref"
+            back.string = "↩"
+            aside.append(back)
+        section.append(aside)
+    soup.append(refs)
+    soup.append(section)
+    return "".join(str(child) for child in soup.contents)
 
 
 def _media_type(path: Path) -> str:
@@ -321,6 +412,10 @@ def _resolve_image_source_path(raw_src: str, image_roots: list[Path]) -> Path | 
     candidates = [source_path]
     if not source_path.is_absolute():
         candidates.extend(root / source_path for root in image_roots)
+        candidates.extend(
+            root / "book-images" / source_path.name
+            for root in image_roots
+        )
     if source_path.parent.name:
         candidates.extend(root / source_path.parent.name / source_path.name for root in image_roots)
     candidates.extend(root / source_path.name for root in image_roots)
@@ -373,7 +468,7 @@ def _chapter_xhtml(*, title: str, body_html: str, language: str, body_id: str | 
 <head>
   <meta charset="utf-8" />
   <title>{escape(title)}</title>
-  <link rel="stylesheet" type="text/css" href="styles/book.css" />
+  <link rel="stylesheet" type="text/css" href="../styles/book.css" />
 </head>
 <body{id_attr}>
 {body_html}
@@ -481,6 +576,7 @@ def render_epub_from_book(
     output_path: Path,
     title: str,
     language: str = "zh-CN",
+    image_roots: list[Path] | None = None,
 ) -> None:
     chapters = [_chapter_payload(chapter) for chapter in translated_chapters]
     if not chapters:
@@ -503,7 +599,9 @@ def render_epub_from_book(
     chapter_documents: list[tuple[str, str]] = []
     image_map: dict[Path, str] = {}
     image_items: list[tuple[str, Path]] = []
-    image_roots = [output_path.parent.resolve()]
+    resolved_image_roots = [output_path.parent.resolve()]
+    resolved_image_roots.extend(root.expanduser().resolve() for root in (image_roots or []))
+    semantic_content = book.get("semantic_content")
 
     for chapter, chapter_file in zip(chapters, chapter_files):
         index = int(chapter.get("index") or 1)
@@ -516,7 +614,12 @@ def render_epub_from_book(
             href_map=href_map,
             current_source_path=chapter.get("source_internal_path"),
         )
-        body_html = _rewrite_images(body_html, image_map, image_items, image_roots)
+        body_html = _inject_semantic_footnotes(
+            body_html,
+            chapter=chapter,
+            semantic_content=semantic_content if isinstance(semantic_content, dict) else None,
+        )
+        body_html = _rewrite_images(body_html, image_map, image_items, resolved_image_roots)
         if chapter.get("preserve_original") or chapter.get("resource_only") or APPARATUS_TITLE_RE.match(chapter_title):
             body_html = _wrap_preserved_apparatus(body_html)
         chapter_documents.append(
@@ -568,8 +671,26 @@ def validate_epub_internal_hrefs(epub_path: Path) -> dict[str, object]:
     total = 0
     resolved = 0
     unresolved: list[dict[str, str]] = []
+    missing_assets: list[dict[str, str]] = []
+    absolute_paths: list[dict[str, str]] = []
     with ZipFile(epub_path) as archive:
         names = set(archive.namelist())
+        text_members = [
+            name
+            for name in names
+            if name.endswith((".xhtml", ".html", ".opf", ".css", ".ncx"))
+        ]
+        absolute_path_re = re.compile(
+            r"(?:file://|/Users/|(?<![A-Za-z])[A-Za-z]:[\\/])",
+            flags=re.IGNORECASE,
+        )
+        for name in text_members:
+            text = archive.read(name).decode("utf-8", errors="ignore")
+            match = absolute_path_re.search(text)
+            if match:
+                absolute_paths.append(
+                    {"member": name, "path_prefix": match.group(0)}
+                )
         xhtml_names = [name for name in names if name.startswith("OEBPS/") and name.endswith((".xhtml", ".html"))]
         ids_by_name: dict[str, set[str]] = {}
         html_by_name: dict[str, str] = {}
@@ -582,6 +703,15 @@ def validate_epub_internal_hrefs(epub_path: Path) -> dict[str, object]:
         for source_name, html in html_by_name.items():
             soup = BeautifulSoup(html, "html.parser")
             source_dir = PurePosixPath(source_name).parent
+            for image in soup.find_all("img"):
+                src = image.get("src")
+                if not isinstance(src, str) or not src.strip():
+                    continue
+                target_name = posixpath.normpath(str(source_dir / src.strip()))
+                if target_name not in names:
+                    missing_assets.append(
+                        {"source": source_name, "src": src, "target": target_name}
+                    )
             for anchor in soup.find_all("a"):
                 href = anchor.get("href")
                 if not isinstance(href, str) or not href.strip():
@@ -611,4 +741,7 @@ def validate_epub_internal_hrefs(epub_path: Path) -> dict[str, object]:
         "unresolved_internal_hrefs": len(unresolved),
         "resolved_ratio": round(resolved / total, 5) if total else 1.0,
         "unresolved": unresolved[:50],
+        "unresolved_hrefs": unresolved[:50],
+        "missing_assets": missing_assets[:50],
+        "absolute_paths": absolute_paths[:50],
     }

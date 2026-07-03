@@ -22,7 +22,7 @@ class OcrAssessment:
 _WEIGHTS = {
     "control_character_density": 0.65,
     "symbol_density": 0.25,
-    "fragmented_tokens": 0.25,
+    "fragmented_tokens": 0.40,
     "impossible_word_join": 0.55,
     "out_of_page_bbox": 0.55,
     "figure_overlap": 0.25,

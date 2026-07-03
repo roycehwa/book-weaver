@@ -55,11 +55,149 @@ def test_render_epub_from_book_writes_epub_structure_and_chapters(tmp_path: Path
         nav = archive.read("OEBPS/nav.xhtml").decode("utf-8")
         assert nav.index("First Chapter") < nav.index("Second Chapter")
         chapter = archive.read("OEBPS/chapters/001-first-chapter.xhtml").decode("utf-8")
+        assert 'href="../styles/book.css"' in chapter
         assert "../images/figure.png" in chapter
         assert "x &lt; y" in chapter or "x < y" in chapter
         css = archive.read("OEBPS/styles/book.css").decode("utf-8")
         assert "line-height: 1.82" in css
         assert "break-before: page" in css
+
+
+def test_render_epub_resolves_relative_original_page_from_book_images(
+    tmp_path: Path,
+) -> None:
+    images_dir = tmp_path / "book-images"
+    images_dir.mkdir()
+    page_image = images_dir / "original-page-p0006.png"
+    page_image.write_bytes(b"png")
+    output_path = tmp_path / "book.epub"
+
+    render_epub_from_book(
+        book={"chapters": []},
+        translated_chapters=[
+            {
+                "index": 1,
+                "title": "Resource",
+                "markdown": "![Original page 6](original-page-p0006.png)",
+            }
+        ],
+        output_path=output_path,
+        title="Resource Book",
+    )
+
+    with ZipFile(output_path) as archive:
+        assert any(
+            name.endswith("/original-page-p0006.png")
+            for name in archive.namelist()
+        )
+
+
+def test_render_epub_from_book_renders_markdown_footnotes_as_notes(tmp_path: Path) -> None:
+    output_path = tmp_path / "footnotes.epub"
+
+    render_epub_from_book(
+        book={"chapters": []},
+        translated_chapters=[
+            {
+                "index": 1,
+                "title": "Chapter",
+                "markdown": (
+                    "# Chapter\n\n正文脚注。[^3]\n\n"
+                    "[^3]: 《内部参考》54期（1951年3月31日），第153–160页。"
+                ),
+            }
+        ],
+        output_path=output_path,
+        title="Footnote Book",
+    )
+
+    with ZipFile(output_path) as archive:
+        chapter = archive.read("OEBPS/chapters/001-chapter.xhtml").decode("utf-8")
+        assert 'href="《内部参考》54期（1951年3月31日），第153–160页。"' not in chapter
+        assert "《内部参考》54期（1951年3月31日），第153–160页。" in chapter
+        assert 'class="footnote"' in chapter
+        assert 'class="footnote-ref"' in chapter
+
+
+def test_render_epub_from_book_renders_semantic_footnote_with_backlink(
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "semantic-footnote.epub"
+    render_epub_from_book(
+        book={
+            "semantic_content": {
+                "footnotes": [
+                    {
+                        "footnote_id": "footnote-a",
+                        "marker": "1",
+                        "source_page": 1,
+                        "backlinks": [
+                            {
+                                "reference_id": "fnref-a",
+                                "chapter_id": "ch-001",
+                                "marker": "1",
+                            }
+                        ],
+                        "spans": [
+                            {
+                                "kind": "prose",
+                                "source_text": "Explanation.",
+                                "translated_text": "说明文字。",
+                            },
+                            {
+                                "kind": "citation",
+                                "source_text": "Book Title, p. 4.",
+                                "translated_text": "Book Title, p. 4.",
+                            },
+                        ],
+                    }
+                ]
+            }
+        },
+        translated_chapters=[
+            {
+                "index": 1,
+                "chapter_id": "ch-001",
+                "title": "Chapter",
+                "source_pages": [1],
+                "markdown": "# Chapter\n\n正文。",
+            }
+        ],
+        output_path=output_path,
+        title="Semantic Notes",
+    )
+
+    with ZipFile(output_path) as archive:
+        chapter = archive.read("OEBPS/chapters/001-chapter.xhtml").decode("utf-8")
+        assert 'id="fnref-a"' in chapter
+        assert 'epub:type="noteref"' in chapter
+        assert 'href="#fn-footnote-a"' in chapter
+        assert 'id="fn-footnote-a"' in chapter
+        assert 'epub:type="footnote"' in chapter
+        assert 'href="#fnref-a"' in chapter
+        assert "说明文字。Book Title, p. 4." in chapter
+
+
+def test_render_epub_from_book_removes_orphan_footnote_backlink(tmp_path: Path) -> None:
+    output_path = tmp_path / "orphan-footnote.epub"
+
+    render_epub_from_book(
+        book={"chapters": []},
+        translated_chapters=[
+            {
+                "index": 1,
+                "title": "Chapter",
+                "markdown": "# Chapter\n\n正文中的旧引用已变成上标。⁹⁶\n\n[^96]: 保留的脚注内容。",
+            }
+        ],
+        output_path=output_path,
+        title="Footnote Book",
+    )
+
+    with ZipFile(output_path) as archive:
+        chapter = archive.read("OEBPS/chapters/001-chapter.xhtml").decode("utf-8")
+        assert "保留的脚注内容。" in chapter
+        assert 'href="#fnref:96"' not in chapter
 
 
 def test_render_epub_from_book_handles_control_chars(tmp_path: Path) -> None:
@@ -110,6 +248,31 @@ def test_render_epub_from_book_recovers_moved_absolute_image_paths(tmp_path: Pat
         assert "OEBPS/images/figure-p0001-01.png" in names
         chapter = archive.read("OEBPS/chapters/001-chapter.xhtml").decode("utf-8")
         assert "../images/figure-p0001-01.png" in chapter
+
+
+def test_render_epub_uses_explicit_image_roots_for_versioned_output(tmp_path: Path) -> None:
+    image_dir = tmp_path / "run" / "book-images"
+    image_dir.mkdir(parents=True)
+    (image_dir / "figure.png").write_bytes(b"fake-png")
+    stale_path = tmp_path / "stale run" / "book-images" / "figure.png"
+    output_path = tmp_path / "run" / "versions" / "final" / "book.epub"
+
+    render_epub_from_book(
+        book={"chapters": []},
+        translated_chapters=[
+            {
+                "index": 1,
+                "title": "Chapter",
+                "markdown": f"![Figure]({stale_path})",
+            }
+        ],
+        output_path=output_path,
+        title="Reviewed Book",
+        image_roots=[image_dir],
+    )
+
+    with ZipFile(output_path) as archive:
+        assert "OEBPS/images/figure.png" in archive.namelist()
 
 
 def test_render_epub_from_book_hides_non_toc_chapters_from_nav(tmp_path: Path) -> None:

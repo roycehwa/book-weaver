@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import re
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,12 @@ from pdf_translator.reconstruct import (
     _repair_bylines,
     _resolve_ref,
 )
+from pdf_translator.semantic_content import (
+    SEMANTIC_CONTENT_SCHEMA,
+    build_semantic_footnote,
+    stable_semantic_id,
+)
+from pdf_translator.ocr_quality import assess_ocr_block
 
 
 TOP_TITLE_BAND = 450.0
@@ -33,6 +40,7 @@ FOOTNOTE_HEAVY_SINGLE_LINE_MIN_CHARS = 72
 FOOTNOTE_LINE_RATIO_TYPICAL_MAX = 0.18
 CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 MATH_SYMBOL_RE = re.compile(r"[=+\-−·×÷*/^_√∂∑∫∞≈≠≤≥<>|]")
+TRACE_PAGE_RE = re.compile(r"(?m)^\[\[page:\s*(\d+)\]\]\s*$")
 NON_SECTION_HEADINGS = {
     "figures",
     "tables",
@@ -57,6 +65,7 @@ PART_WITH_TITLE_RE = re.compile(
 )
 TOC_LINE_RE = re.compile(r"\.{2,}\s*\d+$|^\d+\s+[A-Z].+\d+$")
 NOTE_LINE_RE = re.compile(r"^(?:\d+|\*|†|‡)\s+")
+NOTE_CAPTURE_RE = re.compile(r"(?m)^(?P<marker>\d+|\*|†|‡)\s+(?P<body>.+?)(?=^(?:\d+|\*|†|‡)\s+|\Z)", re.DOTALL)
 REFERENCE_TITLE_RE = re.compile(r"^(?:further reading|references|bibliography|works cited)$", re.IGNORECASE)
 INDEX_TITLE_RE = re.compile(r"^index$", re.IGNORECASE)
 INDEX_LINE_RE = re.compile(r".+,\s*(?:[ivxlcdm]+|\d+)(?:[-,–]\s*(?:[ivxlcdm]+|\d+))*$", re.IGNORECASE)
@@ -261,8 +270,88 @@ def _format_book_block(block: LayoutBlock) -> str:
     return cleaned
 
 
-def _ordered_page_blocks(structured: dict[str, Any]) -> dict[int, list[LayoutBlock]]:
-    blocks = [block for block in _extract_text_blocks(structured) if not _is_book_noise_block(block)]
+def _layout_block_id(block: LayoutBlock) -> str:
+    return stable_semantic_id(
+        "layout-block",
+        block.page_no,
+        block.label,
+        f"{block.left:.2f}:{block.top:.2f}:{block.text}",
+    )
+
+
+def _ocr_quarantine_records(
+    blocks: list[LayoutBlock],
+) -> tuple[list[dict[str, Any]], set[str]]:
+    records: list[dict[str, Any]] = []
+    excluded: set[str] = set()
+    for block in blocks:
+        overlaps = {
+            region
+            for region in ("footer", "header")
+            if region in block.label
+        }
+        assessment = assess_ocr_block(
+            block.text,
+            page_no=block.page_no,
+            overlaps=overlaps,
+        )
+        if assessment.disposition != "suspect_ocr":
+            continue
+        block_id = _layout_block_id(block)
+        excluded.add(block_id)
+        records.append(
+            {
+                "quarantine_id": stable_semantic_id(
+                    "ocr-quarantine",
+                    block.page_no,
+                    block.label,
+                    block.text,
+                ),
+                "block_id": block_id,
+                "source_page": block.page_no,
+                "raw_text": block.text,
+                "reason_codes": list(assessment.reason_codes),
+                "score": assessment.score,
+                "disposition": assessment.disposition,
+                "source_bbox": None,
+                "evidence_asset": None,
+            }
+        )
+    repeated_raw = Counter(str(record["raw_text"]) for record in records)
+    for record in records:
+        raw_text = str(record["raw_text"])
+        control_count = sum(
+            ord(character) < 32 and character not in "\n\r\t"
+            for character in raw_text
+        )
+        letter_count = sum(character.isalpha() for character in raw_text)
+        if (
+            repeated_raw[raw_text] >= 3
+            and "control_character_density" in record["reason_codes"]
+        ):
+            record["resolution"] = "confirmed_noise"
+            record["auto_resolution"] = "repeated_control_artifact"
+        elif (
+            raw_text
+            and control_count / len(raw_text) >= 0.20
+            and letter_count == 0
+        ):
+            record["resolution"] = "confirmed_noise"
+            record["auto_resolution"] = "unreadable_control_artifact"
+    return records, excluded
+
+
+def _ordered_page_blocks(
+    structured: dict[str, Any],
+    *,
+    excluded_block_ids: set[str] | None = None,
+) -> dict[int, list[LayoutBlock]]:
+    excluded = excluded_block_ids or set()
+    blocks = [
+        block
+        for block in _extract_text_blocks(structured)
+        if _layout_block_id(block) not in excluded and not _is_book_noise_block(block)
+    ]
     repaired_blocks = _repair_bylines(blocks)
 
     ordered_pages: dict[int, list[LayoutBlock]] = {}
@@ -410,7 +499,8 @@ def _replace_preserved_apparatus_with_page_images(
             continue
         if not OUTLINE_SKIP_TITLE_RE.match(title):
             continue
-        page_markdown: list[str] = []
+        reading_pages: list[str] = []
+        trace_pages: list[str] = []
         for page_no in chapter.get("source_pages", []):
             try:
                 page_number = int(page_no)
@@ -418,12 +508,13 @@ def _replace_preserved_apparatus_with_page_images(
                 continue
             page_image = _render_pdf_page_image(source_pdf, images_dir, page_number)
             if page_image is not None:
-                page_markdown.append(f"![Original page {page_number}]({page_image.as_posix()})")
-        if not page_markdown:
+                image_markdown = f"![Original page {page_number}]({page_image.name})"
+                reading_pages.append(image_markdown)
+                trace_pages.append(f"[[page: {page_number}]]\n\n{image_markdown}")
+        if not reading_pages:
             continue
-        markdown = "\n\n".join(page_markdown).strip() + "\n"
-        chapter["markdown"] = markdown
-        chapter["trace_markdown"] = markdown
+        chapter["markdown"] = "\n\n".join(reading_pages).strip() + "\n"
+        chapter["trace_markdown"] = "\n\n".join(trace_pages).strip() + "\n"
         chapter["resource_only"] = True
         chapter["toc"] = False
 
@@ -692,6 +783,16 @@ def _page_content_items(
         if item.from_page_footer and out and not footer_started:
             text = "\n\n---\n\n" + text
             footer_started = True
+        if item.from_page_footer:
+            note = text
+            prefix = ""
+            if note.startswith("\n\n---\n\n"):
+                prefix = "\n\n---\n\n"
+                note = note[len(prefix):]
+            text = prefix + "\n".join(
+                f"> {line}" if line.strip() else ">"
+                for line in note.splitlines()
+            )
         out.append(
             BookItem(
                 kind=item.kind,
@@ -704,6 +805,120 @@ def _page_content_items(
             )
         )
     return out
+
+
+def _semantic_footnotes_from_pages(
+    ordered_pages: dict[int, list[LayoutBlock]],
+) -> list[dict[str, Any]]:
+    notes: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for page_no, blocks in sorted(ordered_pages.items()):
+        for block in blocks:
+            if block.label not in {"footnote", "page_footer"}:
+                continue
+            if block.label == "page_footer" and not _book_page_footer_is_note_like(block.text):
+                continue
+            for match in NOTE_CAPTURE_RE.finditer(block.text.strip()):
+                body = match.group("body").strip()
+                if not body:
+                    continue
+                note = build_semantic_footnote(
+                    page_no=page_no,
+                    marker=match.group("marker"),
+                    raw_text=body,
+                )
+                if note["footnote_id"] in seen:
+                    continue
+                seen.add(str(note["footnote_id"]))
+                notes.append(note)
+    return notes
+
+
+_SUPERSCRIPT_DIGITS = str.maketrans("0123456789", "⁰¹²³⁴⁵⁶⁷⁸⁹")
+
+
+def _attach_semantic_footnote_backlinks(
+    notes: list[dict[str, Any]],
+    *,
+    ordered_pages: dict[int, list[LayoutBlock]],
+    chapters: list[dict[str, Any]],
+    standalone_note_pages: set[int] | None = None,
+) -> None:
+    standalone_pages = standalone_note_pages or set()
+    chapter_by_page = {
+        int(page_no): str(chapter.get("chapter_id") or "")
+        for chapter in chapters
+        for page_no in chapter.get("source_pages", [])
+        if isinstance(page_no, int)
+    }
+    for note in notes:
+        page_no = int(note.get("source_page") or 0)
+        marker = str(note.get("marker") or "")
+        explicit_markers = {f"[^{marker}]", f"[{marker}]"}
+        if marker.isdigit():
+            explicit_markers.add(marker.translate(_SUPERSCRIPT_DIGITS))
+        plain_pdf_marker = re.compile(
+            rf"""(?x)
+            [,.:;!?'"”’)]\s*
+            {re.escape(marker)}
+            (?=\s|$|[),.;:–—-])
+            """
+        )
+        dash_pdf_marker = re.compile(
+            rf"\s{re.escape(marker)}\s+[–—-]"
+        )
+        attached_pdf_marker = re.compile(
+            rf"(?<=[A-Za-zÀ-ÖØ-öø-ÿ)]){re.escape(marker)}(?=\s|[),.;:–—-])"
+        )
+        parenthetical_pdf_marker = re.compile(
+            rf"\s{re.escape(marker)}\s*\)"
+        )
+        after_number_pdf_marker = re.compile(
+            rf"(?<=\d)\s+{re.escape(marker)}(?=\s+[A-Za-zÀ-ÖØ-öø-ÿ])"
+        )
+        backlinks: list[dict[str, Any]] = []
+        for reference_page in (page_no, page_no - 1, page_no - 2):
+            page_backlinks: list[dict[str, Any]] = []
+            for index, block in enumerate(ordered_pages.get(reference_page, [])):
+                if block.label in {"footnote", "page_footer"}:
+                    continue
+                if (
+                    not any(reference in block.text for reference in explicit_markers)
+                    and plain_pdf_marker.search(block.text) is None
+                    and dash_pdf_marker.search(block.text) is None
+                    and attached_pdf_marker.search(block.text) is None
+                    and parenthetical_pdf_marker.search(block.text) is None
+                    and after_number_pdf_marker.search(block.text) is None
+                ):
+                    continue
+                reference_id = stable_semantic_id(
+                    "footnote-ref",
+                    reference_page,
+                    f"{marker}:{index}",
+                    block.text,
+                )
+                page_backlinks.append(
+                    {
+                        "reference_id": reference_id,
+                        "chapter_id": chapter_by_page.get(reference_page, ""),
+                        "marker": marker,
+                        "source_page": reference_page,
+                    }
+                )
+            if page_backlinks:
+                backlinks = page_backlinks
+                break
+        note["backlinks"] = backlinks
+        note["reference_pages"] = sorted(
+            {int(backlink["source_page"]) for backlink in backlinks}
+        )
+        note["standalone"] = not backlinks and (
+            marker in {"*", "†", "‡"}
+            or any(
+                candidate in standalone_pages
+                for candidate in (page_no, page_no - 1, page_no - 2)
+            )
+        )
 
 
 def _book_footnote_line_ratio_from_pages(pages: list[dict[str, Any]]) -> float:
@@ -1006,6 +1221,194 @@ def _is_placeholder_title(title: str) -> bool:
     return title.startswith("Untitled Section")
 
 
+def apply_canonical_chapter_plan(book: dict[str, Any], canonical: dict[str, Any]) -> dict[str, Any]:
+    page_markdown: dict[int, str] = {}
+    page_policy: dict[int, dict[str, bool]] = {}
+    for chapter in book.get("chapters", []):
+        for page_no in chapter.get("source_pages", []):
+            try:
+                page_number = int(page_no)
+            except (TypeError, ValueError):
+                continue
+            page_policy[page_number] = {
+                "preserve_original": bool(chapter.get("preserve_original")),
+                "resource_only": bool(chapter.get("resource_only")),
+                "translate": bool(chapter.get("translate", True)),
+            }
+        trace = str(chapter.get("trace_markdown") or "")
+        matches = list(TRACE_PAGE_RE.finditer(trace))
+        for index, match in enumerate(matches):
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(trace)
+            page_markdown[int(match.group(1))] = trace[match.end():end].strip()
+
+    for asset in book.get("assets", []):
+        if not isinstance(asset, dict) or not isinstance(asset.get("page_no"), int):
+            continue
+        asset_markdown = str(asset.get("text") or "").strip()
+        if not asset_markdown and asset.get("path"):
+            label = "Table" if asset.get("kind") == "table" else "Figure"
+            asset_markdown = f"![{label}]({asset['path']})"
+        if asset_markdown and asset_markdown not in page_markdown.get(asset["page_no"], ""):
+            page_markdown[asset["page_no"]] = "\n\n".join(
+                part for part in (page_markdown.get(asset["page_no"], ""), asset_markdown) if part
+            )
+
+    canonical_chapters = [
+        chapter
+        for chapter in canonical.get("chapters", [])
+        if isinstance(chapter, dict)
+    ]
+    if not canonical_chapters:
+        raise ValueError("Canonical chapter plan contains no chapters.")
+
+    planned_pages = {
+        int(page_no)
+        for chapter in canonical_chapters
+        for page_no in (
+            chapter.get("source_pages")
+            or range(int(chapter.get("page_start") or 0), int(chapter.get("page_end") or 0) + 1)
+        )
+    }
+    available_pages = sorted(
+        int(page["page_no"])
+        for page in book.get("pages", [])
+        if isinstance(page, dict)
+        and isinstance(page.get("page_no"), int)
+        and (
+            page.get("has_content") is True
+            or (
+                "has_content" not in page
+                and (
+                    int(page["page_no"]) in page_markdown
+                    or int(page.get("figure_count") or 0) > 0
+                    or int(page.get("table_count") or 0) > 0
+                )
+            )
+        )
+    )
+    chapters: list[dict[str, Any]] = []
+
+    uncovered = [page_no for page_no in available_pages if page_no not in planned_pages]
+    if uncovered:
+        groups: list[list[int]] = []
+        for page_no in uncovered:
+            if (
+                groups
+                and page_no == groups[-1][-1] + 1
+                and page_policy.get(page_no, {}) == page_policy.get(groups[-1][-1], {})
+            ):
+                groups[-1].append(page_no)
+            else:
+                groups.append([page_no])
+        first_planned = min(planned_pages) if planned_pages else 1
+        for group in groups:
+            title = "Front Matter" if group[-1] < first_planned else "Supplementary Material"
+            policies = [page_policy.get(page, {}) for page in group]
+            preserve_original = bool(policies) and all(
+                policy.get("preserve_original", False) for policy in policies
+            )
+            chapters.append(
+                {
+                    "title": title,
+                    "page_start": group[0],
+                    "page_end": group[-1],
+                    "source_pages": group,
+                    "markdown": "\n\n".join(
+                        page_markdown.get(page, "")
+                        for page in group
+                        if page_markdown.get(page, "")
+                    ).strip(),
+                    "trace_markdown": "\n\n".join(
+                        f"[[page: {page}]]\n\n{page_markdown.get(page, '')}" for page in group
+                    ).strip(),
+                    "translate": not preserve_original,
+                    "preserve_original": preserve_original,
+                    "resource_only": True,
+                    "toc": False,
+                }
+            )
+
+    for canonical_chapter in canonical_chapters:
+        pages = [
+            int(page_no)
+            for page_no in (
+                canonical_chapter.get("source_pages")
+                or range(
+                    int(canonical_chapter.get("page_start") or 0),
+                    int(canonical_chapter.get("page_end") or 0) + 1,
+                )
+            )
+        ]
+        chapters.append(
+            {
+                "title": str(canonical_chapter.get("title") or f"Chapter {len(chapters) + 1}"),
+                "page_start": pages[0],
+                "page_end": pages[-1],
+                "source_pages": pages,
+                "markdown": "\n\n".join(page_markdown.get(page, "") for page in pages).strip(),
+                "trace_markdown": "\n\n".join(
+                    f"[[page: {page}]]\n\n{page_markdown.get(page, '')}" for page in pages
+                ).strip(),
+                "translate": True,
+                "preserve_original": False,
+                "toc": True,
+            }
+        )
+
+    chapters.sort(key=lambda chapter: int(chapter["page_start"]))
+    for index, chapter in enumerate(chapters, 1):
+        chapter["index"] = index
+    _assign_chapter_ids(chapters)
+    chapter_by_page = {
+        int(page_no): str(chapter.get("chapter_id") or "")
+        for chapter in chapters
+        for page_no in chapter.get("source_pages", [])
+        if isinstance(page_no, int)
+    }
+    semantic_content = book.get("semantic_content")
+    if isinstance(semantic_content, dict):
+        for note in semantic_content.get("footnotes", []):
+            if not isinstance(note, dict):
+                continue
+            chapter_id = chapter_by_page.get(int(note.get("source_page") or 0), "")
+            for backlink in note.get("backlinks", []):
+                if isinstance(backlink, dict):
+                    backlink["chapter_id"] = chapter_id
+
+    full_parts: list[str] = []
+    trace_parts: list[str] = []
+    for chapter in chapters:
+        if chapter.get("toc", True):
+            full_parts.append(f"# {chapter['title']}")
+        full_parts.append(str(chapter.get("markdown") or "").strip())
+        trace_parts.append(f"# {chapter['title']}")
+        trace_parts.append(str(chapter.get("trace_markdown") or "").strip())
+
+    result = dict(book)
+    result["metadata"] = {
+        **dict(book.get("metadata") or {}),
+        "chapter_source": "user_confirmed_canonical",
+        "canonical_chapter_count": len(canonical_chapters),
+    }
+    result["chapters"] = chapters
+    result["chapter_count"] = len(chapters)
+    result["pages"] = [
+        {
+            **page,
+            "has_content": (
+                page.get("has_content") is True
+                if "has_content" in page
+                else int(page.get("page_no") or 0) in available_pages
+            ),
+        }
+        for page in book.get("pages", [])
+        if isinstance(page, dict)
+    ]
+    result["full_markdown"] = "\n\n".join(part for part in full_parts if part).strip()
+    result["trace_markdown"] = "\n\n".join(part for part in trace_parts if part).strip()
+    return result
+
+
 def _build_preserved_resource_chapters(
     pages: list[dict[str, Any]],
     chapters: list[dict[str, Any]],
@@ -1016,29 +1419,41 @@ def _build_preserved_resource_chapters(
         for page_no in chapter.get("source_pages", [])
     }
     preserved: list[dict[str, Any]] = []
-    for page in pages:
+    uncovered = [
+        page
+        for page in pages
+        if int(page["page_no"]) not in used_pages and page["content_lines"]
+    ]
+    groups: list[list[dict[str, Any]]] = []
+    for page in uncovered:
+        if (
+            groups
+            and int(page["page_no"]) == int(groups[-1][-1]["page_no"]) + 1
+            and page["page_kind"] == groups[-1][-1]["page_kind"]
+        ):
+            groups[-1].append(page)
+        else:
+            groups.append([page])
+
+    for group in groups:
+        page = group[0]
         page_no = int(page["page_no"])
-        if page_no in used_pages:
-            continue
-        if not page["content_lines"]:
-            continue
-        if page.get("figure_count", 0) <= 0 and page.get("table_count", 0) <= 0:
-            continue
-        markdown = _build_chapter_markdown([page], include_page_markers=False)
+        markdown = _build_chapter_markdown(group, include_page_markers=False)
         if not markdown.strip():
             continue
         title = _preserved_resource_title(page)
+        apparatus = page["page_kind"] in {"toc", "references", "index"}
         preserved.append(
             {
                 "index": -1,
                 "title": title,
                 "page_start": page_no,
-                "page_end": page_no,
-                "source_pages": [page_no],
+                "page_end": int(group[-1]["page_no"]),
+                "source_pages": [int(item["page_no"]) for item in group],
                 "markdown": markdown,
-                "trace_markdown": _build_chapter_markdown([page], include_page_markers=True),
-                "translate": False,
-                "preserve_original": True,
+                "trace_markdown": _build_chapter_markdown(group, include_page_markers=True),
+                "translate": not apparatus,
+                "preserve_original": apparatus,
                 "resource_only": True,
                 "toc": False,
             }
@@ -1366,6 +1781,7 @@ def _build_book_from_epub_meta(meta: dict[str, Any], source_path: Path | None) -
                 "chapter_title": page["chapter_title"],
                 "figure_count": page["figure_count"],
                 "table_count": page["table_count"],
+                "has_content": bool(page.get("content_lines")),
             }
             for page in pages
         ],
@@ -1395,7 +1811,13 @@ def build_book_reconstruction(
         source_pdf=source_pdf,
         images_dir=images_dir,
     )
-    ordered_pages = _ordered_page_blocks(structured)
+    raw_text_blocks = _extract_text_blocks(structured)
+    ocr_quarantine, quarantined_block_ids = _ocr_quarantine_records(raw_text_blocks)
+    ordered_pages = _ordered_page_blocks(
+        structured,
+        excluded_block_ids=quarantined_block_ids,
+    )
+    semantic_footnotes = _semantic_footnotes_from_pages(ordered_pages)
     all_page_numbers = set(ordered_pages) | set(picture_items) | set(table_items)
     total_pages = max(all_page_numbers) if all_page_numbers else 0
 
@@ -1504,6 +1926,17 @@ def build_book_reconstruction(
     for index, chapter in enumerate(chapters, 1):
         chapter["index"] = index
     _assign_chapter_ids(chapters)
+    _attach_semantic_footnote_backlinks(
+        semantic_footnotes,
+        ordered_pages=ordered_pages,
+        chapters=chapters,
+        standalone_note_pages={
+            int(page["page_no"])
+            for page in pages
+            if int(page.get("table_count") or 0) > 0
+            or page.get("page_kind") == "table_heavy"
+        },
+    )
 
     full_markdown_parts: list[str] = []
     trace_markdown_parts: list[str] = []
@@ -1557,6 +1990,22 @@ def build_book_reconstruction(
     )
 
     footnote_line_ratio = _book_footnote_line_ratio_from_pages(pages)
+    content_page_numbers = {
+        int(page["page_no"])
+        for page in pages
+        if page.get("content_lines")
+    }
+    covered_page_numbers = {
+        int(page_no)
+        for chapter in chapters
+        for page_no in chapter.get("source_pages", [])
+    }
+    uncovered_content_pages = sorted(content_page_numbers - covered_page_numbers)
+    coverage_ratio = (
+        (len(content_page_numbers) - len(uncovered_content_pages)) / len(content_page_numbers)
+        if content_page_numbers
+        else 1.0
+    )
     return {
         "metadata": {
             "schema": "book_ir",
@@ -1568,6 +2017,8 @@ def build_book_reconstruction(
             "outline_stop_entry_count": len(outline_entries),
             "footnote_line_ratio": round(footnote_line_ratio, 5),
             "footnote_load": _footnote_load_label(footnote_line_ratio),
+            "content_page_coverage_ratio": round(coverage_ratio, 5),
+            "uncovered_content_pages": uncovered_content_pages,
             "cover_image_path": str(cover_path) if cover_path is not None else None,
         },
         "render_policy": {
@@ -1580,6 +2031,12 @@ def build_book_reconstruction(
         "chapter_count": len(chapters),
         "chapters": chapters,
         "assets": assets,
+        "semantic_content": {
+            "schema": SEMANTIC_CONTENT_SCHEMA,
+            "footnotes": semantic_footnotes,
+            "ocr_quarantine": ocr_quarantine,
+            "evidence_assets": [],
+        },
         "pages": [
             {
                 "page_no": page["page_no"],
@@ -1587,6 +2044,11 @@ def build_book_reconstruction(
                 "chapter_title": page["chapter_title"],
                 "figure_count": page["figure_count"],
                 "table_count": page["table_count"],
+                "has_content": bool(
+                    page.get("content_lines")
+                    or int(page.get("figure_count") or 0) > 0
+                    or int(page.get("table_count") or 0) > 0
+                ),
             }
             for page in pages
         ],

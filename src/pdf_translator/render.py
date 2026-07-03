@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html as html_lib
+import os
 import re
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -12,7 +13,7 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, StyleSheet1, getSampleStyleSheet
 from reportlab.lib.units import mm
 from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import (
     BaseDocTemplate,
     Flowable,
@@ -31,7 +32,7 @@ from reportlab.platypus import (
 )
 
 
-BASE_FONT = "STSong-Light"
+BASE_FONT = "BookmateCJK"
 CODE_FONT = "Courier"
 PAGE_MARGIN = 18 * mm
 FOOTNOTE_AREA_HEIGHT = 34 * mm
@@ -42,8 +43,28 @@ CONTENT_HEIGHT = A4[1] - 2 * PAGE_MARGIN - FOOTNOTE_AREA_HEIGHT
 def _register_fonts() -> None:
     try:
         pdfmetrics.getFont(BASE_FONT)
+        return
     except KeyError:
-        pdfmetrics.registerFont(UnicodeCIDFont(BASE_FONT))
+        pass
+    configured = os.environ.get("PDF_TRANSLATOR_CJK_FONT")
+    candidates = [
+        configured,
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+        "C:/Windows/Fonts/msyh.ttc",
+    ]
+    font_path = next(
+        (Path(value) for value in candidates if value and Path(value).is_file()),
+        None,
+    )
+    if font_path is None:
+        raise RuntimeError(
+            "No embeddable CJK font found. Set PDF_TRANSLATOR_CJK_FONT to a "
+            "TrueType/OpenType font with Chinese glyph coverage."
+        )
+    pdfmetrics.registerFont(TTFont(BASE_FONT, str(font_path)))
 
 
 def _build_styles() -> StyleSheet1:
@@ -140,8 +161,38 @@ def _inner_html(node: Tag) -> str:
     return "".join(str(child) for child in node.contents).strip()
 
 
+def _looks_like_broken_href(href: str) -> bool:
+    cleaned = href.strip()
+    if not cleaned:
+        return True
+    if '"' in cleaned or "'" in cleaned:
+        return True
+    if cleaned.endswith(",") and "://" not in cleaned:
+        return True
+    return False
+
+
+def _sanitize_inline_html(html: str) -> str:
+    if not html.strip():
+        return ""
+    soup = BeautifulSoup(f"<wrap>{html}</wrap>", "html.parser")
+    wrap = soup.find("wrap")
+    if wrap is None:
+        return html
+    for tag in wrap.find_all(True):
+        tag.attrs.pop("title", None)
+        if tag.name != "a":
+            continue
+        href = str(tag.get("href") or "").strip()
+        if _looks_like_broken_href(href):
+            tag.unwrap()
+            continue
+        tag.attrs = {"href": href}
+    return "".join(str(child) for child in wrap.contents).strip()
+
+
 def _paragraph_from_tag(node: Tag, style: ParagraphStyle) -> Paragraph:
-    content = _inner_html(node) or "&nbsp;"
+    content = _sanitize_inline_html(_inner_html(node)) or "&nbsp;"
     return Paragraph(content, style)
 
 
@@ -255,12 +306,13 @@ def _resolve_image_path(src: str, images_dir: Path | None = None, base_dir: Path
 
     path = Path(cleaned).expanduser()
     candidates = [path]
+    if images_dir is not None:
+        candidates.append(images_dir / path.name)
     if not path.is_absolute():
         if base_dir is not None:
             candidates.append(base_dir / path)
         if images_dir is not None:
             candidates.append(images_dir / path)
-            candidates.append(images_dir / path.name)
 
     for candidate in candidates:
         if candidate.is_file():
@@ -354,20 +406,40 @@ def _draw_page_footnotes(canvas, doc) -> None:
     canvas.setFont(BASE_FONT, font_size)
     canvas.setFillColor(colors.HexColor("#4b5563"))
 
-    y = top_y
+    lines: list[str | None] = []
     for note in notes:
-        for line in _wrap_pdf_text(note, width, BASE_FONT, font_size):
-            if y < min_y:
-                canvas.drawString(x, y, "[additional footnotes overflow this page]")
-                canvas.restoreState()
-                setattr(canvas, "_page_footnotes", [])
-                return
-            canvas.drawString(x, y, line)
-            y -= leading
-        y -= 2
+        lines.extend(_wrap_pdf_text(note, width, BASE_FONT, font_size))
+        lines.append(None)
+
+    def draw_lines(start_y: float, lower_bound: float) -> list[str | None]:
+        y = start_y
+        remaining = list(lines_to_draw)
+        while remaining:
+            line = remaining[0]
+            step = 2 if line is None else leading
+            if y - step < lower_bound:
+                break
+            remaining.pop(0)
+            if line is not None:
+                canvas.drawString(x, y, line)
+            y -= step
+        return remaining
+
+    lines_to_draw = lines
+    lines_to_draw = draw_lines(top_y, min_y)
+    canvas.restoreState()
+
+    while lines_to_draw:
+        canvas.showPage()
+        canvas.saveState()
+        canvas.setFont(BASE_FONT, font_size)
+        canvas.setFillColor(colors.HexColor("#4b5563"))
+        continuation_top = A4[1] - PAGE_MARGIN
+        canvas.drawString(x, continuation_top, "Footnotes continued")
+        lines_to_draw = draw_lines(continuation_top - leading * 1.5, PAGE_MARGIN)
+        canvas.restoreState()
 
     setattr(canvas, "_page_footnotes", [])
-    canvas.restoreState()
 
 
 def _blockquote_from_tag(node: Tag, styles: StyleSheet1) -> Paragraph | FootnoteFlowable:

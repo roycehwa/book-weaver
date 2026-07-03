@@ -4,6 +4,7 @@ import json
 import hashlib
 import os
 import time
+import copy
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
@@ -27,6 +28,8 @@ from pdf_translator.models import BookTranslationResult, TranslatedChapter, Tran
 
 
 TRANSLATION_PROMPT_VERSION = "v3-quality-retry"
+SEMANTIC_TRANSLATION_POLICY = "semantic-footnote-v1"
+SEMANTIC_SPAN_BOUNDARY = "<!--__SEMANTIC_SPAN_BOUNDARY__-->"
 
 
 SYSTEM_PROMPT = """You are a professional document translator.
@@ -82,6 +85,9 @@ def build_translation_prompt(
         f"Source language: {source}\n"
         f"Target language: {target_language}\n"
         f"Markdown chunk index: {chunk_index}\n\n"
+        "Translate explanatory footnote prose into the target language. "
+        "Preserve bibliographic titles, personal names, archival identifiers, and quoted source titles "
+        "in their original language when translation would reduce citation accuracy.\n\n"
         f"{markdown}"
     )
     if glossary_entries:
@@ -143,6 +149,32 @@ class TranslationObserver(Protocol):
     def cache_hit(self, *, chunk_index: int, input_hash: str, cache_path: Path) -> None: ...
 
     def cache_invalidated(self, *, chunk_index: int, input_hash: str, cache_path: Path, reason: str) -> None: ...
+
+
+def translate_semantic_footnote(
+    note: dict,
+    *,
+    translator: "BaseTranslator",
+    source_language: str | None,
+    target_language: str,
+) -> dict:
+    translated = copy.deepcopy(note)
+    for index, span in enumerate(translated.get("spans", [])):
+        source_text = str(span.get("source_text") or "")
+        if span.get("kind") != "prose":
+            span["translated_text"] = source_text
+            continue
+        chunk = TranslationChunk(
+            index=index,
+            markdown=source_text,
+            prompt_instruction=SEMANTIC_TRANSLATION_POLICY,
+        )
+        span["translated_text"] = translator.translate_chunk(
+            chunk=chunk,
+            source_language=source_language,
+            target_language=target_language,
+        ).strip()
+    return translated
 
 
 def _chunk_input_hash(chunk: TranslationChunk) -> str:
@@ -355,6 +387,8 @@ def _assert_translation_quality(
 
 def _is_transient_translation_error(exc: Exception) -> bool:
     message = str(exc).lower()
+    if "token plan" in message or "(2062)" in message:
+        return False
     if "timeout" in message or "connection" in message or "temporarily" in message:
         return True
     if "http 404" in message or "http 429" in message or "http 5" in message:
@@ -362,6 +396,11 @@ def _is_transient_translation_error(exc: Exception) -> bool:
     if "page not found" in message:
         return True
     return False
+
+
+def _is_permanent_translation_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "token plan" in message or "(2062)" in message
 
 
 def _translate_chunk_resumable(
@@ -440,7 +479,8 @@ def _translate_chunk_resumable(
             last_error = exc
             if "new_sensitive" in str(exc).lower():
                 had_sensitive_failure = True
-            retryable = attempt_no < max_attempts
+            permanent = _is_permanent_translation_error(exc)
+            retryable = attempt_no < max_attempts and not permanent
             if allow_sensitive_split and "new_sensitive" in str(exc).lower():
                 retryable = False
                 try:
@@ -477,6 +517,8 @@ def _translate_chunk_resumable(
                     message=str(exc),
                     retryable=retryable,
                 )
+            if permanent:
+                break
             if _is_transient_translation_error(exc):
                 time.sleep(min(2 ** min(attempt, 5), 30))
                 if attempt_no < max_attempts:
@@ -933,7 +975,7 @@ class MiniMaxAnthropicTranslator(BaseTranslator):
             response_data = response.json()
         except requests.HTTPError as exc:
             error_body = exc.response.text if exc.response is not None else ""
-            status_code = exc.response.status_code if exc.response else "?"
+            status_code = exc.response.status_code if exc.response is not None else "?"
             raise ValueError(
                 f"MiniMax translation failed for chunk {chunk.index}: "
                 f"HTTP {status_code}: {error_body[:500]}"
@@ -998,7 +1040,7 @@ class DeepLTranslator(BaseTranslator):
             response_data = response.json()
         except requests.HTTPError as exc:
             error_body = exc.response.text if exc.response is not None else ""
-            status_code = exc.response.status_code if exc.response else "?"
+            status_code = exc.response.status_code if exc.response is not None else "?"
             raise ValueError(
                 f"DeepL translation failed for chunk {chunk.index}: "
                 f"HTTP {status_code}: {error_body[:500]}"
@@ -1062,7 +1104,7 @@ def _complete_translation_attempt(
             response_data = response.json()
         except requests.HTTPError as exc:
             error_body = exc.response.text if exc.response is not None else ""
-            status_code = exc.response.status_code if exc.response else "?"
+            status_code = exc.response.status_code if exc.response is not None else "?"
             raise ValueError(
                 f"MiniMax translation failed for chunk {chunk.index}: "
                 f"HTTP {status_code}: {error_body[:500]}"
@@ -1164,6 +1206,7 @@ def translate_markdown(
             )
             for chunk in chunks
         ]
+    _write_glossary_constraints(settings.output_dir, enriched_chunks, reset=True)
     translated_chunks = _translate_chunks_ordered(
         chunks=enriched_chunks,
         source_language=settings.source_language,
@@ -1181,6 +1224,46 @@ def translate_markdown(
         target_language=settings.target_language,
         translator=translator.name,
         chunk_count=len(chunks),
+    )
+
+
+def _write_glossary_constraints(
+    run_dir: Path,
+    chunks: list[TranslationChunk],
+    *,
+    reset: bool,
+) -> None:
+    if not run_dir.exists():
+        return
+    path = run_dir / "jobs" / "glossary-constraints.json"
+    existing: dict[str, object] = {}
+    if not reset and path.exists():
+        existing = json.loads(path.read_text(encoding="utf-8"))
+    by_index = {
+        int(item["chunk_index"]): item
+        for item in existing.get("chunks", [])
+        if isinstance(item, dict) and item.get("chunk_index") is not None
+    }
+    for chunk in chunks:
+        terms = [
+            {
+                **dict(entry),
+                "source": str(entry.get("source") or "").strip(),
+                "target": str(entry.get("target") or "").strip(),
+            }
+            for entry in chunk.glossary_entries or []
+            if str(entry.get("source") or "").strip()
+            and str(entry.get("target") or "").strip()
+        ]
+        by_index[chunk.index] = {"chunk_index": chunk.index, "terms": terms}
+    payload = {
+        "schema": "translation_glossary_constraints_v1",
+        "chunks": [by_index[index] for index in sorted(by_index)],
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
     )
 
 
@@ -1214,13 +1297,8 @@ def _is_preserved_apparatus_block(block: str) -> bool:
     if first_line in {"# list of illustrations", "# list of tables", "# list of figures"}:
         return True
     if re.match(r"^-\s+\[\*\*\d+\.\*\*\]\([^)]+\)", first_line):
-        return True
-    link_count = stripped.count("](")
-    if link_count < 8:
         return False
-    ascii_count = _ascii_letter_count(stripped)
-    # Link-heavy figure/table lists are navigation apparatus, not reading prose.
-    return link_count / max(len(stripped), 1) > 0.006 and ascii_count > 500
+    return False
 
 
 def _protect_media_blocks(markdown_text: str) -> tuple[str, dict[str, str]]:
@@ -1288,6 +1366,31 @@ def estimate_translation_chunk_count(markdown_text: str, max_chunk_chars: int) -
     return count
 
 
+def estimate_semantic_translation_chunk_count(
+    book: dict,
+    max_chunk_chars: int,
+) -> int:
+    groups = 0
+    current_length = 0
+    semantic = book.get("semantic_content")
+    if not isinstance(semantic, dict):
+        return 0
+    for note in semantic.get("footnotes", []):
+        if not isinstance(note, dict):
+            continue
+        for span in note.get("spans", []):
+            if not isinstance(span, dict) or span.get("kind") != "prose":
+                continue
+            source_length = len(str(span.get("source_text") or ""))
+            added = source_length + (len(SEMANTIC_SPAN_BOUNDARY) if current_length else 0)
+            if current_length and current_length + added > max_chunk_chars:
+                groups += 1
+                current_length = source_length
+            else:
+                current_length += added
+    return groups + (1 if current_length else 0)
+
+
 def translate_book_chapters(
     *,
     book: dict,
@@ -1302,6 +1405,8 @@ def translate_book_chapters(
     translated_markdown_parts: list[str] = []
     chunk_index = 0
     glossary_entries = settings.glossary_entries or []
+    run_dir = cache_dir.parent if cache_dir is not None else settings.output_dir
+    _write_glossary_constraints(run_dir, [], reset=True)
 
     for chapter in book.get("chapters", []):
         chapter_source_markdown = _chapter_markdown_for_translation(chapter)
@@ -1353,6 +1458,7 @@ def translate_book_chapters(
                         glossary_entries=selected or None,
                     )
                 )
+            _write_glossary_constraints(run_dir, global_chunks, reset=False)
             translated_parts.extend(
                 _translate_chunks_ordered(
                     chunks=global_chunks,
@@ -1387,6 +1493,101 @@ def translate_book_chapters(
             )
         )
 
+    semantic_content = copy.deepcopy(book.get("semantic_content"))
+    if isinstance(semantic_content, dict):
+        prose_spans: list[dict] = []
+        semantic_chunks: list[TranslationChunk] = []
+        for note in semantic_content.get("footnotes", []):
+            if not isinstance(note, dict):
+                continue
+            for span in note.get("spans", []):
+                if not isinstance(span, dict):
+                    continue
+                source_text = str(span.get("source_text") or "")
+                if span.get("kind") != "prose":
+                    span["translated_text"] = source_text
+                    continue
+                prose_spans.append(span)
+        semantic_span_groups: list[list[dict]] = []
+        for span in prose_spans:
+            source_text = str(span.get("source_text") or "")
+            if (
+                semantic_span_groups
+                and sum(
+                    len(str(item.get("source_text") or ""))
+                    for item in semantic_span_groups[-1]
+                )
+                + len(SEMANTIC_SPAN_BOUNDARY)
+                + len(source_text)
+                <= settings.max_chunk_chars
+            ):
+                semantic_span_groups[-1].append(span)
+            else:
+                semantic_span_groups.append([span])
+        semantic_chunks = [
+            TranslationChunk(
+                index=chunk_index + index,
+                markdown=(
+                    f"\n\n{SEMANTIC_SPAN_BOUNDARY}\n\n".join(
+                        str(span.get("source_text") or "") for span in group
+                    )
+                ),
+                prompt_instruction=(
+                    f"{SEMANTIC_TRANSLATION_POLICY}. Preserve every "
+                    f"{SEMANTIC_SPAN_BOUNDARY} marker exactly."
+                ),
+            )
+            for index, group in enumerate(semantic_span_groups)
+        ]
+        if semantic_chunks:
+            translated_spans = _translate_chunks_ordered(
+                chunks=semantic_chunks,
+                source_language=settings.source_language,
+                target_language=settings.target_language,
+                translator=translator,
+                cache_dir=cache_dir,
+                retry_count=retry_count,
+                concurrency=concurrency,
+                observer=observer,
+            )
+            fallback_chunk_count = 0
+            for group, translated_text in zip(
+                semantic_span_groups,
+                translated_spans,
+            ):
+                parts = [
+                    part.strip()
+                    for part in translated_text.split(SEMANTIC_SPAN_BOUNDARY)
+                ]
+                if len(parts) != len(group):
+                    fallback_chunks = [
+                        TranslationChunk(
+                            index=(
+                                chunk_index
+                                + len(semantic_chunks)
+                                + fallback_chunk_count
+                                + index
+                            ),
+                            markdown=str(span.get("source_text") or ""),
+                            prompt_instruction=SEMANTIC_TRANSLATION_POLICY,
+                        )
+                        for index, span in enumerate(group)
+                    ]
+                    parts = _translate_chunks_ordered(
+                        chunks=fallback_chunks,
+                        source_language=settings.source_language,
+                        target_language=settings.target_language,
+                        translator=translator,
+                        cache_dir=cache_dir,
+                        retry_count=retry_count,
+                        concurrency=concurrency,
+                        observer=observer,
+                    )
+                    fallback_chunk_count += len(fallback_chunks)
+                for span, part in zip(group, parts):
+                    span["translated_text"] = part
+            chunk_index += len(semantic_chunks) + fallback_chunk_count
+
     return BookTranslationResult(
         translated_markdown="\n\n".join(translated_markdown_parts).strip() + "\n",
         translated_chapters=translated_chapters,
@@ -1394,4 +1595,5 @@ def translate_book_chapters(
         target_language=settings.target_language,
         translator=translator.name,
         chunk_count=chunk_index,
+        semantic_content=semantic_content if isinstance(semantic_content, dict) else None,
     )
