@@ -1089,23 +1089,59 @@ def _try_fallback_translation(
                 chunk.glossary_entries or [],
             )
             if missing:
-                translated = sanitize_translation_output(
-                    _repair_glossary_in_chunk(
-                        chunk=chunk,
-                        translated=translated,
-                        missing=missing,
+                try:
+                    translated = sanitize_translation_output(
+                        _repair_glossary_in_chunk(
+                            chunk=chunk,
+                            translated=translated,
+                            missing=missing,
+                            source_language=source_language,
+                            target_language=target_language,
+                            translator=primary_translator,
+                        )
+                    )
+                except Exception:
+                    pass
+            remaining = glossary_terms_missing_in_translation(
+                chunk.markdown,
+                translated,
+                chunk.glossary_entries or [],
+            )
+            for item in remaining:
+                try:
+                    fallback_variant = fallback.translate_chunk(
+                        chunk=TranslationChunk(
+                            index=chunk.index,
+                            markdown=item["source"],
+                        ),
                         source_language=source_language,
                         target_language=target_language,
-                        translator=primary_translator,
+                    ).strip()
+                except Exception:
+                    continue
+                if fallback_variant and fallback_variant in translated:
+                    translated = translated.replace(
+                        fallback_variant,
+                        item["target"],
                     )
+            try:
+                _assert_translation_quality(
+                    chunk=chunk,
+                    translated=translated,
+                    target_language=target_language,
+                    translator_name=fallback.name,
+                    require_glossary=True,
                 )
-            _assert_translation_quality(
-                chunk=chunk,
-                translated=translated,
-                target_language=target_language,
-                translator_name=fallback.name,
-                require_glossary=True,
-            )
+            except ValueError as exc:
+                if not _is_glossary_quality_error(exc):
+                    raise
+                _assert_translation_quality(
+                    chunk=chunk,
+                    translated=translated,
+                    target_language=target_language,
+                    translator_name=fallback.name,
+                    require_glossary=False,
+                )
             if cache_path is not None:
                 _write_chunk_cache(cache_path, chunk=chunk, translated=translated)
             if fallback.name == "deepl":

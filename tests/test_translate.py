@@ -2003,6 +2003,72 @@ def test_deepl_sensitive_fallback_converges_glossary_with_primary_repair(
     assert result.translated_markdown == "鞍山市的工业政策发生了变化。\n"
 
 
+def test_deepl_sensitive_fallback_preserves_complete_translation_for_review(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SensitiveMiniMax(BaseTranslator):
+        name = "minimax"
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            raise ValueError("MiniMax translation failed: output new_sensitive (1027)")
+
+    class CompleteDriftingDeepL(BaseTranslator):
+        name = "deepl"
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            if chunk.markdown == "Steel Works":
+                return "钢铁企业"
+            return "这座钢铁公司保存了完整的历史记录。"
+
+    monkeypatch.setenv("TRANSLATION_FALLBACK", "deepl")
+    monkeypatch.setenv("DEEPL_AUTH_KEY", "test-key")
+    monkeypatch.setattr(
+        "pdf_translator.translate.build_translator",
+        lambda _name: CompleteDriftingDeepL(),
+    )
+    monkeypatch.setattr("time.sleep", lambda _seconds: None)
+
+    result = translate_markdown(
+        chunks=[
+            TranslationChunk(
+                index=0,
+                markdown="The Steel Works preserved its complete historical record.",
+            )
+        ],
+        settings=RunSettings(
+            source_pdf=tmp_path / "source.pdf",
+            output_dir=tmp_path,
+            target_language="zh-CN",
+            source_language="en",
+            translator="minimax",
+            max_chunk_chars=9000,
+            glossary_entries=[
+                {
+                    "source": "Steel Works",
+                    "target": "钢铁厂",
+                    "status": "active",
+                }
+            ],
+        ),
+        translator=SensitiveMiniMax(),
+        cache_dir=tmp_path / "cache",
+        retry_count=2,
+    )
+
+    assert result.translated_markdown == "这座钢铁公司保存了完整的历史记录。\n"
+
+
 def test_translate_markdown_skips_deepl_for_non_sensitive_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
