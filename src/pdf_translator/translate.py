@@ -524,6 +524,50 @@ def _repair_glossary_in_chunk(
     target_language: str,
     translator: BaseTranslator,
 ) -> str:
+    source_paragraphs = chunk.markdown.split("\n\n")
+    translated_paragraphs = translated.split("\n\n")
+    if len(source_paragraphs) == len(translated_paragraphs) and len(source_paragraphs) > 1:
+        repaired_paragraphs = list(translated_paragraphs)
+        repaired_any = False
+        active_missing = [
+            {**item, "status": "active"}
+            for item in missing
+        ]
+        for index, (source_paragraph, translated_paragraph) in enumerate(
+            zip(source_paragraphs, translated_paragraphs)
+        ):
+            paragraph_missing = glossary_terms_missing_in_translation(
+                source_paragraph,
+                translated_paragraph,
+                active_missing,
+            )
+            if not paragraph_missing:
+                continue
+            lines = "\n".join(
+                f"- {item['source']} => {item['target']}"
+                for item in paragraph_missing
+            )
+            repair_chunk = TranslationChunk(
+                index=chunk.index,
+                markdown=source_paragraph,
+                glossary_entries=paragraph_missing,
+                prompt_instruction=(
+                    "Glossary repair pass. Revise only this existing Chinese paragraph so "
+                    "every listed mandatory term uses the exact Chinese wording. Preserve "
+                    "all other meaning and formatting:\n"
+                    f"{lines}\n\nCURRENT TRANSLATION TO REVISE:\n"
+                    f"{translated_paragraph}"
+                ),
+            )
+            repaired_paragraphs[index] = translator.translate_chunk(
+                chunk=repair_chunk,
+                source_language=source_language,
+                target_language=target_language,
+            ).strip()
+            repaired_any = True
+        if repaired_any:
+            return "\n\n".join(repaired_paragraphs)
+
     lines = "\n".join(f"- {item['source']} => {item['target']}" for item in missing)
     repair_chunk = TranslationChunk(
         index=chunk.index,

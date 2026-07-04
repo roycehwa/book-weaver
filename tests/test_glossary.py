@@ -305,6 +305,37 @@ def test_glossary_term_does_not_match_prefix_of_longer_word() -> None:
     ) == []
 
 
+def test_glossary_constraints_ignore_sentence_fragments() -> None:
+    entries = [
+        {
+            "source": "During the First",
+            "target": "一战期间",
+            "status": "active",
+        },
+        {
+            "source": "After the CCP",
+            "target": "中共建政后",
+            "status": "active",
+        },
+        {
+            "source": "World War II",
+            "target": "第二次世界大战",
+            "status": "active",
+        },
+    ]
+
+    selected = select_glossary_entries_for_text(
+        (
+            "During the First Five-Year Plan, production increased. "
+            "After the CCP gained control, World War II remained a recent memory."
+        ),
+        entries,
+        chapter_id=None,
+    )
+
+    assert [entry["source"] for entry in selected] == ["World War II"]
+
+
 def test_glossary_terms_missing_prefers_longest_non_overlapping_match() -> None:
     entries = [
         {"source": "Steel Works", "target": "钢铁厂", "status": "active"},

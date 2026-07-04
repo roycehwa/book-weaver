@@ -373,6 +373,62 @@ def test_glossary_conjunction_drift_is_repaired_without_another_model_call(
     assert translator.calls == 1
 
 
+def test_glossary_repair_rewrites_only_affected_paragraph(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pdf_translator.translate import _translate_chunk_resumable
+
+    class ParagraphRepairTranslator(BaseTranslator):
+        name = "minimax"
+
+        def __init__(self) -> None:
+            self.calls: list[TranslationChunk] = []
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            self.calls.append(chunk)
+            if chunk.prompt_instruction:
+                assert chunk.markdown == "World War II reshaped industrial policy."
+                return "第二次世界大战重塑了工业政策。"
+            return "第一段已经正确翻译。\n\n二战重塑了工业政策。"
+
+    translator = ParagraphRepairTranslator()
+    monkeypatch.setattr(
+        "pdf_translator.translate._resolve_fallback_translator",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr("time.sleep", lambda _seconds: None)
+    translated = _translate_chunk_resumable(
+        chunk=TranslationChunk(
+            index=0,
+            markdown=(
+                "The first paragraph is already correct.\n\n"
+                "World War II reshaped industrial policy."
+            ),
+            glossary_entries=[
+                {
+                    "source": "World War II",
+                    "target": "第二次世界大战",
+                    "status": "active",
+                }
+            ],
+        ),
+        source_language="en",
+        target_language="zh-CN",
+        translator=translator,
+        cache_dir=tmp_path,
+        retry_count=6,
+    )
+
+    assert translated == "第一段已经正确翻译。\n\n第二次世界大战重塑了工业政策。"
+    assert len(translator.calls) == 2
+
+
 def test_semantic_footnote_translates_only_explanatory_spans() -> None:
     class SemanticTranslator(BaseTranslator):
         name = "semantic"

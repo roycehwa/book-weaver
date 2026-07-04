@@ -494,6 +494,17 @@ def select_glossary_entries_for_text(
         source = str(entry.get("source") or "").strip()
         if not source:
             continue
+        first_word = source.split(maxsplit=1)[0].casefold()
+        if first_word in {
+            "after",
+            "before",
+            "during",
+            "since",
+            "until",
+            "when",
+            "while",
+        }:
+            continue
         matches = list(re.finditer(re.escape(source), text, flags=re.IGNORECASE))
         available = next(
             (
