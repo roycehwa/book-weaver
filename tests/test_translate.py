@@ -733,6 +733,41 @@ def test_sensitive_split_breaks_long_single_line_at_sentence_boundaries() -> Non
     assert " ".join(parts) == source
 
 
+def test_sensitive_split_preserves_only_refused_minimal_part() -> None:
+    from pdf_translator.translate import _translate_sensitive_chunk_parts
+
+    class SelectiveSensitiveTranslator(BaseTranslator):
+        name = "minimax"
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            if "Deng Xiaoping" in chunk.markdown:
+                raise ValueError("HTTP 500: input new_sensitive (1026)")
+            return "其余内容已翻译。"
+
+    source = (
+        "The economic reforms changed industrial policy. "
+        "Private firms expanded rapidly.\n\n"
+        "Deng Xiaoping consolidated power in 1978.\n\n"
+        "Regional factories then faced new competition."
+    )
+
+    translated = _translate_sensitive_chunk_parts(
+        chunk=TranslationChunk(index=5, markdown=source),
+        source_language="en",
+        target_language="zh-CN",
+        translator=SelectiveSensitiveTranslator(),
+    )
+
+    assert "其余内容已翻译。" in translated
+    assert "Deng Xiaoping consolidated power in 1978." in translated
+    assert "Private firms expanded rapidly." not in translated
+
+
 def test_mock_translator_does_not_add_visible_debug_markers() -> None:
     result = translate_markdown(
         chunks=[TranslationChunk(index=16, markdown="Body text.")],

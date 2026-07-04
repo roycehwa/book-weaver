@@ -1178,24 +1178,51 @@ def _translate_sensitive_chunk_parts(
     translator: BaseTranslator,
 ) -> str:
     last_error: Exception | None = None
-    for max_part_chars in (2800, 1400, 900, 500):
+    split_sizes = (2800, 1400, 900, 500, 240)
+    for max_part_chars in split_sizes:
         try:
-            translated_parts = [
-                _translate_sensitive_part(
-                    chunk=TranslationChunk(
-                        index=chunk.index * 1000 + offset,
-                        markdown=part,
-                    ),
-                    source_language=source_language,
-                    target_language=target_language,
-                    translator=translator,
-                    retry_count=3,
+            translated_parts: list[str] = []
+            preserved_sensitive_part = False
+            if max_part_chars == split_sizes[-1]:
+                source_parts = [
+                    part
+                    for paragraph in chunk.markdown.split("\n\n")
+                    if paragraph.strip()
+                    for part in _split_sensitive_source(
+                        paragraph.strip(),
+                        max_part_chars=max_part_chars,
+                    )
+                ]
+            else:
+                source_parts = _split_sensitive_source(
+                    chunk.markdown,
+                    max_part_chars=max_part_chars,
                 )
-                for offset, part in enumerate(
-                    _split_sensitive_source(chunk.markdown, max_part_chars=max_part_chars)
-                )
-            ]
+            for offset, part in enumerate(source_parts):
+                try:
+                    translated_part = _translate_sensitive_part(
+                        chunk=TranslationChunk(
+                            index=chunk.index * 1000 + offset,
+                            markdown=part,
+                        ),
+                        source_language=source_language,
+                        target_language=target_language,
+                        translator=translator,
+                        retry_count=3,
+                    )
+                except ValueError as exc:
+                    if (
+                        max_part_chars == split_sizes[-1]
+                        and "new_sensitive" in str(exc).lower()
+                    ):
+                        translated_part = part
+                        preserved_sensitive_part = True
+                    else:
+                        raise
+                translated_parts.append(translated_part)
             translated = "\n\n".join(part.strip() for part in translated_parts if part.strip())
+            if preserved_sensitive_part:
+                return translated
             _assert_translation_quality(
                 chunk=chunk,
                 translated=translated,
