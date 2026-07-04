@@ -1935,6 +1935,74 @@ def test_translate_markdown_falls_back_to_deepl_on_sensitive(
     assert "备用 DeepL" in result.translated_markdown
 
 
+def test_deepl_sensitive_fallback_converges_glossary_with_primary_repair(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SensitiveThenRepairingMiniMax(BaseTranslator):
+        name = "minimax"
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            if chunk.prompt_instruction:
+                return "鞍山市的工业政策发生了变化。"
+            raise ValueError("MiniMax translation failed: input new_sensitive (1026)")
+
+    class DriftingDeepL(BaseTranslator):
+        name = "deepl"
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            return "安山市的工业政策发生了变化。"
+
+    monkeypatch.setenv("TRANSLATION_FALLBACK", "deepl")
+    monkeypatch.setenv("DEEPL_AUTH_KEY", "test-key")
+    monkeypatch.setattr(
+        "pdf_translator.translate.build_translator",
+        lambda name: DriftingDeepL()
+        if name.strip().lower() == "deepl"
+        else SensitiveThenRepairingMiniMax(),
+    )
+    monkeypatch.setattr("time.sleep", lambda _seconds: None)
+
+    result = translate_markdown(
+        chunks=[
+            TranslationChunk(
+                index=0,
+                markdown="Anshan City changed its industrial policy.",
+            )
+        ],
+        settings=RunSettings(
+            source_pdf=tmp_path / "source.pdf",
+            output_dir=tmp_path,
+            target_language="zh-CN",
+            source_language="en",
+            translator="minimax",
+            max_chunk_chars=9000,
+            glossary_entries=[
+                {
+                    "source": "Anshan City",
+                    "target": "鞍山市",
+                    "status": "active",
+                }
+            ],
+        ),
+        translator=SensitiveThenRepairingMiniMax(),
+        cache_dir=tmp_path / "cache",
+        retry_count=2,
+    )
+
+    assert result.translated_markdown == "鞍山市的工业政策发生了变化。\n"
+
+
 def test_translate_markdown_skips_deepl_for_non_sensitive_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

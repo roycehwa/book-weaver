@@ -1078,6 +1078,27 @@ def _try_fallback_translation(
             if not translated:
                 raise ValueError(f"Empty fallback translation returned for chunk {chunk.index}.")
             translated = _strip_generated_english_chinese_glosses(chunk.markdown, translated, target_language)
+            translated = _apply_deterministic_glossary_repairs(
+                source_text=chunk.markdown,
+                translated_text=translated,
+                glossary_entries=chunk.glossary_entries,
+            )
+            missing = glossary_terms_missing_in_translation(
+                chunk.markdown,
+                translated,
+                chunk.glossary_entries or [],
+            )
+            if missing:
+                translated = sanitize_translation_output(
+                    _repair_glossary_in_chunk(
+                        chunk=chunk,
+                        translated=translated,
+                        missing=missing,
+                        source_language=source_language,
+                        target_language=target_language,
+                        translator=primary_translator,
+                    )
+                )
             _assert_translation_quality(
                 chunk=chunk,
                 translated=translated,
