@@ -497,6 +497,7 @@ def _write_chunk_cache(
     *,
     chunk: TranslationChunk,
     translated: str,
+    allow_glossary_drift: bool = False,
 ) -> None:
     tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
     tmp_path.write_text(translated + "\n", encoding="utf-8")
@@ -506,6 +507,7 @@ def _write_chunk_cache(
             {
                 "schema": "translation_cache_source_v1",
                 "source_fingerprint": _chunk_source_fingerprint(chunk.markdown),
+                "allow_glossary_drift": allow_glossary_drift,
             },
             ensure_ascii=False,
             indent=2,
@@ -631,11 +633,20 @@ def _translate_chunk_resumable(
                         glossary_entries=chunk.glossary_entries,
                     )
                 try:
+                    source_metadata_path = cache_path.with_suffix(".source.json")
+                    source_metadata = (
+                        json.loads(source_metadata_path.read_text(encoding="utf-8"))
+                        if source_metadata_path.exists()
+                        else {}
+                    )
                     _assert_translation_quality(
                         chunk=chunk,
                         translated=cached,
                         target_language=target_language,
                         translator_name=translator.name,
+                        require_glossary=not bool(
+                            source_metadata.get("allow_glossary_drift")
+                        ),
                     )
                 except ValueError as exc:
                     if observer is not None:
@@ -704,6 +715,9 @@ def _translate_chunk_resumable(
                         translated=legacy,
                         target_language=target_language,
                         translator_name=translator.name,
+                        require_glossary=not bool(
+                            source_metadata.get("allow_glossary_drift")
+                        ),
                     )
                     return _persist_chunk_translation(
                         chunk=chunk,
@@ -1124,6 +1138,7 @@ def _try_fallback_translation(
                         fallback_variant,
                         item["target"],
                     )
+            allow_glossary_drift = False
             try:
                 _assert_translation_quality(
                     chunk=chunk,
@@ -1142,8 +1157,14 @@ def _try_fallback_translation(
                     translator_name=fallback.name,
                     require_glossary=False,
                 )
+                allow_glossary_drift = True
             if cache_path is not None:
-                _write_chunk_cache(cache_path, chunk=chunk, translated=translated)
+                _write_chunk_cache(
+                    cache_path,
+                    chunk=chunk,
+                    translated=translated,
+                    allow_glossary_drift=allow_glossary_drift,
+                )
             if fallback.name == "deepl":
                 _deepl_record_usage(source_chars, chunk_index=chunk.index)
             return translated

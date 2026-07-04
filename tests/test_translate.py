@@ -2087,6 +2087,38 @@ def test_deepl_sensitive_fallback_preserves_complete_translation_for_review(
     )
 
     assert result.translated_markdown == "这座钢铁公司保存了完整的历史记录。\n"
+    metadata_path = next((tmp_path / "cache").glob("chunk-*.source.json"))
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert metadata["allow_glossary_drift"] is True
+
+    cached_result = translate_markdown(
+        chunks=[
+            TranslationChunk(
+                index=0,
+                markdown="The Steel Works preserved its complete historical record.",
+            )
+        ],
+        settings=RunSettings(
+            source_pdf=tmp_path / "source.pdf",
+            output_dir=tmp_path,
+            target_language="zh-CN",
+            source_language="en",
+            translator="minimax",
+            max_chunk_chars=9000,
+            glossary_entries=[
+                {
+                    "source": "Steel Works",
+                    "target": "钢铁厂",
+                    "status": "active",
+                }
+            ],
+        ),
+        translator=SensitiveMiniMax(),
+        cache_dir=tmp_path / "cache",
+        retry_count=2,
+    )
+
+    assert cached_result.translated_markdown == result.translated_markdown
 
 
 def test_translate_markdown_skips_deepl_for_non_sensitive_failure(
