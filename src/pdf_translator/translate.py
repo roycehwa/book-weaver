@@ -1804,6 +1804,16 @@ def _write_glossary_constraints(
 def _chapter_markdown_for_translation(chapter: dict) -> str:
     title = str(chapter.get("title") or f"Chapter {chapter.get('index', '')}").strip()
     markdown = str(chapter.get("markdown") or "").strip()
+    markdown = re.sub(
+        r"(!\[[^\]]*\]\()([^)]+)(\))",
+        lambda match: (
+            f"{match.group(1)}book-images/"
+            f"{match.group(2).split('/book-images/', 1)[1]}{match.group(3)}"
+            if "/book-images/" in match.group(2)
+            else match.group(0)
+        ),
+        markdown,
+    )
     if title.startswith("Untitled Section"):
         return markdown + "\n" if markdown else ""
     return f"# {title}\n\n{markdown}\n" if markdown else f"# {title}\n"

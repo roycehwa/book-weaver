@@ -786,6 +786,26 @@ def test_mock_translator_does_not_add_visible_debug_markers() -> None:
     assert "mock translation chunk" not in result.translated_markdown
 
 
+def test_chapter_markdown_rewrites_managed_absolute_image_paths() -> None:
+    from pdf_translator.translate import _chapter_markdown_for_translation
+
+    markdown = _chapter_markdown_for_translation(
+        {
+            "index": 1,
+            "title": "Introduction",
+            "markdown": (
+                "Body.\n\n"
+                "![Figure](/Users/example/run/book-images/figure-p0001-01.png)\n\n"
+                "[External](https://example.com/image.png)"
+            ),
+        }
+    )
+
+    assert "![Figure](book-images/figure-p0001-01.png)" in markdown
+    assert "/Users/example" not in markdown
+    assert "[External](https://example.com/image.png)" in markdown
+
+
 def test_permanent_token_plan_limit_is_not_retried(tmp_path: Path) -> None:
     class QuotaTranslator(BaseTranslator):
         name = "quota"
