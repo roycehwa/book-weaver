@@ -289,6 +289,22 @@ def test_glossary_terms_ignore_markdown_image_destinations() -> None:
     ) == []
 
 
+def test_glossary_term_does_not_match_prefix_of_longer_word() -> None:
+    entries = [
+        {
+            "source": "Japanese War",
+            "target": "抗日战争",
+            "status": "active",
+        }
+    ]
+
+    assert glossary_terms_missing_in_translation(
+        "The report documented Japanese wartime atrocities.",
+        "报告记录了日本战时暴行。",
+        entries,
+    ) == []
+
+
 def test_glossary_terms_missing_prefers_longest_non_overlapping_match() -> None:
     entries = [
         {"source": "Steel Works", "target": "钢铁厂", "status": "active"},

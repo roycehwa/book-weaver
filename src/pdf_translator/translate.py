@@ -429,6 +429,35 @@ def _is_glossary_quality_error(exc: Exception) -> bool:
     return isinstance(exc, ValueError) and "missing mandatory glossary terms" in str(exc)
 
 
+def _apply_deterministic_glossary_repairs(
+    *,
+    source_text: str,
+    translated_text: str,
+    glossary_entries: list[dict] | None,
+) -> str:
+    """Correct conservative Chinese connector variants without another model call."""
+    repaired = translated_text
+    missing = glossary_terms_missing_in_translation(
+        source_text,
+        repaired,
+        glossary_entries or [],
+    )
+    for entry in missing:
+        target = entry["target"]
+        variants: set[str] = set()
+        if "与" in target:
+            variants.update({target.replace("与", "和"), target.replace("与", "及")})
+        if "和" in target:
+            variants.update({target.replace("和", "与"), target.replace("和", "及")})
+        if "及" in target:
+            variants.update({target.replace("及", "与"), target.replace("及", "和")})
+        for variant in sorted(variants, key=len, reverse=True):
+            if variant and variant in repaired:
+                repaired = repaired.replace(variant, target)
+                break
+    return repaired
+
+
 def _is_untranslated_quality_error(exc: Exception) -> bool:
     if not isinstance(exc, ValueError):
         return False
@@ -549,9 +578,14 @@ def _translate_chunk_resumable(
         cache_dir.mkdir(parents=True, exist_ok=True)
         cache_path = _chunk_cache_path(cache_dir, chunk)
         if cache_path.exists():
-            cached = cache_path.read_text(encoding="utf-8").strip()
-            if cached:
-                cached = _strip_generated_english_chinese_glosses(chunk.markdown, cached, target_language)
+                cached = cache_path.read_text(encoding="utf-8").strip()
+                if cached:
+                    cached = _strip_generated_english_chinese_glosses(chunk.markdown, cached, target_language)
+                    cached = _apply_deterministic_glossary_repairs(
+                        source_text=chunk.markdown,
+                        translated_text=cached,
+                        glossary_entries=chunk.glossary_entries,
+                    )
                 try:
                     _assert_translation_quality(
                         chunk=chunk,
@@ -612,6 +646,11 @@ def _translate_chunk_resumable(
                     continue
                 legacy = sanitize_translation_output(
                     legacy_path.read_text(encoding="utf-8")
+                )
+                legacy = _apply_deterministic_glossary_repairs(
+                    source_text=chunk.markdown,
+                    translated_text=legacy,
+                    glossary_entries=chunk.glossary_entries,
                 )
                 if not legacy:
                     continue
@@ -683,6 +722,11 @@ def _translate_chunk_resumable(
             if not translated:
                 raise ValueError(f"Empty translation returned for chunk {chunk.index}.")
             translated = _strip_generated_english_chinese_glosses(chunk.markdown, translated, target_language)
+            translated = _apply_deterministic_glossary_repairs(
+                source_text=chunk.markdown,
+                translated_text=translated,
+                glossary_entries=chunk.glossary_entries,
+            )
             _assert_translation_quality(
                 chunk=chunk,
                 translated=translated,

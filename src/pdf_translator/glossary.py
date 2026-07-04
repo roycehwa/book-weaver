@@ -516,6 +516,10 @@ def select_glossary_entries_for_text(
 
 
 def _is_complete_source_term_match(text: str, start: int, end: int) -> bool:
+    if start > 0 and text[start - 1].isalnum():
+        return False
+    if end < len(text) and text[end].isalnum():
+        return False
     before = text[max(0, start - 40):start]
     after = text[end:end + 40]
     if re.search(r"[A-Z][A-Za-z'’-]*[–—-]\s*$", before):
