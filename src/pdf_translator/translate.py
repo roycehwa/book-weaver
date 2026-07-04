@@ -1116,6 +1116,47 @@ def _split_sensitive_source(source: str, *, max_part_chars: int) -> list[str]:
         lines = paragraph.splitlines()
         block = ""
         for line in lines:
+            if len(line) > max_part_chars:
+                if block:
+                    parts.append(block)
+                    block = ""
+                sentences = re.split(r"(?<=[.!?。！？])\s+", line)
+                sentence_block = ""
+                for sentence in sentences:
+                    if len(sentence) > max_part_chars:
+                        if sentence_block:
+                            parts.append(sentence_block)
+                            sentence_block = ""
+                        words = sentence.split()
+                        word_block = ""
+                        for word in words:
+                            word_candidate = (
+                                f"{word_block} {word}".strip()
+                                if word_block
+                                else word
+                            )
+                            if len(word_candidate) <= max_part_chars:
+                                word_block = word_candidate
+                            else:
+                                if word_block:
+                                    parts.append(word_block)
+                                word_block = word
+                        if word_block:
+                            sentence_block = word_block
+                        continue
+                    sentence_candidate = (
+                        f"{sentence_block} {sentence}".strip()
+                        if sentence_block
+                        else sentence
+                    )
+                    if len(sentence_candidate) <= max_part_chars:
+                        sentence_block = sentence_candidate
+                    else:
+                        if sentence_block:
+                            parts.append(sentence_block)
+                        sentence_block = sentence
+                block = sentence_block
+                continue
             line_candidate = f"{block}\n{line}".strip() if block else line
             if len(line_candidate) <= max_part_chars:
                 block = line_candidate

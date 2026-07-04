@@ -718,6 +718,21 @@ def test_large_semantic_boundary_loss_retries_in_small_batches(
     assert result.chunk_count == 4
 
 
+def test_sensitive_split_breaks_long_single_line_at_sentence_boundaries() -> None:
+    from pdf_translator.translate import _split_sensitive_source
+
+    source = " ".join(
+        f"Sentence {index} describes an historical policy in sufficient detail."
+        for index in range(30)
+    )
+
+    parts = _split_sensitive_source(source, max_part_chars=220)
+
+    assert len(parts) > 1
+    assert max(map(len, parts)) <= 220
+    assert " ".join(parts) == source
+
+
 def test_mock_translator_does_not_add_visible_debug_markers() -> None:
     result = translate_markdown(
         chunks=[TranslationChunk(index=16, markdown="Body text.")],
