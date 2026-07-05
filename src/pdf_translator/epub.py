@@ -210,7 +210,7 @@ def _compact_trailing_note_cluster(soup: BeautifulSoup) -> None:
     """
 
     children = [child for child in soup.contents if getattr(child, "name", None)]
-    if len(children) < 12:
+    if len(children) < 6:
         return
 
     min_start = max(4, int(len(children) * 0.45))
@@ -224,10 +224,13 @@ def _compact_trailing_note_cluster(soup: BeautifulSoup) -> None:
             break
     if start_index is None:
         return
+    if all(_is_note_marker_node(child) for child in children[start_index:]):
+        for child in children[start_index:]:
+            child.extract()
+        return
 
     section = soup.new_tag("section")
     section["class"] = "chapter-notes"
-    section["epub:type"] = "footnotes"
     heading = soup.new_tag("h2")
     heading.string = "本章注释"
     section.append(heading)
@@ -274,45 +277,27 @@ def _inject_semantic_footnotes(
         return body_html
 
     soup = BeautifulSoup(body_html, "html.parser")
-    refs = soup.new_tag("p")
-    refs["class"] = "semantic-footnote-refs"
     section = soup.new_tag("section")
     section["class"] = "chapter-notes"
-    section["epub:type"] = "footnotes"
     heading = soup.new_tag("h2")
     heading.string = "本章注释"
     section.append(heading)
     for note, backlinks in selected:
         note_id = str(note.get("footnote_id") or "")
-        target_id = f"fn-{note_id}"
         marker = str(note.get("marker") or "")
-        for backlink in backlinks:
-            reference_id = str(backlink.get("reference_id") or f"fnref-{note_id}")
-            anchor = soup.new_tag("a", href=f"#{target_id}")
-            anchor["id"] = reference_id
-            anchor["epub:type"] = "noteref"
-            anchor["role"] = "doc-noteref"
-            anchor.string = str(backlink.get("marker") or marker)
-            refs.append(anchor)
-        aside = soup.new_tag("aside")
-        aside["id"] = target_id
-        aside["epub:type"] = "footnote"
-        aside["role"] = "doc-footnote"
         paragraph = soup.new_tag("p")
-        paragraph.string = "".join(
-            str(span.get("translated_text") or span.get("source_text") or "")
-            for span in note.get("spans", [])
-            if isinstance(span, dict)
+        paragraph["id"] = f"fn-{note_id}"
+        label = soup.new_tag("strong")
+        label.string = f"{marker}. " if marker else ""
+        paragraph.append(label)
+        paragraph.append(
+            "".join(
+                str(span.get("translated_text") or span.get("source_text") or "")
+                for span in note.get("spans", [])
+                if isinstance(span, dict)
+            )
         )
-        aside.append(paragraph)
-        for backlink in backlinks:
-            reference_id = str(backlink.get("reference_id") or f"fnref-{note_id}")
-            back = soup.new_tag("a", href=f"#{reference_id}")
-            back["class"] = "footnote-backref"
-            back.string = "↩"
-            aside.append(back)
-        section.append(aside)
-    soup.append(refs)
+        section.append(paragraph)
     soup.append(section)
     return "".join(str(child) for child in soup.contents)
 

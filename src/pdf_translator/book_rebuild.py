@@ -24,6 +24,7 @@ from pdf_translator.semantic_content import (
     stable_semantic_id,
 )
 from pdf_translator.ocr_quality import assess_ocr_block
+from pdf_translator.guardrails import assert_translatable_pages_have_no_original_fallback
 
 
 TOP_TITLE_BAND = 450.0
@@ -1356,16 +1357,25 @@ def apply_canonical_chapter_plan(book: dict[str, Any], canonical: dict[str, Any]
                 )
             )
         ]
+        chapter_title = str(canonical_chapter.get("title") or f"Chapter {len(chapters) + 1}")
+        assert_translatable_pages_have_no_original_fallback(
+            chapter_title=chapter_title,
+            pages=pages,
+            page_markdown=page_markdown,
+        )
+        markdown = "\n\n".join(page_markdown.get(page, "") for page in pages).strip()
+        trace_markdown = "\n\n".join(
+            f"[[page: {page}]]\n\n{page_markdown.get(page, '')}"
+            for page in pages
+        ).strip()
         chapters.append(
             {
-                "title": str(canonical_chapter.get("title") or f"Chapter {len(chapters) + 1}"),
+                "title": chapter_title,
                 "page_start": pages[0],
                 "page_end": pages[-1],
                 "source_pages": pages,
-                "markdown": "\n\n".join(page_markdown.get(page, "") for page in pages).strip(),
-                "trace_markdown": "\n\n".join(
-                    f"[[page: {page}]]\n\n{page_markdown.get(page, '')}" for page in pages
-                ).strip(),
+                "markdown": markdown,
+                "trace_markdown": trace_markdown,
                 "translate": True,
                 "preserve_original": False,
                 "toc": True,

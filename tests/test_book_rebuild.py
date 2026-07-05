@@ -89,6 +89,44 @@ def test_apply_canonical_chapter_plan_preserves_asset_only_pages() -> None:
     assert all(3 not in chapter["source_pages"] for chapter in result["chapters"])
 
 
+def test_canonical_translatable_chapters_reject_original_page_fallback() -> None:
+    import pytest
+
+    from pdf_translator.guardrails import InputGateError
+
+    book = {
+        "chapters": [
+            {
+                "title": "Automatic Body",
+                "source_pages": [31, 32],
+                "trace_markdown": (
+                    "[[page: 31]]\n\n![Original page 31](/tmp/original-page-p0031.png)\n\n"
+                    "[[page: 32]]\n\nExtracted body text."
+                ),
+                "translate": True,
+                "preserve_original": False,
+            }
+        ],
+        "pages": [
+            {"page_no": 31, "has_content": True},
+            {"page_no": 32, "has_content": True},
+        ],
+    }
+    canonical = {
+        "chapters": [
+            {
+                "title": "Confirmed Body",
+                "source_pages": [31, 32],
+                "page_start": 31,
+                "page_end": 32,
+            }
+        ]
+    }
+
+    with pytest.raises(InputGateError, match="page-render fallback"):
+        apply_canonical_chapter_plan(book, canonical)
+
+
 def test_canonical_plan_preserves_unplanned_resource_pages() -> None:
     book = {
         "chapters": [
@@ -96,7 +134,7 @@ def test_canonical_plan_preserves_unplanned_resource_pages() -> None:
                 "title": "Index",
                 "source_pages": [8, 9],
                 "trace_markdown": (
-                    "[[page: 8]]\n\n![Original page 8](/tmp/p8.png)\n\n"
+                    "[[page: 8]]\n\nIndex heading and entries.\n\n"
                     "[[page: 9]]\n\n![Original page 9](/tmp/p9.png)"
                 ),
                 "preserve_original": True,

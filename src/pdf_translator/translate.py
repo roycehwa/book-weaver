@@ -376,6 +376,8 @@ def _assert_translation_quality(
 ) -> None:
     if translator_name == "mock":
         return
+    if _looks_like_translator_meta_response(translated):
+        raise ValueError(f"Translation for chunk {chunk.index} contains translator meta response.")
     if _looks_untranslated_for_target(chunk.markdown, translated, target_language):
         raise ValueError(
             f"Translation for chunk {chunk.index} looks untranslated "
@@ -463,6 +465,18 @@ def _is_untranslated_quality_error(exc: Exception) -> bool:
         return False
     message = str(exc).lower()
     return "looks untranslated" in message or "looks incomplete" in message
+
+
+def _looks_like_translator_meta_response(translated: str) -> bool:
+    lowered = translated.lower()
+    meta_markers = (
+        "this is a translation job",
+        "please provide the actual markdown content",
+        "i need the actual content",
+        "i will translate it from english",
+        "following all the rules you've specified",
+    )
+    return sum(1 for marker in meta_markers if marker in lowered) >= 2
 
 
 def _should_try_fallback_translation(exc: Exception | None, *, had_sensitive_failure: bool) -> bool:
@@ -1822,6 +1836,15 @@ def _write_glossary_constraints(
     )
 
 
+ORIGINAL_PAGE_FALLBACK_BLOCK_RE = re.compile(r"^!\[Original page \d+\]\([^)]+\)$")
+
+
+def _is_original_page_fallback_block(block: str) -> bool:
+    """Page-render fallback images are not figure/table media blocks."""
+
+    return bool(ORIGINAL_PAGE_FALLBACK_BLOCK_RE.match(block.strip()))
+
+
 def _chapter_markdown_for_translation(chapter: dict) -> str:
     title = str(chapter.get("title") or f"Chapter {chapter.get('index', '')}").strip()
     markdown = str(chapter.get("markdown") or "").strip()
@@ -1835,6 +1858,8 @@ def _chapter_markdown_for_translation(chapter: dict) -> str:
         ),
         markdown,
     )
+    if not markdown and (chapter.get("preserve_original") or chapter.get("resource_only")):
+        return ""
     if title.startswith("Untitled Section"):
         return markdown + "\n" if markdown else ""
     return f"# {title}\n\n{markdown}\n" if markdown else f"# {title}\n"
@@ -1851,6 +1876,8 @@ def _is_markdown_table_block(block: str) -> bool:
 
 def _is_preserved_media_block(block: str) -> bool:
     stripped = block.lstrip()
+    if _is_original_page_fallback_block(block):
+        return False
     return stripped.startswith("![") or _is_markdown_table_block(block)
 
 

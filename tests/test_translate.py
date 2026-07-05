@@ -43,6 +43,40 @@ def test_chinese_prompt_glossary_appendix_is_removed() -> None:
     assert sanitize_translation_output(translated) == "这是正文译文。"
 
 
+def test_required_glossary_appendix_is_removed() -> None:
+    from pdf_translator.glossary_convergence import sanitize_translation_output
+
+    translated = (
+        "## 缩略语\n\n"
+        "正文译文。\n\n"
+        "必用术语表（原文术语出现时，须使用以下精确的中文表述）：\n"
+        "- 毛泽东 => 毛泽东\n"
+        "- 钢铁厂 => 钢铁厂"
+    )
+
+    assert sanitize_translation_output(translated) == "## 缩略语\n\n正文译文。"
+
+
+def test_translator_meta_response_is_rejected() -> None:
+    from pdf_translator.translate import _assert_translation_quality
+
+    chunk = TranslationChunk(index=0, markdown="# Front Matter")
+    polluted = (
+        "# 前言\n\n"
+        "This is a translation job. Please provide the actual Markdown content you want translated, "
+        "and I will translate it from English to Simplified Chinese following all the rules you've specified.\n\n"
+        "The text \"# Front Matter\" is just a heading placeholder."
+    )
+
+    with pytest.raises(ValueError, match="translator meta response"):
+        _assert_translation_quality(
+            chunk=chunk,
+            translated=polluted,
+            target_language="zh-CN",
+            translator_name="minimax",
+        )
+
+
 def test_translate_markdown_never_persists_prompt_glossary_appendix(
     tmp_path: Path,
 ) -> None:
@@ -804,6 +838,29 @@ def test_chapter_markdown_rewrites_managed_absolute_image_paths() -> None:
     assert "![Figure](book-images/figure-p0001-01.png)" in markdown
     assert "/Users/example" not in markdown
     assert "[External](https://example.com/image.png)" in markdown
+
+
+def test_chapter_markdown_keeps_original_page_for_preserved_chapters() -> None:
+    from pdf_translator.translate import _chapter_markdown_for_translation
+
+    preserved = _chapter_markdown_for_translation(
+        {
+            "index": 3,
+            "title": "Notes",
+            "translate": False,
+            "preserve_original": True,
+            "markdown": "![Original page 3](original-page-p0003.png)",
+        }
+    )
+
+    assert "![Original page 3](original-page-p0003.png)" in preserved
+
+
+def test_original_page_fallback_is_not_preserved_media_block() -> None:
+    from pdf_translator.translate import _is_preserved_media_block
+
+    assert _is_preserved_media_block("![Original page 6](original-page-p0006.png)") is False
+    assert _is_preserved_media_block("![Figure 1](book-images/figure-p0001-01.png)") is True
 
 
 def test_permanent_token_plan_limit_is_not_retried(tmp_path: Path) -> None:

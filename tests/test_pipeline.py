@@ -7,6 +7,7 @@ from pdf_translator import pipeline as pipeline_module
 from pdf_translator import polish as polish_module
 from pdf_translator.config import RunSettings
 from pdf_translator.models import NormalizedDocument
+from pdf_translator.pdf_text_repair import IngestQualityError
 from pdf_translator.pipeline import build_artifacts, safe_delivery_file_stem
 
 
@@ -105,6 +106,86 @@ def test_run_intake_pipeline_writes_bookir_without_translation_cache(tmp_path: P
     integrity_ledger = json.loads(integrity_ledger_path.read_text(encoding="utf-8"))
     assert integrity_ledger["schema"] == "integrity_ledger_v1"
     assert not (artifacts.output_dir / "translation-cache").exists()
+
+
+def test_epub_intake_does_not_apply_pdf_space_merging_to_normal_prose(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    _patch_intake_dependencies(monkeypatch)
+    monkeypatch.setattr(
+        pipeline_module,
+        "build_book_reconstruction",
+        lambda *_args, **_kwargs: {
+            "metadata": {"chapter_source": "epub_spine", "outline_entry_count": 1},
+            "render_policy": {"figures": "preserve"},
+            "full_markdown": "# Preface\n\nI set off as a student a few years ago.\n",
+            "chapters": [
+                {
+                    "index": 1,
+                    "chapter_id": "chapter-001",
+                    "title": "Preface",
+                    "markdown": "I set off as a student a few years ago.\n",
+                    "source_pages": [1],
+                    "page_start": 1,
+                    "page_end": 1,
+                    "toc": True,
+                }
+            ],
+        },
+    )
+    settings = RunSettings(
+        source_pdf=tmp_path / "english-book.epub",
+        output_dir=tmp_path / "runs",
+        target_language="zh-CN",
+        source_language="en",
+        translator="mock",
+        max_chunk_chars=9000,
+        profile_name="book",
+        output_format="none",
+    )
+
+    artifacts = pipeline_module.run_intake_pipeline(settings)
+    translation_input = artifacts.translation_input_markdown_path.read_text(encoding="utf-8")
+
+    assert "I set off as a student a few years ago." in translation_input
+    assert "Isetoff" not in translation_input
+    assert "astudent" not in translation_input
+
+
+def test_epub_intake_blocks_before_glossary_when_character_corruption_remains(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    _patch_intake_dependencies(monkeypatch)
+    monkeypatch.setattr(
+        pipeline_module,
+        "build_book_reconstruction",
+        lambda *_args, **_kwargs: {
+            "metadata": {"chapter_source": "epub_spine", "outline_entry_count": 1},
+            "render_policy": {"figures": "preserve"},
+            "full_markdown": "# Preface\n\nDamaged \ufffd prose.\n",
+            "chapters": [],
+        },
+    )
+    settings = RunSettings(
+        source_pdf=tmp_path / "damaged.epub",
+        output_dir=tmp_path / "runs",
+        target_language="zh-CN",
+        source_language="en",
+        translator="mock",
+        max_chunk_chars=9000,
+        profile_name="book",
+        output_format="none",
+    )
+
+    with pytest.raises(IngestQualityError, match="replacement_character"):
+        pipeline_module.run_intake_pipeline(settings)
+
+    report_path = tmp_path / "runs" / "damaged" / "ingest-quality-report.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["acceptable"] is False
+    assert report["blocking_issues"][0]["code"] == "replacement_character"
 
 
 def test_translate_pipeline_skips_model_for_same_chinese_language(tmp_path: Path, monkeypatch) -> None:
