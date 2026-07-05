@@ -4,6 +4,7 @@ import html
 import posixpath
 import re
 import tempfile
+import unicodedata
 import xml.etree.ElementTree as ET
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -771,6 +772,48 @@ def _epub_phrasing_to_markdown(node: Any, internal_xhtml_path: str) -> str:
     return str(node.get_text("", strip=False) or "")
 
 
+def _clean_epub_prose_markup(body: Tag) -> None:
+    """Repair only word breaks that are explicit in the XHTML structure."""
+    for text_node in list(body.find_all(string=True)):
+        normalized = unicodedata.normalize("NFKC", str(text_node))
+        normalized = normalized.replace("\u00ad", "").replace("\xa0", " ")
+        if normalized != str(text_node):
+            text_node.replace_with(NavigableString(normalized))
+
+    for container in body.find_all(["p", "li", "blockquote", "h1", "h2", "h3", "h4"]):
+        for line_break in list(container.find_all("br")):
+            descendants = list(container.descendants)
+            try:
+                break_index = descendants.index(line_break)
+            except ValueError:
+                continue
+            before = next(
+                (
+                    node
+                    for node in reversed(descendants[:break_index])
+                    if isinstance(node, NavigableString) and str(node)
+                ),
+                None,
+            )
+            after = next(
+                (
+                    node
+                    for node in descendants[break_index + 1 :]
+                    if isinstance(node, NavigableString) and str(node)
+                ),
+                None,
+            )
+            if before is None or after is None:
+                continue
+            if not re.search(r"[^\W\d_]-\s*$", str(before), flags=re.UNICODE):
+                continue
+            if not re.match(r"^\s*[^\W\d_]", str(after), flags=re.UNICODE):
+                continue
+            before.replace_with(NavigableString(re.sub(r"-\s*$", "", str(before))))
+            after.replace_with(NavigableString(re.sub(r"^\s*", "", str(after))))
+            line_break.decompose()
+
+
 def _epub_flow_markdown_lines(body: Tag, *, internal_xhtml_path: str) -> list[str]:
     """Serialize body to markdown lines in document order, including standalone images and inline links."""
     prefix = {"h1": "## ", "h2": "### ", "h3": "#### ", "h4": "##### "}
@@ -869,6 +912,7 @@ def _extract_epub_body_chapter(
     for tag in soup.find_all(["script", "style"]):
         tag.decompose()
     body = soup.find("body") or soup
+    _clean_epub_prose_markup(body)
     _epub_replace_toc_nav_regions(body, internal_xhtml_path)
     def resolve_media_href(src: str) -> str | None:
         src = src.split("#", 1)[0].strip()
