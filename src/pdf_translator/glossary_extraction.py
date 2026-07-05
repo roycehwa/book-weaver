@@ -119,7 +119,11 @@ EVENT_MARKERS = frozenset(
 PERSON_NAME_RE = re.compile(r"^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2}$")
 PHRASE_RE = re.compile(r"\b(?:[A-Z][A-Za-z.'-]+(?:\s+|$)){2,5}")
 CONNECTOR_PHRASE_RE = re.compile(
-    r"\b([A-Z][A-Za-z.'-]+(?:\s+(?:of|and|the)\s+[A-Z][A-Za-z.'-]+)+)\b"
+    r"\b("
+    r"(?:[A-Z][A-Za-z'-]*\s+){1,4}"
+    r"(?:of|and|the)\s+"
+    r"(?:[A-Z][A-Za-z'-]*(?:\s+|(?=[,.;:!?]|$))){1,4}"
+    r")"
 )
 INDEX_ENTRY_RE = re.compile(r"^([A-Z][^,\n;]{2,80}?)(?:,\s*\d)", re.MULTILINE)
 DOMAIN_WORD_RE = re.compile(r"\b([A-Za-z]{4,})\b")
@@ -134,7 +138,11 @@ def canonical_source_term(value: str) -> str:
     normalized = unicodedata.normalize("NFKC", value)
     normalized = normalized.translate(str.maketrans({"’": "'", "‘": "'", "“": '"', "”": '"'}))
     normalized = re.sub(r"\b([IVX]{1,6})(and|or|the|his|her|was|is|in|of)\b", r"\1 \2", normalized)
-    normalized = re.sub(r"\b([IVX]{1,6})([a-z]{2,})\b", r"\1 \2", normalized)
+    normalized = re.sub(
+        r"\b([IVX]{2,6})(?=(?:and|or|the|his|her|was|is|in|of)[a-z]*\b)",
+        r"\1 ",
+        normalized,
+    )
     normalized = re.sub(r"([a-z])([A-Z])", r"\1 \2", normalized)
     return _normalize_phrase(normalized).rstrip(" '\".,;:!?…")
 
@@ -208,8 +216,69 @@ def _is_valid_phrase(phrase: str) -> bool:
 
 def _is_fragment_phrase(phrase: str) -> bool:
     return phrase.startswith(
-        ("The ", "In ", "On ", "How ", "A ", "That ", "Within ", "Between ", "From ", "For ")
+        (
+            "The ",
+            "In ",
+            "On ",
+            "How ",
+            "A ",
+            "That ",
+            "Within ",
+            "Between ",
+            "From ",
+            "For ",
+            "After ",
+            "Before ",
+            "During ",
+            "Since ",
+            "Until ",
+            "When ",
+            "While ",
+            "Many ",
+            "Making of ",
+            "Despite ",
+        )
     )
+
+
+_INCOMPLETE_TRAILING_MODIFIERS = frozenset(
+    {
+        "advisory",
+        "central",
+        "contemporary",
+        "cultural",
+        "eastern",
+        "economic",
+        "general",
+        "international",
+        "key",
+        "local",
+        "modern",
+        "national",
+        "northern",
+        "physical",
+        "political",
+        "social",
+        "southern",
+        "western",
+    }
+)
+
+
+def candidate_integrity_rejection(phrase: str) -> str | None:
+    normalized = _normalize_phrase(phrase)
+    if any(marker in normalized for marker in ("*", "[", "]", "(", ")")):
+        return "markup_contamination"
+    if normalized.startswith(("Journal of ", "International Journal of ", "Glossary of ")):
+        return "bibliographic_label"
+    if re.search(r"(?<![A-Za-z'’])\b[IVX]\s+[a-z]{2,}\b", normalized):
+        return "malformed_token_boundary"
+    if _is_fragment_phrase(normalized):
+        return "clause_fragment"
+    words = _phrase_words(normalized)
+    if words and words[-1].casefold().strip("'’-") in _INCOMPLETE_TRAILING_MODIFIERS:
+        return "incomplete_trailing_modifier"
+    return None
 
 
 def _allows_single_word_candidate(
@@ -335,6 +404,8 @@ def extract_candidate_phrases(text: str) -> list[str]:
     seen: dict[str, int] = {}
     for match in PHRASE_RE.finditer(text):
         phrase = _normalize_phrase(match.group(0))
+        if phrase.startswith("The "):
+            phrase = phrase[4:]
         if len(_phrase_words(phrase)) < 2 or not _is_valid_phrase(phrase):
             continue
         seen[phrase] = seen.get(phrase, 0) + 1
@@ -345,6 +416,8 @@ def extract_connector_phrases(text: str) -> list[str]:
     seen: set[str] = set()
     for match in CONNECTOR_PHRASE_RE.finditer(text):
         phrase = _normalize_phrase(match.group(1))
+        if phrase.startswith("The "):
+            phrase = phrase[4:]
         words = _phrase_words(phrase)
         content_words = [word for word in words if word.lower() not in {"of", "and", "the"}]
         if len(content_words) >= 2 and _is_valid_phrase(phrase):
