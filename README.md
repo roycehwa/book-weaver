@@ -1,8 +1,10 @@
 # BookWeaver
 
-`book-weaver` is a book ingestion, translation, reconstruction, and knowledge-weaving pipeline.
+`book-weaver` is a **Phase A** book ingestion, translation, reconstruction, and human-review pipeline.
 
-The project started as a PDF translation pipeline, but its current scope is broader: turn PDF / EPUB books into stable reading artifacts and structured knowledge inputs. Translation is now one branch of the system, not the product boundary.
+Phase B knowledge extraction lives in the separate [`book-knowledge`](https://github.com/roycehwa/book-knowledge) repository. See `docs/PHASE_BOUNDARY.md`.
+
+The project started as a PDF translation pipeline, but its current Phase A scope is: turn PDF / EPUB books into stable reading artifacts and a handoff package for knowledge work. Translation is one branch of Phase A, not the product boundary.
 
 Instead of translating directly on PDF coordinates, it runs a staged flow:
 
@@ -56,12 +58,10 @@ Mainline ingest without translation:
 
 ```bash
 book-weaver intake /absolute/path/to/file.pdf --profile book
-book-weaver knowledge build runs/<file-stem>
-book-weaver knowledge metadata runs/<file-stem>
-book-weaver knowledge plan runs/<file-stem> --metadata-prior auto
-book-weaver knowledge brief runs/<file-stem>
-book-weaver knowledge feedback runs/<file-stem> --input feedback.md
-book-weaver knowledge extract runs/<file-stem> --network-model argument_network
+book-weaver finalize runs/<file-stem>
+
+# Phase B (separate repo: book-knowledge)
+# book-knowledge build runs/<file-stem>
 book-weaver finalize runs/<file-stem>
 ```
 

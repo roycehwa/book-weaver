@@ -377,77 +377,11 @@ def test_public_cli_accepts_translation_review_commands() -> None:
     assert export_args.approve is True
 
 
-def test_public_cli_accepts_knowledge_build_command() -> None:
-    parser = build_parser()
-    args = parser.parse_args(["knowledge", "build", "runs/sample"])
-
-    assert args.command == "knowledge"
-    assert args.knowledge_command == "build"
-    assert str(args.run_dir) == "runs/sample"
 
 
-def test_public_cli_accepts_knowledge_suitability_command() -> None:
-    parser = build_parser()
-    args = parser.parse_args(["knowledge", "suitability", "runs/sample"])
-
-    assert args.command == "knowledge"
-    assert args.knowledge_command == "suitability"
-    assert str(args.run_dir) == "runs/sample"
 
 
-def test_public_cli_accepts_knowledge_plan_command() -> None:
-    parser = build_parser()
-    args = parser.parse_args(["knowledge", "plan", "runs/sample"])
 
-    assert args.command == "knowledge"
-    assert args.knowledge_command == "plan"
-    assert str(args.run_dir) == "runs/sample"
-    assert args.planner == "rule"
-    assert args.metadata_prior == "none"
-
-
-def test_public_cli_accepts_knowledge_metadata_command() -> None:
-    parser = build_parser()
-    args = parser.parse_args(["knowledge", "metadata", "runs/sample", "--refresh"])
-
-    assert args.command == "knowledge"
-    assert args.knowledge_command == "metadata"
-    assert str(args.run_dir) == "runs/sample"
-    assert args.refresh is True
-
-
-def test_public_cli_accepts_knowledge_review_command() -> None:
-    parser = build_parser()
-    args = parser.parse_args(["knowledge", "review", "runs/sample", "--answers", "answers.txt"])
-
-    assert args.command == "knowledge"
-    assert args.knowledge_command == "review"
-    assert str(args.run_dir) == "runs/sample"
-    assert str(args.answers) == "answers.txt"
-
-
-def test_public_cli_accepts_knowledge_brief_and_feedback_commands() -> None:
-    parser = build_parser()
-    brief_args = parser.parse_args(["knowledge", "brief", "runs/sample"])
-    feedback_args = parser.parse_args(["knowledge", "feedback", "runs/sample", "--input", "feedback.md"])
-
-    assert brief_args.command == "knowledge"
-    assert brief_args.knowledge_command == "brief"
-    assert str(brief_args.run_dir) == "runs/sample"
-    assert feedback_args.command == "knowledge"
-    assert feedback_args.knowledge_command == "feedback"
-    assert str(feedback_args.run_dir) == "runs/sample"
-    assert str(feedback_args.input) == "feedback.md"
-
-
-def test_public_cli_accepts_knowledge_extract_command() -> None:
-    parser = build_parser()
-    args = parser.parse_args(["knowledge", "extract", "runs/sample", "--network-model", "argument_network"])
-
-    assert args.command == "knowledge"
-    assert args.knowledge_command == "extract"
-    assert str(args.run_dir) == "runs/sample"
-    assert args.network_model == "argument_network"
 
 
 def test_public_cli_accepts_translate_resume_and_ignore_cache() -> None:
