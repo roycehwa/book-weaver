@@ -139,6 +139,7 @@ def test_short_translation_cannot_bypass_mandatory_glossary_validation() -> None
                 "source": "Swiss Confederation",
                 "target": "瑞士联邦",
                 "status": "active",
+                "enforcement": "hard",
             }
         ],
     )
@@ -180,6 +181,7 @@ def test_known_glossary_drift_is_never_cached_as_success(
                 "source": "Swiss Confederation",
                 "target": "瑞士联邦",
                 "status": "active",
+                "enforcement": "hard",
             }
         ],
     )
@@ -203,6 +205,53 @@ def test_known_glossary_drift_is_never_cached_as_success(
         )
 
     assert list((tmp_path / "cache").glob("chunk-*.md")) == []
+
+
+def test_legacy_glossary_entry_without_enforcement_is_preferred(
+    tmp_path: Path,
+) -> None:
+    class FlexibleTranslator(BaseTranslator):
+        name = "minimax"
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            return "这个共同体与邻国进行了长期而复杂的谈判。" * 20
+
+    settings = RunSettings(
+        source_pdf=tmp_path / "source.pdf",
+        output_dir=tmp_path,
+        source_language="en",
+        target_language="zh-CN",
+        translator="minimax",
+        max_chunk_chars=9000,
+        glossary_entries=[
+            {
+                "source": "Swiss Confederation",
+                "target": "瑞士联邦",
+                "status": "active",
+                "updated_by": "user",
+            }
+        ],
+    )
+
+    result = translate_markdown(
+        chunks=[
+            TranslationChunk(
+                index=0,
+                markdown="The Swiss Confederation negotiated with its neighbours.",
+            )
+        ],
+        settings=settings,
+        translator=FlexibleTranslator(),
+        cache_dir=tmp_path / "cache",
+        retry_count=1,
+    )
+
+    assert "共同体" in result.translated_markdown
 
 
 def test_preferred_glossary_drift_does_not_fail_translation(

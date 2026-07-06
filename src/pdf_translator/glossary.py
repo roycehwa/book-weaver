@@ -638,10 +638,9 @@ def glossary_terms_missing_in_translation(
         chapter_id=chapter_id,
     ):
         enforcement = str(entry.get("enforcement") or "").strip().lower()
-        if enforcement:
-            if enforcement != "hard":
-                continue
-        elif entry.get("updated_by") not in {None, "user"}:
+        if enforcement and enforcement != "hard":
+            continue
+        if not enforcement and entry.get("updated_by") == "user":
             continue
         source_term = str(entry.get("source") or "").strip()
         target_term = str(entry.get("target") or "").strip()

@@ -101,7 +101,7 @@ def build_translation_prompt(
             if str(entry.get("enforcement") or "").lower() == "hard"
             or (
                 not entry.get("enforcement")
-                and entry.get("updated_by") in {None, "user"}
+                and entry.get("updated_by") != "user"
             )
         ]
         preferred_entries = [entry for entry in glossary_entries if entry not in hard_entries]
