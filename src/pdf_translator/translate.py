@@ -16,6 +16,7 @@ import requests
 
 from pdf_translator.chunking import split_markdown_into_chunks
 from pdf_translator.glossary import glossary_terms_missing_in_translation, select_glossary_entries_for_text
+from pdf_translator.provider_traffic import ProviderTrafficController
 from pdf_translator.glossary_convergence import sanitize_translation_output
 from pdf_translator.config import (
     DEFAULT_MINIMAX_MAX_TOKENS,
@@ -94,14 +95,34 @@ def build_translation_prompt(
         f"{FOOTNOTE_TRANSLATION_INSTRUCTION}"
     )
     if glossary_entries:
+        hard_entries = [
+            entry
+            for entry in glossary_entries
+            if str(entry.get("enforcement") or "").lower() == "hard"
+            or (
+                not entry.get("enforcement")
+                and entry.get("updated_by") in {None, "user"}
+            )
+        ]
+        preferred_entries = [entry for entry in glossary_entries if entry not in hard_entries]
         glossary_lines = "\n".join(
             f"- {entry['source']} => {entry.get('target') or ''}".rstrip()
-            for entry in glossary_entries
+            for entry in hard_entries
         )
-        controls += (
-            "\n\nMANDATORY GLOSSARY (when a source term appears, use the exact Chinese wording):\n"
-            f"{glossary_lines}"
+        if glossary_lines:
+            controls += (
+                "\n\nMANDATORY GLOSSARY (when a source term appears, use the exact Chinese wording):\n"
+                f"{glossary_lines}"
+            )
+        preferred_lines = "\n".join(
+            f"- {entry['source']} => {entry.get('target') or ''}".rstrip()
+            for entry in preferred_entries
         )
+        if preferred_lines:
+            controls += (
+                "\n\nPREFERRED GLOSSARY (use when natural in context; grammatical variants are allowed):\n"
+                f"{preferred_lines}"
+            )
     if prompt_instruction:
         controls += f"\n\n{prompt_instruction}"
     return (
@@ -1509,6 +1530,11 @@ class MiniMaxAnthropicTranslator(BaseTranslator):
         self.max_tokens = settings.max_tokens or DEFAULT_MINIMAX_MAX_TOKENS
         # Long-form translation can exceed a 2-minute round-trip; override with MINIMAX_HTTP_TIMEOUT_SECONDS.
         self.http_timeout = float(os.getenv("MINIMAX_HTTP_TIMEOUT_SECONDS", "600"))
+        self.traffic = ProviderTrafficController(
+            max_concurrency=settings.max_concurrency,
+            rpm=settings.rpm,
+            tpm=settings.tpm,
+        )
 
     def translate_chunk(
         self,
@@ -1516,6 +1542,12 @@ class MiniMaxAnthropicTranslator(BaseTranslator):
         source_language: str | None,
         target_language: str,
     ) -> str:
+        return self.translate_prompt(
+            _translation_prompt(chunk, source_language, target_language),
+            chunk_index=chunk.index,
+        )
+
+    def translate_prompt(self, prompt: str, *, chunk_index: int) -> str:
         payload = {
             "model": self.model,
             "max_tokens": self.max_tokens,
@@ -1523,34 +1555,53 @@ class MiniMaxAnthropicTranslator(BaseTranslator):
             "messages": [
                 {
                     "role": "user",
-                    "content": _translation_prompt(chunk, source_language, target_language),
+                    "content": prompt,
                 }
             ],
         }
 
-        try:
-            response = requests.post(
-                self.endpoint,
-                json=payload,
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                    "anthropic-version": "2023-06-01",
-                    "Connection": "close",
-                },
-                timeout=(10, self.http_timeout),
-            )
-            response.raise_for_status()
-            response_data = response.json()
-        except requests.HTTPError as exc:
-            error_body = exc.response.text if exc.response is not None else ""
-            status_code = exc.response.status_code if exc.response is not None else "?"
+        response_data: dict = {}
+        last_error: Exception | None = None
+        for provider_attempt in range(4):
+            try:
+                estimated_tokens = max(1, len(prompt) // 3) + self.max_tokens
+                self.traffic.wait_for_request(estimated_tokens=estimated_tokens)
+                response = requests.post(
+                    self.endpoint,
+                    json=payload,
+                    headers={
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json",
+                        "anthropic-version": "2023-06-01",
+                        "Connection": "close",
+                    },
+                    timeout=(10, self.http_timeout),
+                )
+                response.raise_for_status()
+                response_data = response.json()
+                self.traffic.record_success()
+                break
+            except requests.HTTPError as exc:
+                last_error = exc
+                status_code = exc.response.status_code if exc.response is not None else 0
+                error_body = exc.response.text if exc.response is not None else ""
+                if status_code not in {429, 529}:
+                    self.traffic.record_failure()
+                    raise ValueError(
+                        f"MiniMax translation failed for chunk {chunk_index}: "
+                        f"HTTP {status_code}: {error_body[:500]}"
+                    ) from exc
+                retry_after = exc.response.headers.get("Retry-After") if exc.response is not None else None
+                self.traffic.record_overload(
+                    retry_after=float(retry_after) if retry_after else 2 ** provider_attempt
+                )
+            except requests.RequestException as exc:
+                last_error = exc
+                self.traffic.record_overload(retry_after=2 ** provider_attempt)
+        else:
             raise ValueError(
-                f"MiniMax translation failed for chunk {chunk.index}: "
-                f"HTTP {status_code}: {error_body[:500]}"
-            ) from exc
-        except requests.RequestException as exc:
-            raise ValueError(f"MiniMax translation failed for chunk {chunk.index}: {exc}") from exc
+                f"MiniMax translation failed for chunk {chunk_index} after provider retries: {last_error}"
+            ) from last_error
 
         text_parts: list[str] = []
         for item in response_data.get("content", []):
@@ -1561,10 +1612,10 @@ class MiniMaxAnthropicTranslator(BaseTranslator):
 
         text = "\n".join(part.strip() for part in text_parts if part.strip()).strip()
         if not text:
-            raise ValueError(f"Empty MiniMax translation returned for chunk {chunk.index}.")
+            raise ValueError(f"Empty MiniMax translation returned for chunk {chunk_index}.")
         if response_data.get("stop_reason") == "max_tokens":
             raise ValueError(
-                f"MiniMax translation was truncated for chunk {chunk.index} "
+                f"MiniMax translation was truncated for chunk {chunk_index} "
                 f"(stop_reason=max_tokens, max_tokens={self.max_tokens}). "
                 "Increase MINIMAX_MAX_TOKENS (or MINIMAX_HTTP_TIMEOUT_SECONDS if the request timed out early). "
                 "Only reduce --max-chunk-chars if raising max_tokens is not enough."
@@ -1651,51 +1702,7 @@ def _complete_translation_attempt(
         quality_retry=quality_retry,
     )
     if isinstance(translator, MiniMaxAnthropicTranslator):
-        payload = {
-            "model": translator.model,
-            "max_tokens": translator.max_tokens,
-            "system": SYSTEM_PROMPT,
-            "messages": [{"role": "user", "content": prompt}],
-        }
-        try:
-            response = requests.post(
-                translator.endpoint,
-                json=payload,
-                headers={
-                    "Authorization": f"Bearer {translator.api_key}",
-                    "Content-Type": "application/json",
-                    "anthropic-version": "2023-06-01",
-                    "Connection": "close",
-                },
-                timeout=(10, translator.http_timeout),
-            )
-            response.raise_for_status()
-            response_data = response.json()
-        except requests.HTTPError as exc:
-            error_body = exc.response.text if exc.response is not None else ""
-            status_code = exc.response.status_code if exc.response is not None else "?"
-            raise ValueError(
-                f"MiniMax translation failed for chunk {chunk.index}: "
-                f"HTTP {status_code}: {error_body[:500]}"
-            ) from exc
-        except requests.RequestException as exc:
-            raise ValueError(f"MiniMax translation failed for chunk {chunk.index}: {exc}") from exc
-        text_parts = [
-            str(item.get("text") or "")
-            for item in response_data.get("content", [])
-            if isinstance(item, dict) and item.get("type") == "text"
-        ]
-        text = "\n".join(part.strip() for part in text_parts if part.strip()).strip()
-        if not text:
-            raise ValueError(f"Empty MiniMax translation returned for chunk {chunk.index}.")
-        if response_data.get("stop_reason") == "max_tokens":
-            raise ValueError(
-                f"MiniMax translation was truncated for chunk {chunk.index} "
-                f"(stop_reason=max_tokens, max_tokens={translator.max_tokens}). "
-                "Increase MINIMAX_MAX_TOKENS (or MINIMAX_HTTP_TIMEOUT_SECONDS if the request timed out early). "
-                "Only reduce --max-chunk-chars if raising max_tokens is not enough."
-            )
-        return text
+        return translator.translate_prompt(prompt, chunk_index=chunk.index)
 
     if isinstance(translator, OpenAITranslator):
         response = translator.client.responses.create(

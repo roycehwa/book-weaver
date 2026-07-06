@@ -195,7 +195,50 @@ def test_observer_records_failure_without_losing_prior_success(tmp_path: Path) -
     progress = load_progress(tmp_path)
     assert progress["completed_chunks"] == 1
     assert progress["failed_chunks"] == 1
-    assert progress["retrying_chunks"] == 1
+    assert progress["retrying_chunks"] == 0
+
+
+def test_retrying_chunk_is_cleared_after_success(tmp_path: Path) -> None:
+    observer = create_translation_job(
+        run_dir=tmp_path,
+        translator="mock",
+        source_language="en",
+        target_language="zh-CN",
+        total_chunks=1,
+        concurrency=1,
+        max_chunk_chars=9000,
+        resume=False,
+    )
+
+    observer.attempt_start(chunk_index=0, input_hash="abc", attempt=1)
+    observer.attempt_failure(
+        chunk_index=0,
+        input_hash="abc",
+        attempt=1,
+        error_type="ValueError",
+        message="retry",
+        retryable=True,
+    )
+    observer.attempt_start(chunk_index=0, input_hash="abc", attempt=2)
+    observer.attempt_failure(
+        chunk_index=0,
+        input_hash="abc",
+        attempt=2,
+        error_type="ValueError",
+        message="retry again",
+        retryable=True,
+    )
+    observer.attempt_start(chunk_index=0, input_hash="abc", attempt=3)
+    observer.attempt_success(
+        chunk_index=0,
+        input_hash="abc",
+        cache_path=tmp_path / "cache" / "c0.md",
+    )
+
+    progress = load_progress(tmp_path)
+    assert progress["running_chunks"] == 0
+    assert progress["retrying_chunks"] == 0
+    assert progress["failed_chunks"] == 0
 
 
 def test_observer_does_not_double_count_same_chunk(tmp_path: Path) -> None:

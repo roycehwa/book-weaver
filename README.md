@@ -40,6 +40,9 @@ This keeps user intervention low, removes most layout noise from the reading pat
   - optionally `MINIMAX_MODEL` (defaults to `MiniMax-M2.7-highspeed`)
   - optionally `MINIMAX_MAX_TOKENS` (defaults to `8192`; long zh book chunks often need headroom)
   - optionally `MINIMAX_HTTP_TIMEOUT_SECONDS` (defaults to `600`; single-request wall clock for slow completions)
+  - optionally `MINIMAX_MAX_CONCURRENCY` (defaults to `3`)
+  - optionally `MINIMAX_RPM` (defaults conservatively to `20`)
+  - optionally `MINIMAX_TPM` (defaults conservatively to `1000000`)
 - For other OpenAI-compatible domestic APIs:
   - `LLM_API_KEY`
   - `LLM_BASE_URL`

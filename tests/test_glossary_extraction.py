@@ -3,13 +3,33 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from pdf_translator.glossary import extract_glossary_candidates
+from pdf_translator.glossary import compute_max_candidates, extract_glossary_candidates
 from pdf_translator.glossary_extraction import (
+    _classify_term,
     candidate_integrity_rejection,
     canonical_source_key,
     canonical_source_term,
     extract_connector_phrases,
 )
+
+
+def test_candidate_limit_has_no_minimum_quota() -> None:
+    book = {
+        "chapters": [
+            {
+                "chapter_id": "ch-001",
+                "markdown": "A short chapter about Shareholder Primacy.",
+            }
+        ]
+    }
+
+    assert compute_max_candidates(book) < 60
+
+
+def test_title_case_concepts_are_not_classified_as_people() -> None:
+    assert _classify_term("Agricultural Production") == "concept"
+    assert _classify_term("Archaeological Evidence") == "concept"
+    assert _classify_term("Alison Vacca") == "person"
 
 
 def test_extract_filters_book_title_and_surfaces_policy_terms(tmp_path: Path) -> None:

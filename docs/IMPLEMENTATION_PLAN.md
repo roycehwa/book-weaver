@@ -1,5 +1,11 @@
 # Implementation Plan
 
+> Scope note (2026-07-06): this repository implements Phase A only. Sections
+> describing Reader Brief, knowledge drafts, graph exports, and external
+> knowledge workspaces are retained as historical planning context; active
+> implementation of those sections belongs to the separate `book-knowledge`
+> repository.
+
 This plan turns the current book translation prototype into a staged book-processing system. The scope is translation, EPUB reading output, post-editing, and downstream knowledge processing. Newspaper extraction remains out of scope.
 
 ## Guiding Principles

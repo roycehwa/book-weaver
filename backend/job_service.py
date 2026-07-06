@@ -288,6 +288,16 @@ class BookJobService:
         if not path.is_file():
             raise JobNotFound(f"Job not found: {job_id}")
         snapshot = self._read_json(path, expected_schema="book_job_v1")
+        stale_derived = {
+            key: snapshot.pop(key)
+            for key in ("translation_activity", "translation_resume")
+            if key in snapshot
+        }
+        if stale_derived:
+            path.write_text(
+                json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
         snapshot = self._merge_live_translation_progress(snapshot)
         activity = self.translation_activity(snapshot)
         snapshot = self._maybe_reconcile_stale_translating(snapshot, activity)

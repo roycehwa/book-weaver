@@ -157,6 +157,26 @@ EVENT_MARKERS = frozenset(
 )
 
 PERSON_NAME_RE = re.compile(r"^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2}$")
+CONCEPT_HEAD_WORDS = frozenset(
+    {
+        "analysis",
+        "approach",
+        "evidence",
+        "history",
+        "investigation",
+        "investigations",
+        "landscape",
+        "landscapes",
+        "production",
+        "research",
+        "series",
+        "sources",
+        "study",
+        "survey",
+        "system",
+        "systems",
+    }
+)
 PHRASE_RE = re.compile(r"\b(?:[A-Z][A-Za-z.'-]+(?:\s+|$)){2,5}")
 CONNECTOR_PHRASE_RE = re.compile(
     r"\b("
@@ -230,7 +250,11 @@ def _classify_term(phrase: str) -> str:
         return "policy_term"
     if any(marker in lowered for marker in INSTITUTION_MARKERS):
         return "institution"
-    if PERSON_NAME_RE.fullmatch(phrase) and len(words) <= 3:
+    if (
+        PERSON_NAME_RE.fullmatch(phrase)
+        and len(words) <= 3
+        and words[-1].casefold() not in CONCEPT_HEAD_WORDS
+    ):
         return "person"
     return "concept"
 

@@ -112,11 +112,11 @@ Current mainline command:
 
 ```bash
 book-weaver intake SOURCE --profile book
-book-weaver knowledge build RUN_DIR
-book-weaver knowledge metadata RUN_DIR
-book-weaver knowledge plan RUN_DIR --metadata-prior auto
 book-weaver finalize RUN_DIR
 ```
+
+Knowledge extraction commands belong to the separate `book-knowledge` repository
+and are not part of the Phase A execution path.
 
 Current optional foreign-language reading command:
 

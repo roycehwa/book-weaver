@@ -528,6 +528,10 @@ def run_intake_pipeline(settings: RunSettings) -> PipelineArtifacts:
     return artifacts
 
 
+def _pre_translation_stages(*, using_existing_run: bool) -> tuple[str, ...]:
+    return () if using_existing_run else ("ingesting", "reconstructing")
+
+
 def run_translation_pipeline(
     settings: RunSettings,
     on_stage: Callable[[str, dict[str, Any]], None] | None = None,
@@ -562,7 +566,10 @@ def run_translation_pipeline(
     )
     skip_translation = text_operation == "preserve"
 
-    enter_stage("reconstructing", source_language=settings.source_language)
+    if "reconstructing" in _pre_translation_stages(
+        using_existing_run=using_existing_run
+    ):
+        enter_stage("reconstructing", source_language=settings.source_language)
 
     translation_cache_dir = artifacts.output_dir / "translation-cache"
     translated_chapters = None

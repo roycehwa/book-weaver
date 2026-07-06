@@ -5,6 +5,7 @@ import pytest
 
 from pdf_translator.config import CompatibleAPISettings
 from pdf_translator.config import RunSettings
+from pdf_translator.config import DEFAULT_TRANSLATION_CONCURRENCY
 from pdf_translator.models import TranslationChunk
 from pdf_translator.translate import (
     BaseTranslator,
@@ -202,6 +203,53 @@ def test_known_glossary_drift_is_never_cached_as_success(
         )
 
     assert list((tmp_path / "cache").glob("chunk-*.md")) == []
+
+
+def test_preferred_glossary_drift_does_not_fail_translation(
+    tmp_path: Path,
+) -> None:
+    class FlexibleTranslator(BaseTranslator):
+        name = "minimax"
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            return "这个共同体与邻国进行了长期而复杂的谈判。" * 20
+
+    settings = RunSettings(
+        source_pdf=tmp_path / "source.pdf",
+        output_dir=tmp_path,
+        source_language="en",
+        target_language="zh-CN",
+        translator="minimax",
+        max_chunk_chars=9000,
+        glossary_entries=[
+            {
+                "source": "Swiss Confederation",
+                "target": "瑞士联邦",
+                "status": "active",
+                "enforcement": "preferred",
+            }
+        ],
+    )
+
+    result = translate_markdown(
+        chunks=[
+            TranslationChunk(
+                index=0,
+                markdown="The Swiss Confederation negotiated with its neighbours.",
+            )
+        ],
+        settings=settings,
+        translator=FlexibleTranslator(),
+        cache_dir=tmp_path / "cache",
+        retry_count=1,
+    )
+
+    assert "共同体" in result.translated_markdown
 
 
 def test_legacy_cache_with_glossary_drift_uses_local_repair(
@@ -2240,3 +2288,5 @@ def test_translate_markdown_skips_deepl_for_non_sensitive_failure(
             cache_dir=tmp_path / "cache",
             retry_count=2,
         )
+def test_default_translation_concurrency_is_conservative() -> None:
+    assert DEFAULT_TRANSLATION_CONCURRENCY == 3

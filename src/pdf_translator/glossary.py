@@ -31,16 +31,14 @@ from pdf_translator.glossary_profiles import (
 GLOSSARY_SCHEMA = "phase_a_glossary_v1"
 EXTRACTION_POLICY_SCHEMA = "phase_a_glossary_extraction_v2"
 LEGACY_EXTRACTION_POLICY_SCHEMA = "phase_a_glossary_extraction_v1"
-CANDIDATE_FLOOR = 60
 CANDIDATE_CEILING = 200
 
 
 def compute_max_candidates(book: dict[str, Any]) -> int:
-    """Scale glossary surface limit with book size instead of a fixed cap."""
+    """Return a defensive surface limit without creating a candidate quota."""
     corpus, _ = _book_text_corpus(book)
     chars = len(corpus)
-    chapters = len(book.get("chapters") or [])
-    return min(CANDIDATE_CEILING, max(CANDIDATE_FLOOR, chars // 6000 + chapters * 4))
+    return min(CANDIDATE_CEILING, max(20, 20 + chars // 12_000))
 
 
 def _glossary_dir(run_dir: Path) -> Path:
@@ -343,7 +341,7 @@ def _apply_dynamic_quality_cutoff(
 ) -> tuple[list[dict[str, Any]], float, int]:
     if not ranked:
         return [], minimum_score, 0
-    if len(ranked) <= CANDIDATE_FLOOR:
+    if len(ranked) <= 20:
         cutoff = minimum_score
     else:
         top_score = float(ranked[0]["score"])
@@ -542,6 +540,7 @@ def apply_glossary_decision(
         "reasons": (candidate or {}).get("reasons", []),
         "evidence": (candidate or {}).get("evidence", []),
         "updated_by": decided_by,
+        "enforcement": "hard" if decided_by == "user" else "preferred",
     }
     if status == "active":
         entries.append(entry)
@@ -638,6 +637,12 @@ def glossary_terms_missing_in_translation(
         entries,
         chapter_id=chapter_id,
     ):
+        enforcement = str(entry.get("enforcement") or "").strip().lower()
+        if enforcement:
+            if enforcement != "hard":
+                continue
+        elif entry.get("updated_by") not in {None, "user"}:
+            continue
         source_term = str(entry.get("source") or "").strip()
         target_term = str(entry.get("target") or "").strip()
         if not source_term or not target_term:

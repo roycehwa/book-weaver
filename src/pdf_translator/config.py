@@ -15,7 +15,9 @@ DEFAULT_MINIMAX_BASE_URL = "https://api.minimaxi.com/anthropic/v1/messages"
 # Book chunks are sized for ingest quality; zh outputs often need more completion budget than 2048.
 DEFAULT_MINIMAX_MAX_TOKENS = 8192
 DEFAULT_DEEPL_BASE_URL = "https://api.deepl.com"
-DEFAULT_TRANSLATION_CONCURRENCY = 12
+DEFAULT_TRANSLATION_CONCURRENCY = 3
+DEFAULT_MINIMAX_RPM = 20
+DEFAULT_MINIMAX_TPM = 1_000_000
 
 
 def normalize_minimax_base_url(base_url: str | None) -> str:
@@ -77,6 +79,9 @@ class CompatibleAPISettings:
     model: str
     base_url: str
     max_tokens: int | None = None
+    max_concurrency: int = DEFAULT_TRANSLATION_CONCURRENCY
+    rpm: int = DEFAULT_MINIMAX_RPM
+    tpm: int = DEFAULT_MINIMAX_TPM
 
     @classmethod
     def from_env(cls, provider: str = "compatible") -> "CompatibleAPISettings":
@@ -93,6 +98,11 @@ class CompatibleAPISettings:
                     os.getenv("MINIMAX_BASE_URL") or os.getenv("LLM_BASE_URL")
                 ),
                 max_tokens=int(os.getenv("MINIMAX_MAX_TOKENS") or DEFAULT_MINIMAX_MAX_TOKENS),
+                max_concurrency=int(
+                    os.getenv("MINIMAX_MAX_CONCURRENCY") or DEFAULT_TRANSLATION_CONCURRENCY
+                ),
+                rpm=int(os.getenv("MINIMAX_RPM") or DEFAULT_MINIMAX_RPM),
+                tpm=int(os.getenv("MINIMAX_TPM") or DEFAULT_MINIMAX_TPM),
             )
 
         api_key = os.getenv("LLM_API_KEY")

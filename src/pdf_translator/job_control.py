@@ -294,7 +294,14 @@ class TranslationJobObserver:
                 int(progress.get("total_chunks", 0)),
                 int(chunk_index) + 1,
             )
-            progress["running_chunks"] = int(progress.get("running_chunks", 0)) + 1
+            running = set(progress.get("running_chunk_indices") or [])
+            retrying = set(progress.get("retrying_chunk_indices") or [])
+            running.add(chunk_index)
+            retrying.discard(chunk_index)
+            progress["running_chunk_indices"] = sorted(running)
+            progress["retrying_chunk_indices"] = sorted(retrying)
+            progress["running_chunks"] = len(running)
+            progress["retrying_chunks"] = len(retrying)
             progress["status"] = "running"
             self._write_progress(progress)
         self._event("attempt_start", chunk_index=chunk_index, input_hash=input_hash, attempt=attempt)
@@ -302,8 +309,18 @@ class TranslationJobObserver:
     def attempt_success(self, *, chunk_index: int, input_hash: str, cache_path: Path | None) -> None:
         with self._progress_lock:
             progress = self._load_progress()
-            progress["running_chunks"] = max(int(progress.get("running_chunks", 0)) - 1, 0)
-            progress["retrying_chunks"] = max(int(progress.get("retrying_chunks", 0)) - 1, 0)
+            running = set(progress.get("running_chunk_indices") or [])
+            retrying = set(progress.get("retrying_chunk_indices") or [])
+            failed = set(progress.get("failed_chunk_indices") or [])
+            running.discard(chunk_index)
+            retrying.discard(chunk_index)
+            failed.discard(chunk_index)
+            progress["running_chunk_indices"] = sorted(running)
+            progress["retrying_chunk_indices"] = sorted(retrying)
+            progress["failed_chunk_indices"] = sorted(failed)
+            progress["running_chunks"] = len(running)
+            progress["retrying_chunks"] = len(retrying)
+            progress["failed_chunks"] = len(failed)
             self._record_chunk_done(progress, chunk_index)
             self._write_progress(progress)
         self._event(
@@ -325,11 +342,22 @@ class TranslationJobObserver:
     ) -> None:
         with self._progress_lock:
             progress = self._load_progress()
-            progress["running_chunks"] = max(int(progress.get("running_chunks", 0)) - 1, 0)
+            running = set(progress.get("running_chunk_indices") or [])
+            retrying = set(progress.get("retrying_chunk_indices") or [])
+            failed = set(progress.get("failed_chunk_indices") or [])
+            running.discard(chunk_index)
             if retryable:
-                progress["retrying_chunks"] = int(progress.get("retrying_chunks", 0)) + 1
+                retrying.add(chunk_index)
+                failed.discard(chunk_index)
             else:
-                progress["failed_chunks"] = int(progress.get("failed_chunks", 0)) + 1
+                retrying.discard(chunk_index)
+                failed.add(chunk_index)
+            progress["running_chunk_indices"] = sorted(running)
+            progress["retrying_chunk_indices"] = sorted(retrying)
+            progress["failed_chunk_indices"] = sorted(failed)
+            progress["running_chunks"] = len(running)
+            progress["retrying_chunks"] = len(retrying)
+            progress["failed_chunks"] = len(failed)
             self._write_progress(progress)
         self._event(
             "attempt_failure",
@@ -367,6 +395,9 @@ class TranslationJobObserver:
             progress = self._load_progress()
             progress["status"] = status
             progress["running_chunks"] = 0
+            progress["retrying_chunks"] = 0
+            progress["running_chunk_indices"] = []
+            progress["retrying_chunk_indices"] = []
             if status == "completed":
                 actual_total = len(progress.get("completed_chunk_indices") or [])
                 progress["total_chunks"] = actual_total
@@ -433,8 +464,11 @@ def create_translation_job(
         "completed_chunk_indices": completed_indices,
         "remaining_chunks": max(total_chunks - completed, 0),
         "running_chunks": 0,
+        "running_chunk_indices": [],
         "failed_chunks": 0,
+        "failed_chunk_indices": [],
         "retrying_chunks": 0,
+        "retrying_chunk_indices": [],
         "cache_hit_chunks": completed if resume else 0,
         "invalid_cache_chunks": 0,
     }

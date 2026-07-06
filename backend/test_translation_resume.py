@@ -145,3 +145,32 @@ def test_translation_resume_available_when_failed(tmp_path: Path) -> None:
 
     assert enriched["translation_resume"]["available"] is True
     assert enriched["translation_resume"]["label"] == "从检查点恢复"
+
+
+def test_get_ignores_stale_persisted_derived_resume_fields(tmp_path: Path) -> None:
+    jobs_dir = tmp_path / "jobs"
+    job_id = "job-stale-resume"
+    snapshot = _snapshot(job_id, state="failed")
+    snapshot["failed_stage"] = "translating"
+    snapshot["error"] = {
+        "code": "job_stage_failed",
+        "message": "Job failed during translating.",
+        "retryable": True,
+    }
+    snapshot["translation_resume"] = {
+        "available": False,
+        "reason": "not_retryable",
+        "detail": "Job failed during created.",
+    }
+    snapshot["translation_activity"] = {"status": "unknown"}
+    _write_job(jobs_dir, job_id, snapshot)
+
+    service = BookJobService(jobs_dir=jobs_dir, project_home=tmp_path)
+    enriched = service.get(job_id)
+
+    assert enriched["translation_resume"]["available"] is True
+    persisted = json.loads(
+        (jobs_dir / job_id / "job.json").read_text(encoding="utf-8")
+    )
+    assert "translation_resume" not in persisted
+    assert "translation_activity" not in persisted

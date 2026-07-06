@@ -9,6 +9,16 @@ from pdf_translator.jobs import BookJobRunner, JobRepository, resolve_text_opera
 from pdf_translator.models import PipelineArtifacts
 
 
+def test_existing_translation_resume_does_not_replay_intake_stages() -> None:
+    from pdf_translator.pipeline import _pre_translation_stages
+
+    assert _pre_translation_stages(using_existing_run=True) == ()
+    assert _pre_translation_stages(using_existing_run=False) == (
+        "ingesting",
+        "reconstructing",
+    )
+
+
 @pytest.mark.parametrize(
     ("mode", "source_language", "target_language", "expected"),
     [

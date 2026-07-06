@@ -243,7 +243,7 @@ def test_compute_max_candidates_scales_with_book() -> None:
         ]
     }
     large = compute_max_candidates(big)
-    assert small >= 60
+    assert 0 < small < 60
     assert large > small
     assert large <= 200
 
