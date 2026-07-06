@@ -43,7 +43,47 @@ GENERIC_STOP_PHRASES = frozenset(
         "Part Two",
         "Part Three",
         "Part Four",
+        "Far East",
+        "Near East",
+        "East Africa",
+        "West Africa",
+        "North Africa",
+        "South Asia",
+        "East Asia",
+        "West Asia",
+        "Western Asia",
+        "Middle Eastern",
+        "East African",
+        "North African",
+        "South Asian",
     }
+)
+
+_ORDINAL_CENTURY_RE = re.compile(
+    r"^(?:(?:First|Second|Third|Fourth|Fifth|Sixth|Seventh|Eighth|Ninth|Tenth|Eleventh|Twelfth|"
+    r"Thirteenth|Fourteenth|Fifteenth|Sixteenth|Seventeenth|Eighteenth|Nineteenth|Twentieth|"
+    r"\d{1,2}(?:st|nd|rd|th)?)\s+Centur(?:y|ies))$",
+    re.IGNORECASE,
+)
+_GENERIC_COMPASS_RE = re.compile(
+    r"^(?:(?:Far|Near|Middle|Upper|Lower|Central|Northern|Southern|Eastern|Western)\s+"
+    r"(?:East|West|North|South|Africa|Asia|Europe|Caliphate|Mesopotamia|Iraq)|"
+    r"(?:East|West|North|South|Central)\s+(?:Africa|Asia|Europe|Caliphate))$",
+    re.IGNORECASE,
+)
+_ISOLATED_ROMAN_TOKEN_RE = re.compile(r"\b[IVX] [a-z]")
+_NUMBER_WORD_RE = re.compile(
+    r"\b(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|hundred|thousand|million)\b",
+    re.IGNORECASE,
+)
+_GENERIC_REGIONAL_MODIFIER_RE = re.compile(
+    r"\b(?:Ancient|Medieval|Early|Late|Imperial|Lower|Upper|Central)\s+"
+    r"(?:Near Eastern|Middle Eastern|East African|West African|North African|South Asian)\b",
+    re.IGNORECASE,
+)
+_TRAILING_CONNECTOR_RE = re.compile(
+    r"\b(?:of|and|the|in|on|for|from|with|to|at|by|or|as|an|a)\s*$",
+    re.IGNORECASE,
 )
 
 DOMAIN_MARKERS = frozenset(
@@ -133,8 +173,10 @@ def _normalize_phrase(value: str) -> str:
 def canonical_source_term(value: str) -> str:
     normalized = unicodedata.normalize("NFKC", value)
     normalized = normalized.translate(str.maketrans({"’": "'", "‘": "'", "“": '"', "”": '"'}))
-    normalized = re.sub(r"\b([IVX]{1,6})(and|or|the|his|her|was|is|in|of)\b", r"\1 \2", normalized)
-    normalized = re.sub(r"\b([IVX]{1,6})([a-z]{2,})\b", r"\1 \2", normalized)
+    # Split glued Roman numerals only when there are 2+ numeral chars (e.g. IIandhis),
+    # never treat leading I/V/X in words like Islam or Iraq as numerals.
+    normalized = re.sub(r"\b([IVX]{2,6})(and|or|the|his|her|was|is|in|of)\b", r"\1 \2", normalized)
+    normalized = re.sub(r"\b([IVX]{2,6})([a-z]{2,})\b", r"\1 \2", normalized)
     normalized = re.sub(r"([a-z])([A-Z])", r"\1 \2", normalized)
     return _normalize_phrase(normalized).rstrip(" '\".,;:!?…")
 
@@ -212,6 +254,67 @@ def _is_fragment_phrase(phrase: str) -> bool:
     )
 
 
+def candidate_integrity_rejection(phrase: str) -> str | None:
+    normalized = _normalize_phrase(phrase)
+    if not normalized:
+        return "empty phrase"
+    if _ISOLATED_ROMAN_TOKEN_RE.search(normalized):
+        return "malformed isolated-letter token split"
+    if _ORDINAL_CENTURY_RE.fullmatch(normalized):
+        return "generic century phrase"
+    if _GENERIC_COMPASS_RE.fullmatch(normalized):
+        return "generic geographic phrase"
+    if normalized in GENERIC_STOP_PHRASES:
+        return "generic stop phrase"
+    for stop in GENERIC_STOP_PHRASES:
+        if re.search(rf"(?<!\w){re.escape(stop)}(?!\w)", normalized, flags=re.IGNORECASE):
+            return f"contains generic phrase ({stop})"
+    words = _phrase_words(normalized)
+    if _GENERIC_REGIONAL_MODIFIER_RE.search(normalized):
+        return "generic regional descriptive phrase"
+    number_word_hits = len(_NUMBER_WORD_RE.findall(normalized))
+    if number_word_hits >= 2 or (number_word_hits >= 1 and len(words) <= 4):
+        return "numeric quantity phrase"
+    if _TRAILING_CONNECTOR_RE.search(normalized):
+        return "incomplete phrase ending with connector"
+    if len(words) == 2 and words[0].lower() in {"early", "late", "medieval", "modern", "ancient", "northern", "southern", "eastern", "western"}:
+        if words[1].lower() in {"islam", "islamic", "world", "period", "state", "caliphate", "century"}:
+            return "generic period or regional modifier phrase"
+    return None
+
+
+def _has_positive_terminology_evidence(
+    phrase: str,
+    *,
+    occurrences: int,
+    chapter_count: int,
+    body_chapter_count: int,
+    in_index: bool,
+    policy: GlossaryProfilePolicy,
+) -> bool:
+    normalized = _normalize_phrase(phrase)
+    words = _phrase_words(normalized)
+    markers = _domain_marker_hits(normalized, policy.domain_markers)
+    if markers:
+        return True
+    term_type = _classify_term(normalized)
+    if term_type in {"event", "policy_term", "institution"}:
+        return True
+    if term_type == "person" and (in_index or occurrences >= 3):
+        return True
+    if len(words) >= 3 and body_chapter_count >= 2 and occurrences >= 3:
+        return True
+    if in_index and occurrences >= 4 and body_chapter_count >= 1:
+        return True
+    if (
+        len(words) == 1
+        and policy.allow_single_word_domain
+        and _allows_single_word_candidate(words[0], occurrences=occurrences, policy=policy)
+    ):
+        return True
+    return False
+
+
 def _allows_single_word_candidate(
     word: str,
     *,
@@ -231,6 +334,7 @@ def score_glossary_candidate(
     *,
     occurrences: int,
     chapter_count: int,
+    body_chapter_count: int = 0,
     exclusions: set[str],
     in_index: bool,
     policy: GlossaryProfilePolicy | None = None,
@@ -240,6 +344,9 @@ def score_glossary_candidate(
 
     active_policy = policy or GLOSSARY_PROFILES[SOCIAL_ECON_PHILOSOPHY]
     normalized = _normalize_phrase(phrase)
+    integrity_reason = candidate_integrity_rejection(normalized)
+    if integrity_reason:
+        return 0.0, [integrity_reason], True
     words = _phrase_words(normalized)
     min_len = 3 if active_policy.allow_single_word_domain and len(words) == 1 else 5
     if len(words) < active_policy.min_word_count or len(normalized) < min_len:
@@ -324,6 +431,16 @@ def score_glossary_candidate(
     if len(words) == 2 and not markers and occurrences <= 3 and chapter_count <= 2:
         score -= 3.0
         reasons.append("宽泛两词短语，缺乏全书术语特征")
+
+    if not _has_positive_terminology_evidence(
+        normalized,
+        occurrences=occurrences,
+        chapter_count=chapter_count,
+        body_chapter_count=body_chapter_count,
+        in_index=in_index,
+        policy=active_policy,
+    ):
+        return 0.0, reasons + ["缺乏稳定术语证据，仅凭频率不足以入选"], True
 
     rejected = score < active_policy.min_accept_score
     if rejected:

@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 from pdf_translator.glossary import extract_glossary_candidates
-from pdf_translator.glossary_extraction import canonical_source_key
+from pdf_translator.glossary_extraction import canonical_source_key, canonical_source_term
 
 
 def test_extract_filters_book_title_and_surfaces_policy_terms(tmp_path: Path) -> None:
@@ -106,9 +106,52 @@ def test_extract_merges_trailing_apostrophe_variants(tmp_path: Path) -> None:
     assert matches[0]["source"] == "Soviet Union"
 
 
-def test_canonical_source_key_splits_roman_connector_glue() -> None:
+def test_canonical_source_key_preserves_islam_and_iraq() -> None:
+    assert canonical_source_key("Islamic State") == canonical_source_key("Islamic State")
+    assert canonical_source_key("Iraq") == canonical_source_key("Iraq")
+    assert canonical_source_key("Ibn Fadl") == canonical_source_key("Ibn Fadl")
+    assert " " not in canonical_source_term("Islamic")
     assert canonical_source_key("Charles IIandhis") == canonical_source_key("Charles II andhis")
-    assert canonical_source_key("Charles IIand") == canonical_source_key("Charles II and")
+
+
+def test_extract_rejects_generic_century_and_geography(tmp_path: Path) -> None:
+    book = {
+        "metadata": {"title": "Land and Trade in Early Islam"},
+        "chapters": [
+            {
+                "chapter_id": "ch-001",
+                "markdown": (
+                    "The seventh century shaped Near East trade. Seventh Century markets expanded. "
+                    "Far East contacts remained limited. Early Islamic commerce grew across Iraq."
+                ),
+            },
+            {
+                "chapter_id": "ch-002",
+                "markdown": (
+                    "Seventh Century exchange continued. Middle East routes linked East Africa. "
+                    "The Abbasid Caliphate centralized trade. Islamic State institutions evolved."
+                ),
+            },
+            {
+                "chapter_id": "ch-003",
+                "title": "Index",
+                "markdown": "Abbasid Caliphate, Islamic State, Ibn Fadl",
+            },
+        ],
+    }
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "book.json").write_text(json.dumps(book), encoding="utf-8")
+
+    result = extract_glossary_candidates(run_dir, max_candidates=50)
+    sources = [item["source"] for item in result["candidates"]]
+
+    assert not any("I slam" in source or "I raq" in source for source in sources)
+    assert "Seventh Century" not in sources
+    assert "Near East" not in sources
+    assert "Far East" not in sources
+    assert "Islamic State" in sources
+    assert len(sources) < 10
 
 
 def test_extract_filters_fragment_lead_phrases(tmp_path: Path) -> None:

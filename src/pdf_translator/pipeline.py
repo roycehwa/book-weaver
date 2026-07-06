@@ -206,6 +206,47 @@ def _translated_chapters_payload(
     ]
 
 
+def _synthesize_legacy_manifest(run_dir: Path, settings: RunSettings) -> dict[str, Any]:
+    """Rebuild intake manifest for runs created before book-weaver wrote manifest.json."""
+    artifacts = build_artifacts(run_dir, settings.source_pdf, settings.target_language)
+    profile: dict[str, Any] = {}
+    if artifacts.profile_json_path.is_file():
+        loaded = json.loads(artifacts.profile_json_path.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            profile = loaded
+    files: dict[str, str | None] = {}
+    for key, path in {
+        "normalized_markdown": artifacts.normalized_markdown_path,
+        "normalized_json": artifacts.normalized_json_path,
+        "profile_json": artifacts.profile_json_path,
+        "reconstructed_markdown": artifacts.reconstructed_markdown_path,
+        "translation_input_markdown": artifacts.translation_input_markdown_path,
+        "book_json": artifacts.book_json_path,
+        "book_markdown": artifacts.book_markdown_path,
+        "book_trace_markdown": artifacts.book_trace_markdown_path,
+    }.items():
+        if path is not None and path.exists():
+            files[key] = str(path)
+    chapter_report = run_dir / "chapter-report.json"
+    if chapter_report.is_file():
+        files["chapter_report"] = str(chapter_report)
+    files.update(glossary_manifest_files(run_dir))
+    files = {key: value for key, value in files.items() if value}
+    return {
+        "mode": "intake",
+        "source_pdf": str(settings.source_pdf),
+        "output_dir": str(run_dir),
+        "translator": None,
+        "source_language": settings.source_language or profile.get("detected_language"),
+        "target_language": settings.target_language,
+        "chunk_count": 0,
+        "translation": {"mode": "not_requested", "cache_dir": None},
+        "preflight": profile.get("preflight") or {},
+        "render": {"format": "none", "policy": {}},
+        "files": files,
+    }
+
+
 def _load_existing_run_context(
     settings: RunSettings,
 ) -> tuple[PipelineArtifacts, dict | None, str, dict[str, Any], dict[str, str], dict[str, Any]]:
@@ -215,8 +256,13 @@ def _load_existing_run_context(
     run_dir = run_dir.expanduser().resolve()
     manifest_path = run_dir / "manifest.json"
     if not manifest_path.exists():
-        raise ValueError(f"Run directory missing manifest.json: {run_dir}")
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        book_path = run_dir / "book.json"
+        if not book_path.is_file():
+            raise ValueError(f"Run directory missing manifest.json: {run_dir}")
+        manifest = _synthesize_legacy_manifest(run_dir, settings)
+        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    else:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     source_pdf = Path(str(manifest.get("source_pdf") or settings.source_pdf)).expanduser().resolve()
     artifacts = build_artifacts(run_dir, source_pdf, settings.target_language)
     book: dict | None = None
