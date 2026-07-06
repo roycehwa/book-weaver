@@ -18,7 +18,7 @@ AI 模型配置不存放在 GitHub Actions 中。运行环境通过
 
 ## 如何添加 Secrets
 
-1. 打开 https://github.com/roycehwa/bookmate/settings/secrets/actions
+1. 打开 https://github.com/roycehwa/book-weaver/settings/secrets/actions
 2. 点击 "New repository secret"
 3. 输入 Name 和 Value
 4. 点击 "Add secret"
@@ -34,12 +34,12 @@ git push origin main
 ```
 
 然后在 GitHub 页面查看 Actions 运行情况：
-https://github.com/roycehwa/bookmate/actions
+https://github.com/roycehwa/book-weaver/actions
 
 ## 手动触发部署
 
 也可以手动触发部署：
 
-1. 打开 https://github.com/roycehwa/bookmate/actions
+1. 打开 https://github.com/roycehwa/book-weaver/actions
 2. 选择 "Deploy to Production"
 3. 点击 "Run workflow"

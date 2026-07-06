@@ -20,7 +20,7 @@ cd /root/.openclaw/workspace/bookmate
 git config credential.helper store
 
 # 更新 remote URL 使用 Token
-git remote set-url origin "https://${TOKEN}@github.com/roycehwa/bookmate.git"
+git remote set-url origin "https://${TOKEN}@github.com/roycehwa/book-weaver.git"
 
 echo ""
 echo "正在推送代码..."
@@ -37,7 +37,7 @@ if [ $? -eq 0 ]; then
         echo ""
         echo "配置 GitHub Actions Secrets..."
         # 这里可以添加 gh CLI 命令配置 secrets
-        echo "请手动访问 https://github.com/roycehwa/bookmate/settings/secrets/actions"
+        echo "请手动访问 https://github.com/roycehwa/book-weaver/settings/secrets/actions"
         echo "添加以下 Secrets:"
         echo "  - SERVER_HOST: 101.43.19.135"
         echo "  - SERVER_USER: ubuntu"

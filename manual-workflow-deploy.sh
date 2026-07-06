@@ -4,7 +4,7 @@
 echo "=== 由于 Token 缺少 workflow 权限，请手动上传 workflow 文件 ==="
 echo ""
 echo "步骤 1: 访问 GitHub 仓库"
-echo "  https://github.com/roycehwa/bookmate/tree/main/.github/workflows"
+echo "  https://github.com/roycehwa/book-weaver/tree/main/.github/workflows"
 echo ""
 echo "步骤 2: 点击 'Add file' → 'Create new file'"
 echo ""
