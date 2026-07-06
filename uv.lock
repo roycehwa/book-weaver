@@ -105,21 +105,39 @@ dependencies = [
 [package.optional-dependencies]
 dev = [
     { name = "pytest" },
+    { name = "pytest-asyncio" },
+]
+workspace = [
+    { name = "fastapi" },
+    { name = "httpx" },
+    { name = "pydantic-settings" },
+    { name = "pymupdf" },
+    { name = "python-dotenv" },
+    { name = "python-multipart" },
+    { name = "uvicorn" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "beautifulsoup4", specifier = ">=4.12.3" },
     { name = "docling", specifier = ">=2.90.0" },
+    { name = "fastapi", marker = "extra == 'workspace'", specifier = "==0.109.0" },
+    { name = "httpx", marker = "extra == 'workspace'", specifier = ">=0.28" },
     { name = "langdetect", specifier = ">=1.0.9" },
     { name = "markdown", specifier = ">=3.8" },
     { name = "openai", specifier = ">=1.109.1" },
     { name = "pydantic", specifier = ">=2.11.4" },
+    { name = "pydantic-settings", marker = "extra == 'workspace'", specifier = ">=2.3.0" },
+    { name = "pymupdf", marker = "extra == 'workspace'", specifier = "==1.23.8" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.3.5" },
+    { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23.0" },
+    { name = "python-dotenv", marker = "extra == 'workspace'", specifier = ">=1.0.0" },
+    { name = "python-multipart", marker = "extra == 'workspace'", specifier = "==0.0.6" },
     { name = "reportlab", specifier = ">=4.4.0" },
     { name = "requests", specifier = ">=2.32.0" },
+    { name = "uvicorn", marker = "extra == 'workspace'", specifier = "==0.27.0" },
 ]
-provides-extras = ["dev"]
+provides-extras = ["workspace", "dev"]
 
 [[package]]
 name = "certifi"
@@ -516,6 +534,20 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/15/01/28c8ddae8caaf82c929655000963d83e3f01265a9af34e823c2ef2eee8ac/faker-40.19.1.tar.gz", hash = "sha256:76fa71fd3bf320db25e5504eb356f9a76b8a95cd6098524d006f446035b6b89d", size = 1969318, upload-time = "2026-05-22T15:57:37.433Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/49/b4/40a1ec12ec834604f3848143343baf1c67bc9a1096e401907eaa0d25876a/faker-40.19.1-py3-none-any.whl", hash = "sha256:265259b37c013838baaae34940207288170df385d6c5281413fce56a3504d580", size = 2007643, upload-time = "2026-05-22T15:57:35.867Z" },
+]
+
+[[package]]
+name = "fastapi"
+version = "0.109.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pydantic" },
+    { name = "starlette" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ee/b6/beaa92d1fd977edcd77c91c9d08a63d57ceb248a671a8641e3c598a34ef1/fastapi-0.109.0.tar.gz", hash = "sha256:b978095b9ee01a5cf49b19f4bc1ac9b8ca83aa076e770ef8fd9af09a2b88d191", size = 11475098, upload-time = "2024-01-11T15:36:34.684Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e5/80/ddbf524c6169072ab5e8dd4e106d4eb482bf920da1996dde9f308f90aa8c/fastapi-0.109.0-py3-none-any.whl", hash = "sha256:8c77515984cd8e8cfeb58364f8cc7a28f0692088475e2614f7bf03275eba9093", size = 92049, upload-time = "2024-01-11T15:36:31.271Z" },
 ]
 
 [[package]]
@@ -1776,6 +1808,42 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/5d/ab/34ec41718af73c00119d0351b7a2531d2ebddb51833a36448fc7b862be60/pylatexenc-2.10.tar.gz", hash = "sha256:3dd8fd84eb46dc30bee1e23eaab8d8fb5a7f507347b23e5f38ad9675c84f40d3", size = 162597, upload-time = "2021-04-06T07:56:07.854Z" }
 
 [[package]]
+name = "pymupdf"
+version = "1.23.8"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pymupdfb" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/24/14/acf8adaf7f497a3e83d987a453317f51ebce6a8ad30c4421e242702a9d81/PyMuPDF-1.23.8.tar.gz", hash = "sha256:d8d60fded2a9b72b3535940bbee2066e4927cfaf66e1179f1bb06a8fdda6d4af", size = 84334548, upload-time = "2023-12-19T12:32:41.846Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/30/24/b00a8663b7db1c213ab058f030db4c0420d81369e14ee2b7afef90da9392/PyMuPDF-1.23.8-cp311-none-macosx_10_9_x86_64.whl", hash = "sha256:4f62b2940d88ffcc706c1a5d21efa24a01b65d1c87f0d4669d03b136c984098b", size = 4142213, upload-time = "2023-12-19T12:31:09.291Z" },
+    { url = "https://files.pythonhosted.org/packages/d0/82/efb21d8a47d737ed760190a1a7e834585e8576b1bf52fa42406e1526fab1/PyMuPDF-1.23.8-cp311-none-macosx_11_0_arm64.whl", hash = "sha256:58ab6e7121550767ff4e595800317c9acc8d5c1a3ddaf9116f257bb8159af501", size = 3687479, upload-time = "2023-12-19T12:31:13.188Z" },
+    { url = "https://files.pythonhosted.org/packages/0f/53/9b8bda0ccfd50970d459203eb1723ae6dea3633bb7b77e5363dd3f936507/PyMuPDF-1.23.8-cp311-none-manylinux2014_aarch64.whl", hash = "sha256:4a8f8322daabcbae02fe31cfa270000ebb31a327c766cd7423fff38ab55b3b4e", size = 3851355, upload-time = "2023-12-19T17:06:32.653Z" },
+    { url = "https://files.pythonhosted.org/packages/71/ef/c21400fdab5959d32d3775b0a48eb75841b8d8981d5e9856558bead0ba59/PyMuPDF-1.23.8-cp311-none-manylinux2014_x86_64.whl", hash = "sha256:ed917f7b66c332e5fb6bcda2dcb71b6eddeca24e4d0ea7984e0cb3628fbee894", size = 4354636, upload-time = "2023-12-19T12:31:17.499Z" },
+    { url = "https://files.pythonhosted.org/packages/d5/3a/e84aa1d1fd8e6ec26e46e062fbf5cda2e6a0a5a01f0f1ef5feaf238e50dd/PyMuPDF-1.23.8-cp311-none-win32.whl", hash = "sha256:dec10e23b2dd813fe75d60db0af38b4b640ad6066cb57afe3536273d8740d15e", size = 3261691, upload-time = "2023-12-19T12:31:26.935Z" },
+    { url = "https://files.pythonhosted.org/packages/a9/32/4172fe138c5b95060410c13fe29e1ddb965121c0c5740011ad721b6fb490/PyMuPDF-1.23.8-cp311-none-win_amd64.whl", hash = "sha256:9d272e46cd08e65c5811ad9be84bf4fd5f559e538eae87694d5a4685585c633e", size = 3489741, upload-time = "2023-12-19T12:31:22.659Z" },
+    { url = "https://files.pythonhosted.org/packages/96/e4/c26ce1282bbb31f70c02ea29c92e6c8b540f62db7c5043336fe77afa5378/PyMuPDF-1.23.8-cp312-none-macosx_10_9_x86_64.whl", hash = "sha256:e083fbd3a6c1292ddd564cf7187cf0a333ef79c73afb31532e0b26129df3d3b4", size = 4172464, upload-time = "2023-12-19T12:31:31.841Z" },
+    { url = "https://files.pythonhosted.org/packages/66/62/16286a3d75905605a126a34d40e280776e2b020b661d4379268b689d3c34/PyMuPDF-1.23.8-cp312-none-macosx_11_0_arm64.whl", hash = "sha256:fde13b2e5233a77e2b27e80e83d4f8ae3532e77f4870233e62d09b2c0349389c", size = 3696112, upload-time = "2023-12-19T12:31:35.649Z" },
+    { url = "https://files.pythonhosted.org/packages/2c/37/934d029271846c4f0a671d915afe4be72a81c8082b783f4ec27f04b55c21/PyMuPDF-1.23.8-cp312-none-manylinux2014_aarch64.whl", hash = "sha256:6198b94a276faa370800fbe0e32cea5ca632e50310011d3e60e398e53a9f4ebf", size = 3830280, upload-time = "2023-12-19T17:06:37.791Z" },
+    { url = "https://files.pythonhosted.org/packages/9d/c7/9cebb5796cfd1dfd71d0a1b90dba8eb5fb2e15b81b31fed9ba3ba67d8974/PyMuPDF-1.23.8-cp312-none-manylinux2014_x86_64.whl", hash = "sha256:157518a1f595ff469423f3e867a53468137a43d97041d624d72aab44eea28c67", size = 4333329, upload-time = "2023-12-19T12:31:40.604Z" },
+    { url = "https://files.pythonhosted.org/packages/c7/8d/daabd837b681f04e0649bc0b2180f1111844909c801aec0d52b9ad0e17ce/PyMuPDF-1.23.8-cp312-none-win32.whl", hash = "sha256:8e6dcb03473058022354de687a6264309b27582e140eea0688bc96529c27228b", size = 3259647, upload-time = "2023-12-19T12:31:48.665Z" },
+    { url = "https://files.pythonhosted.org/packages/df/a6/8e850e6ba57f5d16e88d256994614d45b832f93d04ee6c7b6eb295bc8bc0/PyMuPDF-1.23.8-cp312-none-win_amd64.whl", hash = "sha256:07947f0e1e7439ceb244009ec27c23a6cf44f5ac6c39c23259ea64f54af37acc", size = 3505362, upload-time = "2023-12-19T12:31:44.933Z" },
+]
+
+[[package]]
+name = "pymupdfb"
+version = "1.23.7"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d8/ed/c0d859744ea301498adfa49ff3e5f873481dc1083d5cc0727c0678b57eff/PyMuPDFb-1.23.7-py3-none-macosx_10_9_x86_64.whl", hash = "sha256:3fddd302121a2109c31d0b2d554ef4afc426b67baa60221daf1bc277951ae4ef", size = 30141686, upload-time = "2023-11-30T11:30:27.085Z" },
+    { url = "https://files.pythonhosted.org/packages/b6/76/d6c3eccc2226348824337dc7260b5febea0b5f159fb52c03090dbd5d4aeb/PyMuPDFb-1.23.7-py3-none-macosx_11_0_arm64.whl", hash = "sha256:aef672f303691904c8951f811f5de3e2ba09d1804571a7f002145ed535cedbdd", size = 29364999, upload-time = "2023-11-30T11:31:17.673Z" },
+    { url = "https://files.pythonhosted.org/packages/a5/a1/6cb4e4a62230934076f13a87b34b6b3f6c81cb0249d87986e22033175a9a/PyMuPDFb-1.23.7-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:ca5a93fac4777f1d2de61fec2e0b96cf649c75bd60bc44f6b6547f8aaccb8a70", size = 30180345, upload-time = "2023-11-30T23:20:35.093Z" },
+    { url = "https://files.pythonhosted.org/packages/e3/52/91a228e9f087c5403c45bb3b0963c1c49de8f71eca842226a5de2b1ff3d1/PyMuPDFb-1.23.7-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:adb43972f75500fae50279919d589a49b91ed7a74ec03e811c5000727dd63cea", size = 30597804, upload-time = "2023-11-30T11:31:55.672Z" },
+    { url = "https://files.pythonhosted.org/packages/76/73/c232ab83e5467f36ed7275662776e7b74d0cac2ed857e8530fa234add52b/PyMuPDFb-1.23.7-py3-none-win32.whl", hash = "sha256:f65e6dbf48daa2348ae708d76ed8310cc5eb9fc78eb335c5cade5dcaa3d52979", size = 21749114, upload-time = "2023-11-30T11:32:17.379Z" },
+    { url = "https://files.pythonhosted.org/packages/01/24/99cfd4e23d42c2f8032a1b55353193c7ca7fb43915432e035afd5e7c52ec/PyMuPDFb-1.23.7-py3-none-win_amd64.whl", hash = "sha256:7552793efa6976574b8b7840fd0091773c410e6048bc7cbf4b2eb3ed92d0b7a5", size = 24484195, upload-time = "2023-11-30T11:31:34.87Z" },
+]
+
+[[package]]
 name = "pypdfium2"
 version = "5.8.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1821,6 +1889,19 @@ wheels = [
 ]
 
 [[package]]
+name = "pytest-asyncio"
+version = "1.4.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pytest" },
+    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/43/7c/d36d04db312ecf4298932ef77e6e4a9e8ad017906e24e34f0b0c361a2473/pytest_asyncio-1.4.0.tar.gz", hash = "sha256:c6c0d2259945122819f171a32ecea2c349ead889ee28176caaf492143424be42", size = 58514, upload-time = "2026-05-26T09:56:04.083Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/03/e2/08a497ef684b88559c9cc5f4ad53a37e7b99e727094a86d6ea32536d5d3c/pytest_asyncio-1.4.0-py3-none-any.whl", hash = "sha256:933ca923a23075a87fb7070c0ec272a6848489824d887c85c812670932835aa1", size = 16930, upload-time = "2026-05-26T09:56:02.576Z" },
+]
+
+[[package]]
 name = "python-dateutil"
 version = "2.9.0.post0"
 source = { registry = "https://pypi.org/simple" }
@@ -1852,6 +1933,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/82/ed/0301aeeac3e5353ef3d94b6ec08bbcabd04a72018415dcb29e588514bba8/python_dotenv-1.2.2.tar.gz", hash = "sha256:2c371a91fbd7ba082c2c1dc1f8bf89ca22564a087c2c287cd9b662adde799cf3", size = 50135, upload-time = "2026-03-01T16:00:26.196Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/0b/d7/1959b9648791274998a9c3526f6d0ec8fd2233e4d4acce81bbae76b44b2a/python_dotenv-1.2.2-py3-none-any.whl", hash = "sha256:1d8214789a24de455a8b8bd8ae6fe3c6b69a5e3d64aa8a8e5d68e694bbcb285a", size = 22101, upload-time = "2026-03-01T16:00:25.09Z" },
+]
+
+[[package]]
+name = "python-multipart"
+version = "0.0.6"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/2d/23/abcfad10c3348cb6358400f8adbc21b523bbc6c954494fd0974428068672/python_multipart-0.0.6.tar.gz", hash = "sha256:e9925a80bb668529f1b67c7fdb0a5dacdd7cbfc6fb0bff3ea443fe22bdd62132", size = 31024, upload-time = "2023-02-27T16:40:10.091Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b4/ff/b1e11d8bffb5e0e1b6d27f402eeedbeb9be6df2cdbc09356a1ae49806dbf/python_multipart-0.0.6-py3-none-any.whl", hash = "sha256:ee698bab5ef148b0a760751c261902cd096e57e10558e11aca17646b74ee1c18", size = 45711, upload-time = "2023-02-27T16:40:14.113Z" },
 ]
 
 [[package]]
@@ -2494,6 +2584,18 @@ wheels = [
 ]
 
 [[package]]
+name = "starlette"
+version = "0.35.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "anyio" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/5e/8a/80e0343c8051e522752eaae54e96c814946ac97ae0c08b441620e3a22755/starlette-0.35.1.tar.gz", hash = "sha256:3e2639dac3520e4f58734ed22553f950d3f3cb1001cd2eaac4d57e8cdc5f66bc", size = 2840584, upload-time = "2024-01-11T19:59:00.652Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/03/13/c60c738da2fb69d60ee1dc5631e8d152352003cc0bc4ce39582bdd90e293/starlette-0.35.1-py3-none-any.whl", hash = "sha256:50bbbda9baa098e361f398fda0928062abbaf1f54f4fadcbe17c092a01eb9a25", size = 71076, upload-time = "2024-01-11T19:58:58.451Z" },
+]
+
+[[package]]
 name = "sympy"
 version = "1.14.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2826,6 +2928,19 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/53/0c/06f8b233b8fd13b9e5ee11424ef85419ba0d8ba0b3138bf360be2ff56953/urllib3-2.7.0.tar.gz", hash = "sha256:231e0ec3b63ceb14667c67be60f2f2c40a518cb38b03af60abc813da26505f4c", size = 433602, upload-time = "2026-05-07T16:13:18.596Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/7f/3e/5db95bcf282c52709639744ca2a8b149baccf648e39c8cc87553df9eae0c/urllib3-2.7.0-py3-none-any.whl", hash = "sha256:9fb4c81ebbb1ce9531cce37674bbc6f1360472bc18ca9a553ede278ef7276897", size = 131087, upload-time = "2026-05-07T16:13:17.151Z" },
+]
+
+[[package]]
+name = "uvicorn"
+version = "0.27.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "click" },
+    { name = "h11" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/52/75/9cf554ed256d8bcdf3a9bb831b599c4e48e4e5993931fb512f75e529ece4/uvicorn-0.27.0.tar.gz", hash = "sha256:c855578045d45625fd027367f7653d249f7c49f9361ba15cf9624186b26b8eb6", size = 40963, upload-time = "2024-01-22T20:32:35.679Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ec/00/2555ae5c4c8550ffccf8eea97476750bd1cfc0880b4b3ab7237dff4b01d7/uvicorn-0.27.0-py3-none-any.whl", hash = "sha256:890b00f6c537d58695d3bb1f28e23db9d9e7a17cbcc76d7457c499935f933e24", size = 60648, upload-time = "2024-01-22T20:32:31.148Z" },
 ]
 
 [[package]]

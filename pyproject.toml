@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "book-weaver"
 version = "0.1.0"
-description = "Book ingestion, translation, reconstruction, and knowledge-weaving pipeline."
+description = "BookWeaver Phase A: ingestion, translation, review workspace, and handoff to Phase B."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -24,9 +24,24 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+workspace = [
+  "fastapi==0.109.0",
+  "uvicorn==0.27.0",
+  "python-multipart==0.0.6",
+  "pymupdf==1.23.8",
+  "httpx>=0.28",
+  "pydantic-settings>=2.3.0",
+  "python-dotenv>=1.0.0",
+]
 dev = [
   "pytest>=8.3.5",
+  "pytest-asyncio>=0.23.0",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "backend"]
+norecursedirs = ["backend/archive", ".venv"]
+asyncio_mode = "auto"
 
 [project.scripts]
 book-weaver = "pdf_translator.cli:main"

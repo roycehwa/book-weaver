@@ -7,3 +7,9 @@ __pycache__/
 *.egg-info/
 .DS_Store
 .env
+node_modules/
+frontend/dist/
+backend/cache/
+backend/storage/books/
+*.log
+backend/venv/

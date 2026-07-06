@@ -1,0 +1,78 @@
+name: Deploy to Production
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup SSH
+      uses: webfactory/ssh-agent@v0.9.0
+      with:
+        ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+      continue-on-error: true
+    
+    - name: Deploy to Server via SSH
+      env:
+        SERVER_HOST: ${{ secrets.SERVER_HOST }}
+        SERVER_USER: ${{ secrets.SERVER_USER }}
+      run: |
+        if [ -z "$SERVER_HOST" ] || [ -z "$SERVER_USER" ]; then
+          echo "⚠️ Server secrets not configured, skipping deployment"
+          exit 0
+        fi
+        
+        ssh -o StrictHostKeyChecking=no $SERVER_USER@$SERVER_HOST << 'EOF'
+          set -e
+          echo "🚀 开始部署 BookMate..."
+          
+          # 进入项目目录
+          cd /opt/bookmate || exit 1
+          
+          # 拉取最新代码
+          echo "📥 拉取最新代码..."
+          git fetch origin
+          git reset --hard origin/main
+          
+          # 更新后端依赖
+          echo "📦 更新后端依赖..."
+          cd backend
+          source venv/bin/activate
+          pip install -r requirements.txt
+          cd ..
+          
+          # 构建前端
+          echo "🔨 构建前端..."
+          cd frontend
+          npm ci
+          npm run build
+          cd ..
+          
+          # 重启服务
+          echo "🔄 重启服务..."
+          sudo systemctl restart bookmate-backend || pm2 restart bookmate-backend || echo "请手动重启后端服务"
+          
+          # 复制前端到 nginx 目录
+          sudo cp -r frontend/dist/* /var/www/html/
+          
+          echo "✅ 部署完成!"
+        EOF
+      continue-on-error: true
+    
+    - name: Deploy via Webhook (Fallback)
+      if: failure()
+      env:
+        DEPLOY_WEBHOOK: ${{ secrets.DEPLOY_WEBHOOK }}
+      run: |
+        if [ -n "$DEPLOY_WEBHOOK" ]; then
+          echo "📡 尝试通过 Webhook 触发部署..."
+          curl -X POST "$DEPLOY_WEBHOOK" -H "Content-Type: application/json" -d '{"source":"github-actions"}' || true
+        else
+          echo "ℹ️ 无部署 Webhook 配置，跳过自动部署"
+        fi

@@ -1,10 +1,10 @@
 # BookWeaver
 
-`book-weaver` is a **Phase A** book ingestion, translation, reconstruction, and human-review pipeline.
+**Phase A** is this repository: translation engine, workspace API, and web UI — one project named **book-weaver**.
 
-Phase B knowledge extraction lives in the separate [`book-knowledge`](https://github.com/roycehwa/book-knowledge) repository. See `docs/PHASE_BOUNDARY.md`.
+**Phase B** (knowledge extraction) is [`book-knowledge`](https://github.com/roycehwa/book-knowledge). See `docs/PHASE_BOUNDARY.md`.
 
-The project started as a PDF translation pipeline, but its current Phase A scope is: turn PDF / EPUB books into stable reading artifacts and a handoff package for knowledge work. Translation is one branch of Phase A, not the product boundary.
+There is no separate Bookmate repository; older `bookmate-review` checkouts should migrate here.
 
 Instead of translating directly on PDF coordinates, it runs a staged flow:
 
@@ -46,6 +46,26 @@ This keeps user intervention low, removes most layout noise from the reading pat
   - `LLM_MODEL`
 
 ## Quick start
+
+### Engine CLI
+
+```bash
+uv sync --extra dev
+uv run book-weaver --help
+```
+
+### Workspace (API + UI)
+
+```bash
+uv sync --extra dev --extra workspace
+cd backend && uv run uvicorn main:app --host 127.0.0.1 --port 8000
+# another terminal:
+cd frontend && npm install && npm run dev
+```
+
+Jobs default to `~/Desktop/文档/Bookmate/Jobs`. No `BOOK_WEAVER_HOME` needed in this unified repo.
+
+### Legacy pip install
 
 ```bash
 /opt/homebrew/bin/python3.11 -m venv .venv

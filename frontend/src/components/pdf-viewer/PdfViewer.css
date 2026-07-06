@@ -1,0 +1,392 @@
+/**
+ * PdfViewer 样式表
+ * BookMate PDF阅读器组件样式
+ */
+
+/* ============================================
+   基础变量
+   ============================================ */
+.pdf-viewer {
+  --pdf-bg: #f5f5f5;
+  --pdf-toolbar-bg: #ffffff;
+  --pdf-border: #e0e0e0;
+  --pdf-text: #333333;
+  --pdf-text-secondary: #666666;
+  --pdf-primary: #1976d2;
+  --pdf-primary-hover: #1565c0;
+  --pdf-disabled: #bdbdbd;
+  --pdf-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+  --pdf-radius: 8px;
+  --pdf-transition: all 0.2s ease;
+  
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  background-color: var(--pdf-bg);
+  border-radius: var(--pdf-radius);
+  overflow: hidden;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+}
+
+/* ============================================
+   加载状态
+   ============================================ */
+.pdf-viewer--loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 400px;
+}
+
+.pdf-viewer__spinner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+}
+
+.pdf-viewer__spinner-icon {
+  width: 48px;
+  height: 48px;
+  border: 4px solid var(--pdf-border);
+  border-top-color: var(--pdf-primary);
+  border-radius: 50%;
+  animation: pdf-spinner-rotate 1s linear infinite;
+}
+
+.pdf-viewer__spinner-icon--small {
+  width: 32px;
+  height: 32px;
+  border-width: 3px;
+}
+
+@keyframes pdf-spinner-rotate {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.pdf-viewer__loading-text {
+  color: var(--pdf-text-secondary);
+  font-size: 14px;
+  margin: 0;
+}
+
+/* ============================================
+   错误状态
+   ============================================ */
+.pdf-viewer--error {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 400px;
+}
+
+.pdf-viewer__error {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 32px;
+  text-align: center;
+}
+
+.pdf-viewer__error-icon {
+  width: 64px;
+  height: 64px;
+  color: #e53935;
+}
+
+.pdf-viewer__error-title {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--pdf-text);
+  margin: 0;
+}
+
+.pdf-viewer__error-message {
+  font-size: 14px;
+  color: var(--pdf-text-secondary);
+  margin: 0;
+  max-width: 300px;
+}
+
+/* ============================================
+   工具栏
+   ============================================ */
+.pdf-viewer__toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  background-color: var(--pdf-toolbar-bg);
+  border-bottom: 1px solid var(--pdf-border);
+  box-shadow: var(--pdf-shadow);
+  z-index: 10;
+}
+
+/* 页码导航 */
+.pdf-viewer__page-nav {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.pdf-viewer__btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 8px;
+  background-color: transparent;
+  border: 1px solid var(--pdf-border);
+  border-radius: 6px;
+  cursor: pointer;
+  transition: var(--pdf-transition);
+  color: var(--pdf-text);
+}
+
+.pdf-viewer__btn:hover:not(:disabled) {
+  background-color: var(--pdf-bg);
+  border-color: var(--pdf-primary);
+  color: var(--pdf-primary);
+}
+
+.pdf-viewer__btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  color: var(--pdf-disabled);
+}
+
+.pdf-viewer__btn svg {
+  width: 20px;
+  height: 20px;
+}
+
+.pdf-viewer__btn--nav {
+  width: 36px;
+  height: 36px;
+  padding: 0;
+}
+
+.pdf-viewer__btn--zoom {
+  width: 36px;
+  height: 36px;
+  padding: 0;
+}
+
+.pdf-viewer__btn--reset {
+  min-width: 64px;
+  padding: 8px 12px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--pdf-text);
+}
+
+.pdf-viewer__btn--reset:hover:not(:disabled) {
+  background-color: var(--pdf-primary);
+  border-color: var(--pdf-primary);
+  color: white;
+}
+
+/* 页码信息 */
+.pdf-viewer__page-info {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 8px;
+}
+
+.pdf-viewer__page-input {
+  width: 48px;
+  height: 32px;
+  padding: 0 8px;
+  text-align: center;
+  font-size: 14px;
+  color: var(--pdf-text);
+  background-color: white;
+  border: 1px solid var(--pdf-border);
+  border-radius: 4px;
+  outline: none;
+  transition: var(--pdf-transition);
+}
+
+.pdf-viewer__page-input:focus {
+  border-color: var(--pdf-primary);
+  box-shadow: 0 0 0 2px rgba(25, 118, 210, 0.2);
+}
+
+.pdf-viewer__page-separator {
+  color: var(--pdf-text-secondary);
+  font-size: 14px;
+}
+
+.pdf-viewer__page-total {
+  color: var(--pdf-text-secondary);
+  font-size: 14px;
+  min-width: 32px;
+}
+
+/* 缩放控制 */
+.pdf-viewer__zoom-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* ============================================
+   PDF 容器
+   ============================================ */
+.pdf-viewer__container {
+  flex: 1;
+  overflow: auto;
+  padding: 24px;
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  background-color: #e0e0e0;
+  background-image: 
+    linear-gradient(45deg, #d0d0d0 25%, transparent 25%),
+    linear-gradient(-45deg, #d0d0d0 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, #d0d0d0 75%),
+    linear-gradient(-45deg, transparent 75%, #d0d0d0 75%);
+  background-size: 20px 20px;
+  background-position: 0 0, 0 10px, 10px -10px, -10px 0px;
+}
+
+.pdf-viewer__document {
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.15);
+  background-color: white;
+}
+
+.pdf-viewer__page {
+  background-color: white;
+}
+
+.pdf-viewer__page canvas {
+  display: block;
+  max-width: 100%;
+  height: auto;
+}
+
+/* 页面加载状态 */
+.pdf-viewer__page-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 400px;
+  min-height: 500px;
+  background-color: white;
+}
+
+.pdf-viewer__page-error {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 400px;
+  min-height: 500px;
+  background-color: white;
+  color: #e53935;
+  font-size: 14px;
+}
+
+/* ============================================
+   底部页脚
+   ============================================ */
+.pdf-viewer__footer {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 10px 16px;
+  background-color: var(--pdf-toolbar-bg);
+  border-top: 1px solid var(--pdf-border);
+  font-size: 12px;
+  color: var(--pdf-text-secondary);
+}
+
+.pdf-viewer__footer-page {
+  font-weight: 500;
+}
+
+/* ============================================
+   响应式适配
+   ============================================ */
+@media (max-width: 768px) {
+  .pdf-viewer__toolbar {
+    flex-wrap: wrap;
+    gap: 12px;
+    padding: 10px 12px;
+  }
+  
+  .pdf-viewer__page-nav,
+  .pdf-viewer__zoom-controls {
+    flex: 1;
+    justify-content: center;
+  }
+  
+  .pdf-viewer__container {
+    padding: 12px;
+  }
+  
+  .pdf-viewer__page-loading,
+  .pdf-viewer__page-error {
+    min-width: 280px;
+    min-height: 350px;
+  }
+}
+
+/* ============================================
+   暗色模式支持
+   ============================================ */
+@media (prefers-color-scheme: dark) {
+  .pdf-viewer {
+    --pdf-bg: #1e1e1e;
+    --pdf-toolbar-bg: #2d2d2d;
+    --pdf-border: #404040;
+    --pdf-text: #e0e0e0;
+    --pdf-text-secondary: #a0a0a0;
+    --pdf-primary: #4fc3f7;
+    --pdf-primary-hover: #29b6f6;
+    --pdf-disabled: #616161;
+    --pdf-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+  }
+  
+  .pdf-viewer__container {
+    background-color: #121212;
+    background-image: 
+      linear-gradient(45deg, #1a1a1a 25%, transparent 25%),
+      linear-gradient(-45deg, #1a1a1a 25%, transparent 25%),
+      linear-gradient(45deg, transparent 75%, #1a1a1a 75%),
+      linear-gradient(-45deg, transparent 75%, #1a1a1a 75%);
+  }
+  
+  .pdf-viewer__page-loading,
+  .pdf-viewer__page-error {
+    background-color: #2d2d2d;
+  }
+  
+  .pdf-viewer__page-input {
+    background-color: #3d3d3d;
+    color: var(--pdf-text);
+    border-color: #505050;
+  }
+}
+
+/* ============================================
+   打印样式
+   ============================================ */
+@media print {
+  .pdf-viewer__toolbar,
+  .pdf-viewer__footer {
+    display: none;
+  }
+  
+  .pdf-viewer__container {
+    padding: 0;
+    background: none;
+  }
+  
+  .pdf-viewer__document {
+    box-shadow: none;
+  }
+}
