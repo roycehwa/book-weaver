@@ -6,7 +6,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-from pdf_translator.pdf_text_repair import repair_book_dict
 from pdf_translator.glossary_extraction import (
     _classify_term,
     _count_occurrences,
@@ -94,7 +93,6 @@ def extract_glossary_candidates(
     profile_source: str | None = None,
 ) -> dict[str, Any]:
     book = json.loads((run_dir / "book.json").read_text(encoding="utf-8"))
-    book = repair_book_dict(book)
     corpus, chapter_text = _book_text_corpus(book)
     exclusions = _metadata_exclusions(book)
     existing_policy = _load_extraction_policy(run_dir)
@@ -216,7 +214,6 @@ def extract_glossary_candidates(
             phrase,
             occurrences=int(entry["occurrences"]),
             chapter_count=len(entry["chapters"]),
-            body_chapter_count=len(entry.get("body_chapters") or set()),
             exclusions=exclusions,
             in_index=bool(entry["in_index"]),
             policy=active_policy,
