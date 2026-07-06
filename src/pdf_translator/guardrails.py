@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import json
+import re
 import tempfile
 import traceback
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Any
 
 from pdf_translator.ingest import ingest_document, ingest_pdf, read_epub_spine_length
 from pdf_translator.models import NormalizedDocument
@@ -389,3 +391,80 @@ def ingest_pdf_guarded(
     normalized.source_pdf = source_pdf
     _enforce_text_layer(normalized, preflight)
     return normalized, preflight
+
+
+ORIGINAL_PAGE_FALLBACK_RE = re.compile(r"!\[Original page (\d+)\]\([^)]+\)")
+
+
+def collect_non_ocr_policy_violations(book: dict[str, Any]) -> list[str]:
+    """List content that violates the non-OCR input policy."""
+
+    violations: list[str] = []
+    semantic = book.get("semantic_content")
+    if isinstance(semantic, dict):
+        for record in semantic.get("ocr_quarantine", []):
+            if not isinstance(record, dict):
+                continue
+            if record.get("resolution") in {"confirmed_noise", "restored_to_reading"}:
+                continue
+            page = record.get("source_page")
+            violations.append(
+                f"unresolved suspect OCR on page {page} "
+                f"(quarantine_id={record.get('quarantine_id')})"
+            )
+
+    for chapter in book.get("chapters", []):
+        if not isinstance(chapter, dict):
+            continue
+        if bool(chapter.get("preserve_original")) or not bool(chapter.get("translate", True)):
+            continue
+        title = str(chapter.get("title") or chapter.get("chapter_id") or "chapter")
+        markdown = str(chapter.get("markdown") or "")
+        for match in ORIGINAL_PAGE_FALLBACK_RE.finditer(markdown):
+            violations.append(
+                f"translatable chapter {title!r} includes page-render fallback for page "
+                f"{match.group(1)}; content is not processable without OCR"
+            )
+    return violations
+
+
+def enforce_non_ocr_translatable_policy(book: dict[str, Any]) -> None:
+    """Reject books that depend on OCR or page-render fallback in translatable scope."""
+
+    violations = collect_non_ocr_policy_violations(book)
+    if not violations:
+        return
+    preview = "; ".join(violations[:8])
+    if len(violations) > 8:
+        preview += f"; and {len(violations) - 8} more"
+    raise InputGateError(
+        "Non-OCR input policy rejected book: "
+        f"{preview}. "
+        "Only preserve_original chapters may use deliberate page images; "
+        "translatable content must come from the embedded text layer."
+    )
+
+
+def assert_translatable_pages_have_no_original_fallback(
+    *,
+    chapter_title: str,
+    pages: list[int],
+    page_markdown: dict[int, str],
+) -> None:
+    """Reject canonical chapter assembly when translatable pages need page-render fallback."""
+
+    blocked_pages = [
+        page
+        for page in pages
+        if ORIGINAL_PAGE_FALLBACK_RE.search(str(page_markdown.get(page) or ""))
+    ]
+    if not blocked_pages:
+        return
+    page_list = ", ".join(str(page) for page in blocked_pages[:12])
+    if len(blocked_pages) > 12:
+        page_list += f", and {len(blocked_pages) - 12} more"
+    raise InputGateError(
+        f"Non-OCR input policy rejected canonical chapter {chapter_title!r}: "
+        f"translatable pages {page_list} contain page-render fallback. "
+        "Move these pages to preserve_original scope or fix the source PDF text layer."
+    )

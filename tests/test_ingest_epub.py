@@ -146,6 +146,28 @@ def test_ingest_epub_preserves_external_link_in_paragraph(tmp_path: Path) -> Non
     assert "[the doc](https://example.org/doc)" in md
 
 
+def test_ingest_epub_repairs_deterministic_word_breaks_without_joining_normal_words(
+    tmp_path: Path,
+) -> None:
+    xhtml = """<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head><body>
+<p>inter­national trade</p>
+<p>trans-<br/>formation accelerated</p>
+<p>com<span class="italic">mun</span>ism changed</p>
+<p>a <span>student</span> arrived</p>
+</body></html>"""
+    epub = tmp_path / "word-breaks.epub"
+    _write_epub(epub, chapter_xhtml=xhtml)
+
+    doc = ingest_epub(epub)
+    md = doc.structured["_epub_meta"]["chapters"][0]["markdown"]
+
+    assert "international trade" in md
+    assert "transformation accelerated" in md
+    assert "communism changed" in md
+    assert "a student arrived" in md
+
+
 def test_ingest_epub_chapter_title_not_tripled_in_full_markdown(tmp_path: Path) -> None:
     xhtml = """<?xml version="1.0" encoding="utf-8"?>
 <html xmlns="http://www.w3.org/1999/xhtml"><head><title>Ignored</title></head><body>

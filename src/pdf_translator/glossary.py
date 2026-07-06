@@ -19,6 +19,7 @@ from pdf_translator.glossary_extraction import (
     score_glossary_candidate,
     canonical_source_key,
     canonical_source_term,
+    candidate_integrity_rejection,
 )
 from pdf_translator.glossary_profiles import (
     GLOSSARY_PROFILE_LABELS,
@@ -187,11 +188,30 @@ def extract_glossary_candidates(
             _count_occurrences(corpus, variant)
             for variant in entry["variants"]
         )
+        canonical_term = str(entry["source"])
+        for chapter in book.get("chapters", []):
+            if _is_index_chapter(chapter):
+                continue
+            chapter_id = str(chapter.get("chapter_id") or chapter.get("id") or "unknown")
+            markdown = chapter_text.get(chapter_id, "")
+            if _count_occurrences(markdown, canonical_term):
+                entry["body_chapters"].add(chapter_id)
 
     ranked: list[dict[str, Any]] = []
     rejected_count = 0
+    reference_only_rejected = 0
+    integrity_rejected = 0
     for entry in stats.values():
         phrase = str(entry["source"])
+        integrity_reason = candidate_integrity_rejection(phrase)
+        if integrity_reason is not None:
+            rejected_count += 1
+            integrity_rejected += 1
+            continue
+        if not entry["body_chapters"]:
+            rejected_count += 1
+            reference_only_rejected += 1
+            continue
         score, reasons, rejected = score_glossary_candidate(
             phrase,
             occurrences=int(entry["occurrences"]),
@@ -215,6 +235,7 @@ def extract_glossary_candidates(
                 "score": round(score, 2),
                 "occurrences": int(entry["occurrences"]),
                 "chapter_count": len(entry["chapters"]),
+                "body_chapter_count": len(entry["body_chapters"]),
                 "reasons": reasons,
                 "evidence": sorted(entry["chapters"]),
                 "updated_by": "machine",
@@ -222,7 +243,13 @@ def extract_glossary_candidates(
         )
 
     ranked.sort(key=lambda item: (-float(item["score"]), -int(item["occurrences"]), item["source"]))
-    candidates = ranked[: max(1, limit)]
+    ranked, overlap_suppressed = _suppress_overlapping_candidates(ranked)
+    eligible_before_cutoff = len(ranked)
+    ranked, quality_cutoff, below_threshold_rejected = _apply_dynamic_quality_cutoff(
+        ranked,
+        minimum_score=float(active_policy.min_accept_score),
+    )
+    candidates = ranked[:limit]
 
     policy = {
         "schema": EXTRACTION_POLICY_SCHEMA,
@@ -233,9 +260,16 @@ def extract_glossary_candidates(
         "stats": {
             "raw_phrases_seen": len(stats),
             "eligible": len(ranked),
+            "eligible_before_cutoff": eligible_before_cutoff,
             "rejected": rejected_count,
+            "integrity_rejected": integrity_rejected,
+            "reference_only_rejected": reference_only_rejected,
+            "overlap_suppressed": overlap_suppressed,
+            "below_threshold_rejected": below_threshold_rejected,
+            "quality_cutoff": quality_cutoff,
             "surfaced": len(candidates),
             "max_candidates_limit": limit,
+            "hard_ceiling_reached": len(ranked) > limit,
         },
         "metadata_exclusions": sorted(exclusions),
         **detection,
@@ -272,6 +306,53 @@ def extract_glossary_candidates(
         humanities_subhints=policy.get("humanities_subhints", []),
     )
     return payload
+
+
+def _is_contiguous_word_subset(shorter: str, longer: str) -> bool:
+    short_words = canonical_source_key(shorter).split()
+    long_words = canonical_source_key(longer).split()
+    if len(short_words) >= len(long_words):
+        return False
+    width = len(short_words)
+    return any(long_words[index : index + width] == short_words for index in range(len(long_words) - width + 1))
+
+
+def _suppress_overlapping_candidates(
+    ranked: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    kept: list[dict[str, Any]] = []
+    suppressed = 0
+    for candidate in ranked:
+        source = str(candidate["source"])
+        occurrences = int(candidate["occurrences"])
+        chapters = int(candidate["body_chapter_count"])
+        represented = any(
+            _is_contiguous_word_subset(source, str(existing["source"]))
+            and int(existing["occurrences"]) * 5 >= occurrences * 3
+            and int(existing["body_chapter_count"]) >= chapters
+            for existing in kept
+        )
+        if represented:
+            suppressed += 1
+            continue
+        kept.append(candidate)
+    return kept, suppressed
+
+
+def _apply_dynamic_quality_cutoff(
+    ranked: list[dict[str, Any]],
+    *,
+    minimum_score: float,
+) -> tuple[list[dict[str, Any]], float, int]:
+    if not ranked:
+        return [], minimum_score, 0
+    if len(ranked) <= CANDIDATE_FLOOR:
+        cutoff = minimum_score
+    else:
+        top_score = float(ranked[0]["score"])
+        cutoff = max(minimum_score, 8.0, top_score - 7.0)
+    surfaced = [item for item in ranked if float(item["score"]) >= cutoff]
+    return surfaced, cutoff, len(ranked) - len(surfaced)
 
 
 def load_candidates(run_dir: Path) -> list[dict[str, Any]]:
@@ -483,6 +564,11 @@ def select_glossary_entries_for_text(
     chapter_id: str | None,
     limit: int = 20,
 ) -> list[dict[str, Any]]:
+    text = re.sub(
+        r"!?\[([^\]]*)\]\((?:\\.|[^)])*\)",
+        lambda match: match.group(1),
+        text,
+    )
     selected: list[tuple[int, dict[str, Any]]] = []
     occupied: list[tuple[int, int]] = []
     for entry in sorted(
@@ -494,6 +580,17 @@ def select_glossary_entries_for_text(
             continue
         source = str(entry.get("source") or "").strip()
         if not source:
+            continue
+        first_word = source.split(maxsplit=1)[0].casefold()
+        if first_word in {
+            "after",
+            "before",
+            "during",
+            "since",
+            "until",
+            "when",
+            "while",
+        }:
             continue
         matches = list(re.finditer(re.escape(source), text, flags=re.IGNORECASE))
         available = next(
@@ -517,6 +614,10 @@ def select_glossary_entries_for_text(
 
 
 def _is_complete_source_term_match(text: str, start: int, end: int) -> bool:
+    if start > 0 and text[start - 1].isalnum():
+        return False
+    if end < len(text) and text[end].isalnum():
+        return False
     before = text[max(0, start - 40):start]
     after = text[end:end + 40]
     if re.search(r"[A-Z][A-Za-z'’-]*[–—-]\s*$", before):

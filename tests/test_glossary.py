@@ -263,6 +263,79 @@ def test_glossary_terms_missing_in_translation_ignores_irrelevant_terms() -> Non
     ) == []
 
 
+def test_glossary_terms_ignore_markdown_image_destinations() -> None:
+    entries = [
+        {
+            "source": "Geneva and Savoy",
+            "target": "日内瓦与萨瓦",
+            "status": "active",
+        },
+        {
+            "source": "Mathieu Caesar",
+            "target": "马蒂厄·凯撒",
+            "status": "active",
+        },
+    ]
+    source = (
+        "The economy remained stable.\n\n"
+        "![Figure 1](/tmp/The Uncertain World of Geneva and Savoy/"
+        "Mathieu Caesar/figure.png)"
+    )
+
+    assert glossary_terms_missing_in_translation(
+        source,
+        "经济保持稳定。",
+        entries,
+    ) == []
+
+
+def test_glossary_term_does_not_match_prefix_of_longer_word() -> None:
+    entries = [
+        {
+            "source": "Japanese War",
+            "target": "抗日战争",
+            "status": "active",
+        }
+    ]
+
+    assert glossary_terms_missing_in_translation(
+        "The report documented Japanese wartime atrocities.",
+        "报告记录了日本战时暴行。",
+        entries,
+    ) == []
+
+
+def test_glossary_constraints_ignore_sentence_fragments() -> None:
+    entries = [
+        {
+            "source": "During the First",
+            "target": "一战期间",
+            "status": "active",
+        },
+        {
+            "source": "After the CCP",
+            "target": "中共建政后",
+            "status": "active",
+        },
+        {
+            "source": "World War II",
+            "target": "第二次世界大战",
+            "status": "active",
+        },
+    ]
+
+    selected = select_glossary_entries_for_text(
+        (
+            "During the First Five-Year Plan, production increased. "
+            "After the CCP gained control, World War II remained a recent memory."
+        ),
+        entries,
+        chapter_id=None,
+    )
+
+    assert [entry["source"] for entry in selected] == ["World War II"]
+
+
 def test_glossary_terms_missing_prefers_longest_non_overlapping_match() -> None:
     entries = [
         {"source": "Steel Works", "target": "钢铁厂", "status": "active"},

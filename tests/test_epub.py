@@ -169,13 +169,42 @@ def test_render_epub_from_book_renders_semantic_footnote_with_backlink(
 
     with ZipFile(output_path) as archive:
         chapter = archive.read("OEBPS/chapters/001-chapter.xhtml").decode("utf-8")
-        assert 'id="fnref-a"' in chapter
-        assert 'epub:type="noteref"' in chapter
-        assert 'href="#fn-footnote-a"' in chapter
         assert 'id="fn-footnote-a"' in chapter
-        assert 'epub:type="footnote"' in chapter
-        assert 'href="#fnref-a"' in chapter
+        assert 'epub:type="noteref"' not in chapter
+        assert 'role="doc-footnote"' not in chapter
+        assert 'class="semantic-footnote-refs"' not in chapter
         assert "说明文字。Book Title, p. 4." in chapter
+
+
+def test_render_epub_removes_marker_only_trailing_note_cluster(
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "marker-only-notes.epub"
+    render_epub_from_book(
+        book={"chapters": []},
+        translated_chapters=[
+            {
+                "index": 1,
+                "chapter_id": "ch-001",
+                "title": "Chapter",
+                "source_pages": [1],
+                "markdown": (
+                    "# Chapter\n\n"
+                    + "\n\n".join(f"正文段落 {index}。" for index in range(1, 8))
+                    + "\n\n30\n\n31\n\n32"
+                ),
+            }
+        ],
+        output_path=output_path,
+        title="Marker Notes",
+    )
+
+    with ZipFile(output_path) as archive:
+        chapter = archive.read("OEBPS/chapters/001-chapter.xhtml").decode("utf-8")
+        assert "<p>30</p>" not in chapter
+        assert "<p>31</p>" not in chapter
+        assert "<p>32</p>" not in chapter
+        assert "本章注释" not in chapter
 
 
 def test_render_epub_from_book_removes_orphan_footnote_backlink(tmp_path: Path) -> None:

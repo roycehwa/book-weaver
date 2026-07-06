@@ -16,6 +16,7 @@ import requests
 
 from pdf_translator.chunking import split_markdown_into_chunks
 from pdf_translator.glossary import glossary_terms_missing_in_translation, select_glossary_entries_for_text
+from pdf_translator.glossary_convergence import sanitize_translation_output
 from pdf_translator.config import (
     DEFAULT_MINIMAX_MAX_TOKENS,
     CompatibleAPISettings,
@@ -27,7 +28,7 @@ from pdf_translator.config import (
 from pdf_translator.models import BookTranslationResult, TranslatedChapter, TranslationChunk, TranslationResult
 
 
-TRANSLATION_PROMPT_VERSION = "v4-mandatory-glossary"
+TRANSLATION_PROMPT_VERSION = "v5-delimited-glossary-controls"
 FOOTNOTE_TRANSLATION_INSTRUCTION = (
     "Translate explanatory footnote prose into the target language. "
     "Preserve bibliographic titles, personal names, archival identifiers, and quoted source titles "
@@ -86,25 +87,29 @@ def build_translation_prompt(
     prompt_instruction: str | None = None,
 ) -> str:
     source = source_language or "auto-detect"
-    prompt = (
+    controls = (
         f"Source language: {source}\n"
         f"Target language: {target_language}\n"
         f"Markdown chunk index: {chunk_index}\n\n"
-        f"{FOOTNOTE_TRANSLATION_INSTRUCTION}\n\n"
-        f"{markdown}"
+        f"{FOOTNOTE_TRANSLATION_INSTRUCTION}"
     )
     if glossary_entries:
         glossary_lines = "\n".join(
             f"- {entry['source']} => {entry.get('target') or ''}".rstrip()
             for entry in glossary_entries
         )
-        prompt += (
+        controls += (
             "\n\nMANDATORY GLOSSARY (when a source term appears, use the exact Chinese wording):\n"
-            f"{glossary_lines}\n"
+            f"{glossary_lines}"
         )
     if prompt_instruction:
-        prompt += f"\n\n{prompt_instruction}\n"
-    return prompt
+        controls += f"\n\n{prompt_instruction}"
+    return (
+        f"{controls}\n\n"
+        "Return only the translated contents of SOURCE_MARKDOWN. "
+        "Do not repeat control instructions or glossary mappings.\n\n"
+        f"<SOURCE_MARKDOWN>\n{markdown}\n</SOURCE_MARKDOWN>"
+    )
 
 
 def _translation_prompt(
@@ -196,6 +201,10 @@ def _chunk_input_hash(chunk: TranslationChunk) -> str:
     instruction_part = chunk.prompt_instruction or ""
     digest_input = f"{TRANSLATION_PROMPT_VERSION}\n{glossary_part}\n{instruction_part}\n{chunk.markdown}"
     return hashlib.sha256(digest_input.encode("utf-8")).hexdigest()[:16]
+
+
+def _chunk_source_fingerprint(markdown: str) -> str:
+    return hashlib.sha256(markdown.encode("utf-8")).hexdigest()
 
 
 def _chunk_cache_path(cache_dir: Path, chunk: TranslationChunk) -> Path:
@@ -334,6 +343,7 @@ def _allow_mixed_english_for_target(source: str, translated: str, target_languag
 
 
 def _strip_generated_english_chinese_glosses(source: str, translated: str, target_language: str) -> str:
+    translated = sanitize_translation_output(translated)
     if not target_language.lower().startswith("zh"):
         return translated
     source_count = _english_then_chinese_gloss_count(source)
@@ -366,6 +376,8 @@ def _assert_translation_quality(
 ) -> None:
     if translator_name == "mock":
         return
+    if _looks_like_translator_meta_response(translated):
+        raise ValueError(f"Translation for chunk {chunk.index} contains translator meta response.")
     if _looks_untranslated_for_target(chunk.markdown, translated, target_language):
         raise ValueError(
             f"Translation for chunk {chunk.index} looks untranslated "
@@ -382,19 +394,6 @@ def _assert_translation_quality(
             f"Translation for chunk {chunk.index} contains generated English-Chinese glosses "
             f"(source_glosses={_english_then_chinese_gloss_count(chunk.markdown)}, "
             f"translated_glosses={_english_then_chinese_gloss_count(translated)})."
-        )
-    if target_language.lower().startswith("zh") and _ascii_letter_count(chunk.markdown) < 1000 and _cjk_count(translated) >= 160:
-        return
-    suspect_words, mixed_lines, max_line_suspects = _mixed_untranslated_english_signal(translated)
-    if suspect_words >= 18 and mixed_lines >= 2 and not _allow_mixed_english_for_target(chunk.markdown, translated, target_language):
-        raise ValueError(
-            f"Translation for chunk {chunk.index} contains mixed untranslated English "
-            f"(suspect_words={suspect_words}, mixed_lines={mixed_lines}, max_line={max_line_suspects})."
-        )
-    if max_line_suspects >= 10 and not _allow_mixed_english_for_target(chunk.markdown, translated, target_language):
-        raise ValueError(
-            f"Translation for chunk {chunk.index} contains a heavily mixed English line "
-            f"(suspect_words={suspect_words}, mixed_lines={mixed_lines}, max_line={max_line_suspects})."
         )
     if (
         require_glossary
@@ -413,10 +412,52 @@ def _assert_translation_quality(
             raise ValueError(
                 f"Translation for chunk {chunk.index} missing mandatory glossary terms: {terms}"
             )
+    if target_language.lower().startswith("zh") and _ascii_letter_count(chunk.markdown) < 1000 and _cjk_count(translated) >= 160:
+        return
+    suspect_words, mixed_lines, max_line_suspects = _mixed_untranslated_english_signal(translated)
+    if suspect_words >= 18 and mixed_lines >= 2 and not _allow_mixed_english_for_target(chunk.markdown, translated, target_language):
+        raise ValueError(
+            f"Translation for chunk {chunk.index} contains mixed untranslated English "
+            f"(suspect_words={suspect_words}, mixed_lines={mixed_lines}, max_line={max_line_suspects})."
+        )
+    if max_line_suspects >= 10 and not _allow_mixed_english_for_target(chunk.markdown, translated, target_language):
+        raise ValueError(
+            f"Translation for chunk {chunk.index} contains a heavily mixed English line "
+            f"(suspect_words={suspect_words}, mixed_lines={mixed_lines}, max_line={max_line_suspects})."
+        )
 
 
 def _is_glossary_quality_error(exc: Exception) -> bool:
     return isinstance(exc, ValueError) and "missing mandatory glossary terms" in str(exc)
+
+
+def _apply_deterministic_glossary_repairs(
+    *,
+    source_text: str,
+    translated_text: str,
+    glossary_entries: list[dict] | None,
+) -> str:
+    """Correct conservative Chinese connector variants without another model call."""
+    repaired = translated_text
+    missing = glossary_terms_missing_in_translation(
+        source_text,
+        repaired,
+        glossary_entries or [],
+    )
+    for entry in missing:
+        target = entry["target"]
+        variants: set[str] = set()
+        if "与" in target:
+            variants.update({target.replace("与", "和"), target.replace("与", "及")})
+        if "和" in target:
+            variants.update({target.replace("和", "与"), target.replace("和", "及")})
+        if "及" in target:
+            variants.update({target.replace("及", "与"), target.replace("及", "和")})
+        for variant in sorted(variants, key=len, reverse=True):
+            if variant and variant in repaired:
+                repaired = repaired.replace(variant, target)
+                break
+    return repaired
 
 
 def _is_untranslated_quality_error(exc: Exception) -> bool:
@@ -424,6 +465,18 @@ def _is_untranslated_quality_error(exc: Exception) -> bool:
         return False
     message = str(exc).lower()
     return "looks untranslated" in message or "looks incomplete" in message
+
+
+def _looks_like_translator_meta_response(translated: str) -> bool:
+    lowered = translated.lower()
+    meta_markers = (
+        "this is a translation job",
+        "please provide the actual markdown content",
+        "i need the actual content",
+        "i will translate it from english",
+        "following all the rules you've specified",
+    )
+    return sum(1 for marker in meta_markers if marker in lowered) >= 2
 
 
 def _should_try_fallback_translation(exc: Exception | None, *, had_sensitive_failure: bool) -> bool:
@@ -443,9 +496,7 @@ def _persist_chunk_translation(
     input_hash: str,
 ) -> str:
     if cache_path is not None:
-        tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
-        tmp_path.write_text(translated + "\n", encoding="utf-8")
-        tmp_path.replace(cache_path)
+        _write_chunk_cache(cache_path, chunk=chunk, translated=translated)
     if observer is not None:
         observer.attempt_success(
             chunk_index=chunk.index,
@@ -453,6 +504,31 @@ def _persist_chunk_translation(
             cache_path=cache_path,
         )
     return translated
+
+
+def _write_chunk_cache(
+    cache_path: Path,
+    *,
+    chunk: TranslationChunk,
+    translated: str,
+    allow_glossary_drift: bool = False,
+) -> None:
+    tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+    tmp_path.write_text(translated + "\n", encoding="utf-8")
+    tmp_path.replace(cache_path)
+    cache_path.with_suffix(".source.json").write_text(
+        json.dumps(
+            {
+                "schema": "translation_cache_source_v1",
+                "source_fingerprint": _chunk_source_fingerprint(chunk.markdown),
+                "allow_glossary_drift": allow_glossary_drift,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
 
 def _repair_glossary_in_chunk(
@@ -464,6 +540,50 @@ def _repair_glossary_in_chunk(
     target_language: str,
     translator: BaseTranslator,
 ) -> str:
+    source_paragraphs = chunk.markdown.split("\n\n")
+    translated_paragraphs = translated.split("\n\n")
+    if len(source_paragraphs) == len(translated_paragraphs) and len(source_paragraphs) > 1:
+        repaired_paragraphs = list(translated_paragraphs)
+        repaired_any = False
+        active_missing = [
+            {**item, "status": "active"}
+            for item in missing
+        ]
+        for index, (source_paragraph, translated_paragraph) in enumerate(
+            zip(source_paragraphs, translated_paragraphs)
+        ):
+            paragraph_missing = glossary_terms_missing_in_translation(
+                source_paragraph,
+                translated_paragraph,
+                active_missing,
+            )
+            if not paragraph_missing:
+                continue
+            lines = "\n".join(
+                f"- {item['source']} => {item['target']}"
+                for item in paragraph_missing
+            )
+            repair_chunk = TranslationChunk(
+                index=chunk.index,
+                markdown=source_paragraph,
+                glossary_entries=paragraph_missing,
+                prompt_instruction=(
+                    "Glossary repair pass. Revise only this existing Chinese paragraph so "
+                    "every listed mandatory term uses the exact Chinese wording. Preserve "
+                    "all other meaning and formatting:\n"
+                    f"{lines}\n\nCURRENT TRANSLATION TO REVISE:\n"
+                    f"{translated_paragraph}"
+                ),
+            )
+            repaired_paragraphs[index] = translator.translate_chunk(
+                chunk=repair_chunk,
+                source_language=source_language,
+                target_language=target_language,
+            ).strip()
+            repaired_any = True
+        if repaired_any:
+            return "\n\n".join(repaired_paragraphs)
+
     lines = "\n".join(f"- {item['source']} => {item['target']}" for item in missing)
     repair_chunk = TranslationChunk(
         index=chunk.index,
@@ -518,15 +638,29 @@ def _translate_chunk_resumable(
         cache_dir.mkdir(parents=True, exist_ok=True)
         cache_path = _chunk_cache_path(cache_dir, chunk)
         if cache_path.exists():
-            cached = cache_path.read_text(encoding="utf-8").strip()
-            if cached:
-                cached = _strip_generated_english_chinese_glosses(chunk.markdown, cached, target_language)
+                cached = cache_path.read_text(encoding="utf-8").strip()
+                if cached:
+                    cached = _strip_generated_english_chinese_glosses(chunk.markdown, cached, target_language)
+                    cached = _apply_deterministic_glossary_repairs(
+                        source_text=chunk.markdown,
+                        translated_text=cached,
+                        glossary_entries=chunk.glossary_entries,
+                    )
                 try:
+                    source_metadata_path = cache_path.with_suffix(".source.json")
+                    source_metadata = (
+                        json.loads(source_metadata_path.read_text(encoding="utf-8"))
+                        if source_metadata_path.exists()
+                        else {}
+                    )
                     _assert_translation_quality(
                         chunk=chunk,
                         translated=cached,
                         target_language=target_language,
                         translator_name=translator.name,
+                        require_glossary=not bool(
+                            source_metadata.get("allow_glossary_drift")
+                        ),
                     )
                 except ValueError as exc:
                     if observer is not None:
@@ -541,6 +675,105 @@ def _translate_chunk_resumable(
                     if observer is not None:
                         observer.cache_hit(chunk_index=chunk.index, input_hash=input_hash, cache_path=cache_path)
                     return cached
+        else:
+            source_fingerprint = _chunk_source_fingerprint(chunk.markdown)
+            legacy_path_set = set(
+                cache_dir.glob(f"chunk-{chunk.index:06d}-*.md")
+            )
+            for source_metadata_path in cache_dir.glob("chunk-*.source.json"):
+                try:
+                    source_metadata = json.loads(
+                        source_metadata_path.read_text(encoding="utf-8")
+                    )
+                except json.JSONDecodeError:
+                    continue
+                if source_metadata.get("source_fingerprint") != source_fingerprint:
+                    continue
+                translated_path = Path(
+                    str(source_metadata_path)[: -len(".source.json")] + ".md"
+                )
+                if translated_path.exists():
+                    legacy_path_set.add(translated_path)
+            legacy_paths = sorted(
+                legacy_path_set,
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )
+            for legacy_path in legacy_paths:
+                source_path = legacy_path.with_suffix(".source.json")
+                if not source_path.exists():
+                    continue
+                try:
+                    source_metadata = json.loads(
+                        source_path.read_text(encoding="utf-8")
+                    )
+                except json.JSONDecodeError:
+                    continue
+                if source_metadata.get(
+                    "source_fingerprint"
+                ) != source_fingerprint:
+                    continue
+                legacy = sanitize_translation_output(
+                    legacy_path.read_text(encoding="utf-8")
+                )
+                legacy = _apply_deterministic_glossary_repairs(
+                    source_text=chunk.markdown,
+                    translated_text=legacy,
+                    glossary_entries=chunk.glossary_entries,
+                )
+                if not legacy:
+                    continue
+                try:
+                    _assert_translation_quality(
+                        chunk=chunk,
+                        translated=legacy,
+                        target_language=target_language,
+                        translator_name=translator.name,
+                        require_glossary=not bool(
+                            source_metadata.get("allow_glossary_drift")
+                        ),
+                    )
+                    return _persist_chunk_translation(
+                        chunk=chunk,
+                        translated=legacy,
+                        cache_path=cache_path,
+                        observer=observer,
+                        input_hash=input_hash,
+                    )
+                except ValueError as exc:
+                    if not _is_glossary_quality_error(exc):
+                        continue
+                    missing = glossary_terms_missing_in_translation(
+                        chunk.markdown,
+                        legacy,
+                        chunk.glossary_entries or [],
+                    )
+                    try:
+                        repaired = sanitize_translation_output(
+                            _repair_glossary_in_chunk(
+                                chunk=chunk,
+                                translated=legacy,
+                                missing=missing,
+                                source_language=source_language,
+                                target_language=target_language,
+                                translator=translator,
+                            )
+                        )
+                        _assert_translation_quality(
+                            chunk=chunk,
+                            translated=repaired,
+                            target_language=target_language,
+                            translator_name=translator.name,
+                        )
+                    except Exception:
+                        continue
+                    return _persist_chunk_translation(
+                        chunk=chunk,
+                        translated=repaired,
+                        cache_path=cache_path,
+                        observer=observer,
+                        input_hash=input_hash,
+                    )
 
     last_error: Exception | None = None
     had_sensitive_failure = False
@@ -561,23 +794,61 @@ def _translate_chunk_resumable(
             if not translated:
                 raise ValueError(f"Empty translation returned for chunk {chunk.index}.")
             translated = _strip_generated_english_chinese_glosses(chunk.markdown, translated, target_language)
+            translated = _apply_deterministic_glossary_repairs(
+                source_text=chunk.markdown,
+                translated_text=translated,
+                glossary_entries=chunk.glossary_entries,
+            )
             _assert_translation_quality(
                 chunk=chunk,
                 translated=translated,
                 target_language=target_language,
                 translator_name=translator.name,
             )
-            if cache_path is not None:
-                tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
-                tmp_path.write_text(translated + "\n", encoding="utf-8")
-                tmp_path.replace(cache_path)
-            if observer is not None:
-                observer.attempt_success(chunk_index=chunk.index, input_hash=input_hash, cache_path=cache_path)
-            return translated
+            return _persist_chunk_translation(
+                chunk=chunk,
+                translated=translated,
+                cache_path=cache_path,
+                observer=observer,
+                input_hash=input_hash,
+            )
         except Exception as exc:
             last_error = exc
             if _is_glossary_quality_error(exc):
                 last_glossary_candidate = translated
+                missing = glossary_terms_missing_in_translation(
+                    chunk.markdown,
+                    translated,
+                    chunk.glossary_entries or [],
+                )
+                if missing:
+                    try:
+                        repaired = sanitize_translation_output(
+                            _repair_glossary_in_chunk(
+                                chunk=chunk,
+                                translated=translated,
+                                missing=missing,
+                                source_language=source_language,
+                                target_language=target_language,
+                                translator=translator,
+                            )
+                        )
+                        _assert_translation_quality(
+                            chunk=chunk,
+                            translated=repaired,
+                            target_language=target_language,
+                            translator_name=translator.name,
+                        )
+                    except Exception:
+                        pass
+                    else:
+                        return _persist_chunk_translation(
+                            chunk=chunk,
+                            translated=repaired,
+                            cache_path=cache_path,
+                            observer=observer,
+                            input_hash=input_hash,
+                        )
             if "new_sensitive" in str(exc).lower():
                 had_sensitive_failure = True
             permanent = _is_permanent_translation_error(exc)
@@ -597,13 +868,13 @@ def _translate_chunk_resumable(
                         target_language=target_language,
                         translator_name=translator.name,
                     )
-                    if cache_path is not None:
-                        tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
-                        tmp_path.write_text(translated + "\n", encoding="utf-8")
-                        tmp_path.replace(cache_path)
-                    if observer is not None:
-                        observer.attempt_success(chunk_index=chunk.index, input_hash=input_hash, cache_path=cache_path)
-                    return translated
+                    return _persist_chunk_translation(
+                        chunk=chunk,
+                        translated=translated,
+                        cache_path=cache_path,
+                        observer=observer,
+                        input_hash=input_hash,
+                    )
                 except Exception as split_exc:
                     last_error = split_exc
                     if "new_sensitive" in str(split_exc).lower():
@@ -701,39 +972,15 @@ def _translate_chunk_resumable(
                     translator_name=translator.name,
                     require_glossary=True,
                 )
-                if cache_path is not None:
-                    tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
-                    tmp_path.write_text(repaired + "\n", encoding="utf-8")
-                    tmp_path.replace(cache_path)
-                if observer is not None:
-                    observer.attempt_success(
-                        chunk_index=chunk.index,
-                        input_hash=input_hash,
-                        cache_path=cache_path,
-                    )
-                return repaired
+                return _persist_chunk_translation(
+                    chunk=chunk,
+                    translated=repaired,
+                    cache_path=cache_path,
+                    observer=observer,
+                    input_hash=input_hash,
+                )
             except Exception:
                 pass
-        accepted = last_glossary_candidate
-        _assert_translation_quality(
-            chunk=chunk,
-            translated=accepted,
-            target_language=target_language,
-            translator_name=translator.name,
-            require_glossary=False,
-        )
-        if cache_path is not None:
-            tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
-            tmp_path.write_text(accepted + "\n", encoding="utf-8")
-            tmp_path.replace(cache_path)
-        if observer is not None:
-            observer.attempt_success(
-                chunk_index=chunk.index,
-                input_hash=input_hash,
-                cache_path=cache_path,
-            )
-        return accepted
-
     raise ValueError(f"Translation failed for chunk {chunk.index} after {retry_count} attempts: {last_error}") from last_error
 
 
@@ -859,17 +1106,79 @@ def _try_fallback_translation(
             if not translated:
                 raise ValueError(f"Empty fallback translation returned for chunk {chunk.index}.")
             translated = _strip_generated_english_chinese_glosses(chunk.markdown, translated, target_language)
-            _assert_translation_quality(
-                chunk=chunk,
-                translated=translated,
-                target_language=target_language,
-                translator_name=fallback.name,
-                require_glossary=False,
+            translated = _apply_deterministic_glossary_repairs(
+                source_text=chunk.markdown,
+                translated_text=translated,
+                glossary_entries=chunk.glossary_entries,
             )
+            missing = glossary_terms_missing_in_translation(
+                chunk.markdown,
+                translated,
+                chunk.glossary_entries or [],
+            )
+            if missing:
+                try:
+                    translated = sanitize_translation_output(
+                        _repair_glossary_in_chunk(
+                            chunk=chunk,
+                            translated=translated,
+                            missing=missing,
+                            source_language=source_language,
+                            target_language=target_language,
+                            translator=primary_translator,
+                        )
+                    )
+                except Exception:
+                    pass
+            remaining = glossary_terms_missing_in_translation(
+                chunk.markdown,
+                translated,
+                chunk.glossary_entries or [],
+            )
+            for item in remaining:
+                try:
+                    fallback_variant = fallback.translate_chunk(
+                        chunk=TranslationChunk(
+                            index=chunk.index,
+                            markdown=item["source"],
+                        ),
+                        source_language=source_language,
+                        target_language=target_language,
+                    ).strip()
+                except Exception:
+                    continue
+                if fallback_variant and fallback_variant in translated:
+                    translated = translated.replace(
+                        fallback_variant,
+                        item["target"],
+                    )
+            allow_glossary_drift = False
+            try:
+                _assert_translation_quality(
+                    chunk=chunk,
+                    translated=translated,
+                    target_language=target_language,
+                    translator_name=fallback.name,
+                    require_glossary=True,
+                )
+            except ValueError as exc:
+                if not _is_glossary_quality_error(exc):
+                    raise
+                _assert_translation_quality(
+                    chunk=chunk,
+                    translated=translated,
+                    target_language=target_language,
+                    translator_name=fallback.name,
+                    require_glossary=False,
+                )
+                allow_glossary_drift = True
             if cache_path is not None:
-                tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
-                tmp_path.write_text(translated + "\n", encoding="utf-8")
-                tmp_path.replace(cache_path)
+                _write_chunk_cache(
+                    cache_path,
+                    chunk=chunk,
+                    translated=translated,
+                    allow_glossary_drift=allow_glossary_drift,
+                )
             if fallback.name == "deepl":
                 _deepl_record_usage(source_chars, chunk_index=chunk.index)
             return translated
@@ -899,6 +1208,47 @@ def _split_sensitive_source(source: str, *, max_part_chars: int) -> list[str]:
         lines = paragraph.splitlines()
         block = ""
         for line in lines:
+            if len(line) > max_part_chars:
+                if block:
+                    parts.append(block)
+                    block = ""
+                sentences = re.split(r"(?<=[.!?。！？])\s+", line)
+                sentence_block = ""
+                for sentence in sentences:
+                    if len(sentence) > max_part_chars:
+                        if sentence_block:
+                            parts.append(sentence_block)
+                            sentence_block = ""
+                        words = sentence.split()
+                        word_block = ""
+                        for word in words:
+                            word_candidate = (
+                                f"{word_block} {word}".strip()
+                                if word_block
+                                else word
+                            )
+                            if len(word_candidate) <= max_part_chars:
+                                word_block = word_candidate
+                            else:
+                                if word_block:
+                                    parts.append(word_block)
+                                word_block = word
+                        if word_block:
+                            sentence_block = word_block
+                        continue
+                    sentence_candidate = (
+                        f"{sentence_block} {sentence}".strip()
+                        if sentence_block
+                        else sentence
+                    )
+                    if len(sentence_candidate) <= max_part_chars:
+                        sentence_block = sentence_candidate
+                    else:
+                        if sentence_block:
+                            parts.append(sentence_block)
+                        sentence_block = sentence
+                block = sentence_block
+                continue
             line_candidate = f"{block}\n{line}".strip() if block else line
             if len(line_candidate) <= max_part_chars:
                 block = line_candidate
@@ -920,24 +1270,51 @@ def _translate_sensitive_chunk_parts(
     translator: BaseTranslator,
 ) -> str:
     last_error: Exception | None = None
-    for max_part_chars in (2800, 1400, 900, 500):
+    split_sizes = (2800, 1400, 900, 500, 240)
+    for max_part_chars in split_sizes:
         try:
-            translated_parts = [
-                _translate_sensitive_part(
-                    chunk=TranslationChunk(
-                        index=chunk.index * 1000 + offset,
-                        markdown=part,
-                    ),
-                    source_language=source_language,
-                    target_language=target_language,
-                    translator=translator,
-                    retry_count=3,
+            translated_parts: list[str] = []
+            preserved_sensitive_part = False
+            if max_part_chars == split_sizes[-1]:
+                source_parts = [
+                    part
+                    for paragraph in chunk.markdown.split("\n\n")
+                    if paragraph.strip()
+                    for part in _split_sensitive_source(
+                        paragraph.strip(),
+                        max_part_chars=max_part_chars,
+                    )
+                ]
+            else:
+                source_parts = _split_sensitive_source(
+                    chunk.markdown,
+                    max_part_chars=max_part_chars,
                 )
-                for offset, part in enumerate(
-                    _split_sensitive_source(chunk.markdown, max_part_chars=max_part_chars)
-                )
-            ]
+            for offset, part in enumerate(source_parts):
+                try:
+                    translated_part = _translate_sensitive_part(
+                        chunk=TranslationChunk(
+                            index=chunk.index * 1000 + offset,
+                            markdown=part,
+                        ),
+                        source_language=source_language,
+                        target_language=target_language,
+                        translator=translator,
+                        retry_count=3,
+                    )
+                except ValueError as exc:
+                    if (
+                        max_part_chars == split_sizes[-1]
+                        and "new_sensitive" in str(exc).lower()
+                    ):
+                        translated_part = part
+                        preserved_sensitive_part = True
+                    else:
+                        raise
+                translated_parts.append(translated_part)
             translated = "\n\n".join(part.strip() for part in translated_parts if part.strip())
+            if preserved_sensitive_part:
+                return translated
             _assert_translation_quality(
                 chunk=chunk,
                 translated=translated,
@@ -1459,9 +1836,30 @@ def _write_glossary_constraints(
     )
 
 
+ORIGINAL_PAGE_FALLBACK_BLOCK_RE = re.compile(r"^!\[Original page \d+\]\([^)]+\)$")
+
+
+def _is_original_page_fallback_block(block: str) -> bool:
+    """Page-render fallback images are not figure/table media blocks."""
+
+    return bool(ORIGINAL_PAGE_FALLBACK_BLOCK_RE.match(block.strip()))
+
+
 def _chapter_markdown_for_translation(chapter: dict) -> str:
     title = str(chapter.get("title") or f"Chapter {chapter.get('index', '')}").strip()
     markdown = str(chapter.get("markdown") or "").strip()
+    markdown = re.sub(
+        r"(!\[[^\]]*\]\()([^)]+)(\))",
+        lambda match: (
+            f"{match.group(1)}book-images/"
+            f"{match.group(2).split('/book-images/', 1)[1]}{match.group(3)}"
+            if "/book-images/" in match.group(2)
+            else match.group(0)
+        ),
+        markdown,
+    )
+    if not markdown and (chapter.get("preserve_original") or chapter.get("resource_only")):
+        return ""
     if title.startswith("Untitled Section"):
         return markdown + "\n" if markdown else ""
     return f"# {title}\n\n{markdown}\n" if markdown else f"# {title}\n"
@@ -1478,6 +1876,8 @@ def _is_markdown_table_block(block: str) -> bool:
 
 def _is_preserved_media_block(block: str) -> bool:
     stripped = block.lstrip()
+    if _is_original_page_fallback_block(block):
+        return False
     return stripped.startswith("![") or _is_markdown_table_block(block)
 
 
@@ -1752,30 +2152,73 @@ def translate_book_chapters(
                     for part in translated_text.split(SEMANTIC_SPAN_BOUNDARY)
                 ]
                 if len(parts) != len(group):
-                    fallback_chunks = [
-                        TranslationChunk(
+                    fallback_groups = (
+                        [group[index : index + 12] for index in range(0, len(group), 12)]
+                        if len(group) > 12
+                        else [[span] for span in group]
+                    )
+                    parts = []
+                    for fallback_group in fallback_groups:
+                        fallback_chunk = TranslationChunk(
                             index=(
                                 chunk_index
                                 + len(semantic_chunks)
                                 + fallback_chunk_count
-                                + index
                             ),
-                            markdown=str(span.get("source_text") or ""),
-                            prompt_instruction=SEMANTIC_TRANSLATION_POLICY,
+                            markdown=(
+                                f"\n\n{SEMANTIC_SPAN_BOUNDARY}\n\n".join(
+                                    str(span.get("source_text") or "")
+                                    for span in fallback_group
+                                )
+                            ),
+                            prompt_instruction=(
+                                f"{SEMANTIC_TRANSLATION_POLICY}. Preserve every "
+                                f"{SEMANTIC_SPAN_BOUNDARY} marker exactly."
+                            ),
                         )
-                        for index, span in enumerate(group)
-                    ]
-                    parts = _translate_chunks_ordered(
-                        chunks=fallback_chunks,
-                        source_language=settings.source_language,
-                        target_language=settings.target_language,
-                        translator=translator,
-                        cache_dir=cache_dir,
-                        retry_count=retry_count,
-                        concurrency=concurrency,
-                        observer=observer,
-                    )
-                    fallback_chunk_count += len(fallback_chunks)
+                        fallback_chunk_count += 1
+                        fallback_text = _translate_chunks_ordered(
+                            chunks=[fallback_chunk],
+                            source_language=settings.source_language,
+                            target_language=settings.target_language,
+                            translator=translator,
+                            cache_dir=cache_dir,
+                            retry_count=retry_count,
+                            concurrency=concurrency,
+                            observer=observer,
+                        )[0]
+                        fallback_parts = [
+                            part.strip()
+                            for part in fallback_text.split(
+                                SEMANTIC_SPAN_BOUNDARY
+                            )
+                        ]
+                        if len(fallback_parts) != len(fallback_group):
+                            individual_chunks = [
+                                TranslationChunk(
+                                    index=(
+                                        chunk_index
+                                        + len(semantic_chunks)
+                                        + fallback_chunk_count
+                                        + index
+                                    ),
+                                    markdown=str(span.get("source_text") or ""),
+                                    prompt_instruction=SEMANTIC_TRANSLATION_POLICY,
+                                )
+                                for index, span in enumerate(fallback_group)
+                            ]
+                            fallback_parts = _translate_chunks_ordered(
+                                chunks=individual_chunks,
+                                source_language=settings.source_language,
+                                target_language=settings.target_language,
+                                translator=translator,
+                                cache_dir=cache_dir,
+                                retry_count=retry_count,
+                                concurrency=concurrency,
+                                observer=observer,
+                            )
+                            fallback_chunk_count += len(individual_chunks)
+                        parts.extend(fallback_parts)
                 for span, part in zip(group, parts):
                     span["translated_text"] = part
             chunk_index += len(semantic_chunks) + fallback_chunk_count

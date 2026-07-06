@@ -5,7 +5,21 @@ import re
 from pdf_translator.models import TranslationChunk
 
 
+def _is_atomic_markdown_block(block: str) -> bool:
+    stripped = block.strip()
+    lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+    if stripped.startswith("```") and stripped.endswith("```"):
+        return True
+    if re.fullmatch(r"!\[[^\]]*]\([^)]+\)", stripped, re.DOTALL):
+        return True
+    if len(lines) >= 2 and all(line.startswith("|") and line.endswith("|") for line in lines):
+        return True
+    return False
+
+
 def _split_oversized_block(block: str, max_chars: int) -> list[str]:
+    if _is_atomic_markdown_block(block):
+        return [block.strip()]
     sentences = [
         match.group(0).strip()
         for match in re.finditer(

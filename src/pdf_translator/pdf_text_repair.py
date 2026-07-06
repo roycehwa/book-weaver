@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -23,9 +23,22 @@ _LOGIC_SYMBOL_LINE = re.compile(r"[◻◇φ∀∃⊢⊨≤≥]")
 
 INGEST_ISSUE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("orphan_footnote_y", re.compile(r"\. y\.|^\s*y\.\s*$", re.IGNORECASE | re.MULTILINE)),
-    ("midword_space", re.compile(r"\b[a-z] [a-z]{2,}\b", re.IGNORECASE)),
+    (
+        "midword_space",
+        re.compile(r"(?<![A-Za-z'’])\b[b-hj-z] [a-z]{3,}\b", re.IGNORECASE),
+    ),
     ("glued_words", re.compile(r"\bformalsystems\b", re.IGNORECASE)),
 )
+BLOCKING_INGEST_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("replacement_character", re.compile("\ufffd")),
+    ("soft_hyphen", re.compile("\u00ad")),
+    ("hyphenated_line_break", re.compile(r"(?<=[^\W\d_])-\s*\n\s*(?=[^\W\d_])", re.UNICODE)),
+    ("control_character", re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")),
+)
+
+
+class IngestQualityError(ValueError):
+    pass
 
 
 @dataclass(slots=True)
@@ -33,6 +46,12 @@ class IngestQualityReport:
     issue_counts: dict[str, int]
     total_chars: int
     issue_rate_per_1k: float
+    blocking_issues: list[dict[str, Any]] = field(default_factory=list)
+    warning_issues: list[dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def acceptable(self) -> bool:
+        return not self.blocking_issues
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -40,7 +59,9 @@ class IngestQualityReport:
             "issue_counts": self.issue_counts,
             "total_chars": self.total_chars,
             "issue_rate_per_1k": round(self.issue_rate_per_1k, 3),
-            "acceptable": self.issue_rate_per_1k <= 2.0,
+            "acceptable": self.acceptable,
+            "blocking_issues": self.blocking_issues,
+            "warning_issues": self.warning_issues,
         }
 
 
@@ -75,13 +96,50 @@ def scan_ingest_quality(text: str) -> IngestQualityReport:
     issue_counts: dict[str, int] = {}
     for name, pattern in INGEST_ISSUE_PATTERNS:
         issue_counts[name] = len(pattern.findall(text))
+    for name, pattern in BLOCKING_INGEST_PATTERNS:
+        issue_counts[name] = len(pattern.findall(text))
     total_chars = max(len(text), 1)
     total_issues = sum(issue_counts.values())
+    blocking_issues = _quality_evidence(text, BLOCKING_INGEST_PATTERNS)
+    warning_issues = _quality_evidence(text, INGEST_ISSUE_PATTERNS)
     return IngestQualityReport(
         issue_counts=issue_counts,
         total_chars=total_chars,
         issue_rate_per_1k=(total_issues / total_chars) * 1000.0,
+        blocking_issues=blocking_issues,
+        warning_issues=warning_issues,
     )
+
+
+def _quality_evidence(
+    text: str,
+    patterns: tuple[tuple[str, re.Pattern[str]], ...],
+) -> list[dict[str, Any]]:
+    evidence: list[dict[str, Any]] = []
+    headings = [
+        (match.start(), match.group(1))
+        for match in re.finditer(r"^#{1,6}\s+(.+?)\s*$", text, flags=re.MULTILINE)
+    ]
+    for code, pattern in patterns:
+        for match in pattern.finditer(text):
+            chapter = next(
+                (title for offset, title in reversed(headings) if offset <= match.start()),
+                None,
+            )
+            start = max(0, match.start() - 48)
+            end = min(len(text), match.end() + 48)
+            excerpt = text[start:end].replace("\n", "\\n")
+            evidence.append(
+                {
+                    "code": code,
+                    "chapter": chapter,
+                    "line": text.count("\n", 0, match.start()) + 1,
+                    "excerpt": excerpt,
+                }
+            )
+            if len(evidence) >= 100:
+                return evidence
+    return evidence
 
 
 def repair_book_dict(book: dict[str, Any]) -> dict[str, Any]:
@@ -108,8 +166,20 @@ def repair_book_dict(book: dict[str, Any]) -> dict[str, Any]:
     return book
 
 
-def write_ingest_quality_report(run_dir: Path, *, source_markdown: str) -> Path:
+def write_ingest_quality_report(
+    run_dir: Path,
+    *,
+    source_markdown: str,
+    block_on_errors: bool = False,
+) -> Path:
     report = scan_ingest_quality(source_markdown)
     path = run_dir / "ingest-quality-report.json"
     path.write_text(json.dumps(report.as_dict(), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    if block_on_errors and not report.acceptable:
+        codes = sorted({str(issue["code"]) for issue in report.blocking_issues})
+        raise IngestQualityError(
+            "EPUB ingest quality gate blocked downstream processing: "
+            + ", ".join(codes)
+            + f". See {path}."
+        )
     return path

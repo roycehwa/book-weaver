@@ -6,6 +6,7 @@ from pdf_translator.integrity import (
     IntegrityGateError,
     assert_approved_export_ready,
     build_integrity_ledger,
+    refresh_review_readiness,
 )
 
 
@@ -134,3 +135,25 @@ def test_open_review_blocks_approval_but_not_technical_readiness() -> None:
     assert ledger["approved_ready"] is False
     assert ledger["ready"] is False
     assert ledger["failures"]["unresolved_review"] == ["review-a"]
+
+
+def test_refresh_review_readiness_replaces_stale_open_failures() -> None:
+    ledger = build_integrity_ledger(
+        _complete_book(),
+        review_items=[{"item_id": "review-a", "segment_id": "seg-a", "status": "open"}],
+    )
+
+    refreshed = refresh_review_readiness(
+        ledger,
+        review_items=[
+            {"item_id": "review-a", "segment_id": "seg-a", "status": "open"}
+        ],
+        review_state={
+            "decisions": {"seg-a": {"status": "approved", "approved_text": "译文"}}
+        },
+    )
+
+    assert refreshed["failures"]["unresolved_review"] == []
+    assert refreshed["technical_ready"] is True
+    assert refreshed["approved_ready"] is True
+    assert refreshed["ready"] is True

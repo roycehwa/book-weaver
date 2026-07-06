@@ -3,7 +3,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from pdf_translator.glossary import apply_glossary_decision, compute_max_candidates, extract_glossary_candidates
+from pdf_translator.glossary import (
+    _apply_dynamic_quality_cutoff,
+    apply_glossary_decision,
+    compute_max_candidates,
+    extract_glossary_candidates,
+)
 from pdf_translator.glossary_extraction import (
     extract_connector_phrases,
     extract_domain_single_words,
@@ -241,6 +246,86 @@ def test_compute_max_candidates_scales_with_book() -> None:
     assert small >= 60
     assert large > small
     assert large <= 200
+
+
+def test_bibliography_only_frequency_does_not_make_phrase_eligible(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    book = {
+        "metadata": {"title": "History"},
+        "chapters": [
+            {
+                "chapter_id": "body",
+                "title": "Chapter One",
+                "markdown": "The Cultural Revolution changed institutions. " * 5,
+            },
+            {
+                "chapter_id": "notes",
+                "title": "Notes and Bibliography",
+                "markdown": "Journal of Modern Historical Studies. " * 40,
+            },
+        ],
+    }
+    (run_dir / "book.json").write_text(json.dumps(book), encoding="utf-8")
+
+    result = extract_glossary_candidates(
+        run_dir,
+        max_candidates=200,
+        profile=HUMANITIES_HISTORY,
+    )
+    sources = {item["source"] for item in result["candidates"]}
+
+    assert "Cultural Revolution" in sources
+    assert all("Journal of Modern" not in source for source in sources)
+    assert (
+        result["policy"]["stats"]["reference_only_rejected"]
+        + result["policy"]["stats"]["integrity_rejected"]
+    ) >= 1
+
+
+def test_overlapping_candidate_family_keeps_stable_complete_name(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    book = {
+        "metadata": {"title": "Institutions"},
+        "chapters": [
+            {
+                "chapter_id": f"ch-{index}",
+                "title": f"Chapter {index}",
+                "markdown": "The United States Institute of Peace published a report. " * 4,
+            }
+            for index in range(1, 4)
+        ],
+    }
+    (run_dir / "book.json").write_text(json.dumps(book), encoding="utf-8")
+
+    result = extract_glossary_candidates(
+        run_dir,
+        max_candidates=200,
+        profile=HUMANITIES_HISTORY,
+    )
+    sources = {item["source"] for item in result["candidates"]}
+
+    assert "United States Institute of Peace" in sources
+    assert "United States Institute" not in sources
+    assert "Institute of Peace" not in sources
+    assert result["policy"]["stats"]["overlap_suppressed"] >= 1
+
+
+def test_dynamic_quality_cutoff_does_not_treat_safety_ceiling_as_target() -> None:
+    ranked = [
+        {"source": f"Candidate {index}", "score": score}
+        for index, score in enumerate([17.0, 15.0, 13.0, 11.0] + [7.0] * 80)
+    ]
+
+    surfaced, cutoff, rejected = _apply_dynamic_quality_cutoff(
+        ranked,
+        minimum_score=3.5,
+    )
+
+    assert [item["score"] for item in surfaced] == [17.0, 15.0, 13.0, 11.0]
+    assert cutoff == 10.0
+    assert rejected == 80
 
 
 def test_profile_override_preserves_active_entries(tmp_path: Path) -> None:

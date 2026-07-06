@@ -20,7 +20,7 @@ from pdf_translator.glossary import (
     load_active_entries_for_translation,
     load_active_glossary_if_present,
 )
-from pdf_translator.guardrails import ingest_pdf_guarded
+from pdf_translator.guardrails import enforce_non_ocr_translatable_policy, ingest_pdf_guarded
 from pdf_translator.job_control import create_translation_job
 from pdf_translator.jobs import resolve_text_operation
 from pdf_translator.pdf_text_repair import (
@@ -28,6 +28,7 @@ from pdf_translator.pdf_text_repair import (
     repair_pdf_markdown,
     write_ingest_quality_report,
 )
+from pdf_translator.ingest_cleanup import clean_pdf_ingest_markdown
 from pdf_translator.models import (
     BookTranslationResult,
     PipelineArtifacts,
@@ -269,7 +270,8 @@ def _load_existing_run_context(
     extra_files: dict[str, str] = {}
     if artifacts.book_json_path.exists():
         book = json.loads(artifacts.book_json_path.read_text(encoding="utf-8"))
-        book = repair_book_dict(book)
+        if source_pdf.suffix.lower() == ".pdf":
+            book = repair_book_dict(book)
         if settings.canonical_chapters_path is not None:
             canonical = json.loads(
                 settings.canonical_chapters_path.expanduser().resolve().read_text(encoding="utf-8")
@@ -298,7 +300,11 @@ def _load_existing_run_context(
                     render_book_markdown(book, include_trace=True),
                     encoding="utf-8",
                 )
-            write_ingest_quality_report(run_dir, source_markdown=repaired_input)
+            write_ingest_quality_report(
+                run_dir,
+                source_markdown=repaired_input,
+                block_on_errors=source_pdf.suffix.lower() == ".epub",
+            )
     profile: dict[str, Any] = {}
     if artifacts.profile_json_path.exists():
         profile = json.loads(artifacts.profile_json_path.read_text(encoding="utf-8"))
@@ -332,7 +338,13 @@ def _prepare_intake_artifacts(settings: RunSettings) -> tuple[
     if settings.source_language is None:
         settings.source_language = normalized.detected_language
 
-    artifacts.normalized_markdown_path.write_text(normalized.raw_markdown, encoding="utf-8")
+    is_pdf_source = settings.source_pdf.suffix.lower() == ".pdf"
+    cleaned_raw_markdown = (
+        clean_pdf_ingest_markdown(normalized.raw_markdown)
+        if is_pdf_source
+        else normalized.raw_markdown
+    )
+    artifacts.normalized_markdown_path.write_text(cleaned_raw_markdown, encoding="utf-8")
     artifacts.normalized_json_path.write_text(
         json.dumps(normalized.structured, ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -343,12 +355,14 @@ def _prepare_intake_artifacts(settings: RunSettings) -> tuple[
         json.dumps(profile, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    artifacts.reconstructed_markdown_path.write_text(
-        repair_pdf_markdown(normalized.reconstructed_markdown),
-        encoding="utf-8",
+    reconstructed_markdown = (
+        repair_pdf_markdown(normalized.reconstructed_markdown)
+        if is_pdf_source
+        else normalized.reconstructed_markdown
     )
+    artifacts.reconstructed_markdown_path.write_text(reconstructed_markdown, encoding="utf-8")
 
-    translation_input_markdown = repair_pdf_markdown(normalized.reconstructed_markdown)
+    translation_input_markdown = reconstructed_markdown
     book: dict | None = None
     extra_files: dict[str, str] = {
         "profile_json": str(artifacts.profile_json_path),
@@ -360,7 +374,8 @@ def _prepare_intake_artifacts(settings: RunSettings) -> tuple[
             source_pdf=settings.source_pdf,
             images_dir=book_images_dir,
         )
-        book = repair_book_dict(book)
+        if is_pdf_source:
+            book = repair_book_dict(book)
         page_ledger_path = _write_page_ledger(output_dir, book)
         integrity_ledger_path = _write_integrity_ledger(output_dir, book)
         if render_translation_input_markdown(book).strip():
@@ -393,7 +408,11 @@ def _prepare_intake_artifacts(settings: RunSettings) -> tuple[
         translation_input_markdown,
         encoding="utf-8",
     )
-    write_ingest_quality_report(artifacts.output_dir, source_markdown=translation_input_markdown)
+    write_ingest_quality_report(
+        artifacts.output_dir,
+        source_markdown=translation_input_markdown,
+        block_on_errors=not is_pdf_source,
+    )
 
     return artifacts, normalized, preflight, profile, book, translation_input_markdown, extra_files
 
@@ -600,6 +619,7 @@ def run_translation_pipeline(
         }
         try:
             if book is not None:
+                enforce_non_ocr_translatable_policy(book)
                 translated = translate_book_chapters(
                     book=book,
                     settings=translation_settings,

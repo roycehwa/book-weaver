@@ -510,6 +510,12 @@ def detect_review_items(
         evidence: dict[str, Any] = {}
 
         source_text = str(source.get("source_text") or "").strip()
+        chapter_title = str(source.get("chapter_title") or "").strip()
+        resource_chapter = bool(source.get("resource_only")) or bool(
+            re.fullmatch(r"(?:maps?|地图)", chapter_title, re.IGNORECASE)
+        )
+        if resource_chapter:
+            continue
         if _is_non_prose_review_segment(source_text):
             continue
         if not bool(source.get("translate", True)) and text_operation == "translate":

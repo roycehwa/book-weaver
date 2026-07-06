@@ -17,6 +17,452 @@ from pdf_translator.translate import (
 )
 
 
+def test_prompt_glossary_appendix_is_removed_before_accepting_translation() -> None:
+    from pdf_translator.glossary_convergence import sanitize_translation_output
+
+    fixture_path = (
+        Path(__file__).parent
+        / "fixtures"
+        / "translation"
+        / "glossary_prompt_leak.json"
+    )
+    fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+
+    assert sanitize_translation_output(fixture["translated"]) == fixture["clean"]
+
+
+def test_chinese_prompt_glossary_appendix_is_removed() -> None:
+    from pdf_translator.glossary_convergence import sanitize_translation_output
+
+    translated = (
+        "这是正文译文。\n\n"
+        "强制术语表（当源术语出现时，使用确切的中文措辞）：\n"
+        "- Common Lordships => 共同领主辖地"
+    )
+
+    assert sanitize_translation_output(translated) == "这是正文译文。"
+
+
+def test_required_glossary_appendix_is_removed() -> None:
+    from pdf_translator.glossary_convergence import sanitize_translation_output
+
+    translated = (
+        "## 缩略语\n\n"
+        "正文译文。\n\n"
+        "必用术语表（原文术语出现时，须使用以下精确的中文表述）：\n"
+        "- 毛泽东 => 毛泽东\n"
+        "- 钢铁厂 => 钢铁厂"
+    )
+
+    assert sanitize_translation_output(translated) == "## 缩略语\n\n正文译文。"
+
+
+def test_translator_meta_response_is_rejected() -> None:
+    from pdf_translator.translate import _assert_translation_quality
+
+    chunk = TranslationChunk(index=0, markdown="# Front Matter")
+    polluted = (
+        "# 前言\n\n"
+        "This is a translation job. Please provide the actual Markdown content you want translated, "
+        "and I will translate it from English to Simplified Chinese following all the rules you've specified.\n\n"
+        "The text \"# Front Matter\" is just a heading placeholder."
+    )
+
+    with pytest.raises(ValueError, match="translator meta response"):
+        _assert_translation_quality(
+            chunk=chunk,
+            translated=polluted,
+            target_language="zh-CN",
+            translator_name="minimax",
+        )
+
+
+def test_translate_markdown_never_persists_prompt_glossary_appendix(
+    tmp_path: Path,
+) -> None:
+    class LeakingTranslator(BaseTranslator):
+        name = "leaking"
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            return (
+                "这家国有企业调整了采购政策。\n\n"
+                "MANDATORY GLOSSARY (when a source term appears, use the exact Chinese wording):\n"
+                "- state-owned enterprise => 国有企业"
+            )
+
+    result = translate_markdown(
+        chunks=[
+            TranslationChunk(
+                index=0,
+                markdown="The state-owned enterprise changed its procurement policy.",
+            )
+        ],
+        settings=RunSettings(
+            source_pdf=tmp_path / "source.pdf",
+            output_dir=tmp_path,
+            source_language="en",
+            target_language="zh-CN",
+            translator="mock",
+            max_chunk_chars=9000,
+            glossary_entries=[
+                {
+                    "source": "state-owned enterprise",
+                    "target": "国有企业",
+                    "status": "active",
+                }
+            ],
+        ),
+        translator=LeakingTranslator(),
+        cache_dir=tmp_path,
+    )
+
+    assert result.translated_markdown == "这家国有企业调整了采购政策。\n"
+    assert "MANDATORY GLOSSARY" not in next(tmp_path.glob("chunk-*.md")).read_text(
+        encoding="utf-8"
+    )
+
+
+def test_short_translation_cannot_bypass_mandatory_glossary_validation() -> None:
+    from pdf_translator.translate import _assert_translation_quality
+
+    chunk = TranslationChunk(
+        index=0,
+        markdown="The Swiss Confederation negotiated with its neighbours.",
+        glossary_entries=[
+            {
+                "source": "Swiss Confederation",
+                "target": "瑞士联邦",
+                "status": "active",
+            }
+        ],
+    )
+    fluent_but_drifting = "这个邦联与邻国进行了谈判。" * 20
+
+    with pytest.raises(ValueError, match="Swiss Confederation => 瑞士联邦"):
+        _assert_translation_quality(
+            chunk=chunk,
+            translated=fluent_but_drifting,
+            target_language="zh-CN",
+            translator_name="minimax",
+        )
+
+
+def test_known_glossary_drift_is_never_cached_as_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class AlwaysDriftingTranslator(BaseTranslator):
+        name = "minimax"
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            return "这个邦联与邻国进行了长期而复杂的谈判。" * 20
+
+    settings = RunSettings(
+        source_pdf=tmp_path / "source.pdf",
+        output_dir=tmp_path,
+        source_language="en",
+        target_language="zh-CN",
+        translator="minimax",
+        max_chunk_chars=9000,
+        glossary_entries=[
+            {
+                "source": "Swiss Confederation",
+                "target": "瑞士联邦",
+                "status": "active",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        "pdf_translator.translate._resolve_fallback_translator",
+        lambda **_kwargs: None,
+    )
+
+    with pytest.raises(ValueError, match="missing mandatory glossary terms"):
+        translate_markdown(
+            chunks=[
+                TranslationChunk(
+                    index=0,
+                    markdown="The Swiss Confederation negotiated with its neighbours.",
+                )
+            ],
+            settings=settings,
+            translator=AlwaysDriftingTranslator(),
+            cache_dir=tmp_path / "cache",
+            retry_count=1,
+        )
+
+    assert list((tmp_path / "cache").glob("chunk-*.md")) == []
+
+
+def test_legacy_cache_with_glossary_drift_uses_local_repair(
+    tmp_path: Path,
+) -> None:
+    from pdf_translator.translate import (
+        _chunk_source_fingerprint,
+        _translate_chunk_resumable,
+    )
+
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    legacy_path = cache_dir / "chunk-000042-legacy.md"
+    legacy_path.write_text(
+        "这个邦联与邻国进行了谈判。\n",
+        encoding="utf-8",
+    )
+    legacy_path.with_suffix(".source.json").write_text(
+        json.dumps(
+            {
+                "source_fingerprint": _chunk_source_fingerprint(
+                    "The Swiss Confederation negotiated with its neighbours."
+                )
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class LocalRepairTranslator(BaseTranslator):
+        name = "minimax"
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            assert chunk.prompt_instruction is not None
+            assert "CURRENT TRANSLATION TO REVISE" in chunk.prompt_instruction
+            return "瑞士联邦与邻国进行了谈判。"
+
+    translated = _translate_chunk_resumable(
+        chunk=TranslationChunk(
+            index=0,
+            markdown="The Swiss Confederation negotiated with its neighbours.",
+            glossary_entries=[
+                {
+                    "source": "Swiss Confederation",
+                    "target": "瑞士联邦",
+                    "status": "active",
+                }
+            ],
+        ),
+        source_language="en",
+        target_language="zh-CN",
+        translator=LocalRepairTranslator(),
+        cache_dir=cache_dir,
+        retry_count=1,
+    )
+
+    assert translated == "瑞士联邦与邻国进行了谈判。"
+    assert any(
+        path.name != "chunk-000042-legacy.md"
+        and path.read_text(encoding="utf-8").strip() == translated
+        for path in cache_dir.glob("chunk-000000-*.md")
+    )
+
+
+def test_legacy_cache_is_ignored_when_source_fingerprint_differs(
+    tmp_path: Path,
+) -> None:
+    from pdf_translator.translate import _chunk_source_fingerprint, _translate_chunk_resumable
+
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    legacy_path = cache_dir / "chunk-000000-legacy.md"
+    legacy_path.write_text("完全无关的旧译文。\n", encoding="utf-8")
+    legacy_path.with_suffix(".source.json").write_text(
+        json.dumps(
+            {"source_fingerprint": _chunk_source_fingerprint("Different old source.")}
+        ),
+        encoding="utf-8",
+    )
+
+    class FreshTranslator(BaseTranslator):
+        name = "minimax"
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            assert chunk.prompt_instruction is None
+            return "当前源文本的正确译文。"
+
+    translated = _translate_chunk_resumable(
+        chunk=TranslationChunk(index=0, markdown="Current source text."),
+        source_language="en",
+        target_language="zh-CN",
+        translator=FreshTranslator(),
+        cache_dir=cache_dir,
+        retry_count=1,
+    )
+
+    assert translated == "当前源文本的正确译文。"
+
+
+def test_first_translation_glossary_drift_is_repaired_immediately(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pdf_translator.translate import _translate_chunk_resumable
+
+    calls: list[TranslationChunk] = []
+
+    class RepairingTranslator(BaseTranslator):
+        name = "minimax"
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            calls.append(chunk)
+            if chunk.prompt_instruction:
+                return "瑞士联邦与邻国进行了谈判。"
+            return "这个邦联与邻国进行了谈判。"
+
+    monkeypatch.setattr(
+        "pdf_translator.translate._resolve_fallback_translator",
+        lambda **_kwargs: None,
+    )
+    translated = _translate_chunk_resumable(
+        chunk=TranslationChunk(
+            index=0,
+            markdown="The Swiss Confederation negotiated with its neighbours.",
+            glossary_entries=[
+                {
+                    "source": "Swiss Confederation",
+                    "target": "瑞士联邦",
+                    "status": "active",
+                }
+            ],
+        ),
+        source_language="en",
+        target_language="zh-CN",
+        translator=RepairingTranslator(),
+        cache_dir=tmp_path,
+        retry_count=6,
+    )
+
+    assert translated == "瑞士联邦与邻国进行了谈判。"
+    assert len(calls) == 2
+    assert calls[1].prompt_instruction is not None
+
+
+def test_glossary_conjunction_drift_is_repaired_without_another_model_call(
+    tmp_path: Path,
+) -> None:
+    from pdf_translator.translate import _translate_chunk_resumable
+
+    class ConjunctionDriftTranslator(BaseTranslator):
+        name = "minimax"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            self.calls += 1
+            return "原国民党和日本工程师参与了重建。"
+
+    translator = ConjunctionDriftTranslator()
+    translated = _translate_chunk_resumable(
+        chunk=TranslationChunk(
+            index=0,
+            markdown=(
+                "Former Nationalist and Japanese engineers participated "
+                "in the reconstruction."
+            ),
+            glossary_entries=[
+                {
+                    "source": "Nationalist and Japanese",
+                    "target": "国民党与日本",
+                    "status": "active",
+                }
+            ],
+        ),
+        source_language="en",
+        target_language="zh-CN",
+        translator=translator,
+        cache_dir=tmp_path,
+        retry_count=6,
+    )
+
+    assert translated == "原国民党与日本工程师参与了重建。"
+    assert translator.calls == 1
+
+
+def test_glossary_repair_rewrites_only_affected_paragraph(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pdf_translator.translate import _translate_chunk_resumable
+
+    class ParagraphRepairTranslator(BaseTranslator):
+        name = "minimax"
+
+        def __init__(self) -> None:
+            self.calls: list[TranslationChunk] = []
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            self.calls.append(chunk)
+            if chunk.prompt_instruction:
+                assert chunk.markdown == "World War II reshaped industrial policy."
+                return "第二次世界大战重塑了工业政策。"
+            return "第一段已经正确翻译。\n\n二战重塑了工业政策。"
+
+    translator = ParagraphRepairTranslator()
+    monkeypatch.setattr(
+        "pdf_translator.translate._resolve_fallback_translator",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr("time.sleep", lambda _seconds: None)
+    translated = _translate_chunk_resumable(
+        chunk=TranslationChunk(
+            index=0,
+            markdown=(
+                "The first paragraph is already correct.\n\n"
+                "World War II reshaped industrial policy."
+            ),
+            glossary_entries=[
+                {
+                    "source": "World War II",
+                    "target": "第二次世界大战",
+                    "status": "active",
+                }
+            ],
+        ),
+        source_language="en",
+        target_language="zh-CN",
+        translator=translator,
+        cache_dir=tmp_path,
+        retry_count=6,
+    )
+
+    assert translated == "第一段已经正确翻译。\n\n第二次世界大战重塑了工业政策。"
+    assert len(translator.calls) == 2
+
+
 def test_semantic_footnote_translates_only_explanatory_spans() -> None:
     class SemanticTranslator(BaseTranslator):
         name = "semantic"
@@ -236,6 +682,126 @@ def test_semantic_batch_boundary_loss_falls_back_to_individual_spans(
     assert result.chunk_count == 3
 
 
+def test_large_semantic_boundary_loss_retries_in_small_batches(
+    tmp_path: Path,
+) -> None:
+    class SizeSensitiveTranslator(BaseTranslator):
+        name = "size-sensitive"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            self.calls += 1
+            translated = "<!--__SEMANTIC_SPAN_BOUNDARY__-->".join(
+                f"这是第 {index} 条详细的中文说明，用于解释正文中的历史背景与论证。"
+                for index, _part in enumerate(
+                    chunk.markdown.split("<!--__SEMANTIC_SPAN_BOUNDARY__-->")
+                )
+            )
+            if translated.count("<!--__SEMANTIC_SPAN_BOUNDARY__-->") >= 12:
+                return translated.replace(
+                    "<!--__SEMANTIC_SPAN_BOUNDARY__-->",
+                    "",
+                    1,
+                )
+            return translated
+
+    book = {
+        "chapters": [],
+        "semantic_content": {
+            "footnotes": [
+                {
+                    "spans": [
+                        {
+                            "span_id": f"p{index}",
+                            "kind": "prose",
+                            "source_text": f"Explanation {index}.",
+                        }
+                    ]
+                }
+                for index in range(25)
+            ]
+        },
+    }
+    settings = RunSettings(
+        source_pdf=tmp_path / "source.pdf",
+        output_dir=tmp_path,
+        target_language="zh-CN",
+        source_language="en",
+        translator="size-sensitive",
+        max_chunk_chars=9000,
+    )
+    translator = SizeSensitiveTranslator()
+
+    result = translate_book_chapters(book=book, settings=settings, translator=translator)
+
+    assert [
+        note["spans"][0]["translated_text"]
+        for note in result.semantic_content["footnotes"]
+    ] == [
+        f"这是第 {index % 12} 条详细的中文说明，用于解释正文中的历史背景与论证。"
+        for index in range(25)
+    ]
+    assert translator.calls == 4
+    assert result.chunk_count == 4
+
+
+def test_sensitive_split_breaks_long_single_line_at_sentence_boundaries() -> None:
+    from pdf_translator.translate import _split_sensitive_source
+
+    source = " ".join(
+        f"Sentence {index} describes an historical policy in sufficient detail."
+        for index in range(30)
+    )
+
+    parts = _split_sensitive_source(source, max_part_chars=220)
+
+    assert len(parts) > 1
+    assert max(map(len, parts)) <= 220
+    assert " ".join(parts) == source
+
+
+def test_sensitive_split_preserves_only_refused_minimal_part() -> None:
+    from pdf_translator.translate import _translate_sensitive_chunk_parts
+
+    class SelectiveSensitiveTranslator(BaseTranslator):
+        name = "minimax"
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            if "Deng Xiaoping" in chunk.markdown:
+                raise ValueError("HTTP 500: input new_sensitive (1026)")
+            return "其余内容已翻译。"
+
+    source = (
+        "The economic reforms changed industrial policy. "
+        "Private firms expanded rapidly.\n\n"
+        "Deng Xiaoping consolidated power in 1978.\n\n"
+        "Regional factories then faced new competition."
+    )
+
+    translated = _translate_sensitive_chunk_parts(
+        chunk=TranslationChunk(index=5, markdown=source),
+        source_language="en",
+        target_language="zh-CN",
+        translator=SelectiveSensitiveTranslator(),
+    )
+
+    assert "其余内容已翻译。" in translated
+    assert "Deng Xiaoping consolidated power in 1978." in translated
+    assert "Private firms expanded rapidly." not in translated
+
+
 def test_mock_translator_does_not_add_visible_debug_markers() -> None:
     result = translate_markdown(
         chunks=[TranslationChunk(index=16, markdown="Body text.")],
@@ -252,6 +818,49 @@ def test_mock_translator_does_not_add_visible_debug_markers() -> None:
 
     assert result.translated_markdown == "Body text.\n"
     assert "mock translation chunk" not in result.translated_markdown
+
+
+def test_chapter_markdown_rewrites_managed_absolute_image_paths() -> None:
+    from pdf_translator.translate import _chapter_markdown_for_translation
+
+    markdown = _chapter_markdown_for_translation(
+        {
+            "index": 1,
+            "title": "Introduction",
+            "markdown": (
+                "Body.\n\n"
+                "![Figure](/Users/example/run/book-images/figure-p0001-01.png)\n\n"
+                "[External](https://example.com/image.png)"
+            ),
+        }
+    )
+
+    assert "![Figure](book-images/figure-p0001-01.png)" in markdown
+    assert "/Users/example" not in markdown
+    assert "[External](https://example.com/image.png)" in markdown
+
+
+def test_chapter_markdown_keeps_original_page_for_preserved_chapters() -> None:
+    from pdf_translator.translate import _chapter_markdown_for_translation
+
+    preserved = _chapter_markdown_for_translation(
+        {
+            "index": 3,
+            "title": "Notes",
+            "translate": False,
+            "preserve_original": True,
+            "markdown": "![Original page 3](original-page-p0003.png)",
+        }
+    )
+
+    assert "![Original page 3](original-page-p0003.png)" in preserved
+
+
+def test_original_page_fallback_is_not_preserved_media_block() -> None:
+    from pdf_translator.translate import _is_preserved_media_block
+
+    assert _is_preserved_media_block("![Original page 6](original-page-p0006.png)") is False
+    assert _is_preserved_media_block("![Figure 1](book-images/figure-p0001-01.png)") is True
 
 
 def test_permanent_token_plan_limit_is_not_retried(tmp_path: Path) -> None:
@@ -318,6 +927,27 @@ def test_translation_prompt_makes_glossary_mandatory() -> None:
 
     assert "MANDATORY GLOSSARY" in prompt
     assert "Soviet Union => 苏联" in prompt
+
+
+def test_translation_prompt_places_controls_before_delimited_source() -> None:
+    from pdf_translator.translate import build_translation_prompt
+
+    source = "The Soviet Union supplied technical assistance."
+    prompt = build_translation_prompt(
+        source,
+        source_language="en",
+        target_language="zh-CN",
+        glossary_entries=[
+            {
+                "source": "Soviet Union",
+                "target": "苏联",
+                "status": "active",
+            }
+        ],
+    )
+
+    assert prompt.index("MANDATORY GLOSSARY") < prompt.index("<SOURCE_MARKDOWN>")
+    assert prompt.endswith(f"<SOURCE_MARKDOWN>\n{source}\n</SOURCE_MARKDOWN>")
 
 
 class FailingTranslator(BaseTranslator):
@@ -1252,15 +1882,16 @@ def test_minimax_translator_uses_anthropic_messages_api(monkeypatch: pytest.Monk
     assert body["model"] == "MiniMax-M2.7-highspeed"
     assert body["max_tokens"] == 2048
     assert captured["headers"].get("anthropic-version") == "2023-06-01"
+    from pdf_translator.translate import build_translation_prompt
+
     assert body["messages"] == [
         {
             "role": "user",
-            "content": (
-                "Source language: en\nTarget language: zh-CN\nMarkdown chunk index: 3\n\n"
-                "Translate explanatory footnote prose into the target language. "
-                "Preserve bibliographic titles, personal names, archival identifiers, and quoted "
-                "source titles in their original language when translation would reduce citation "
-                "accuracy.\n\n# Title\n\nBody."
+            "content": build_translation_prompt(
+                "# Title\n\nBody.",
+                source_language="en",
+                target_language="zh-CN",
+                chunk_index=3,
             ),
         }
     ]
@@ -1379,6 +2010,172 @@ def test_translate_markdown_falls_back_to_deepl_on_sensitive(
     )
 
     assert "备用 DeepL" in result.translated_markdown
+
+
+def test_deepl_sensitive_fallback_converges_glossary_with_primary_repair(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SensitiveThenRepairingMiniMax(BaseTranslator):
+        name = "minimax"
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            if chunk.prompt_instruction:
+                return "鞍山市的工业政策发生了变化。"
+            raise ValueError("MiniMax translation failed: input new_sensitive (1026)")
+
+    class DriftingDeepL(BaseTranslator):
+        name = "deepl"
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            return "安山市的工业政策发生了变化。"
+
+    monkeypatch.setenv("TRANSLATION_FALLBACK", "deepl")
+    monkeypatch.setenv("DEEPL_AUTH_KEY", "test-key")
+    monkeypatch.setattr(
+        "pdf_translator.translate.build_translator",
+        lambda name: DriftingDeepL()
+        if name.strip().lower() == "deepl"
+        else SensitiveThenRepairingMiniMax(),
+    )
+    monkeypatch.setattr("time.sleep", lambda _seconds: None)
+
+    result = translate_markdown(
+        chunks=[
+            TranslationChunk(
+                index=0,
+                markdown="Anshan City changed its industrial policy.",
+            )
+        ],
+        settings=RunSettings(
+            source_pdf=tmp_path / "source.pdf",
+            output_dir=tmp_path,
+            target_language="zh-CN",
+            source_language="en",
+            translator="minimax",
+            max_chunk_chars=9000,
+            glossary_entries=[
+                {
+                    "source": "Anshan City",
+                    "target": "鞍山市",
+                    "status": "active",
+                }
+            ],
+        ),
+        translator=SensitiveThenRepairingMiniMax(),
+        cache_dir=tmp_path / "cache",
+        retry_count=2,
+    )
+
+    assert result.translated_markdown == "鞍山市的工业政策发生了变化。\n"
+
+
+def test_deepl_sensitive_fallback_preserves_complete_translation_for_review(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SensitiveMiniMax(BaseTranslator):
+        name = "minimax"
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            raise ValueError("MiniMax translation failed: output new_sensitive (1027)")
+
+    class CompleteDriftingDeepL(BaseTranslator):
+        name = "deepl"
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            if chunk.markdown == "Steel Works":
+                return "钢铁企业"
+            return "这座钢铁公司保存了完整的历史记录。"
+
+    monkeypatch.setenv("TRANSLATION_FALLBACK", "deepl")
+    monkeypatch.setenv("DEEPL_AUTH_KEY", "test-key")
+    monkeypatch.setattr(
+        "pdf_translator.translate.build_translator",
+        lambda _name: CompleteDriftingDeepL(),
+    )
+    monkeypatch.setattr("time.sleep", lambda _seconds: None)
+
+    result = translate_markdown(
+        chunks=[
+            TranslationChunk(
+                index=0,
+                markdown="The Steel Works preserved its complete historical record.",
+            )
+        ],
+        settings=RunSettings(
+            source_pdf=tmp_path / "source.pdf",
+            output_dir=tmp_path,
+            target_language="zh-CN",
+            source_language="en",
+            translator="minimax",
+            max_chunk_chars=9000,
+            glossary_entries=[
+                {
+                    "source": "Steel Works",
+                    "target": "钢铁厂",
+                    "status": "active",
+                }
+            ],
+        ),
+        translator=SensitiveMiniMax(),
+        cache_dir=tmp_path / "cache",
+        retry_count=2,
+    )
+
+    assert result.translated_markdown == "这座钢铁公司保存了完整的历史记录。\n"
+    metadata_path = next((tmp_path / "cache").glob("chunk-*.source.json"))
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert metadata["allow_glossary_drift"] is True
+
+    cached_result = translate_markdown(
+        chunks=[
+            TranslationChunk(
+                index=0,
+                markdown="The Steel Works preserved its complete historical record.",
+            )
+        ],
+        settings=RunSettings(
+            source_pdf=tmp_path / "source.pdf",
+            output_dir=tmp_path,
+            target_language="zh-CN",
+            source_language="en",
+            translator="minimax",
+            max_chunk_chars=9000,
+            glossary_entries=[
+                {
+                    "source": "Steel Works",
+                    "target": "钢铁厂",
+                    "status": "active",
+                }
+            ],
+        ),
+        translator=SensitiveMiniMax(),
+        cache_dir=tmp_path / "cache",
+        retry_count=2,
+    )
+
+    assert cached_result.translated_markdown == result.translated_markdown
 
 
 def test_translate_markdown_skips_deepl_for_non_sensitive_failure(

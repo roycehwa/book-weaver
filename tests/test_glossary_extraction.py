@@ -4,7 +4,12 @@ import json
 from pathlib import Path
 
 from pdf_translator.glossary import extract_glossary_candidates
-from pdf_translator.glossary_extraction import canonical_source_key, canonical_source_term
+from pdf_translator.glossary_extraction import (
+    candidate_integrity_rejection,
+    canonical_source_key,
+    canonical_source_term,
+    extract_connector_phrases,
+)
 
 
 def test_extract_filters_book_title_and_surfaces_policy_terms(tmp_path: Path) -> None:
@@ -152,6 +157,38 @@ def test_extract_rejects_generic_century_and_geography(tmp_path: Path) -> None:
     assert "Far East" not in sources
     assert "Islamic State" in sources
     assert len(sources) < 10
+
+
+def test_canonical_source_term_does_not_split_words_starting_with_roman_letters() -> None:
+    assert canonical_source_term("Iran-Iraq War") == "Iran-Iraq War"
+    assert canonical_source_term("Iraqi Women") == "Iraqi Women"
+    assert canonical_source_term("Institute of Peace") == "Institute of Peace"
+    assert canonical_source_term("Vice Chair") == "Vice Chair"
+
+
+def test_connector_extraction_keeps_complete_title_cased_tail() -> None:
+    phrases = extract_connector_phrases(
+        "The Federation of Iraqi Women met the United States Institute of Peace. "
+        "They discussed the Mother of All Battles."
+    )
+
+    assert "Federation of Iraqi Women" in phrases
+    assert "United States Institute of Peace" in phrases
+    assert "Mother of All Battles" in phrases
+    assert "Federation of Iraqi" not in phrases
+    assert "Institute of Peace" not in phrases
+
+
+def test_candidate_integrity_rejects_clause_leads_and_incomplete_modifiers() -> None:
+    assert candidate_integrity_rejection("During the Gulf War") == "clause_fragment"
+    assert candidate_integrity_rejection("Making of Modern") == "clause_fragment"
+    assert candidate_integrity_rejection("District Advisory") == "incomplete_trailing_modifier"
+    assert candidate_integrity_rejection("Despite War") == "clause_fragment"
+    assert candidate_integrity_rejection("Journal of Middle East Studies") == "bibliographic_label"
+    assert candidate_integrity_rejection("Glossary of Key Arabic Terms") == "bibliographic_label"
+    assert candidate_integrity_rejection("Iraq in Wartime*") == "markup_contamination"
+    assert candidate_integrity_rejection("Iran-Iraq War") is None
+    assert candidate_integrity_rejection("United States Institute of Peace") is None
 
 
 def test_extract_filters_fragment_lead_phrases(tmp_path: Path) -> None:

@@ -24,6 +24,7 @@ from pdf_translator.semantic_content import (
     stable_semantic_id,
 )
 from pdf_translator.ocr_quality import assess_ocr_block
+from pdf_translator.guardrails import assert_translatable_pages_have_no_original_fallback
 
 
 TOP_TITLE_BAND = 450.0
@@ -760,6 +761,7 @@ def _page_content_items(
         )
         for block in blocks
         if _format_book_block(block)
+        and not _is_semantic_footnote_block(block)
         and not (block.label == "caption" and _normalize_text(block.text) in suppressed_caption_texts)
     ]
     items.extend(figures)
@@ -814,7 +816,7 @@ def _semantic_footnotes_from_pages(
     seen: set[str] = set()
     for page_no, blocks in sorted(ordered_pages.items()):
         for block in blocks:
-            if block.label not in {"footnote", "page_footer"}:
+            if not _is_semantic_footnote_block(block):
                 continue
             if block.label == "page_footer" and not _book_page_footer_is_note_like(block.text):
                 continue
@@ -832,6 +834,22 @@ def _semantic_footnotes_from_pages(
                 seen.add(str(note["footnote_id"]))
                 notes.append(note)
     return notes
+
+
+def _is_semantic_footnote_block(block: LayoutBlock) -> bool:
+    if block.label == "footnote":
+        return True
+    if block.label == "page_footer":
+        return _book_page_footer_is_note_like(block.text)
+    return (
+        block.label in {"text", "code"}
+        and (
+            block.top <= 300 and block.bottom <= 220
+            if block.bottom
+            else block.top <= 220
+        )
+        and _text_block_footnote_heavy(block.text)
+    )
 
 
 _SUPERSCRIPT_DIGITS = str.maketrans("0123456789", "⁰¹²³⁴⁵⁶⁷⁸⁹")
@@ -1339,16 +1357,25 @@ def apply_canonical_chapter_plan(book: dict[str, Any], canonical: dict[str, Any]
                 )
             )
         ]
+        chapter_title = str(canonical_chapter.get("title") or f"Chapter {len(chapters) + 1}")
+        assert_translatable_pages_have_no_original_fallback(
+            chapter_title=chapter_title,
+            pages=pages,
+            page_markdown=page_markdown,
+        )
+        markdown = "\n\n".join(page_markdown.get(page, "") for page in pages).strip()
+        trace_markdown = "\n\n".join(
+            f"[[page: {page}]]\n\n{page_markdown.get(page, '')}"
+            for page in pages
+        ).strip()
         chapters.append(
             {
-                "title": str(canonical_chapter.get("title") or f"Chapter {len(chapters) + 1}"),
+                "title": chapter_title,
                 "page_start": pages[0],
                 "page_end": pages[-1],
                 "source_pages": pages,
-                "markdown": "\n\n".join(page_markdown.get(page, "") for page in pages).strip(),
-                "trace_markdown": "\n\n".join(
-                    f"[[page: {page}]]\n\n{page_markdown.get(page, '')}" for page in pages
-                ).strip(),
+                "markdown": markdown,
+                "trace_markdown": trace_markdown,
                 "translate": True,
                 "preserve_original": False,
                 "toc": True,

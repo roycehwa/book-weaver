@@ -89,6 +89,44 @@ def test_apply_canonical_chapter_plan_preserves_asset_only_pages() -> None:
     assert all(3 not in chapter["source_pages"] for chapter in result["chapters"])
 
 
+def test_canonical_translatable_chapters_reject_original_page_fallback() -> None:
+    import pytest
+
+    from pdf_translator.guardrails import InputGateError
+
+    book = {
+        "chapters": [
+            {
+                "title": "Automatic Body",
+                "source_pages": [31, 32],
+                "trace_markdown": (
+                    "[[page: 31]]\n\n![Original page 31](/tmp/original-page-p0031.png)\n\n"
+                    "[[page: 32]]\n\nExtracted body text."
+                ),
+                "translate": True,
+                "preserve_original": False,
+            }
+        ],
+        "pages": [
+            {"page_no": 31, "has_content": True},
+            {"page_no": 32, "has_content": True},
+        ],
+    }
+    canonical = {
+        "chapters": [
+            {
+                "title": "Confirmed Body",
+                "source_pages": [31, 32],
+                "page_start": 31,
+                "page_end": 32,
+            }
+        ]
+    }
+
+    with pytest.raises(InputGateError, match="page-render fallback"):
+        apply_canonical_chapter_plan(book, canonical)
+
+
 def test_canonical_plan_preserves_unplanned_resource_pages() -> None:
     book = {
         "chapters": [
@@ -96,7 +134,7 @@ def test_canonical_plan_preserves_unplanned_resource_pages() -> None:
                 "title": "Index",
                 "source_pages": [8, 9],
                 "trace_markdown": (
-                    "[[page: 8]]\n\n![Original page 8](/tmp/p8.png)\n\n"
+                    "[[page: 8]]\n\nIndex heading and entries.\n\n"
                     "[[page: 9]]\n\n![Original page 9](/tmp/p9.png)"
                 ),
                 "preserve_original": True,
@@ -566,7 +604,7 @@ def test_book_rebuild_preserves_toc_outside_reader_navigation_and_splits_chapter
     assert "[[page: 2]]" in result["chapters"][1]["trace_markdown"]
 
 
-def test_book_rebuild_places_docling_footnotes_after_page_body() -> None:
+def test_book_rebuild_detaches_docling_footnotes_from_body_flow() -> None:
     structured = {
         "body": {
             "children": [{"$ref": f"#/texts/{index}"} for index in range(4)]
@@ -585,9 +623,8 @@ def test_book_rebuild_places_docling_footnotes_after_page_body() -> None:
     markdown = result["chapters"][0]["markdown"]
 
     assert markdown.index("Left column body.") < markdown.index("Right column body.")
-    assert markdown.index("Right column body.") < markdown.index("1 Left column note.")
-    assert "---" in markdown
-    assert "> 1 Left column note." in markdown
+    assert "1 Left column note." not in markdown
+    assert "> 1 Left column note." not in markdown
     semantic = result["semantic_content"]
     assert semantic["schema"] == "semantic_content_v1"
     assert len(semantic["footnotes"]) == 1
@@ -894,8 +931,7 @@ def test_book_rebuild_filters_running_page_headers() -> None:
     assert "running header" in result["full_markdown"]
 
 
-def test_book_rebuild_retains_note_like_page_footer_after_body(monkeypatch) -> None:
-    """Footnote bodies tagged as page_footer should follow main text on the same page."""
+def test_book_rebuild_detaches_note_like_page_footer_from_body(monkeypatch) -> None:
     structured = {
         "body": {
             "children": [{"$ref": f"#/texts/{index}"} for index in range(4)]
@@ -920,12 +956,12 @@ def test_book_rebuild_retains_note_like_page_footer_after_body(monkeypatch) -> N
     md = result["chapters"][0]["markdown"]
 
     assert "Main body paragraph" in md
-    assert "First footnote line" in md
-    assert "Second footnote line" in md
-    assert md.index("Main body paragraph") < md.index("First footnote line")
-    assert "\n\n---\n\n" in md
-    assert "> 1 First footnote line" in md
+    assert "First footnote line" not in md
+    assert "Second footnote line" not in md
     assert "12" not in md
+    notes = result["semantic_content"]["footnotes"]
+    assert [note["marker"] for note in notes] == ["1", "2"]
+    assert notes[0]["source_text"].startswith("First footnote line")
 
 
 def test_book_rebuild_quarantines_ocr_garbage_before_noise_filtering() -> None:
@@ -1004,8 +1040,7 @@ def test_unreadable_control_blob_is_auto_confirmed_without_repetition() -> None:
     assert item["raw_text"] == artifact
 
 
-def test_book_rebuild_promotes_inline_footnote_text_to_footer_band(monkeypatch) -> None:
-    """Footnotes emitted as regular text blocks get a separator before the note block."""
+def test_book_rebuild_detaches_mislabelled_bottom_footnotes(monkeypatch) -> None:
     structured = {
         "body": {"children": [{"$ref": "#/texts/0"}, {"$ref": "#/texts/1"}, {"$ref": "#/texts/2"}]},
         "texts": [
@@ -1032,10 +1067,11 @@ def test_book_rebuild_promotes_inline_footnote_text_to_footer_band(monkeypatch) 
     result = build_book_reconstruction(structured)
     md = result["chapters"][0]["markdown"]
     assert "Main body paragraph" in md
-    assert "First footnote line" in md
-    assert md.index("Main body paragraph") < md.index("---")
-    assert md.index("---") < md.index("First footnote line")
-    assert "> 1 First footnote line" in md
+    assert "First footnote line" not in md
+    assert [note["marker"] for note in result["semantic_content"]["footnotes"]] == [
+        "1",
+        "2",
+    ]
     assert "footnote_line_ratio" in result["metadata"]
     assert 0.0 <= result["metadata"]["footnote_line_ratio"] <= 1.0
     assert result["metadata"]["footnote_load"] in ("typical", "footnote_heavy")
