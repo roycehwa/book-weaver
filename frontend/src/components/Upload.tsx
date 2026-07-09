@@ -1,6 +1,6 @@
-import { useCallback, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
-import { jobsApi, type CreateJobOptions, type DuplicateBookCheckResponse, type DuplicateBookMatch } from '../api'
+import { useCallback, useEffect, useState } from 'react'
+import { useNavigate, Link } from 'react-router-dom'
+import { jobsApi, workspaceApi, type CreateJobOptions, type DuplicateBookCheckResponse, type DuplicateBookMatch, type WorkspaceSourceBook } from '../api'
 
 const duplicateReasonLabels: Record<DuplicateBookMatch['reason'], string> = {
   same_file: '同一源文件',
@@ -120,17 +120,11 @@ const Upload = () => {
   return (
     <div className="mx-auto max-w-3xl">
       <div className="mb-6">
-        <h1 className="text-2xl font-bold text-slate-900">上传书籍并进入工作台</h1>
-        <p className="mt-2 text-sm text-slate-600">
-          先选择处理方式，再上传 PDF 或 EPUB。译本路径会走术语定稿、翻译、章节确认与人工审阅。
-        </p>
+        <h1 className="text-2xl font-bold text-slate-900">书籍处理</h1>
       </div>
 
       <div className="mb-6 rounded-xl border border-slate-200 bg-white p-4">
-        <div className="text-sm font-semibold text-slate-900">处理方式（必选）</div>
-        <p className="mt-1 text-xs text-slate-500">
-          这是上传前最重要的选项。选错会导致只解析原文、不生成中文译本。
-        </p>
+        <div className="text-sm font-semibold text-slate-900">处理方式</div>
         <div className="mt-3 grid gap-3 sm:grid-cols-2">
           <label
             className={`cursor-pointer rounded-xl border-2 p-4 transition-colors ${
@@ -148,9 +142,7 @@ const Upload = () => {
               className="sr-only"
             />
             <div className="font-medium text-slate-900">翻译并进入审阅</div>
-            <p className="mt-1 text-xs leading-5 text-slate-600">
-              生成中文译本，使用 MiniMax 翻译，并进入术语定稿与审阅流程。<strong>推荐用于英文书。</strong>
-            </p>
+            <div className="mt-1 text-xs leading-5 text-slate-600">生成中文译本，走术语定稿与审阅。</div>
           </label>
           <label
             className={`cursor-pointer rounded-xl border-2 p-4 transition-colors ${
@@ -378,6 +370,95 @@ const Upload = () => {
           </button>
         )}
       </div>
+      <BookListSection />
+    </div>
+  )
+}
+
+function BookListSection() {
+  const [books, setBooks] = useState<WorkspaceSourceBook[]>([])
+  const [loading, setLoading] = useState(true)
+  const [removingJobId, setRemovingJobId] = useState<string | null>(null)
+  const [removeError, setRemoveError] = useState<string | null>(null)
+  const loadBooks = useCallback(async () => {
+    const data = await workspaceApi.listBooks()
+    setBooks(data.source_books || [])
+  }, [])
+  useEffect(() => {
+    let active = true
+    const load = async () => {
+      try {
+        const data = await workspaceApi.listBooks()
+        if (active) setBooks(data.source_books || [])
+      } catch {
+        if (active) setBooks([])
+      } finally {
+        if (active) setLoading(false)
+      }
+    }
+    load()
+    return () => { active = false }
+  }, [])
+  if (loading) return null
+  if (!books.length) return null
+  const removeJob = async (jobId: string, title: string) => {
+    if (!window.confirm(`删除「${title || jobId}」的处理记录？此操作会移除本地任务目录。`)) return
+    setRemovingJobId(jobId)
+    setRemoveError(null)
+    try {
+      await jobsApi.delete(jobId)
+      await loadBooks()
+    } catch (deleteError) {
+      setRemoveError(deleteError instanceof Error ? deleteError.message : '删除处理记录失败')
+    } finally {
+      setRemovingJobId(null)
+    }
+  }
+  return (
+    <div className="mt-10">
+      <div className="mb-3 flex items-baseline justify-between">
+        <h2 className="text-lg font-semibold text-slate-900">已上传的书籍</h2>
+        <span className="text-xs text-slate-400">{books.length} 本</span>
+      </div>
+      {removeError && (
+        <div className="mb-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+          {removeError}
+        </div>
+      )}
+      <ul className="divide-y divide-slate-100 rounded-xl border border-slate-200 bg-white">
+        {books.map((book) => {
+          const jobId = book.task_history?.[0]?.job_id
+          if (!jobId) return null
+          return (
+          <li key={jobId} className="px-5 py-3">
+            <div className="flex items-center justify-between gap-3">
+              <div className="min-w-0 flex-1">
+                <Link to={`/jobs/${jobId}`} className="block truncate text-sm font-medium text-slate-900 hover:text-primary-700">
+                  {book.title || book.source_id}
+                </Link>
+                <div className="mt-0.5 text-xs text-slate-500">
+                  {book.text_versions.length} 个文本版本 · 章节{book.chapter_structure.label}
+                </div>
+              </div>
+              <Link
+                to={`/jobs/${jobId}`}
+                className="shrink-0 text-xs text-primary-700 hover:underline"
+              >
+                打开
+              </Link>
+              <button
+                type="button"
+                onClick={() => void removeJob(jobId, book.title || book.source_id)}
+                disabled={removingJobId === jobId}
+                className="shrink-0 rounded border border-red-200 px-2 py-1 text-xs text-red-700 hover:bg-red-50 disabled:opacity-50"
+              >
+                {removingJobId === jobId ? '删除中…' : '删除'}
+              </button>
+            </div>
+          </li>
+          )
+        })}
+      </ul>
     </div>
   )
 }

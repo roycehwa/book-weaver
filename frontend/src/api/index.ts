@@ -628,6 +628,22 @@ export interface JobChapterDraftPrefs {
   toc_depth?: number | null
 }
 
+export interface JobEpubPage {
+  index: number
+  page_number: number
+  page_label?: string
+  chapter_title: string
+  chapter_href: string
+  page_anchor: string
+  page_url: string
+}
+
+export interface JobEpubPagesResponse {
+  job_id: string
+  total: number
+  pages: JobEpubPage[]
+}
+
 export interface CreateJobOptions {
   processingMode: 'auto' | 'translate' | 'preserve'
   sourceLanguage?: string
@@ -924,6 +940,8 @@ export const jobsApi = {
       kind: 'pdf' | 'epub' | 'other'
       download_url: string
     }>(`/jobs/${encodeURIComponent(jobId)}/source/info`),
+  getEpubPages: (jobId: string) =>
+    request<JobEpubPagesResponse>(`/jobs/${encodeURIComponent(jobId)}/epub/pages`),
 }
 
 export const workspaceApi = {

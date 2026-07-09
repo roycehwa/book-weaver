@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+import subprocess
+import sys
 import time
 import copy
 from abc import ABC, abstractmethod
@@ -15,11 +17,15 @@ from openai import OpenAI
 import requests
 
 from pdf_translator.chunking import split_markdown_into_chunks
+from pdf_translator.chapter_kind import classify_chapter, should_translate_chapter
+from pdf_translator.chapter_segments import chapter_segments_for_translation
 from pdf_translator.glossary import glossary_terms_missing_in_translation, select_glossary_entries_for_text
 from pdf_translator.provider_traffic import ProviderTrafficController
 from pdf_translator.glossary_convergence import sanitize_translation_output
 from pdf_translator.config import (
+    DEFAULT_MINIMAX_HTTP_TIMEOUT_SECONDS,
     DEFAULT_MINIMAX_MAX_TOKENS,
+    DEFAULT_TRANSLATION_RETRY_COUNT,
     CompatibleAPISettings,
     DeepLSettings,
     OpenAISettings,
@@ -29,11 +35,19 @@ from pdf_translator.config import (
 from pdf_translator.models import BookTranslationResult, TranslatedChapter, TranslationChunk, TranslationResult
 
 
-TRANSLATION_PROMPT_VERSION = "v5-delimited-glossary-controls"
+TRANSLATION_PROMPT_VERSION = "v6-footnote-full-translation"
 FOOTNOTE_TRANSLATION_INSTRUCTION = (
     "Translate explanatory footnote prose into the target language. "
-    "Preserve bibliographic titles, personal names, archival identifiers, and quoted source titles "
-    "in their original language when translation would reduce citation accuracy."
+    "Translate the entire footnote into the target language. "
+    "Every sentence and clause of the explanatory prose must be rendered in the target language, "
+    "including sentences that introduce a citation. "
+    "Preserve bibliographic titles when translation would reduce citation accuracy. "
+    "Inside the footnote, only the following tokens stay in the source language: "
+    "(a) text wrapped in straight or curly quotation marks that is a verbatim quotation, "
+    "(b) archival identifiers, manuscript shelfmarks, and URLs. "
+    "Personal names, place names, and book titles mentioned in the explanatory prose must be "
+    "transliterated or translated as natural in the target language. "
+    "Do not leave entire footnotes in the source language just because they contain a citation."
 )
 SEMANTIC_TRANSLATION_POLICY = FOOTNOTE_TRANSLATION_INSTRUCTION
 SEMANTIC_SPAN_BOUNDARY = "<!--__SEMANTIC_SPAN_BOUNDARY__-->"
@@ -143,9 +157,15 @@ def _translation_prompt(
     retry_note = ""
     if quality_retry:
         if "missing mandatory glossary terms" in quality_retry:
+            missing_terms = re.findall(r"([^\s,]+)\s*=>\s*([^,)]+)", quality_retry)
+            terms_list = "\n".join(
+                f"- {src_term}：must contain the literal Chinese target term `{tgt_term}`"
+                for src_term, tgt_term in missing_terms[:6]
+            ) if missing_terms else ""
             retry_note = (
-                f"\nGlossary retry: {quality_retry}\n"
-                "Use the exact mandatory Chinese wording from the glossary for every matching source term.\n"
+                f"\nGlossary retry: the previous translation was rejected because the literal Chinese target terms were missing.\n"
+                f"{terms_list}\n"
+                "Rewrite your translation so each listed source term is rendered with its exact Chinese target verbatim. Do not paraphrase, do not use a synonym, do not omit the term.\n"
             )
         else:
             retry_note = (
@@ -239,6 +259,14 @@ def _read_chunk_cache(cache_dir: Path, chunk: TranslationChunk) -> str:
         return cache_path.read_text(encoding="utf-8").strip()
     matches = sorted(cache_dir.glob(f"chunk-{chunk.index:06d}-*.md"))
     if len(matches) == 1:
+        source_path = matches[0].with_suffix(".source.json")
+        if source_path.exists():
+            try:
+                source_metadata = json.loads(source_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                return ""
+            if source_metadata.get("source_fingerprint") != _chunk_source_fingerprint(chunk.markdown):
+                return ""
         return matches[0].read_text(encoding="utf-8").strip()
     return ""
 
@@ -458,15 +486,35 @@ def _apply_deterministic_glossary_repairs(
     translated_text: str,
     glossary_entries: list[dict] | None,
 ) -> str:
-    """Correct conservative Chinese connector variants without another model call."""
-    repaired = translated_text
-    missing = glossary_terms_missing_in_translation(
-        source_text,
-        repaired,
-        glossary_entries or [],
-    )
-    for entry in missing:
-        target = entry["target"]
+    """Apply deterministic glossary repairs that do not change meaning.
+
+    This is intentionally limited to conservative Chinese connector variants.
+    Missing hard terms must still go through the glossary quality gate and,
+    when possible, a model repair pass. Appending a missing term in parentheses
+    hides glossary drift without actually fixing the translation.
+    """
+    if not glossary_entries:
+        return translated_text
+    return _swap_connector_variants(translated_text, glossary_entries)
+
+
+def _is_hard_glossary_entry(entry: dict) -> bool:
+    enforcement = str(entry.get("enforcement") or "").strip().lower()
+    if enforcement == "hard":
+        return True
+    if not enforcement and entry.get("updated_by") != "user":
+        return True
+    return False
+
+
+def _swap_connector_variants(text: str, glossary_entries: list[dict]) -> str:
+    """Replace ``与/和/及`` connector variants with the canonical target."""
+    for entry in glossary_entries:
+        if not _is_hard_glossary_entry(entry):
+            continue
+        target = str(entry.get("target") or "").strip()
+        if not target:
+            continue
         variants: set[str] = set()
         if "与" in target:
             variants.update({target.replace("与", "和"), target.replace("与", "及")})
@@ -475,10 +523,9 @@ def _apply_deterministic_glossary_repairs(
         if "及" in target:
             variants.update({target.replace("及", "与"), target.replace("及", "和")})
         for variant in sorted(variants, key=len, reverse=True):
-            if variant and variant in repaired:
-                repaired = repaired.replace(variant, target)
-                break
-    return repaired
+            if variant and variant in text:
+                text = text.replace(variant, target)
+    return text
 
 
 def _is_untranslated_quality_error(exc: Exception) -> bool:
@@ -486,6 +533,19 @@ def _is_untranslated_quality_error(exc: Exception) -> bool:
         return False
     message = str(exc).lower()
     return "looks untranslated" in message or "looks incomplete" in message
+
+
+def _looks_untranslated_split_part(source: str, translated: str, target_language: str) -> bool:
+    if not target_language.lower().startswith("zh"):
+        return False
+    source_ascii = _ascii_letter_count(source)
+    if source_ascii < 120:
+        return False
+    translated_cjk = _cjk_count(translated)
+    translated_ascii = _ascii_letter_count(translated)
+    if translated_cjk >= max(20, int(source_ascii * 0.08)):
+        return False
+    return translated_ascii >= 80 and translated_ascii > translated_cjk * 3
 
 
 def _looks_like_translator_meta_response(translated: str) -> bool:
@@ -506,6 +566,36 @@ def _should_try_fallback_translation(exc: Exception | None, *, had_sensitive_fai
     if exc is None:
         return False
     return _is_untranslated_quality_error(exc) or _is_glossary_quality_error(exc)
+
+
+def _translation_fail_open_enabled() -> bool:
+    value = os.getenv("TRANSLATION_FAIL_OPEN", "1").strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
+def _failed_chunk_placeholder(
+    *,
+    chunk: TranslationChunk,
+    target_language: str,
+    error: Exception | None,
+) -> str:
+    detail = str(error) if error is not None else "unknown translation quality failure"
+    if target_language.lower().startswith("zh"):
+        warning = (
+            f"> ⚠️ BookWeaver：本段自动翻译未通过质量校验，已保留原文供审阅修订。"
+            f"原因：{detail}"
+        )
+    else:
+        warning = (
+            f"> ⚠️ BookWeaver: automatic translation for this chunk did not pass "
+            f"quality checks; source text is preserved for review. Reason: {detail}"
+        )
+    return (
+        "<!-- BOOKWEAVER_TRANSLATION_FAIL_OPEN "
+        f"chunk={chunk.index} reason={json.dumps(detail, ensure_ascii=False)} -->\n\n"
+        f"{warning}\n\n"
+        f"{chunk.markdown}"
+    )
 
 
 def _persist_chunk_translation(
@@ -533,6 +623,7 @@ def _write_chunk_cache(
     chunk: TranslationChunk,
     translated: str,
     allow_glossary_drift: bool = False,
+    allow_failed_placeholder: bool = False,
 ) -> None:
     tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
     tmp_path.write_text(translated + "\n", encoding="utf-8")
@@ -543,6 +634,7 @@ def _write_chunk_cache(
                 "schema": "translation_cache_source_v1",
                 "source_fingerprint": _chunk_source_fingerprint(chunk.markdown),
                 "allow_glossary_drift": allow_glossary_drift,
+                "allow_failed_placeholder": allow_failed_placeholder,
             },
             ensure_ascii=False,
             indent=2,
@@ -679,11 +771,13 @@ def _translate_chunk_resumable(
                         translated=cached,
                         target_language=target_language,
                         translator_name=translator.name,
-                        require_glossary=not bool(
-                            source_metadata.get("allow_glossary_drift")
-                        ),
+                        require_glossary=not bool(source_metadata.get("allow_glossary_drift")),
                     )
                 except ValueError as exc:
+                    if source_metadata.get("allow_failed_placeholder") or "BOOKWEAVER_TRANSLATION_FAIL_OPEN" in cached:
+                        if observer is not None:
+                            observer.cache_hit(chunk_index=chunk.index, input_hash=input_hash, cache_path=cache_path)
+                        return cached
                     if observer is not None:
                         observer.cache_invalidated(
                             chunk_index=chunk.index,
@@ -836,40 +930,13 @@ def _translate_chunk_resumable(
         except Exception as exc:
             last_error = exc
             if _is_glossary_quality_error(exc):
+                # The deterministic repair runs inside _assert_translation_quality's
+                # preamble (``_apply_deterministic_glossary_repairs``); if the gate
+                # still fires here the repair could not satisfy the term injection
+                # (e.g. malformed glossary entry). Do not retry — surface the
+                # failure immediately so the rest of the book can keep moving.
                 last_glossary_candidate = translated
-                missing = glossary_terms_missing_in_translation(
-                    chunk.markdown,
-                    translated,
-                    chunk.glossary_entries or [],
-                )
-                if missing:
-                    try:
-                        repaired = sanitize_translation_output(
-                            _repair_glossary_in_chunk(
-                                chunk=chunk,
-                                translated=translated,
-                                missing=missing,
-                                source_language=source_language,
-                                target_language=target_language,
-                                translator=translator,
-                            )
-                        )
-                        _assert_translation_quality(
-                            chunk=chunk,
-                            translated=repaired,
-                            target_language=target_language,
-                            translator_name=translator.name,
-                        )
-                    except Exception:
-                        pass
-                    else:
-                        return _persist_chunk_translation(
-                            chunk=chunk,
-                            translated=repaired,
-                            cache_path=cache_path,
-                            observer=observer,
-                            input_hash=input_hash,
-                        )
+                break
             if "new_sensitive" in str(exc).lower():
                 had_sensitive_failure = True
             permanent = _is_permanent_translation_error(exc)
@@ -936,6 +1003,29 @@ def _translate_chunk_resumable(
             observer.attempt_success(chunk_index=chunk.index, input_hash=input_hash, cache_path=cache_path)
         return fallback_translated
 
+    if last_error and _is_untranslated_quality_error(last_error) and _translation_fail_open_enabled():
+        placeholder = _failed_chunk_placeholder(
+            chunk=chunk,
+            target_language=target_language,
+            error=last_error,
+        )
+        if cache_path is not None:
+            _write_chunk_cache(
+                cache_path,
+                chunk=chunk,
+                translated=placeholder,
+                allow_glossary_drift=True,
+                allow_failed_placeholder=True,
+            )
+        if observer is not None:
+            observer.attempt_success(
+                chunk_index=chunk.index,
+                input_hash=input_hash,
+                cache_path=cache_path,
+            )
+        return placeholder
+
+    split_error: Exception | None = None
     if last_error and _is_untranslated_quality_error(last_error):
         try:
             split_translated = _translate_sensitive_chunk_parts(
@@ -949,12 +1039,17 @@ def _translate_chunk_resumable(
                 split_translated,
                 target_language,
             )
+            split_translated = _apply_deterministic_glossary_repairs(
+                source_text=chunk.markdown,
+                translated_text=split_translated,
+                glossary_entries=chunk.glossary_entries,
+            )
             _assert_translation_quality(
                 chunk=chunk,
                 translated=split_translated,
                 target_language=target_language,
                 translator_name=translator.name,
-                require_glossary=False,
+                require_glossary=True,
             )
             return _persist_chunk_translation(
                 chunk=chunk,
@@ -963,8 +1058,8 @@ def _translate_chunk_resumable(
                 observer=observer,
                 input_hash=input_hash,
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            split_error = exc
 
     if last_error and _is_glossary_quality_error(last_error) and last_glossary_candidate:
         missing = glossary_terms_missing_in_translation(
@@ -1174,6 +1269,11 @@ def _try_fallback_translation(
                         item["target"],
                     )
             allow_glossary_drift = False
+            translated = _apply_deterministic_glossary_repairs(
+                source_text=chunk.markdown,
+                translated_text=translated,
+                glossary_entries=chunk.glossary_entries,
+            )
             try:
                 _assert_translation_quality(
                     chunk=chunk,
@@ -1373,11 +1473,17 @@ def _translate_sensitive_part(
             ).strip()
             if not translated:
                 raise ValueError(f"Empty translation returned for chunk {chunk.index}.")
-            return _strip_generated_english_chinese_glosses(
+            translated = _strip_generated_english_chinese_glosses(
                 chunk.markdown,
                 translated,
                 target_language,
             )
+            if _looks_untranslated_split_part(chunk.markdown, translated, target_language):
+                raise ValueError(
+                    f"Split translation part {chunk.index} looks untranslated "
+                    f"(ascii={_ascii_letter_count(translated)}, cjk={_cjk_count(translated)})."
+                )
+            return translated
         except Exception as exc:
             last_error = exc
             if "new_sensitive" in str(exc).lower():
@@ -1520,6 +1626,108 @@ class OpenAICompatibleTranslator(BaseTranslator):
         return text
 
 
+def _minimax_subprocess_enabled() -> bool:
+    value = os.getenv("MINIMAX_USE_SUBPROCESS_TIMEOUT", "1").strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
+def _post_minimax_json(
+    endpoint: str,
+    *,
+    payload: dict,
+    headers: dict[str, str],
+    timeout_seconds: float,
+) -> dict:
+    if not _minimax_subprocess_enabled():
+        response = requests.post(
+            endpoint,
+            json=payload,
+            headers=headers,
+            timeout=(10, timeout_seconds),
+        )
+        data: dict | None = None
+        if response.status_code < 400:
+            data = response.json()
+        return {
+            "status_code": response.status_code,
+            "headers": dict(getattr(response, "headers", {}) or {}),
+            "text": str(getattr(response, "text", "") or ""),
+            "json": data,
+        }
+
+    request = {
+        "endpoint": endpoint,
+        "payload": payload,
+        "headers": headers,
+        "timeout_seconds": timeout_seconds,
+    }
+    script = r"""
+import json
+import sys
+import requests
+
+request = json.loads(sys.stdin.read())
+try:
+    response = requests.post(
+        request["endpoint"],
+        json=request["payload"],
+        headers=request["headers"],
+        timeout=(10, float(request["timeout_seconds"])),
+    )
+    body = response.text
+    data = None
+    if response.status_code < 400:
+        data = response.json()
+    print(json.dumps({
+        "ok": True,
+        "status_code": response.status_code,
+        "headers": dict(response.headers),
+        "text": body,
+        "json": data,
+    }, ensure_ascii=False))
+except requests.RequestException as exc:
+    print(json.dumps({
+        "ok": False,
+        "error_type": exc.__class__.__name__,
+        "message": str(exc),
+    }, ensure_ascii=False))
+except Exception as exc:
+    print(json.dumps({
+        "ok": False,
+        "error_type": exc.__class__.__name__,
+        "message": str(exc),
+    }, ensure_ascii=False))
+"""
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            input=json.dumps(request, ensure_ascii=False),
+            text=True,
+            capture_output=True,
+            timeout=max(1.0, float(timeout_seconds)) + 5.0,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise requests.Timeout(
+            f"MiniMax request exceeded wall timeout {timeout_seconds:.0f}s"
+        ) from exc
+    if result.returncode != 0:
+        raise requests.ConnectionError(
+            f"MiniMax request subprocess failed: {result.stderr[:500]}"
+        )
+    try:
+        response = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise requests.ConnectionError(
+            f"MiniMax request subprocess returned invalid JSON: {result.stdout[:500]}"
+        ) from exc
+    if not response.get("ok"):
+        raise requests.RequestException(
+            f"{response.get('error_type')}: {response.get('message')}"
+        )
+    return response
+
+
 class MiniMaxAnthropicTranslator(BaseTranslator):
     name = "minimax"
 
@@ -1528,8 +1736,10 @@ class MiniMaxAnthropicTranslator(BaseTranslator):
         self.endpoint = settings.base_url
         self.model = settings.model
         self.max_tokens = settings.max_tokens or DEFAULT_MINIMAX_MAX_TOKENS
-        # Long-form translation can exceed a 2-minute round-trip; override with MINIMAX_HTTP_TIMEOUT_SECONDS.
-        self.http_timeout = float(os.getenv("MINIMAX_HTTP_TIMEOUT_SECONDS", "600"))
+        # Keep single-request stalls bounded; override with MINIMAX_HTTP_TIMEOUT_SECONDS for slower accounts.
+        self.http_timeout = float(
+            os.getenv("MINIMAX_HTTP_TIMEOUT_SECONDS", str(DEFAULT_MINIMAX_HTTP_TIMEOUT_SECONDS))
+        )
         self.traffic = ProviderTrafficController(
             max_concurrency=settings.max_concurrency,
             rpm=settings.rpm,
@@ -1566,35 +1776,34 @@ class MiniMaxAnthropicTranslator(BaseTranslator):
             try:
                 estimated_tokens = max(1, len(prompt) // 3) + self.max_tokens
                 self.traffic.wait_for_request(estimated_tokens=estimated_tokens)
-                response = requests.post(
+                response = _post_minimax_json(
                     self.endpoint,
-                    json=payload,
+                    payload=payload,
                     headers={
                         "Authorization": f"Bearer {self.api_key}",
                         "Content-Type": "application/json",
                         "anthropic-version": "2023-06-01",
                         "Connection": "close",
                     },
-                    timeout=(10, self.http_timeout),
+                    timeout_seconds=self.http_timeout,
                 )
-                response.raise_for_status()
-                response_data = response.json()
+                status_code = int(response.get("status_code") or 0)
+                if status_code >= 400:
+                    error_body = str(response.get("text") or "")
+                    if status_code not in {429, 529}:
+                        self.traffic.record_failure()
+                        raise ValueError(
+                            f"MiniMax translation failed for chunk {chunk_index}: "
+                            f"HTTP {status_code}: {error_body[:500]}"
+                        )
+                    retry_after = str((response.get("headers") or {}).get("Retry-After") or "")
+                    self.traffic.record_overload(
+                        retry_after=float(retry_after) if retry_after else 2 ** provider_attempt
+                    )
+                    continue
+                response_data = response.get("json") or {}
                 self.traffic.record_success()
                 break
-            except requests.HTTPError as exc:
-                last_error = exc
-                status_code = exc.response.status_code if exc.response is not None else 0
-                error_body = exc.response.text if exc.response is not None else ""
-                if status_code not in {429, 529}:
-                    self.traffic.record_failure()
-                    raise ValueError(
-                        f"MiniMax translation failed for chunk {chunk_index}: "
-                        f"HTTP {status_code}: {error_body[:500]}"
-                    ) from exc
-                retry_after = exc.response.headers.get("Retry-After") if exc.response is not None else None
-                self.traffic.record_overload(
-                    retry_after=float(retry_after) if retry_after else 2 ** provider_attempt
-                )
             except requests.RequestException as exc:
                 last_error = exc
                 self.traffic.record_overload(retry_after=2 ** provider_attempt)
@@ -1761,7 +1970,7 @@ def translate_markdown(
     settings: RunSettings,
     translator: BaseTranslator,
     cache_dir: Path | None = None,
-    retry_count: int = 6,
+    retry_count: int = DEFAULT_TRANSLATION_RETRY_COUNT,
     concurrency: int = 1,
     observer: TranslationObserver | None = None,
 ) -> TranslationResult:
@@ -1990,13 +2199,24 @@ def estimate_semantic_translation_chunk_count(
     return groups + (1 if current_length else 0)
 
 
+def estimate_chapter_segment_translation_chunk_count(
+    book: dict,
+    max_chunk_chars: int,
+) -> int:
+    return sum(
+        1
+        for segment in chapter_segments_for_translation(book, max_chars=max_chunk_chars)
+        if bool(segment.get("translate", True))
+    )
+
+
 def translate_book_chapters(
     *,
     book: dict,
     settings: RunSettings,
     translator: BaseTranslator,
     cache_dir: Path | None = None,
-    retry_count: int = 6,
+    retry_count: int = DEFAULT_TRANSLATION_RETRY_COUNT,
     concurrency: int = 1,
     observer: TranslationObserver | None = None,
 ) -> BookTranslationResult:
@@ -2006,10 +2226,19 @@ def translate_book_chapters(
     glossary_entries = settings.glossary_entries or []
     run_dir = cache_dir.parent if cache_dir is not None else settings.output_dir
     _write_glossary_constraints(run_dir, [], reset=True)
+    pages = book.get("pages") if isinstance(book, dict) else []
+    pages = pages if isinstance(pages, list) else []
+    segment_plan = chapter_segments_for_translation(book, max_chars=settings.max_chunk_chars)
+    segments_by_chapter: dict[str, list[dict]] = {}
+    for segment in segment_plan:
+        segments_by_chapter.setdefault(str(segment.get("chapter_id") or ""), []).append(segment)
 
     for chapter in book.get("chapters", []):
+        if isinstance(chapter, dict) and not chapter.get("kind"):
+            chapter["kind"] = classify_chapter(chapter, pages=pages)
         chapter_source_markdown = _chapter_markdown_for_translation(chapter)
-        if not bool(chapter.get("translate", True)):
+        chapter_id = str(chapter.get("chapter_id") or chapter.get("id") or "") or None
+        if not should_translate_chapter(chapter):
             translated_markdown = chapter_source_markdown.strip()
             if translated_markdown:
                 translated_markdown += "\n"
@@ -2031,32 +2260,31 @@ def translate_book_chapters(
             continue
 
         translated_parts: list[str] = []
-        media_segments = [("media", chapter_source_markdown.strip())] if _is_preserved_apparatus_block(chapter_source_markdown) else _split_markdown_media_segments(chapter_source_markdown)
-        for segment_kind, segment_markdown in media_segments:
-            if segment_kind == "media":
+        planned_segments = segments_by_chapter.get(chapter_id or "")
+        for planned_segment in planned_segments or []:
+            segment_markdown = str(planned_segment.get("markdown") or "").strip()
+            if not segment_markdown:
+                continue
+            if not bool(planned_segment.get("translate", True)):
                 translated_parts.append(segment_markdown)
                 continue
 
-            source_chunks = split_markdown_into_chunks(segment_markdown, settings.max_chunk_chars)
-            chapter_id = str(chapter.get("chapter_id") or chapter.get("id") or "") or None
-            global_chunks = []
-            for offset, source_chunk in enumerate(source_chunks):
-                selected = (
-                    select_glossary_entries_for_text(
-                        source_chunk.markdown,
-                        glossary_entries,
-                        chapter_id=chapter_id,
-                    )
-                    if glossary_entries
-                    else []
+            selected = (
+                select_glossary_entries_for_text(
+                    segment_markdown,
+                    glossary_entries,
+                    chapter_id=chapter_id,
                 )
-                global_chunks.append(
-                    TranslationChunk(
-                        index=chunk_index + offset,
-                        markdown=source_chunk.markdown,
-                        glossary_entries=selected or None,
-                    )
+                if glossary_entries
+                else []
+            )
+            global_chunks = [
+                TranslationChunk(
+                    index=chunk_index,
+                    markdown=segment_markdown,
+                    glossary_entries=selected or None,
                 )
+            ]
             _write_glossary_constraints(run_dir, global_chunks, reset=False)
             translated_parts.extend(
                 _translate_chunks_ordered(

@@ -5,7 +5,7 @@ import json
 import sys
 from pathlib import Path
 
-from pdf_translator.config import DEFAULT_TRANSLATION_CONCURRENCY, RunSettings
+from pdf_translator.config import DEFAULT_MAX_CHUNK_CHARS, DEFAULT_TRANSLATION_CONCURRENCY, RunSettings
 from pdf_translator.guardrails import (
     DEFAULT_INGEST_TIMEOUT_SECONDS,
     IngestGuardrailError,
@@ -201,7 +201,7 @@ def build_parser() -> argparse.ArgumentParser:
     intake_parser.add_argument(
         "--max-chunk-chars",
         type=int,
-        default=9000,
+        default=DEFAULT_MAX_CHUNK_CHARS,
         help="Chunk-size estimate used in chapter reports.",
     )
     intake_parser.add_argument(
@@ -271,7 +271,7 @@ def build_parser() -> argparse.ArgumentParser:
     translate_parser.add_argument(
         "--max-chunk-chars",
         type=int,
-        default=9000,
+        default=DEFAULT_MAX_CHUNK_CHARS,
         help="Max chunk size for translation requests.",
     )
     translate_parser.add_argument(

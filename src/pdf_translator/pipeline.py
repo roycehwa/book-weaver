@@ -11,6 +11,7 @@ from typing import Any
 
 from pdf_translator.book_rebuild import apply_canonical_chapter_plan, build_book_reconstruction
 from pdf_translator.book_views import render_book_markdown, render_translation_input_markdown
+from pdf_translator.chapter_segments import build_chapter_segments
 from pdf_translator.chunking import split_markdown_into_chunks
 from pdf_translator.config import RunSettings
 from pdf_translator.epub import render_epub_from_book, validate_epub_internal_hrefs
@@ -18,7 +19,6 @@ from pdf_translator.glossary import (
     extract_glossary_candidates,
     glossary_manifest_files,
     load_active_entries_for_translation,
-    load_active_glossary_if_present,
 )
 from pdf_translator.guardrails import enforce_non_ocr_translatable_policy, ingest_pdf_guarded
 from pdf_translator.job_control import create_translation_job
@@ -35,18 +35,21 @@ from pdf_translator.models import (
     TranslatedChapter,
     TranslationResult,
 )
-from pdf_translator.page_integrity import build_page_ledger
+from pdf_translator.page_integrity import (
+    PageIntegrityError,
+    build_page_ledger,
+)
 from pdf_translator.integrity import build_integrity_ledger
 from pdf_translator.profile import build_document_profile
 from pdf_translator.render import render_pdf_from_markdown
 from pdf_translator.review import build_review_artifacts, write_review_artifacts
 from pdf_translator.translate import (
     build_translator,
+    estimate_chapter_segment_translation_chunk_count,
     estimate_translation_chunk_count,
     estimate_semantic_translation_chunk_count,
     translate_book_chapters,
     translate_markdown,
-    _chapter_markdown_for_translation,
 )
 from pdf_translator.workflow import (
     STAGE_AWAITING_GLOSSARY,
@@ -140,7 +143,33 @@ def _build_chapter_report(book: dict, *, max_chunk_chars: int) -> dict:
 
 
 def _write_page_ledger(run_dir: Path, book: dict[str, Any]) -> Path:
-    ledger = build_page_ledger(book)
+    """Write a per-page disposition ledger.
+
+    Page-ownership gaps (e.g. unanchored plates, copyright page,
+    index pages not captured by any detected chapter) are common
+    in long scanned books. They are recorded as a degraded ledger
+    summary here so the rest of the pipeline can still proceed;
+    the integrity ledger is the authoritative gate for
+    downstream export decisions and exposes the failures there.
+    """
+    try:
+        ledger = build_page_ledger(book)
+    except PageIntegrityError as exc:
+        ledger = {
+            "schema": "page_ledger_v1",
+            "pages": [],
+            "summary": {
+                "total_pages": len(book.get("pages", [])),
+                "content_pages": 0,
+                "resource_pages": 0,
+                "blank_pages": 0,
+                "skipped_pages": 0,
+                "missing_pages": 0,
+                "degraded": True,
+                "degraded_reason": str(exc),
+            },
+        }
+        print(f"page ledger built in degraded mode: {exc}", file=sys.stderr)
     path = run_dir / "page-ledger.json"
     path.write_text(
         json.dumps(ledger, ensure_ascii=False, indent=2) + "\n",
@@ -268,10 +297,31 @@ def _load_existing_run_context(
     artifacts = build_artifacts(run_dir, source_pdf, settings.target_language)
     book: dict | None = None
     extra_files: dict[str, str] = {}
-    if artifacts.book_json_path.exists():
-        book = json.loads(artifacts.book_json_path.read_text(encoding="utf-8"))
+    if not artifacts.book_json_path.exists() and (run_dir / "normalized.json").exists() and source_pdf.is_file():
+        from pdf_translator.book_rebuild import build_book_reconstruction
+        normalized_payload = json.loads((run_dir / "normalized.json").read_text(encoding="utf-8"))
+        book_images_dir = run_dir / "book-images"
+        rebuilt = build_book_reconstruction(
+            normalized_payload,
+            source_pdf=source_pdf,
+            images_dir=book_images_dir,
+        )
         if source_pdf.suffix.lower() == ".pdf":
-            book = repair_book_dict(book)
+            rebuilt = repair_book_dict(rebuilt)
+        page_ledger_path = _write_page_ledger(run_dir, rebuilt)
+        integrity_ledger_path = _write_integrity_ledger(run_dir, rebuilt)
+        artifacts.book_json_path.parent.mkdir(parents=True, exist_ok=True)
+        artifacts.book_json_path.write_text(json.dumps(rebuilt, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        extra_files["book_json"] = str(artifacts.book_json_path)
+        extra_files["page_ledger"] = str(page_ledger_path)
+        extra_files["integrity_ledger"] = str(integrity_ledger_path)
+        extra_files["book_images_dir"] = str(book_images_dir)
+        book = rebuilt
+    if artifacts.book_json_path.exists():
+        if book is None:
+            book = json.loads(artifacts.book_json_path.read_text(encoding="utf-8"))
+            if source_pdf.suffix.lower() == ".pdf":
+                book = repair_book_dict(book)
         if settings.canonical_chapters_path is not None:
             canonical = json.loads(
                 settings.canonical_chapters_path.expanduser().resolve().read_text(encoding="utf-8")
@@ -305,6 +355,14 @@ def _load_existing_run_context(
                 source_markdown=repaired_input,
                 block_on_errors=source_pdf.suffix.lower() == ".epub",
             )
+        segment_plan = build_chapter_segments(book, max_chars=settings.max_chunk_chars)
+        book["chapter_segments"] = segment_plan["segments"]
+        chapter_segments_path = run_dir / "chapter-segments.json"
+        chapter_segments_path.write_text(
+            json.dumps(segment_plan, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        extra_files["chapter_segments"] = str(chapter_segments_path)
     profile: dict[str, Any] = {}
     if artifacts.profile_json_path.exists():
         profile = json.loads(artifacts.profile_json_path.read_text(encoding="utf-8"))
@@ -425,12 +483,7 @@ def _estimated_translation_total(
 ) -> int:
     if book is None:
         return len(split_markdown_into_chunks(translation_input_markdown, max_chunk_chars))
-    total = 0
-    for chapter in book.get("chapters", []):
-        if not bool(chapter.get("translate", True)):
-            continue
-        chapter_markdown = _chapter_markdown_for_translation(chapter)
-        total += estimate_translation_chunk_count(chapter_markdown, max_chunk_chars)
+    total = estimate_chapter_segment_translation_chunk_count(book, max_chunk_chars)
     return total + estimate_semantic_translation_chunk_count(book, max_chunk_chars)
 
 
@@ -696,18 +749,19 @@ def run_translation_pipeline(
         encoding="utf-8",
     )
     extra_files["translated_chapters"] = str(translated_chapters_path)
-    if translated.semantic_content is not None:
+    _translated_semantic = getattr(translated, "semantic_content", None)
+    if isinstance(_translated_semantic, dict):
         translated_semantic_path = artifacts.output_dir / "translated-semantic-content.json"
         translated_semantic_path.write_text(
-            json.dumps(translated.semantic_content, ensure_ascii=False, indent=2) + "\n",
+            json.dumps(_translated_semantic, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
         extra_files["translated_semantic_content"] = str(translated_semantic_path)
     enter_stage("pre_review")
     review_source_book = book or _fallback_book_from_markdown(settings.source_pdf, translation_input_markdown)
-    if translated.semantic_content is not None:
+    if isinstance(_translated_semantic, dict):
         review_source_book = dict(review_source_book)
-        review_source_book["semantic_content"] = translated.semantic_content
+        review_source_book["semantic_content"] = _translated_semantic
     if book is not None:
         _write_page_ledger(artifacts.output_dir, review_source_book)
     review_artifacts = build_review_artifacts(
@@ -743,9 +797,9 @@ def run_translation_pipeline(
                 }
             ],
         }
-        if translated.semantic_content is not None:
+        if isinstance(_translated_semantic, dict):
             epub_book = dict(epub_book)
-            epub_book["semantic_content"] = translated.semantic_content
+            epub_book["semantic_content"] = _translated_semantic
         epub_chapters = translated_chapters or [
             {
                 "index": 1,
@@ -766,8 +820,8 @@ def run_translation_pipeline(
         rendered_files["epub_href_validation"] = epub_validation
 
     integrity_book = dict(review_source_book)
-    if translated.semantic_content is not None:
-        integrity_book["semantic_content"] = translated.semantic_content
+    if isinstance(_translated_semantic, dict):
+        integrity_book["semantic_content"] = _translated_semantic
     integrity_ledger_path = _write_integrity_ledger(
         artifacts.output_dir,
         integrity_book,

@@ -2,7 +2,6 @@ import { useState, useEffect, useCallback } from 'react';
 import { pdfjs } from 'react-pdf';
 // 用 vite 的 ?url 让 worker 资源走 dev middleware / 产物 hash 路径，
 // 不依赖全局配置或 pdfjs-dist 自带的相对路径（react-pdf 默认值在 vite 下无法解析）。
-// eslint-disable-next-line import/no-unresolved
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.js?url';
 import type { PdfLoadState } from './types';
 

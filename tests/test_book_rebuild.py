@@ -127,6 +127,78 @@ def test_canonical_translatable_chapters_reject_original_page_fallback() -> None
         apply_canonical_chapter_plan(book, canonical)
 
 
+def test_canonical_resource_chapter_preserves_original_page_fallback() -> None:
+    book = {
+        "chapters": [
+            {
+                "title": "Contents",
+                "source_pages": [5],
+                "trace_markdown": "[[page: 5]]\n\n![Original page 5](/tmp/p5.png)",
+                "translate": False,
+                "preserve_original": True,
+                "resource_only": True,
+                "toc": True,
+            }
+        ],
+        "pages": [
+            {"page_no": 5, "has_content": True},
+        ],
+    }
+    canonical = {
+        "chapters": [
+            {
+                "title": "Contents",
+                "source_pages": [5],
+                "page_start": 5,
+                "page_end": 5,
+            }
+        ]
+    }
+
+    result = apply_canonical_chapter_plan(book, canonical)
+
+    chapter = result["chapters"][0]
+    assert chapter["title"] == "Contents"
+    assert chapter["preserve_original"] is True
+    assert chapter["translate"] is False
+    assert "Original page 5" in chapter["markdown"]
+
+
+def test_canonical_apparatus_chapter_preserves_original_page_fallback() -> None:
+    book = {
+        "chapters": [
+            {
+                "title": "Notes",
+                "source_pages": [216],
+                "trace_markdown": "[[page: 216]]\n\n![Original page 216](/tmp/p216.png)",
+                "translate": True,
+                "preserve_original": False,
+                "resource_only": False,
+            }
+        ],
+        "pages": [
+            {"page_no": 216, "has_content": True},
+        ],
+    }
+    canonical = {
+        "chapters": [
+            {
+                "title": "Notes",
+                "source_pages": [216],
+                "page_start": 216,
+                "page_end": 216,
+            }
+        ]
+    }
+
+    result = apply_canonical_chapter_plan(book, canonical)
+
+    chapter = result["chapters"][0]
+    assert chapter["title"] == "Notes"
+    assert chapter["preserve_original"] is True
+    assert chapter["translate"] is False
+
+
 def test_canonical_plan_preserves_unplanned_resource_pages() -> None:
     book = {
         "chapters": [

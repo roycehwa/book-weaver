@@ -253,6 +253,7 @@ def test_begin_translation_does_not_auto_confirm_pending_terms(tmp_path: Path) -
     active = load_active_glossary(run_dir)
     by_source = {entry["source"]: entry for entry in active["entries"]}
     assert workflow["stage"] == "translating"
+    assert workflow["glossary_finalized_by_user"] is True
     assert "glossary_auto_confirmed" not in workflow
     assert by_source["Shareholder Primacy"]["status"] == "active"
     assert "Corporate Governance" not in by_source

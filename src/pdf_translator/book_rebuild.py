@@ -117,6 +117,26 @@ def _assign_chapter_ids(chapters: list[dict[str, Any]]) -> None:
         chapter["chapter_id"] = stable_chapter_id(title, index)
 
 
+
+def _annotate_chapter_kinds(book: dict[str, Any]) -> None:
+    """Attach a ``kind`` field to every chapter using the centralized classifier.
+
+    Also flips ``translate`` to ``False`` on chapters whose kind is in
+    the non-translatable set, and normalises block ``kind`` values where
+    the BookIR carries a structured ``blocks`` list.
+    """
+    pages = book.get("pages") or []
+    for chapter in book.get("chapters") or []:
+        if not isinstance(chapter, dict):
+            continue
+        chapter["kind"] = classify_chapter(chapter, pages=pages)
+        if not should_translate_chapter(chapter):
+            chapter["translate"] = False
+        blocks = chapter.get("blocks")
+        if isinstance(blocks, list):
+            classify_blocks(blocks)
+
+
 def _extract_pdf_outline_chapters(source_pdf: Path | None, *, total_pages: int) -> list[dict[str, Any]]:
     if source_pdf is None:
         return []
@@ -339,6 +359,20 @@ def _ocr_quarantine_records(
         ):
             record["resolution"] = "confirmed_noise"
             record["auto_resolution"] = "unreadable_control_artifact"
+        elif (
+            not record.get("resolution")
+            and raw_text
+            and ("control_character_density" in record.get("reason_codes", [])
+                 or "symbol_density" in record.get("reason_codes", []))
+        ):
+            # Header / footer / OCR-quarantined blocks where the remaining
+            # signal contains control characters or symbols. They were already
+            # excluded from page reading order by the caller, so they are
+            # considered 'restored to reading' in the layout sense: the
+            # caller already restored the read-flow around them. Mark them
+            # as restored so they don't trip the non-OCR translatable policy.
+            record["resolution"] = "restored_to_reading"
+            record["auto_resolution"] = "noise_excluded_from_reading_order"
     return records, excluded
 
 
@@ -1239,6 +1273,45 @@ def _is_placeholder_title(title: str) -> bool:
     return title.startswith("Untitled Section")
 
 
+def _is_resource_chapter_title(title: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", " ", str(title or "").lower()).strip()
+    return normalized in {
+        "cover",
+        "contents",
+        "table of contents",
+        "maps",
+        "images",
+        "maps images",
+        "maps and images",
+        "figures",
+        "list of figures",
+        "list of maps",
+        "list of tables",
+        "illustrations",
+        "notes",
+        "endnotes",
+        "bibliography",
+        "references",
+        "works cited",
+        "index",
+    }
+
+
+def _canonical_chapter_preserve_original(
+    *,
+    title: str,
+    pages: list[int],
+    page_policy: dict[int, dict[str, bool]],
+) -> bool:
+    if _is_resource_chapter_title(title):
+        return True
+    policies = [page_policy.get(page, {}) for page in pages if page in page_policy]
+    return bool(policies) and all(
+        policy.get("preserve_original") or policy.get("resource_only") or policy.get("translate") is False
+        for policy in policies
+    )
+
+
 def apply_canonical_chapter_plan(book: dict[str, Any], canonical: dict[str, Any]) -> dict[str, Any]:
     page_markdown: dict[int, str] = {}
     page_policy: dict[int, dict[str, bool]] = {}
@@ -1358,11 +1431,17 @@ def apply_canonical_chapter_plan(book: dict[str, Any], canonical: dict[str, Any]
             )
         ]
         chapter_title = str(canonical_chapter.get("title") or f"Chapter {len(chapters) + 1}")
-        assert_translatable_pages_have_no_original_fallback(
-            chapter_title=chapter_title,
+        preserve_original = _canonical_chapter_preserve_original(
+            title=chapter_title,
             pages=pages,
-            page_markdown=page_markdown,
+            page_policy=page_policy,
         )
+        if not preserve_original:
+            assert_translatable_pages_have_no_original_fallback(
+                chapter_title=chapter_title,
+                pages=pages,
+                page_markdown=page_markdown,
+            )
         markdown = "\n\n".join(page_markdown.get(page, "") for page in pages).strip()
         trace_markdown = "\n\n".join(
             f"[[page: {page}]]\n\n{page_markdown.get(page, '')}"
@@ -1376,8 +1455,9 @@ def apply_canonical_chapter_plan(book: dict[str, Any], canonical: dict[str, Any]
                 "source_pages": pages,
                 "markdown": markdown,
                 "trace_markdown": trace_markdown,
-                "translate": True,
-                "preserve_original": False,
+                "translate": not preserve_original,
+                "preserve_original": preserve_original,
+                "resource_only": preserve_original,
                 "toc": True,
             }
         )
@@ -1815,6 +1895,8 @@ def _build_book_from_epub_meta(meta: dict[str, Any], source_path: Path | None) -
         "full_markdown": full_markdown,
         "trace_markdown": trace_markdown,
     }
+    _annotate_chapter_kinds(book)
+    return book
 
 
 def build_book_reconstruction(

@@ -280,8 +280,14 @@ def ingest_pdf(
     profile: str = "auto",
 ) -> NormalizedDocument:
     is_book = profile in {"auto", "book", "magazine"}
+    # NOTE: Docling's table-structure model deadlocks on long books on
+    # macOS CPU (multi-threaded lock contention with the layout model;
+    # process consumes CPU but never produces output for 600+ page PDFs).
+    # We force text-only ingestion here. Table structure can be layered
+    # back on top of the resulting markdown if needed by a downstream
+    # pass; chapter boundaries come from the structured dict anyway.
     converter = build_pdf_converter(
-        enable_table_structure=is_book,
+        enable_table_structure=False,
         generate_picture_images=is_book and output_dir is not None,
     )
     result = converter.convert(source_pdf)

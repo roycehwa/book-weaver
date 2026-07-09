@@ -24,7 +24,7 @@ _CONTAINER_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _TITLE_RE = re.compile(
-    rb"<\\s*(?:h1|h2|h3|title)(?:\\s[^>]*)?>(.*?)</\\s*(?:h1|h2|h3|title)\\s*>",
+    rb"<\s*(?:h1|h2|h3|title)(?:\s[^>]*)?>(.*?)</\s*(?:h1|h2|h3|title)\s*>",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -180,11 +180,11 @@ class EpubPage:
 
 
 _PAGE_ANCHOR_RE = re.compile(
-    rb"""<a\s+id=["'](page_([0-9]+|[ivxlcdm]+))["']\s*/?>""",
+    rb"""<(?P<tag>[a-zA-Z][\w:.-]*)\b(?=[^>]*\bid=["'](?P<anchor>page_(?P<label>[0-9]+|[ivxlcdm]+))["'])(?![^>]*\bhref=)[^>]*>""",
     re.IGNORECASE,
 )
 _PAGE_MARKER_TAG_RE = re.compile(
-    rb"""<a\b(?=[^>]*\bid=["'](page_(?:[0-9]+|[ivxlcdm]+))["'])(?![^>]*\bhref=)[^>]*(?:/>|>\s*</a\s*>)""",
+    rb"""<(?P<tag>[a-zA-Z][\w:.-]*)\b(?=[^>]*\bid=["'](?P<anchor>page_(?:[0-9]+|[ivxlcdm]+))["'])(?![^>]*\bhref=)[^>]*(?:/>\s*|>\s*</(?P=tag)\s*>)""",
     re.IGNORECASE,
 )
 
@@ -236,11 +236,10 @@ def resolve_epub_pages(path: Path) -> list[EpubPage]:
         except KeyError:
             continue
         anchors = list(_PAGE_ANCHOR_RE.finditer(xhtml))
-        anchor_ids: list[str] = [m.group(1).decode("utf-8", "replace") for m in anchors]
+        anchor_ids: list[str] = [m.group("anchor").decode("utf-8", "replace") for m in anchors]
         chapter_pages.append((entry.href, entry.title, anchor_ids))
-    if not any(p[2] for p in chapter_pages):
-        raise ValueError("EPUB 中没有可识别的 page 锚点")
-    # 按 spine 顺序展开页；无锚点的章节整章作为 1 个 page，page_anchor 留空
+    # 按 spine 顺序展开页；无锚点的章节整章作为 1 个 page，page_anchor 留空。
+    # 真实 EPUB 经常没有印刷页锚点，这时按 spine 章节降级预览，避免 UI 中断。
     page_index = 0
     for href, title, anchor_ids in chapter_pages:
         if not anchor_ids:
@@ -288,7 +287,7 @@ def render_epub_page_by_anchor(path: Path, chapter_href: str, page_anchor: str, 
     anchors = list(_PAGE_ANCHOR_RE.finditer(xhtml))
     target_idx = None
     for i, m in enumerate(anchors):
-        if m.group(1).decode("utf-8", "replace") == page_anchor:
+        if m.group("anchor").decode("utf-8", "replace") == page_anchor:
             target_idx = i
             break
     if target_idx is None:
@@ -309,11 +308,15 @@ def _find_body_close(xhtml: bytes) -> int:
 
 
 _CSS_HREF_RE = re.compile(
-    rb"""<link\s+[^>]*rel=["']stylesheet["'][^>]*href=["']([^"']+)["'][^>]*/?>""",
+    rb"""<link\b(?=[^>]*\brel=["']stylesheet["'])(?=[^>]*\bhref=["'][^"']+["'])[^>]*/?>""",
     re.IGNORECASE,
 )
 _IMG_SRC_RE = re.compile(
     rb"""<img\s+[^>]*src=["']([^"']+)["']""",
+    re.IGNORECASE,
+)
+_RESOURCE_ATTR_RE = re.compile(
+    rb"""(?P<prefix>\b(?:src|href|xlink:href)=["'])(?P<url>[^"']+)(?P<suffix>["'])""",
     re.IGNORECASE,
 )
 
@@ -338,20 +341,40 @@ def _rewrite_assets(html: bytes, chapter_href: str, job_id: str, zip_path: Path)
     # 2) 删除 head 里指向 CSS 的 link（用我们已注入的 inline 样式即可）
     html = _CSS_HREF_RE.sub(b"", html)
 
-    # 3) 把 <img src="..."> 改写到 /api/.../epub/asset
-    def _rewrite_img(m: re.Match) -> bytes:
-        original = m.group(1)
+    # 3) 把图片 / SVG image 的相对资源改写到 /api/.../epub/asset
+    def _rewrite_resource_attr(m: re.Match) -> bytes:
+        original = m.group("url")
         if original.startswith(b"data:") or original.startswith(b"http://") or original.startswith(b"https://"):
             return m.group(0)
         rel = original.decode("utf-8", "replace")
+        if rel.startswith("#"):
+            return m.group(0)
+        if not re.search(r"\.(?:png|jpe?g|gif|webp|svg|avif)(?:$|[?#])", rel, re.IGNORECASE):
+            return m.group(0)
         if chapter_dir and not rel.startswith("/"):
             full = chapter_dir + "/" + rel
         else:
             full = rel.lstrip("/")
+        full = str(Path(full).as_posix())
+        parts: list[str] = []
+        for part in full.split("/"):
+            if part == "..":
+                if parts:
+                    parts.pop()
+            elif part and part != ".":
+                parts.append(part)
+        full = "/".join(parts)
         encoded = quote(full, safe="")
-        return (b'<img src="/api/jobs/' + job_id.encode("utf-8") + b'/epub/asset?path=' + encoded.encode("utf-8") + b'"')
+        return (
+            m.group("prefix")
+            + b"/api/jobs/"
+            + job_id.encode("utf-8")
+            + b"/epub/asset?path="
+            + encoded.encode("utf-8")
+            + m.group("suffix")
+        )
 
-    html = _IMG_SRC_RE.sub(_rewrite_img, html)
+    html = _RESOURCE_ATTR_RE.sub(_rewrite_resource_attr, html)
 
     # 4) head 注入 inline CSS
     style_tag = b"<style>" + inline_css + b"</style>"
@@ -368,7 +391,7 @@ def _wrap_fragment(fragment: bytes, chapter_href: str, job_id: str, zip_path: Pa
     # links and may absorb all following prose. Page anchors are navigation
     # markers, not links, so project them as inert spans before serving HTML.
     inert_fragment = _PAGE_MARKER_TAG_RE.sub(
-        lambda match: b'<span id="' + match.group(1) + b'"></span>',
+        lambda match: b'<span id="' + match.group("anchor") + b'"></span>',
         fragment,
     )
     # 1) 先把 fragment 里的资源重写

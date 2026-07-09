@@ -1,6 +1,5 @@
 import { Routes, Route, Navigate } from 'react-router-dom'
 import Layout from './components/Layout'
-import Home from './components/Home'
 import Library from './components/Library'
 import Reader from './components/Reader'
 import Review from './components/Review'
@@ -24,7 +23,7 @@ function App() {
           }
         />
         <Route path="/" element={<Layout />}>
-          <Route index element={<Home />} />
+          <Route index element={<Navigate to="/upload" replace />} />
           <Route path="library" element={<Library />} />
           <Route path="book/:id" element={<Reader />} />
           <Route path="reader/:id" element={<Navigate to="/book/:id" replace />} />

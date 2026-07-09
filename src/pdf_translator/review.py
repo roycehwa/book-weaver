@@ -14,6 +14,12 @@ from pdf_translator.glossary import (
 )
 from pdf_translator.models import TranslationChunk
 from pdf_translator.chunking import split_markdown_into_chunks
+from pdf_translator.chapter_kind import classify_chapter, should_translate_chapter
+from pdf_translator.chapter_segments import chapter_segments_for_translation
+from pdf_translator.review_exemptions import (
+    apply_review_exemptions,
+    summarise_exemptions,
+)
 from pdf_translator.translate import (
     _chapter_markdown_for_translation,
     _chunk_cache_path,
@@ -80,6 +86,12 @@ MODEL_REFUSAL_PATTERNS = (
     re.compile(r"please provide.*markdown", re.I),
     re.compile(r"no markdown (?:content|document)", re.I),
 )
+FAIL_OPEN_MARKER = "BOOKWEAVER_TRANSLATION_FAIL_OPEN"
+FAIL_OPEN_COMMENT_RE = re.compile(r"<!--\s*BOOKWEAVER_TRANSLATION_FAIL_OPEN\b.*?-->\s*", re.DOTALL)
+FAIL_OPEN_WARNING_RE = re.compile(
+    r"(?:^|\n)>?\s*⚠️\s*BookWeaver：本段自动翻译未通过质量校验.*?(?:\n\s*\n|$)",
+    re.DOTALL,
+)
 
 
 def utc_now() -> str:
@@ -144,6 +156,7 @@ def build_source_segments(book: dict[str, Any], *, source_path: Path) -> list[di
                     "chapter_id": key,
                     "chapter_index": int(chapter.get("index") or fallback_index),
                     "chapter_title": _chapter_title(chapter, fallback_index),
+                    "chapter_kind": str(chapter.get("kind") or ""),
                     "block_index": block_index,
                     "source_text": block,
                     "source_path": str(source_path),
@@ -210,8 +223,66 @@ def build_aligned_review_segments(
             for item in payload.get("chunks", [])
             if isinstance(item, dict) and item.get("chunk_index") is not None
         }
+    segment_plan = chapter_segments_for_translation(book, max_chars=max_chunk_chars)
+    if segment_plan:
+        for segment in segment_plan:
+            source_text = str(segment.get("markdown") or "").strip()
+            if not source_text:
+                continue
+            translate = bool(segment.get("translate", True))
+            chunk_index = global_chunk_index
+            chunk_terms = glossary_constraints.get(chunk_index) if translate else None
+            translated_text = source_text
+            if translate:
+                translated_text = _read_chunk_cache(
+                    cache_dir,
+                    TranslationChunk(
+                        index=chunk_index,
+                        markdown=source_text,
+                        glossary_entries=chunk_terms,
+                    ),
+                )
+                global_chunk_index += 1
+            base = {
+                "segment_id": str(segment.get("segment_id") or f"segment-{len(source_segments) + 1:04d}"),
+                "chapter_id": str(segment.get("chapter_id") or ""),
+                "chapter_index": int(segment.get("chapter_index") or 0),
+                "chapter_title": str(segment.get("chapter_title") or ""),
+                "block_index": int(segment.get("segment_index_in_chapter") or 0),
+                "source_location": {
+                    "chapter_index": segment.get("chapter_index"),
+                    "chapter_id": segment.get("chapter_id"),
+                    "chapter_title": segment.get("chapter_title"),
+                    "page_start": segment.get("page_start"),
+                    "page_end": segment.get("page_end"),
+                    "source_pages": segment.get("source_pages") or [],
+                    "source_internal_path": None,
+                },
+                "translate": translate,
+            }
+            if chunk_terms:
+                base["glossary_entries"] = chunk_terms
+            source_segments.append(
+                {
+                    **base,
+                    "source_text": source_text,
+                    "source_path": str(source_path),
+                    "status": "pending",
+                }
+            )
+            translated_segments.append(
+                {
+                    **base,
+                    "translated_text": translated_text,
+                    "target_language": target_language,
+                    "status": "needs_review",
+                }
+            )
+        return _merge_reading_review_segments(source_segments, translated_segments)
 
     for fallback_index, chapter in enumerate(book.get("chapters") or [], 1):
+        if isinstance(chapter, dict) and not chapter.get("kind"):
+            chapter["kind"] = classify_chapter(chapter, pages=book.get("pages") or [])
         key = _chapter_key(chapter, fallback_index)
         chapter_index = int(chapter.get("index") or fallback_index)
         title = _chapter_title(chapter, fallback_index)
@@ -261,10 +332,10 @@ def build_aligned_review_segments(
                 }
             )
 
-        if not bool(chapter.get("translate", True)):
+        if not should_translate_chapter(chapter):
             text = chapter_source_markdown.strip()
             if text:
-                append_segment(text, text)
+                append_segment(text, text, translate_override=False)
             continue
 
         media_segments = (
@@ -516,11 +587,20 @@ def detect_review_items(
         )
         if resource_chapter:
             continue
-        if _is_non_prose_review_segment(source_text):
+        has_fail_open_placeholder = FAIL_OPEN_MARKER in translated_text
+        if _is_non_prose_review_segment(source_text) and not has_fail_open_placeholder:
             continue
         if not bool(source.get("translate", True)) and text_operation == "translate":
             continue
-        if not translated_text:
+        if has_fail_open_placeholder:
+            issue_type = "translation_failed_open"
+            severity = "high"
+            evidence = {
+                "marker": FAIL_OPEN_MARKER,
+                "reason": "Model output failed translation quality checks; source was preserved for manual review.",
+                "translation_part_ids": source.get("translation_part_ids", []),
+            }
+        elif not translated_text:
             issue_type = "missing_content" if text_operation == "preserve" else "missing_translation"
             severity = "high"
         elif text_operation == "preserve":
@@ -550,8 +630,17 @@ def detect_review_items(
                 issue_type = "possibly_incomplete"
                 severity = "high"
             elif mixed_words >= 4:
-                issue_type = "mixed_english"
-                severity = "medium"
+                # Phase A optimisation: exemption rules gate the
+                # mixed_english flag (notes / proper nouns / code /
+                # foreign script / glossary terms). Other defect
+                # branches (untranslated, possibly_incomplete) still
+                # surface because they reflect real translation gaps.
+                _exempt, _exempt_reason = apply_review_exemptions(source)
+                if _exempt:
+                    evidence["exempt_reason"] = _exempt_reason
+                else:
+                    issue_type = "mixed_english"
+                    severity = "medium"
 
         if (
             issue_type is None
@@ -878,7 +967,7 @@ def _rewrite_prompt(
 ) -> str:
     source = source_text.strip()
     comment = reviewer_comment.strip()
-    current = current_translation.strip()
+    current = "" if FAIL_OPEN_MARKER in current_translation else current_translation.strip()
     current_section = current if current else "(none — translate the source text from scratch)"
     prompt = (
         "Rewrite this translation according to the reviewer instruction.\n"
@@ -897,6 +986,14 @@ def _rewrite_prompt(
         )
         prompt += f"\n\nMANDATORY GLOSSARY:\n{glossary_lines}"
     return prompt
+
+
+def _strip_fail_open_notice(text: str) -> str:
+    if FAIL_OPEN_MARKER not in text:
+        return text.strip()
+    cleaned = FAIL_OPEN_COMMENT_RE.sub("", text)
+    cleaned = FAIL_OPEN_WARNING_RE.sub("\n", cleaned)
+    return cleaned.strip()
 
 
 def _cjk_count(text: str) -> int:
@@ -926,16 +1023,18 @@ def _translate_missing_segment(
         source_language=resolved_source_language,
         target_language=target_language,
     ).strip()
+    candidate = _strip_fail_open_notice(candidate)
     if _is_valid_rewrite_candidate(source, candidate, target_language):
         return candidate
     if not reviewer_comment:
         return candidate
     retry_prompt = _rewrite_prompt(source, "", reviewer_comment)
-    return translator.translate_chunk(
+    retry_candidate = translator.translate_chunk(
         TranslationChunk(index=index, markdown=retry_prompt),
         source_language=resolved_source_language,
         target_language=target_language,
     ).strip()
+    return _strip_fail_open_notice(retry_candidate)
 
 
 def _is_valid_rewrite_candidate(source_text: str, candidate: str, target_language: str) -> bool:
@@ -1021,6 +1120,7 @@ def rewrite_review_requests(
                 source_language=source_language or "en",
                 target_language=target_language,
             ).strip()
+            candidate = _strip_fail_open_notice(candidate)
             missing_terms = glossary_terms_missing_in_translation(
                 source_text,
                 candidate,
@@ -1050,6 +1150,7 @@ def rewrite_review_requests(
                     source_language=source_language or "en",
                     target_language=target_language,
                 ).strip()
+                candidate = _strip_fail_open_notice(candidate)
                 if glossary_terms_missing_in_translation(
                     source_text,
                     candidate,

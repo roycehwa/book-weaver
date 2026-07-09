@@ -281,7 +281,7 @@ def test_review_rewrite_uses_nested_cli_command(tmp_path: Path, monkeypatch):
     )
 
     assert response.status_code == 200
-    assert calls[0][:2] == ["review-rewrite", str(run_dir)]
+    assert calls[0][:3] == ["review", "rewrite", str(run_dir)]
 
 
 def test_review_export_uses_nested_cli_command(tmp_path: Path, monkeypatch):
@@ -321,7 +321,7 @@ def test_review_export_uses_nested_cli_command(tmp_path: Path, monkeypatch):
     )
 
     assert response.status_code == 200
-    assert calls[0][:2] == ["review-export", str(run_dir)]
+    assert calls[0][:3] == ["review", "export", str(run_dir)]
     assert set(response.json()["delivered_files"]) == {
         "translated_pdf",
         "translated_epub",
@@ -894,6 +894,82 @@ def test_workspace_books_next_action_confirm_chapters_after_glossary_ready(monke
     assert book["steps"]["glossary_finalization"]["status"] == "done"
 
 
+def test_workspace_books_next_action_rejects_auto_confirmed_chapters_after_glossary_ready(monkeypatch):
+    module = importlib.import_module("main")
+    snapshot = _job_snapshot(
+        "job-auto-chapters",
+        filename="Policy Book.epub",
+        state="awaiting_glossary",
+        text_operation="translate",
+        artifacts={
+            "glossary_candidates": {"href": "artifacts/glossary/candidates.json"},
+            "canonical_chapters": {
+                "href": "artifacts/canonical-chapters.json",
+                "source_artifact": "book",
+            },
+        },
+    )
+    monkeypatch.setattr(
+        module,
+        "get_job_service",
+        lambda: SimpleNamespace(
+            glossary_workflow=lambda job_id: {
+                "stage": "glossary_ready",
+                "glossary_finalized_by_user": True,
+            },
+        ),
+    )
+
+    book = module._workspace_book_from_job(snapshot)
+
+    assert book["next_action"]["kind"] == "confirm_chapters"
+    assert book["steps"]["chapter_confirmation"]["status"] == "action_required"
+
+
+def test_workspace_books_accepts_legacy_user_confirmed_canonical_file(
+    tmp_path: Path,
+    monkeypatch,
+):
+    module = importlib.import_module("main")
+    canonical_path = tmp_path / "canonical-chapters.json"
+    canonical_path.write_text(
+        json.dumps(
+            {
+                "schema": "bookmate_canonical_chapters_v1",
+                "source_artifact": "user_confirmation",
+                "chapters": [{"index": 1, "chapter_id": "ch-1", "title": "Manual"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    snapshot = _job_snapshot(
+        "job-legacy-user-chapters",
+        filename="Policy Book.epub",
+        state="awaiting_glossary",
+        text_operation="translate",
+        artifacts={
+            "glossary_candidates": {"href": "artifacts/glossary/candidates.json"},
+            "canonical_chapters": {"href": "artifacts/canonical-chapters.json"},
+        },
+    )
+    monkeypatch.setattr(
+        module,
+        "get_job_service",
+        lambda: SimpleNamespace(
+            artifact_path=lambda job_id, artifact_name: canonical_path,
+            glossary_workflow=lambda job_id: {
+                "stage": "glossary_ready",
+                "glossary_finalized_by_user": True,
+            },
+        ),
+    )
+
+    book = module._workspace_book_from_job(snapshot)
+
+    assert book["next_action"]["kind"] == "start_translation"
+    assert book["steps"]["chapter_confirmation"]["status"] == "done"
+
+
 def test_workspace_books_next_action_start_translation_after_glossary_and_chapters_ready(monkeypatch):
     module = importlib.import_module("main")
     snapshot = _job_snapshot(
@@ -903,22 +979,24 @@ def test_workspace_books_next_action_start_translation_after_glossary_and_chapte
         text_operation="translate",
         artifacts={
             "glossary_candidates": {"href": "artifacts/glossary/candidates.json"},
-            "canonical_chapters": {"href": "artifacts/canonical-chapters.json"},
+            "canonical_chapters": {
+                "href": "artifacts/canonical-chapters.json",
+                "source_artifact": "user_confirmation",
+            },
         },
     )
-    service = SimpleNamespace(
-        list=lambda: [snapshot],
-        glossary_workflow=lambda job_id: {
-            "stage": "glossary_ready",
-            "glossary_finalized_by_user": True,
-        },
+    monkeypatch.setattr(
+        module,
+        "get_job_service",
+        lambda: SimpleNamespace(
+            glossary_workflow=lambda job_id: {
+                "stage": "glossary_ready",
+                "glossary_finalized_by_user": True,
+            },
+        ),
     )
-    monkeypatch.setattr(module, "get_job_service", lambda: service)
 
-    response = TestClient(module.app).get("/api/workspace/books")
-
-    assert response.status_code == 200
-    book = response.json()["books"][0]
+    book = module._workspace_book_from_job(snapshot)
     assert book["next_action"]["kind"] == "start_translation"
 
 
@@ -991,6 +1069,30 @@ def test_workspace_books_polish_failure_prompts_resume(monkeypatch):
     assert book["steps"]["polish"]["status"] == "failed"
     assert book["next_action"]["kind"] == "resume_job"
     assert book["next_action"]["label"] == "重试润色"
+
+
+def test_workspace_books_failed_translation_respects_resume_gate(monkeypatch):
+    module = importlib.import_module("main")
+    snapshot = _job_snapshot(
+        "job-translation-human-gate",
+        filename="Policy Book.epub",
+        state="failed",
+        failed_stage="translating",
+        text_operation="translate",
+        artifacts={"book": {"href": "artifacts/book.json"}},
+    )
+    snapshot["translation_resume"] = {
+        "available": False,
+        "reason": "human_gate_required",
+        "detail": "请先人工确认章节目录，再开始全文翻译。",
+    }
+    monkeypatch.setattr(module, "get_job_service", lambda: SimpleNamespace(list=lambda: [snapshot]))
+
+    book = module._workspace_book_from_job(snapshot)
+
+    assert book["pipeline_status"] == "failed"
+    assert book["next_action"]["kind"] == "confirm_chapters"
+    assert book["next_action"]["label"] == "请先人工确认章节目录，再开始全文翻译。"
 
 
 def test_workspace_books_skips_translation_review_for_preserved_jobs(tmp_path, monkeypatch):

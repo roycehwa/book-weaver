@@ -274,6 +274,67 @@ def test_mixed_english_flags_untranslated_explanatory_footnote() -> None:
     assert items[0]["issue_type"] == "mixed_english"
 
 
+def test_fail_open_placeholder_is_high_priority_review_item() -> None:
+    items = detect_review_items(
+        [
+            {
+                "segment_id": "ch-001:r001",
+                "chapter_id": "ch-001",
+                "chapter_index": 1,
+                "chapter_title": "History",
+                "block_index": 1,
+                "source_text": "This English paragraph should have been translated.",
+                "translation_part_ids": ["ch-001:c001"],
+                "translate": True,
+            }
+        ],
+        [
+            {
+                "segment_id": "ch-001:r001",
+                "translated_text": (
+                    "<!-- BOOKWEAVER_TRANSLATION_FAIL_OPEN "
+                    "reason=\"looks untranslated\" -->\n\n"
+                    "> 本段自动翻译未通过质量校验，已保留原文供审阅修订。\n\n"
+                    "This English paragraph should have been translated."
+                ),
+            }
+        ],
+        target_language="zh-CN",
+    )
+
+    assert len(items) == 1
+    assert items[0]["issue_type"] == "translation_failed_open"
+    assert items[0]["severity"] == "high"
+    assert items[0]["evidence"]["translation_part_ids"] == ["ch-001:c001"]
+
+
+def test_aligned_review_classifies_legacy_index_as_untranslated_resource(tmp_path: Path) -> None:
+    from pdf_translator.review import build_aligned_review_segments
+
+    book = {
+        "chapters": [
+            {
+                "index": 1,
+                "chapter_id": "ch-001-index",
+                "title": "Index",
+                "markdown": "Apple, 3\nConservatism, 8",
+                "translate": True,
+            }
+        ],
+        "pages": [],
+    }
+    source_segments, translated_segments = build_aligned_review_segments(
+        book,
+        source_path=tmp_path / "source.epub",
+        target_language="zh-CN",
+        cache_dir=tmp_path / "cache",
+        max_chunk_chars=1000,
+    )
+
+    assert source_segments[0]["translate"] is False
+    assert translated_segments[0]["translated_text"].strip() == "# Index\n\nApple, 3\nConservatism, 8"
+
+
 def test_review_skips_map_frontmatter_with_figure_captions() -> None:
     from pdf_translator.review import detect_review_items
 
@@ -844,6 +905,22 @@ def test_rewrite_prompt_for_missing_translation_uses_source_text() -> None:
     assert "SOURCE TEXT:" in prompt
     assert "CURRENT TRANSLATION:" in prompt
     assert "[missing translation]" not in prompt
+
+
+def test_rewrite_prompt_strips_fail_open_placeholder_from_current_translation() -> None:
+    prompt = _rewrite_prompt(
+        "The source paragraph must be translated.",
+        (
+            "<!-- BOOKWEAVER_TRANSLATION_FAIL_OPEN chunk=12 reason=\"bad\" -->\n\n"
+            "> ⚠️ BookWeaver：本段自动翻译未通过质量校验，已保留原文供审阅修订。原因：bad\n\n"
+            "The source paragraph must be translated."
+        ),
+        "请完整翻译成中文。",
+    )
+
+    assert "BOOKWEAVER_TRANSLATION_FAIL_OPEN" not in prompt
+    assert "BookWeaver：本段自动翻译未通过质量校验" not in prompt
+    assert "(none — translate the source text from scratch)" in prompt
 
 
 def test_is_valid_rewrite_candidate_rejects_placeholder() -> None:

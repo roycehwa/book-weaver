@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import './EpubViewer.css'
 
 export interface EpubViewerProps {
@@ -59,7 +59,6 @@ export const EpubViewer: React.FC<EpubViewerProps> = ({
   const [inputPage, setInputPage] = useState<string>(String(initialPage))
   const [pageHtml, setPageHtml] = useState<string>('')
   const [pageLoading, setPageLoading] = useState<boolean>(false)
-  const contentRef = useRef<HTMLDivElement | null>(null)
 
   // 加载页索引
   useEffect(() => {
@@ -285,10 +284,11 @@ export const EpubViewer: React.FC<EpubViewerProps> = ({
             style={{ transform: `scale(${scale})`, transformOrigin: 'top center' }}
             data-page-index={current.index}
           >
-            <div
-              ref={contentRef}
-              className={`epub-viewer__content ${pageLoading ? 'is-loading' : 'is-ready'}`}
-              dangerouslySetInnerHTML={{ __html: pageHtml }}
+            <iframe
+              title="EPUB 页面预览"
+              className={`epub-viewer__content epub-viewer__frame ${pageLoading ? 'is-loading' : 'is-ready'}`}
+              srcDoc={pageHtml}
+              sandbox=""
             />
           </div>
         </div>

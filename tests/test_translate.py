@@ -5,6 +5,7 @@ import pytest
 
 from pdf_translator.config import CompatibleAPISettings
 from pdf_translator.config import RunSettings
+from pdf_translator.config import DEFAULT_MINIMAX_HTTP_TIMEOUT_SECONDS
 from pdf_translator.config import DEFAULT_TRANSLATION_CONCURRENCY
 from pdf_translator.models import TranslationChunk
 from pdf_translator.translate import (
@@ -1325,6 +1326,44 @@ def test_translate_markdown_retries_untranslated_chinese_output(tmp_path: Path, 
     assert "已经翻译成中文" in result.translated_markdown
 
 
+def test_sensitive_split_retries_untranslated_small_part(monkeypatch: pytest.MonkeyPatch) -> None:
+    from pdf_translator.translate import _translate_sensitive_part
+
+    class InitiallyUntranslatedPartTranslator(BaseTranslator):
+        name = "realish"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            self.calls += 1
+            if self.calls == 1:
+                return "This is still English prose with only 少量中文. " * 4
+            return "这是一个已经充分翻译成中文的小段落，保留必要的人名与引文。"
+
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
+    translator = InitiallyUntranslatedPartTranslator()
+
+    translated = _translate_sensitive_part(
+        chunk=TranslationChunk(
+            index=7,
+            markdown="This source English paragraph needs translation into Chinese. " * 4,
+        ),
+        source_language="en",
+        target_language="zh-CN",
+        translator=translator,
+        retry_count=2,
+    )
+
+    assert translator.calls == 2
+    assert "充分翻译成中文" in translated
+
+
 def test_translate_markdown_uses_quality_retry_prompt_after_bad_output(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1929,6 +1968,8 @@ def test_build_translator_supports_minimax(monkeypatch: pytest.MonkeyPatch) -> N
 
 def test_minimax_translator_uses_anthropic_messages_api(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, object] = {}
+    monkeypatch.delenv("MINIMAX_HTTP_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.setenv("MINIMAX_USE_SUBPROCESS_TIMEOUT", "0")
 
     class FakeResponse:
         def __init__(self) -> None:
@@ -1979,6 +2020,7 @@ def test_minimax_translator_uses_anthropic_messages_api(monkeypatch: pytest.Monk
     assert body["model"] == "MiniMax-M2.7-highspeed"
     assert body["max_tokens"] == 2048
     assert captured["headers"].get("anthropic-version") == "2023-06-01"
+    assert captured["timeout"] == (10, DEFAULT_MINIMAX_HTTP_TIMEOUT_SECONDS)
     from pdf_translator.translate import build_translation_prompt
 
     assert body["messages"] == [
@@ -1992,6 +2034,28 @@ def test_minimax_translator_uses_anthropic_messages_api(monkeypatch: pytest.Monk
             ),
         }
     ]
+
+
+def test_minimax_subprocess_wall_timeout_raises_requests_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from subprocess import TimeoutExpired
+    import requests
+    from pdf_translator.translate import _post_minimax_json
+
+    def fake_run(*args, **kwargs):
+        raise TimeoutExpired(cmd=args[0], timeout=kwargs["timeout"])
+
+    monkeypatch.delenv("MINIMAX_USE_SUBPROCESS_TIMEOUT", raising=False)
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    with pytest.raises(requests.Timeout, match="wall timeout"):
+        _post_minimax_json(
+            "https://example.test",
+            payload={"model": "m"},
+            headers={},
+            timeout_seconds=1,
+        )
 
 
 def test_build_translator_supports_deepl(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2311,6 +2375,7 @@ def test_translate_markdown_skips_deepl_for_non_sensitive_failure(
         return real_build(name)
 
     monkeypatch.setenv("TRANSLATION_FALLBACK", "deepl")
+    monkeypatch.setenv("TRANSLATION_FAIL_OPEN", "0")
     monkeypatch.setenv("DEEPL_AUTH_KEY", "test-key")
     monkeypatch.setattr("pdf_translator.translate.build_translator", fake_build)
     monkeypatch.setattr("time.sleep", lambda seconds: None)
@@ -2337,5 +2402,224 @@ def test_translate_markdown_skips_deepl_for_non_sensitive_failure(
             cache_dir=tmp_path / "cache",
             retry_count=2,
         )
+
+
+def test_translate_markdown_fail_open_preserves_bad_chunk_for_review(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailingTranslator(BaseTranslator):
+        name = "minimax"
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            return "This is still English prose. " * 30
+
+    monkeypatch.delenv("TRANSLATION_FAIL_OPEN", raising=False)
+    monkeypatch.delenv("TRANSLATION_FALLBACK", raising=False)
+    monkeypatch.delenv("DEEPL_AUTH_KEY", raising=False)
+    monkeypatch.delenv("DEEPL_API_KEY", raising=False)
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
+    settings = RunSettings(
+        source_pdf=tmp_path / "source.pdf",
+        output_dir=tmp_path,
+        target_language="zh-CN",
+        source_language="en",
+        translator="minimax",
+        max_chunk_chars=1000,
+    )
+
+    result = translate_markdown(
+        chunks=[
+            TranslationChunk(
+                index=0,
+                markdown="This source English paragraph needs translation. " * 30,
+            )
+        ],
+        settings=settings,
+        translator=FailingTranslator(),
+        cache_dir=tmp_path / "cache",
+        retry_count=1,
+    )
+
+    assert "BOOKWEAVER_TRANSLATION_FAIL_OPEN" in result.translated_markdown
+    assert "保留原文供审阅修订" in result.translated_markdown
+    assert "This source English paragraph needs translation." in result.translated_markdown
+
+    class ShouldNotBeCalledTranslator(BaseTranslator):
+        name = "minimax"
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            raise AssertionError("fail-open cache should be accepted without model call")
+
+    cached = translate_markdown(
+        chunks=[
+            TranslationChunk(
+                index=0,
+                markdown="This source English paragraph needs translation. " * 30,
+            )
+        ],
+        settings=settings,
+        translator=ShouldNotBeCalledTranslator(),
+        cache_dir=tmp_path / "cache",
+        retry_count=1,
+    )
+
+    assert cached.translated_markdown == result.translated_markdown
+
+
+def test_translate_markdown_default_quality_retries_fail_open_after_two_attempts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailingTranslator(BaseTranslator):
+        name = "minimax"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            self.calls += 1
+            return "This remains untranslated English prose. " * 30
+
+    monkeypatch.delenv("TRANSLATION_FAIL_OPEN", raising=False)
+    monkeypatch.delenv("TRANSLATION_FALLBACK", raising=False)
+    monkeypatch.delenv("DEEPL_AUTH_KEY", raising=False)
+    monkeypatch.delenv("DEEPL_API_KEY", raising=False)
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
+    settings = RunSettings(
+        source_pdf=tmp_path / "source.pdf",
+        output_dir=tmp_path,
+        target_language="zh-CN",
+        source_language="en",
+        translator="minimax",
+        max_chunk_chars=1000,
+    )
+    translator = FailingTranslator()
+
+    result = translate_markdown(
+        chunks=[
+            TranslationChunk(
+                index=0,
+                markdown="This source English paragraph needs translation. " * 30,
+            )
+        ],
+        settings=settings,
+        translator=translator,
+        cache_dir=tmp_path / "cache",
+    )
+
+    assert translator.calls == 2
+    assert "BOOKWEAVER_TRANSLATION_FAIL_OPEN" in result.translated_markdown
+
+
+def test_translate_book_chapters_classifies_legacy_contents_and_index_as_skipped(
+    tmp_path: Path,
+) -> None:
+    class BodyOnlyTranslator(BaseTranslator):
+        name = "mock"
+
+        def __init__(self) -> None:
+            self.sources: list[str] = []
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            self.sources.append(chunk.markdown)
+            assert "Contents" not in chunk.markdown
+            assert "Index" not in chunk.markdown
+            return "这是正文译文。"
+
+    settings = RunSettings(
+        source_pdf=tmp_path / "source.epub",
+        output_dir=tmp_path,
+        target_language="zh-CN",
+        source_language="en",
+        translator="mock",
+        max_chunk_chars=1000,
+    )
+    book = {
+        "chapters": [
+            {
+                "index": 1,
+                "chapter_id": "ch-001-contents",
+                "title": "Contents",
+                "markdown": "Chapter One .... 1",
+                "translate": True,
+            },
+            {
+                "index": 2,
+                "chapter_id": "ch-002-body",
+                "title": "Chapter One",
+                "markdown": "This body paragraph should be translated.",
+                "translate": True,
+            },
+            {
+                "index": 3,
+                "chapter_id": "ch-003-index",
+                "title": "Index",
+                "markdown": "Apple, 3\nConservatism, 8",
+                "translate": True,
+            },
+        ],
+        "pages": [],
+    }
+    translator = BodyOnlyTranslator()
+
+    result = translate_book_chapters(
+        book=book,
+        settings=settings,
+        translator=translator,
+        cache_dir=tmp_path / "cache",
+    )
+
+    assert len(translator.sources) == 1
+    assert result.translated_chapters[0].markdown.strip() == "# Contents\n\nChapter One .... 1"
+    assert result.translated_chapters[1].markdown.strip() == "这是正文译文。"
+    assert result.translated_chapters[2].markdown.strip() == "# Index\n\nApple, 3\nConservatism, 8"
+
+
+def test_read_chunk_cache_rejects_index_fallback_when_source_fingerprint_differs(
+    tmp_path: Path,
+) -> None:
+    from pdf_translator.translate import _chunk_source_fingerprint, _read_chunk_cache
+
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    stale_path = cache_dir / "chunk-000006-stalehash.md"
+    stale_path.write_text("旧缓存译文\n", encoding="utf-8")
+    stale_path.with_suffix(".source.json").write_text(
+        json.dumps(
+            {
+                "schema": "translation_cache_source_v1",
+                "source_fingerprint": _chunk_source_fingerprint("old source"),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert _read_chunk_cache(
+        cache_dir,
+        TranslationChunk(index=6, markdown="new source after policy changed"),
+    ) == ""
+
+
 def test_default_translation_concurrency_is_conservative() -> None:
     assert DEFAULT_TRANSLATION_CONCURRENCY == 3

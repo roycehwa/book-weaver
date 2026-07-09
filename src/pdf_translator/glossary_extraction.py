@@ -11,51 +11,95 @@ if TYPE_CHECKING:
 # Phrases that are almost never useful as book-level translation glossary entries.
 GENERIC_STOP_PHRASES = frozenset(
     {
-        "United States",
-        "New York",
-        "Los Angeles",
-        "San Francisco",
-        "North America",
-        "South America",
-        "Latin America",
-        "Middle East",
-        "Western Europe",
-        "Eastern Europe",
-        "World War",
-        "Second World",
-        "Third World",
-        "White House",
-        "Supreme Court",
-        "Federal Reserve",
-        "Wall Street",
-        "Silicon Valley",
-        "Harvard University",
-        "Yale University",
-        "Oxford University",
-        "Cambridge University",
-        "University Press",
-        "Chicago Press",
-        "Johns Hopkins",
-        "Table Of",
-        "Figure One",
-        "Chapter One",
-        "Part One",
-        "Part Two",
-        "Part Three",
-        "Part Four",
-        "Far East",
-        "Near East",
-        "East Africa",
-        "West Africa",
-        "North Africa",
-        "South Asia",
-        "East Asia",
-        "West Asia",
-        "Western Asia",
-        "Middle Eastern",
-        "East African",
-        "North African",
-        "South Asian",
+        "acknowledgements",
+        "acknowledgments",
+        "as well as",
+        "at the same time",
+        "bibliography",
+        "cambridge university",
+        "chapter one",
+        "chicago press",
+        "early islam",
+        "early middle",
+        "east africa",
+        "east african",
+        "east asia",
+        "eastern europe",
+        "eighth century",
+        "eleventh century",
+        "far east",
+        "federal reserve",
+        "fifth century",
+        "figure one",
+        "first half",
+        "for example",
+        "foreword",
+        "fourth century",
+        "further reading",
+        "harvard university",
+        "high middle",
+        "in addition",
+        "in fact",
+        "in other words",
+        "in particular",
+        "in the case",
+        "index",
+        "introduction",
+        "islamic middle east",
+        "johns hopkins",
+        "land and trade",
+        "land trade",
+        "late antique",
+        "latin america",
+        "list of figures",
+        "list of tables",
+        "los angeles",
+        "middle east",
+        "middle eastern",
+        "near east",
+        "new york",
+        "ninth century",
+        "north africa",
+        "north african",
+        "north america",
+        "on the other hand",
+        "oxford university",
+        "part four",
+        "part one",
+        "part three",
+        "part two",
+        "preface",
+        "press university",
+        "references",
+        "san francisco",
+        "second half",
+        "second world",
+        "seventh century",
+        "silicon valley",
+        "sixth century",
+        "south america",
+        "south asia",
+        "south asian",
+        "such as",
+        "supreme court",
+        "table contents",
+        "table of",
+        "table of contents",
+        "tenth century",
+        "third century",
+        "third world",
+        "twelfth century",
+        "united kingdom",
+        "united states",
+        "university press",
+        "wall street",
+        "west africa",
+        "west asia",
+        "western asia",
+        "western europe",
+        "white house",
+        "world war",
+        "yale university",
     }
 )
 
@@ -85,6 +129,23 @@ _TRAILING_CONNECTOR_RE = re.compile(
     r"\b(?:of|and|the|in|on|for|from|with|to|at|by|or|as|an|a)\s*$",
     re.IGNORECASE,
 )
+
+def is_generic_stop_phrase(normalised_phrase: str) -> bool:
+    """Return True if the normalised phrase is in the generic stop list.
+
+    The list is intentionally a hand-curated set of phrases that
+    frequently appear in book corpora but should never be treated as
+    book-level glossary entries (publishing boilerplate, generic
+    geographic regions, ordinal centuries). It does NOT enforce any
+    occurrence or chapter-count floor: a 600-page monograph and a
+    100-page children's book use the same list, because "early
+    Islam" or "land and trade" are equally non-terms regardless of
+    how often they appear.
+    """
+    if not normalised_phrase:
+        return False
+    return normalised_phrase.strip().lower() in GENERIC_STOP_PHRASES
+
 
 DOMAIN_MARKERS = frozenset(
     {
@@ -227,10 +288,20 @@ def _metadata_exclusions(book: dict[str, Any]) -> set[str]:
             part_clean = _normalize_phrase(part.strip(" ."))
             if len(part_clean) >= 4:
                 exclusions.add(part_clean)
-    for chapter in book.get("chapters", [])[:3]:
+    for chapter in book.get("chapters", []):
         title = str(chapter.get("title") or "").strip()
-        if title and not title.lower().startswith("untitled"):
-            exclusions.add(_normalize_phrase(title))
+        if not title or title.lower().startswith("untitled"):
+            continue
+        cleaned = _normalize_phrase(title)
+        if cleaned:
+            exclusions.add(cleaned)
+        # also exclude each word-trail of the title so e.g. a chapter
+        # titled "Notes on Transcription" still blocks the substring
+        # "Notes on Transcription" from becoming a candidate.
+        for part in re.split(r"[:—–\-|]", title):
+            part_clean = _normalize_phrase(part.strip(" ."))
+            if len(part_clean) >= 4:
+                exclusions.add(part_clean)
     return exclusions
 
 

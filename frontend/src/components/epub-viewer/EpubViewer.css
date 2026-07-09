@@ -171,6 +171,12 @@
   transition: opacity 0.18s ease;
 }
 
+.epub-viewer__frame {
+  display: block;
+  height: 600px;
+  border: 0;
+}
+
 .epub-viewer__content.is-ready {
   opacity: 1;
 }

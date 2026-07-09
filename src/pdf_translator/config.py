@@ -15,9 +15,12 @@ DEFAULT_MINIMAX_BASE_URL = "https://api.minimaxi.com/anthropic/v1/messages"
 # Book chunks are sized for ingest quality; zh outputs often need more completion budget than 2048.
 DEFAULT_MINIMAX_MAX_TOKENS = 8192
 DEFAULT_DEEPL_BASE_URL = "https://api.deepl.com"
+DEFAULT_MAX_CHUNK_CHARS = 5000
 DEFAULT_TRANSLATION_CONCURRENCY = 3
-DEFAULT_MINIMAX_RPM = 20
-DEFAULT_MINIMAX_TPM = 1_000_000
+DEFAULT_TRANSLATION_RETRY_COUNT = 2
+DEFAULT_MINIMAX_HTTP_TIMEOUT_SECONDS = 120
+DEFAULT_MINIMAX_RPM = 500
+DEFAULT_MINIMAX_TPM = 20_000_000
 
 
 def normalize_minimax_base_url(base_url: str | None) -> str:

@@ -724,6 +724,26 @@ def _canonical_lifecycle_stage(job: dict[str, Any]) -> str:
     return state
 
 
+def _chapters_confirmed_by_user(job: dict[str, Any], artifacts: dict[str, Any]) -> bool:
+    canonical = artifacts.get("canonical_chapters")
+    if isinstance(canonical, dict):
+        if canonical.get("source_artifact") == "user_confirmation":
+            return True
+        if "source_artifact" in canonical:
+            return False
+    job_id = job.get("job_id")
+    if not isinstance(job_id, str) or not job_id:
+        return False
+    try:
+        path = get_job_service().artifact_path(job_id, "canonical_chapters")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    return payload.get("source_artifact") == "user_confirmation"
+
+
 def _workspace_book_from_job(job: dict[str, Any]) -> dict[str, Any]:
     state = str(job.get("state") or "created")
     failed_stage = job.get("failed_stage")
@@ -776,7 +796,7 @@ def _workspace_book_from_job(job: dict[str, Any]) -> dict[str, Any]:
     review_ready = state in {"awaiting_human_review", "exporting", "completed"} and "review_items" in artifacts
     review_completion = _review_completion_for_job(job) if is_translation_path and review_ready else {}
     review_done = bool(review_completion.get("review_completed"))
-    chapters_confirmed = "canonical_chapters" in artifacts or "chapter_structure" in artifacts
+    chapters_confirmed = _chapters_confirmed_by_user(job, artifacts)
     polish_outcome = _polish_outcome(job)
     polish_finished = polish_outcome in {"applied", "no_candidates", "waived"}
     polish_failed = state == "failed" and failed_stage == "polishing" or polish_outcome == "failed"
@@ -923,8 +943,34 @@ def _workspace_book_from_job(job: dict[str, Any]) -> dict[str, Any]:
 
     if state == "failed":
         pipeline_status = "failed"
-        label = "重试润色" if failed_stage == "polishing" else "从检查点恢复"
-        next_action = {"kind": "resume_job", "label": label, "href": f"/jobs/{job.get('job_id')}"}
+        resume_state = job.get("translation_resume") if isinstance(job.get("translation_resume"), dict) else None
+        if resume_state is None and is_translation_path and failed_stage in {"translating", "preserving"}:
+            job_id = job.get("job_id")
+            if isinstance(job_id, str) and job_id:
+                try:
+                    enriched = get_job_service().get(job_id)
+                    candidate = enriched.get("translation_resume")
+                    if isinstance(candidate, dict):
+                        resume_state = candidate
+                except Exception:
+                    resume_state = None
+        if (
+            is_translation_path
+            and failed_stage in {"translating", "preserving"}
+            and isinstance(resume_state, dict)
+            and resume_state.get("available") is False
+        ):
+            reason = str(resume_state.get("reason") or "")
+            detail = str(resume_state.get("detail") or "请先完成前置确认，再继续翻译。")
+            if reason == "human_gate_required" and "章节" in detail:
+                next_action = {"kind": "confirm_chapters", "label": detail, "href": f"/jobs/{job.get('job_id')}"}
+            elif reason == "human_gate_required":
+                next_action = {"kind": "finalize_glossary", "label": detail, "href": f"/jobs/{job.get('job_id')}"}
+            else:
+                next_action = {"kind": "view_progress", "label": detail, "href": f"/jobs/{job.get('job_id')}"}
+        else:
+            label = "重试润色" if failed_stage == "polishing" else "从检查点恢复"
+            next_action = {"kind": "resume_job", "label": label, "href": f"/jobs/{job.get('job_id')}"}
     elif is_translation_path and glossary_ready_pending_translation and not chapters_confirmed:
         pipeline_status = "processing"
         next_action = {
@@ -1569,6 +1615,154 @@ async def get_job_events(job_id: str):
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except JobServiceError as exc:
         raise HTTPException(status_code=500, detail="Invalid job event history.") from exc
+
+
+@api_router.get("/jobs/{job_id}/translation-events")
+async def get_translation_events(
+    job_id: str,
+    since_offset: int = 0,
+    limit: int = 500,
+):
+    """Tail the per-chunk translation events written by the translator.
+
+    The frontend should poll this endpoint with ``since_offset`` instead
+    of reading ``state`` (which may be stale when ``progress.json`` is
+    throttled). Lines are JSON objects that match the schema
+    ``translation_event_v1``; each line is one chunk attempt.
+    """
+    try:
+        service = get_job_service()
+        job_dir = service._job_dir(job_id)  # noqa: SLF001 (internal but stable)
+    except JobNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except JobServiceError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    events_paths = sorted(
+        job_dir.glob("artifacts/*/jobs/translation-events.jsonl"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    events_path = events_paths[0] if events_paths else job_dir / "jobs" / "translation-events.jsonl"
+    if not events_path.exists():
+        return {
+            "job_id": job_id,
+            "events": [],
+            "offset": 0,
+            "size": 0,
+            "completed": False,
+        }
+    try:
+        current_size = events_path.stat().st_size
+    except OSError:
+        raise HTTPException(status_code=503, detail="events file unreadable")
+    if since_offset < 0 or since_offset > current_size:
+        since_offset = 0
+    consumed_offset = since_offset
+    try:
+        with events_path.open("rb") as fp:
+            fp.seek(since_offset)
+            events: list[dict] = []
+            while since_offset <= current_size:
+                raw_line = fp.readline()
+                if not raw_line:
+                    break
+                consumed_offset += len(raw_line)
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+                try:
+                    events.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+                if 0 < limit <= len(events):
+                    break
+    except OSError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    progress_path = events_path.parent / "progress.json"
+    completed = False
+    if progress_path.exists():
+        try:
+            payload = json.loads(progress_path.read_text(encoding="utf-8"))
+            completed = str(payload.get("status") or "") in {"completed", "failed"}
+        except (OSError, json.JSONDecodeError):
+            pass
+    return {
+        "job_id": job_id,
+        "events": events,
+        "offset": consumed_offset,
+        "size": current_size,
+        "completed": completed,
+    }
+
+
+@api_router.get("/jobs/{job_id}/events/stream")
+async def stream_job_events(job_id: str):
+    """Server-Sent Events tail of the job's events.jsonl.
+
+    Streams new events as ``data: <json>\n\n`` lines. Closes the
+    connection when the job is no longer ``translating`` (the client
+    can decide whether to re-open). The tail is computed by reading
+    the last byte offset of the file on first read, so historical
+    events are not replayed.
+    """
+
+    async def _event_source():
+        try:
+            service = get_job_service()
+            job_dir = service._job_dir(job_id)  # internal but stable
+        except JobNotFound as exc:
+            yield f"event: error\ndata: {json.dumps({'detail': str(exc)})}\n\n"
+            return
+        except JobServiceError as exc:
+            yield f"event: error\ndata: {json.dumps({'detail': str(exc)})}\n\n"
+            return
+        events_path = job_dir / "events.jsonl"
+        if not events_path.exists():
+            yield f"event: error\ndata: {json.dumps({'detail': 'no events file'})}\n\n"
+            return
+        offset = events_path.stat().st_size
+        # initial hello so the client knows the stream is live
+        yield f"event: hello\ndata: {json.dumps({'job_id': job_id, 'offset': offset})}\n\n"
+        idle_ticks = 0
+        while idle_ticks < 6:  # ~30s of no-activity then close
+            await asyncio.sleep(5)
+            try:
+                cur_size = events_path.stat().st_size
+            except FileNotFoundError:
+                break
+            if cur_size < offset:
+                # file rotated/truncated; restart from the new size
+                offset = 0
+            if cur_size == offset:
+                idle_ticks += 1
+                # check job state: if not translating, close
+                try:
+                    snap = service.get(job_id)
+                except Exception:
+                    break
+                if snap.get("state") not in {"translating", "failed"}:
+                    yield f"event: closed\ndata: {json.dumps({'reason': 'state=' + str(snap.get('state'))})}\n\n"
+                    return
+                yield f"event: heartbeat\ndata: {json.dumps({'job_id': job_id, 'idle_ticks': idle_ticks})}\n\n"
+                continue
+            idle_ticks = 0
+            with events_path.open("rb") as fp:
+                fp.seek(offset)
+                new_blob = fp.read(cur_size - offset).decode("utf-8", errors="replace")
+            offset = cur_size
+            for line in new_blob.splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    evt = json.loads(line)
+                except json.JSONDecodeError:
+                    evt = {"raw": line}
+                yield f"data: {json.dumps(evt, ensure_ascii=False)}\n\n"
+        yield f"event: closed\ndata: {json.dumps({'reason': 'idle_timeout'})}\n\n"
+
+    from fastapi.responses import StreamingResponse
+
+    return StreamingResponse(_event_source(), media_type="text/event-stream")
 
 
 @api_router.get("/jobs/{job_id}/source")
@@ -3758,7 +3952,8 @@ async def run_review_rewrite(run_dir: str, request: ReviewRewriteRequest):
             detail="没有可执行的待重译段落。",
         )
     args = [
-        "review-rewrite",
+        "review",
+        "rewrite",
         str(path),
         "--target-lang",
         request.target_lang,
@@ -3791,7 +3986,8 @@ async def run_review_export(run_dir: str, request: ReviewExportRequest):
         )
     path = _resolve_review_run_dir(run_dir)
     args = [
-        "review-export",
+        "review",
+        "export",
         str(path),
         "--version",
         request.version,

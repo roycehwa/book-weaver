@@ -131,10 +131,7 @@ function ReviewCenter() {
             返回主页面
           </button>
         </div>
-        <p className="mt-1 text-sm text-slate-600">
-          这里显示可审阅的译稿：包括 BookMate 任务生成的审阅副本，以及从 Desktop/文档/OK 同步来的历史输出。
-          它不是上传任务清单；需要查看一本书从上传到知识解析的处理状态，请回到书籍工作台。
-        </p>
+        <p className="mt-1 text-sm text-slate-600">所有需要审阅的译稿。</p>
         <div className="mt-4 flex flex-wrap gap-2">
           <input
             className="min-w-64 flex-1 rounded-lg border border-slate-300 px-3 py-2 text-sm"

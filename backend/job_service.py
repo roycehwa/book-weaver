@@ -20,6 +20,11 @@ _TRANSLATION_ENV_KEYS = (
     "MINIMAX_MODEL",
     "LLM_MODEL",
     "MINIMAX_HTTP_TIMEOUT_SECONDS",
+    "MINIMAX_MAX_CONCURRENCY",
+    "MINIMAX_RPM",
+    "MINIMAX_TPM",
+    "MINIMAX_MAX_TOKENS",
+    "BOOKWEAVER_MAX_CHUNK_CHARS",
     "DEEPL_AUTH_KEY",
 )
 
@@ -163,11 +168,98 @@ class BookJobService:
 
     def resume(self, job_id: str) -> None:
         self._validate_job_id(job_id)
+        snapshot = self.get(job_id)
+        state = str(snapshot.get("state") or "")
+        failed_stage = str(snapshot.get("failed_stage") or "")
+        if state == "translating" or failed_stage in {"translating", "polishing", "validating", "pre_review"}:
+            self._require_user_confirmed_canonical_chapters(job_id)
         self._acquire_worker_lock(job_id)
         try:
             self._run(["job", "resume", job_id, "--jobs-dir", str(self.jobs_dir), "--json"])
         finally:
             self._release_worker_lock(job_id)
+
+    def mark_translation_resume_blocked(self, job_id: str, message: str) -> None:
+        self._validate_job_id(job_id)
+        path = self._job_dir(job_id) / "job.json"
+        if not path.is_file():
+            raise JobNotFound(f"Job not found: {job_id}")
+        snapshot = self._read_json_any(path)
+        if not isinstance(snapshot, dict):
+            raise JobServiceError(f"Invalid job snapshot: {job_id}")
+        snapshot["state"] = "failed"
+        snapshot["failed_stage"] = "translating"
+        snapshot["updated_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        snapshot["revision"] = int(snapshot.get("revision") or 0) + 1
+        snapshot["error"] = {
+            "code": "translation_resume_blocked",
+            "message": message,
+            "retryable": False,
+            "details": {
+                "stage": "translating",
+                "requires_human_action": True,
+            },
+        }
+        self._write_json_atomic(path, snapshot)
+
+    def _auto_resume_path(self, job_id: str) -> Path:
+        return self._job_dir(job_id) / "auto-resume.json"
+
+    def auto_resume_attempts(self, job_id: str) -> int:
+        path = self._auto_resume_path(job_id)
+        if not path.is_file():
+            return 0
+        try:
+            payload = self._read_json_any(path)
+        except JobServiceError:
+            return 0
+        if not isinstance(payload, dict):
+            return 0
+        try:
+            return max(0, int(payload.get("attempts") or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def record_auto_resume_attempt(self, job_id: str) -> None:
+        self._validate_job_id(job_id)
+        path = self._auto_resume_path(job_id)
+        attempts = self.auto_resume_attempts(job_id) + 1
+        self._write_json_atomic(
+            path,
+            {
+                "schema": "bookmate_auto_resume_v1",
+                "job_id": job_id,
+                "attempts": attempts,
+                "last_attempt_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            },
+        )
+
+    def mark_translation_auto_resume_exhausted(self, job_id: str, max_attempts: int) -> None:
+        self._validate_job_id(job_id)
+        path = self._job_dir(job_id) / "job.json"
+        if not path.is_file():
+            raise JobNotFound(f"Job not found: {job_id}")
+        snapshot = self._read_json_any(path)
+        if not isinstance(snapshot, dict):
+            raise JobServiceError(f"Invalid job snapshot: {job_id}")
+        snapshot["state"] = "failed"
+        snapshot["failed_stage"] = "translating"
+        snapshot["updated_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        snapshot["revision"] = int(snapshot.get("revision") or 0) + 1
+        previous_error = snapshot.get("error") if isinstance(snapshot.get("error"), dict) else {}
+        previous_detail = previous_error.get("details") if isinstance(previous_error.get("details"), dict) else {}
+        reason = previous_detail.get("reason") or previous_error.get("message") or "翻译自动恢复已达到上限。"
+        snapshot["error"] = {
+            "code": "translation_auto_resume_exhausted",
+            "message": f"翻译自动恢复已达到上限（{max_attempts} 次），需要人工查看失败块或调整术语/章节后再重试。",
+            "retryable": False,
+            "details": {
+                "stage": "translating",
+                "auto_resume_attempts": max_attempts,
+                "reason": reason,
+            },
+        }
+        self._write_json_atomic(path, snapshot)
 
     def _worker_lock_path(self, job_id: str) -> Path:
         return self._job_dir(job_id) / "translation-worker.lock"
@@ -267,10 +359,51 @@ class BookJobService:
         job_id = str(snapshot.get("job_id") or "")
         if not job_id or self.translation_worker_lock_held(job_id):
             return snapshot
-        if not activity or activity.get("status") != "failed":
+        if not activity:
             return snapshot
+        activity_status = str(activity.get("status") or "")
         last_error = str(activity.get("last_error") or "翻译进程已停止。")
-        path = self._job_dir(job_id) / "job.json"
+        stale_seconds = int(activity.get("seconds_since_update") or 0)
+        job_dir = self._job_dir(job_id)
+        progress_paths = sorted(
+            job_dir.glob("artifacts/*/jobs/progress.json"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        worker_progress = None
+        if progress_paths:
+            try:
+                worker_progress = json.loads(progress_paths[0].read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                worker_progress = None
+        worker_has_pending_chunks = bool(worker_progress) and (
+            int(worker_progress.get("running_chunks") or 0) > 0
+            or int(worker_progress.get("retrying_chunks") or 0) > 0
+        )
+        worker_recent = stale_seconds <= 600
+        worker_alive = bool(worker_progress) and worker_recent and (
+            worker_has_pending_chunks
+            or activity_status in {"active", "waiting"}
+        )
+        if worker_alive:
+            return snapshot
+        cache_dirs = sorted(
+            job_dir.glob("artifacts/*/translation-cache"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        cache_chunks = 0
+        latest_mtime: float = 0.0
+        if cache_dirs:
+            for path in cache_dirs[0].glob("chunk-*.md"):
+                cache_chunks += 1
+                latest_mtime = max(latest_mtime, path.stat().st_mtime)
+        import time as _time
+        cache_stale = cache_chunks == 0 or (_time.time() - latest_mtime) > 180
+        if not cache_stale:
+            # worker is gone but fresh cache entries are still being written —
+            # another resume is already underway, do not flip state.
+            return snapshot
         merged = dict(snapshot)
         merged["state"] = "failed"
         merged["failed_stage"] = "translating"
@@ -280,6 +413,7 @@ class BookJobService:
             "retryable": True,
             "details": {"stage": "translating", "reason": last_error},
         }
+        path = job_dir / "job.json"
         path.write_text(json.dumps(merged, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         return merged
 
@@ -557,6 +691,17 @@ class BookJobService:
 
         if state == "failed":
             if error.get("retryable") and failed_stage in {"translating", "preserving"}:
+                human_gate_detail = (
+                    self._translation_resume_human_gate_blocker(job_id)
+                    if job_id and failed_stage == "translating"
+                    else None
+                )
+                if human_gate_detail:
+                    return {
+                        "available": False,
+                        "reason": "human_gate_required",
+                        "detail": human_gate_detail,
+                    }
                 detail = str(error.get("message") or "翻译阶段失败，可从断点继续。")
                 if activity and activity.get("last_error"):
                     detail = str(activity["last_error"])
@@ -587,6 +732,17 @@ class BookJobService:
                     "reason": "already_running",
                     "detail": detail,
                 }
+            human_gate_detail = (
+                self._translation_resume_human_gate_blocker(job_id)
+                if job_id
+                else None
+            )
+            if human_gate_detail:
+                return {
+                    "available": False,
+                    "reason": "human_gate_required",
+                    "detail": human_gate_detail,
+                }
             detail = "翻译进程已停止或无响应，可从已完成块继续。"
             if act and act.get("last_error"):
                 detail = f"{detail} 最近错误：{act['last_error']}"
@@ -603,6 +759,63 @@ class BookJobService:
             "reason": "wrong_state",
             "detail": "当前阶段不需要恢复翻译。",
         }
+
+    def _translation_resume_human_gate_blocker(self, job_id: str) -> str | None:
+        path = self._job_dir(job_id) / "job.json"
+        if not path.is_file():
+            return f"Job not found: {job_id}"
+        try:
+            snapshot = self._read_json_any(path)
+            canonical = self._read_json_any(
+                self._artifact_path_from_snapshot(job_id, snapshot, "canonical_chapters")
+            )
+        except (JobNotFound, JobServiceError, OSError, json.JSONDecodeError) as exc:
+            return str(exc) or "请先人工确认章节目录，再开始全文翻译。"
+        if not isinstance(canonical, dict) or canonical.get("source_artifact") != "user_confirmation":
+            return "请先人工确认章节目录，再开始全文翻译。"
+
+        try:
+            from pdf_translator.workflow import (
+                STAGE_GLOSSARY_READY,
+                TRANSLATION_ALLOWED_STAGES,
+                glossary_ready_summary,
+            )
+
+            run_dir = self._artifact_path_from_snapshot(job_id, snapshot, "book").parent
+            summary = glossary_ready_summary(run_dir)
+            workflow_path = run_dir / "workflow.json"
+            workflow = (
+                self._read_json_any(workflow_path)
+                if workflow_path.is_file()
+                else {}
+            )
+            stage = workflow.get("stage") or summary.get("workflow_stage")
+            ready_entries = int(summary.get("ready_entries") or 0)
+            if ready_entries <= 0:
+                return "请先完成术语确认，再开始全文翻译。"
+            if stage == STAGE_GLOSSARY_READY and workflow.get("glossary_finalized_by_user") is not True:
+                return "请先完成术语确认，再开始全文翻译。"
+            if stage not in TRANSLATION_ALLOWED_STAGES:
+                return "请先完成术语确认，再开始全文翻译。"
+        except (JobNotFound, JobServiceError, OSError, ValueError, json.JSONDecodeError) as exc:
+            return str(exc)
+        return None
+
+    def _artifact_path_from_snapshot(
+        self,
+        job_id: str,
+        snapshot: dict[str, Any],
+        artifact_name: str,
+    ) -> Path:
+        artifact = snapshot.get("artifacts", {}).get(artifact_name)
+        href = artifact.get("href") if isinstance(artifact, dict) else None
+        if not isinstance(href, str):
+            raise JobNotFound(f"Artifact not found: {artifact_name}")
+        job_dir = self._job_dir(job_id).resolve()
+        path = (job_dir / href).resolve()
+        if not path.is_relative_to(job_dir) or not path.is_file():
+            raise JobNotFound(f"Artifact not found: {artifact_name}")
+        return path
 
     def source_path(self, job_id: str) -> Path:
         snapshot = self.get(job_id)
@@ -986,12 +1199,59 @@ class BookJobService:
         self._write_json_atomic(canonical_path, canonical)
 
         snapshot.setdefault("artifacts", {})["canonical_chapters"] = {
-            "href": canonical_path.relative_to(job_dir).as_posix()
+            "href": canonical_path.relative_to(job_dir).as_posix(),
+            "source_artifact": source_artifact,
         }
+        segment_path = self._write_chapter_segment_preview(job_id, canonical, source_artifact)
+        if segment_path is not None:
+            snapshot.setdefault("artifacts", {})["chapter_segments"] = {
+                "href": segment_path.relative_to(job_dir).as_posix(),
+                "source_artifact": source_artifact,
+            }
         snapshot["updated_at"] = canonical["created_at"]
         snapshot["revision"] = int(snapshot.get("revision") or 0) + 1
         self._write_json_atomic(job_dir / "job.json", snapshot)
         return snapshot
+
+    def _write_chapter_segment_preview(
+        self,
+        job_id: str,
+        canonical: dict[str, Any],
+        source_artifact: str,
+    ) -> Path | None:
+        if source_artifact != "user_confirmation":
+            return None
+        try:
+            book_path = self.artifact_path(job_id, "book")
+        except JobNotFound:
+            return None
+        try:
+            from pdf_translator.book_rebuild import apply_canonical_chapter_plan
+            from pdf_translator.chapter_segments import build_chapter_segments
+            from pdf_translator.config import DEFAULT_MAX_CHUNK_CHARS
+        except Exception as exc:
+            raise JobServiceError("无法加载章节拆分预览模块。") from exc
+        try:
+            max_chars = int(os.getenv("BOOKWEAVER_MAX_CHUNK_CHARS") or DEFAULT_MAX_CHUNK_CHARS)
+        except ValueError:
+            max_chars = int(DEFAULT_MAX_CHUNK_CHARS)
+        book = self._read_json_any(book_path)
+        if not isinstance(book, dict):
+            raise JobServiceError("书籍结构不可用于生成章节拆分预览。")
+        try:
+            canonical_book = apply_canonical_chapter_plan(book, canonical)
+            segment_plan = build_chapter_segments(canonical_book, max_chars=max_chars)
+        except Exception as exc:
+            detail = str(exc).strip()
+            message = "生成章节拆分预览失败。"
+            if detail:
+                message = f"生成章节拆分预览失败：{detail}"
+            raise JobServiceError(message) from exc
+        job_dir = self._job_dir(job_id)
+        segment_path = job_dir / "artifacts" / "chapter-segments.json"
+        segment_path.parent.mkdir(parents=True, exist_ok=True)
+        self._write_json_atomic(segment_path, segment_plan)
+        return segment_path
 
     def review_run_dir(self, job_id: str) -> Path:
         snapshot = self.get(job_id)
@@ -1426,10 +1686,43 @@ class BookJobService:
         artifacts = snapshot.get("artifacts")
         if not isinstance(artifacts, dict) or "canonical_chapters" not in artifacts:
             raise JobServiceError("请先确认章节目录，再开始全文翻译。")
+        self._require_user_confirmed_canonical_chapters(job_id)
         state = str(snapshot.get("state") or "")
         if state not in {"awaiting_glossary", "failed", "translating"}:
             raise JobServiceError(f"当前状态无法开始翻译：{state}")
+        self._require_glossary_ready_for_translation(job_id)
         return snapshot
+
+    def _require_user_confirmed_canonical_chapters(self, job_id: str) -> None:
+        try:
+            canonical = self._read_json_any(self.artifact_path(job_id, "canonical_chapters"))
+        except JobNotFound as exc:
+            raise JobServiceError("请先人工确认章节目录，再开始全文翻译。") from exc
+        if not isinstance(canonical, dict) or canonical.get("source_artifact") != "user_confirmation":
+            raise JobServiceError("请先人工确认章节目录，再开始全文翻译。")
+
+    def _require_glossary_ready_for_translation(self, job_id: str) -> None:
+        from pdf_translator.workflow import (
+            STAGE_GLOSSARY_READY,
+            TRANSLATION_ALLOWED_STAGES,
+            glossary_ready_summary,
+        )
+
+        try:
+            run_dir = self._run_dir(job_id)
+            summary = glossary_ready_summary(run_dir)
+            workflow = self.glossary_workflow(job_id) or {}
+        except (JobNotFound, OSError, ValueError, json.JSONDecodeError) as exc:
+            raise JobServiceError("请先完成术语确认，再开始全文翻译。") from exc
+
+        stage = workflow.get("stage") or summary.get("workflow_stage")
+        ready_entries = int(summary.get("ready_entries") or 0)
+        if ready_entries <= 0:
+            raise JobServiceError("请先完成术语确认，再开始全文翻译。")
+        if stage == STAGE_GLOSSARY_READY and workflow.get("glossary_finalized_by_user") is not True:
+            raise JobServiceError("请先完成术语确认，再开始全文翻译。")
+        if stage not in TRANSLATION_ALLOWED_STAGES:
+            raise JobServiceError("请先完成术语确认，再开始全文翻译。")
 
     def run_translation(self, job_id: str) -> None:
         self._validate_job_id(job_id)

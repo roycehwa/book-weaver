@@ -18,6 +18,11 @@ STAGE_TRANSLATING = "translating"
 STAGE_PRE_REVIEW = "pre_review"
 STAGE_AWAITING_HUMAN_REVIEW = "awaiting_human_review"
 STAGE_COMPLETED = "completed"
+GLOSSARY_STICKY_KEYS = (
+    "active_term_count",
+    "decided_by",
+    "glossary_finalized_by_user",
+)
 
 
 class GlossaryNotReadyError(ValueError):
@@ -40,15 +45,19 @@ def load_workflow(run_dir: Path) -> dict[str, Any] | None:
 
 
 def write_workflow(run_dir: Path, *, stage: str, **extra: Any) -> dict[str, Any]:
+    existing = load_workflow(run_dir)
     payload = {
         "schema": WORKFLOW_SCHEMA,
         "stage": stage,
         "updated_at": _now(),
         **extra,
     }
-    existing = load_workflow(run_dir)
     if existing is not None:
         payload.setdefault("created_at", existing.get("created_at", _now()))
+        if stage != STAGE_AWAITING_GLOSSARY:
+            for key in GLOSSARY_STICKY_KEYS:
+                if key not in payload and key in existing:
+                    payload[key] = existing[key]
     else:
         payload["created_at"] = _now()
     path = _workflow_path(run_dir)

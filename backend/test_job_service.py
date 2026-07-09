@@ -54,6 +54,175 @@ def test_start_translation_requires_confirmed_canonical_chapters(
         service.start_translation("job-1")
 
 
+def test_start_translation_rejects_auto_confirmed_canonical_chapters(tmp_path: Path) -> None:
+    service = BookJobService(project_home=tmp_path, jobs_dir=tmp_path / "jobs")
+    job_dir = service.jobs_dir / "job-1"
+    artifacts_dir = job_dir / "artifacts"
+    artifacts_dir.mkdir(parents=True)
+    (artifacts_dir / "canonical-chapters.json").write_text(
+        json.dumps(
+            {
+                "schema": "bookmate_canonical_chapters_v1",
+                "job_id": "job-1",
+                "source_artifact": "book",
+                "chapters": [{"index": 1, "chapter_id": "ch-1", "title": "Auto"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    snapshot = _snapshot("job-1")
+    snapshot["state"] = "awaiting_glossary"
+    snapshot["artifacts"] = {
+        "canonical_chapters": {"href": "artifacts/canonical-chapters.json"},
+        "glossary_candidates": {"href": "artifacts/glossary/candidates.json"},
+    }
+    (job_dir / "job.json").write_text(json.dumps(snapshot), encoding="utf-8")
+
+    with pytest.raises(JobServiceError, match="人工确认章节"):
+        service.start_translation("job-1")
+
+
+def test_start_translation_requires_finalized_glossary(tmp_path: Path) -> None:
+    service = BookJobService(project_home=tmp_path, jobs_dir=tmp_path / "jobs")
+    job_dir = service.jobs_dir / "job-1"
+    run_dir = job_dir / "artifacts" / "run"
+    (run_dir / "glossary").mkdir(parents=True)
+    (run_dir / "book.json").write_text(json.dumps({"chapters": []}), encoding="utf-8")
+    (run_dir / "workflow.json").write_text(
+        json.dumps({"schema": "phase_a_workflow_v1", "stage": "awaiting_glossary"}),
+        encoding="utf-8",
+    )
+    (run_dir / "glossary" / "active.json").write_text(
+        json.dumps(
+            {
+                "schema": "phase_a_glossary_v1",
+                "entries": [
+                    {
+                        "source": "Good Company",
+                        "target": "好公司",
+                        "type": "name_or_key_term",
+                        "status": "active",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (job_dir / "artifacts" / "canonical-chapters.json").write_text(
+        json.dumps(
+            {
+                "schema": "bookmate_canonical_chapters_v1",
+                "job_id": "job-1",
+                "source_artifact": "user_confirmation",
+                "chapters": [{"index": 1, "chapter_id": "ch-1", "title": "Manual"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    snapshot = _snapshot("job-1")
+    snapshot["state"] = "awaiting_glossary"
+    snapshot["artifacts"] = {
+        "book": {"href": "artifacts/run/book.json"},
+        "canonical_chapters": {"href": "artifacts/canonical-chapters.json"},
+        "glossary_active": {"href": "artifacts/run/glossary/active.json"},
+    }
+    (job_dir / "job.json").write_text(json.dumps(snapshot), encoding="utf-8")
+
+    with pytest.raises(JobServiceError, match="术语"):
+        service.start_translation("job-1")
+
+
+def test_resume_translation_rejects_auto_confirmed_canonical_chapters(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = BookJobService(project_home=tmp_path, jobs_dir=tmp_path / "jobs")
+    job_dir = service.jobs_dir / "job-1"
+    artifacts_dir = job_dir / "artifacts"
+    artifacts_dir.mkdir(parents=True)
+    (artifacts_dir / "canonical-chapters.json").write_text(
+        json.dumps(
+            {
+                "schema": "bookmate_canonical_chapters_v1",
+                "job_id": "job-1",
+                "source_artifact": "book",
+                "chapters": [{"index": 1, "chapter_id": "ch-1", "title": "Auto"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    snapshot = _snapshot("job-1")
+    snapshot["state"] = "translating"
+    snapshot["resolved"] = {"text_operation": "translate"}
+    snapshot["artifacts"] = {
+        "canonical_chapters": {"href": "artifacts/canonical-chapters.json"},
+    }
+    (job_dir / "job.json").write_text(json.dumps(snapshot), encoding="utf-8")
+    called = {"run": False}
+    monkeypatch.setattr(service, "_run", lambda *args, **kwargs: called.__setitem__("run", True))
+
+    with pytest.raises(JobServiceError, match="人工确认章节"):
+        service.resume("job-1")
+
+    assert called["run"] is False
+
+
+def test_start_translation_accepts_user_confirmed_canonical_chapters(tmp_path: Path) -> None:
+    service = BookJobService(project_home=tmp_path, jobs_dir=tmp_path / "jobs")
+    job_dir = service.jobs_dir / "job-1"
+    artifacts_dir = job_dir / "artifacts"
+    run_dir = artifacts_dir / "run"
+    (run_dir / "glossary").mkdir(parents=True)
+    (run_dir / "book.json").write_text(json.dumps({"chapters": []}), encoding="utf-8")
+    (run_dir / "workflow.json").write_text(
+        json.dumps(
+            {
+                "schema": "phase_a_workflow_v1",
+                "stage": "glossary_ready",
+                "glossary_finalized_by_user": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "glossary" / "active.json").write_text(
+        json.dumps(
+            {
+                "schema": "phase_a_glossary_v1",
+                "entries": [
+                    {
+                        "source": "Good Company",
+                        "target": "好公司",
+                        "type": "name_or_key_term",
+                        "status": "active",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (artifacts_dir / "canonical-chapters.json").write_text(
+        json.dumps(
+            {
+                "schema": "bookmate_canonical_chapters_v1",
+                "job_id": "job-1",
+                "source_artifact": "user_confirmation",
+                "chapters": [{"index": 1, "chapter_id": "ch-1", "title": "Manual"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    snapshot = _snapshot("job-1")
+    snapshot["state"] = "awaiting_glossary"
+    snapshot["artifacts"] = {
+        "book": {"href": "artifacts/run/book.json"},
+        "canonical_chapters": {"href": "artifacts/canonical-chapters.json"},
+        "glossary_active": {"href": "artifacts/run/glossary/active.json"},
+    }
+    (job_dir / "job.json").write_text(json.dumps(snapshot), encoding="utf-8")
+
+    assert service.start_translation("job-1")["job_id"] == "job-1"
+
+
 def _snapshot(job_id: str, updated_at: str = "2026-06-12T10:00:00Z") -> dict:
     return {
         "schema": "book_job_v1",
@@ -319,6 +488,99 @@ def test_confirm_chapters_accepts_user_edited_chapters(tmp_path: Path) -> None:
     assert canonical["source_artifact"] == "user_confirmation"
     assert canonical["chapters"][0]["chapter_id"] == "manual-1"
     assert canonical["chapters"][0]["title"] == "用户修正章节"
+
+
+def test_confirm_chapters_writes_user_chapter_segment_preview(tmp_path: Path) -> None:
+    service = BookJobService(project_home=tmp_path, jobs_dir=tmp_path / "jobs")
+    job_dir = service.jobs_dir / "job-1"
+    artifacts_dir = job_dir / "artifacts"
+    artifacts_dir.mkdir(parents=True)
+    book = {
+        "metadata": {"chapter_source": "automatic"},
+        "chapters": [
+            {
+                "title": "Automatic",
+                "source_pages": [1, 2],
+                "trace_markdown": (
+                    "[[page: 1]]\n## First Idea\n\nAlpha.\n\n"
+                    "[[page: 2]]\n## Second Idea\n\nBeta."
+                ),
+                "markdown": "## First Idea\n\nAlpha.\n\n## Second Idea\n\nBeta.",
+            }
+        ],
+        "pages": [
+            {"page_no": 1, "has_content": True},
+            {"page_no": 2, "has_content": True},
+        ],
+    }
+    (artifacts_dir / "book.json").write_text(json.dumps(book), encoding="utf-8")
+    snapshot = _snapshot("job-1")
+    snapshot["state"] = "awaiting_human_review"
+    snapshot["artifacts"] = {"book": {"href": "artifacts/book.json"}}
+    (job_dir / "job.json").write_text(json.dumps(snapshot), encoding="utf-8")
+
+    result = service.confirm_chapters(
+        "job-1",
+        chapters=[
+            {
+                "index": 1,
+                "chapter_id": "manual-1",
+                "title": "用户确认章节",
+                "page_start": 1,
+                "page_end": 2,
+                "source_pages": [1, 2],
+            }
+        ],
+    )
+
+    segment_path = artifacts_dir / "chapter-segments.json"
+    assert segment_path.is_file()
+    payload = json.loads(segment_path.read_text(encoding="utf-8"))
+    assert payload["schema"] == "bookweaver_chapter_segments_v1"
+    assert payload["source"] == "canonical_chapters"
+    assert {segment["chapter_title"] for segment in payload["segments"]} == {"用户确认章节"}
+    assert [segment["section_title"] for segment in payload["segments"]] == ["First Idea", "Second Idea"]
+    assert result["artifacts"]["chapter_segments"]["href"] == "artifacts/chapter-segments.json"
+    assert result["artifacts"]["chapter_segments"]["source_artifact"] == "user_confirmation"
+
+
+def test_confirm_chapters_preview_error_includes_underlying_reason(tmp_path: Path) -> None:
+    service = BookJobService(project_home=tmp_path, jobs_dir=tmp_path / "jobs")
+    job_dir = service.jobs_dir / "job-1"
+    artifacts_dir = job_dir / "artifacts"
+    artifacts_dir.mkdir(parents=True)
+    book = {
+        "chapters": [
+            {
+                "title": "Automatic Body",
+                "source_pages": [31],
+                "trace_markdown": "[[page: 31]]\n\n![Original page 31](/tmp/original-page-p0031.png)",
+                "translate": True,
+                "preserve_original": False,
+            }
+        ],
+        "pages": [{"page_no": 31, "has_content": True}],
+    }
+    (artifacts_dir / "book.json").write_text(json.dumps(book), encoding="utf-8")
+    snapshot = _snapshot("job-1")
+    snapshot["state"] = "awaiting_human_review"
+    snapshot["artifacts"] = {"book": {"href": "artifacts/book.json"}}
+    (job_dir / "job.json").write_text(json.dumps(snapshot), encoding="utf-8")
+
+    with pytest.raises(JobServiceError, match="Confirmed Body.*page-render fallback"):
+        service.confirm_chapters(
+            "job-1",
+            chapters=[
+                {
+                    "index": 1,
+                    "chapter_id": "manual-1",
+                    "title": "Confirmed Body",
+                    "page_start": 31,
+                    "page_end": 31,
+                    "source_pages": [31],
+                }
+            ],
+        )
 
 
 def test_draft_chapters_prefers_saved_canonical_chapters(tmp_path: Path) -> None:

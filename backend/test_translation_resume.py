@@ -24,6 +24,57 @@ def _write_job(jobs_dir: Path, job_id: str, snapshot: dict) -> None:
     (job_dir / "job.json").write_text(json.dumps(snapshot, ensure_ascii=False), encoding="utf-8")
 
 
+def _write_translation_gates(jobs_dir: Path, job_id: str, snapshot: dict) -> None:
+    job_dir = jobs_dir / job_id
+    run_dir = job_dir / "artifacts" / "book-run"
+    (run_dir / "glossary").mkdir(parents=True, exist_ok=True)
+    (run_dir / "book.json").write_text(json.dumps({"chapters": []}), encoding="utf-8")
+    (run_dir / "workflow.json").write_text(
+        json.dumps(
+            {
+                "schema": "phase_a_workflow_v1",
+                "stage": "glossary_ready",
+                "glossary_finalized_by_user": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "glossary" / "active.json").write_text(
+        json.dumps(
+            {
+                "schema": "phase_a_glossary_v1",
+                "entries": [
+                    {
+                        "source": "Good Company",
+                        "target": "好公司",
+                        "type": "name_or_key_term",
+                        "status": "active",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (job_dir / "artifacts" / "canonical-chapters.json").write_text(
+        json.dumps(
+            {
+                "schema": "bookmate_canonical_chapters_v1",
+                "job_id": job_id,
+                "source_artifact": "user_confirmation",
+                "chapters": [{"index": 1, "chapter_id": "ch-1", "title": "Manual"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    snapshot["artifacts"] = {
+        **(snapshot.get("artifacts") if isinstance(snapshot.get("artifacts"), dict) else {}),
+        "book": {"href": "artifacts/book-run/book.json"},
+        "canonical_chapters": {"href": "artifacts/canonical-chapters.json"},
+        "glossary_active": {"href": "artifacts/book-run/glossary/active.json"},
+    }
+    _write_job(jobs_dir, job_id, snapshot)
+
+
 def _write_progress(
     jobs_dir: Path,
     job_id: str,
@@ -65,7 +116,8 @@ def test_translation_resume_unavailable_while_active(tmp_path: Path) -> None:
 def test_translation_resume_available_when_stalled(tmp_path: Path) -> None:
     jobs_dir = tmp_path / "jobs"
     job_id = "job-stalled"
-    _write_job(jobs_dir, job_id, _snapshot(job_id))
+    snapshot = _snapshot(job_id)
+    _write_translation_gates(jobs_dir, job_id, snapshot)
     updated_at = (datetime.now(timezone.utc) - timedelta(minutes=12)).isoformat().replace("+00:00", "Z")
     _write_progress(jobs_dir, job_id, updated_at=updated_at, running_chunks=3)
 
@@ -73,7 +125,7 @@ def test_translation_resume_available_when_stalled(tmp_path: Path) -> None:
     snapshot = service.get(job_id)
 
     assert snapshot["translation_resume"]["available"] is True
-    assert snapshot["translation_resume"]["label"] == "继续翻译（从断点）"
+    assert snapshot["translation_resume"]["label"] == "从检查点恢复"
 
 
 def test_translation_resume_cooldown_after_recent_request(tmp_path: Path) -> None:
@@ -97,7 +149,8 @@ def test_translation_resume_cooldown_after_recent_request(tmp_path: Path) -> Non
 def test_translation_activity_marks_failed_when_progress_failed(tmp_path: Path) -> None:
     jobs_dir = tmp_path / "jobs"
     job_id = "job-progress-failed"
-    _write_job(jobs_dir, job_id, _snapshot(job_id))
+    snapshot = _snapshot(job_id)
+    _write_translation_gates(jobs_dir, job_id, snapshot)
     run_dir = jobs_dir / job_id / "artifacts" / "book-run" / "jobs"
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "progress.json").write_text(
@@ -136,7 +189,7 @@ def test_translation_resume_available_when_failed(tmp_path: Path) -> None:
         "message": "Job failed during translating.",
         "retryable": True,
     }
-    _write_job(jobs_dir, job_id, snapshot)
+    _write_translation_gates(jobs_dir, job_id, snapshot)
     updated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     _write_progress(jobs_dir, job_id, updated_at=updated_at)
 
@@ -163,7 +216,7 @@ def test_get_ignores_stale_persisted_derived_resume_fields(tmp_path: Path) -> No
         "detail": "Job failed during created.",
     }
     snapshot["translation_activity"] = {"status": "unknown"}
-    _write_job(jobs_dir, job_id, snapshot)
+    _write_translation_gates(jobs_dir, job_id, snapshot)
 
     service = BookJobService(jobs_dir=jobs_dir, project_home=tmp_path)
     enriched = service.get(job_id)

@@ -386,7 +386,7 @@ class BookJobRunner:
 
     def run_translate_phase(self, job_id: str) -> dict[str, Any]:
         snapshot = self.repository.load(job_id)
-        if snapshot["state"] not in {"awaiting_glossary", "failed"}:
+        if snapshot["state"] not in {"awaiting_glossary", "failed", "translating"}:
             raise ValueError(f"Job {job_id} cannot translate from state {snapshot['state']!r}.")
         run_dir = self._run_output_dir(job_id)
         from pdf_translator.workflow import require_glossary_ready
@@ -586,7 +586,7 @@ class BookJobRunner:
         return self.run(job_id)
 
     def _settings(self, snapshot: dict[str, Any]):
-        from pdf_translator.config import RunSettings
+        from pdf_translator.config import DEFAULT_MAX_CHUNK_CHARS, RunSettings
 
         job_dir = self.repository.job_dir(snapshot["job_id"])
         request = snapshot["request"]
@@ -596,7 +596,7 @@ class BookJobRunner:
             target_language=request["target_language"],
             source_language=request.get("source_language"),
             translator=request["translator"],
-            max_chunk_chars=9000,
+            max_chunk_chars=int(os.getenv("BOOKWEAVER_MAX_CHUNK_CHARS") or DEFAULT_MAX_CHUNK_CHARS),
             profile_name="book",
             output_format=request["output_format"],
             processing_mode=request["processing_mode"],
@@ -681,6 +681,7 @@ class BookJobRunner:
             {
                 "translated_chapters": output_dir / "translated-chapters.json",
                 "chapter_report": output_dir / "chapter-report.json",
+                "chapter_segments": output_dir / "chapter-segments.json",
                 "page_ledger": output_dir / "page-ledger.json",
                 "segments": output_dir / "segments.json",
                 "translated_segments": output_dir / "translated-segments.json",

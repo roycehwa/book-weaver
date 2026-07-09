@@ -39,10 +39,10 @@ This keeps user intervention low, removes most layout noise from the reading pat
   - optionally `MINIMAX_BASE_URL` (defaults to `https://api.minimaxi.com/anthropic/v1/messages`)
   - optionally `MINIMAX_MODEL` (defaults to `MiniMax-M2.7-highspeed`)
   - optionally `MINIMAX_MAX_TOKENS` (defaults to `8192`; long zh book chunks often need headroom)
-  - optionally `MINIMAX_HTTP_TIMEOUT_SECONDS` (defaults to `600`; single-request wall clock for slow completions)
+  - optionally `MINIMAX_HTTP_TIMEOUT_SECONDS` (defaults to `120`; single-request stall guard)
   - optionally `MINIMAX_MAX_CONCURRENCY` (defaults to `3`)
-  - optionally `MINIMAX_RPM` (defaults conservatively to `20`)
-  - optionally `MINIMAX_TPM` (defaults conservatively to `1000000`)
+  - optionally `MINIMAX_RPM` (defaults to `500` for MiniMax-M2.7/highspeed)
+  - optionally `MINIMAX_TPM` (defaults to `20000000` for MiniMax-M2.7/highspeed)
 - For other OpenAI-compatible domestic APIs:
   - `LLM_API_KEY`
   - `LLM_BASE_URL`
@@ -189,8 +189,11 @@ MINIMAX_MODEL=MiniMax-M2.7-highspeed
 # Optional; this is the built-in default.
 MINIMAX_BASE_URL=https://api.minimaxi.com/anthropic/v1/messages
 MINIMAX_MAX_TOKENS=8192
-# Optional; increase if the API is slow to return full completions.
-MINIMAX_HTTP_TIMEOUT_SECONDS=600
+# Optional; increase only if full completions regularly need longer.
+MINIMAX_HTTP_TIMEOUT_SECONDS=120
+MINIMAX_MAX_CONCURRENCY=3
+MINIMAX_RPM=500
+MINIMAX_TPM=20000000
 EOF
 book-weaver translate ./book.pdf --profile book --target-lang zh-CN --translator minimax --format epub
 ```

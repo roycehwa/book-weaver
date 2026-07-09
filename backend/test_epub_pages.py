@@ -103,15 +103,41 @@ def test_resolve_epub_pages_chapter_with_no_anchors_is_single_page(tmp_path: Pat
     assert pages[1].page_label == "1"
 
 
-def test_resolve_epub_pages_raises_when_no_anchors_anywhere(tmp_path: Path) -> None:
+def test_resolve_epub_pages_accepts_span_pagebreak_anchors(tmp_path: Path) -> None:
+    epub = tmp_path / "book.epub"
+    _write_minimal_epub(
+        epub,
+        [("ch01.xhtml", "ch01", [])],
+        {
+            "ch01.xhtml": (
+                '<h1><span aria-label="page 1." epub:type="pagebreak" '
+                'id="page_1" role="doc-pagebreak"/>Chapter</h1>'
+                '<p>First page.</p>'
+                '<p><span aria-label="page 2." epub:type="pagebreak" '
+                'id="page_2" role="doc-pagebreak"/>Second page.</p>'
+            )
+        },
+    )
+
+    pages = resolve_epub_pages(epub)
+
+    assert [p.page_anchor for p in pages] == ["page_1", "page_2"]
+    assert [p.page_label for p in pages] == ["1", "2"]
+
+
+def test_resolve_epub_pages_falls_back_to_spine_when_no_anchors_anywhere(tmp_path: Path) -> None:
     epub = tmp_path / "book.epub"
     _write_minimal_epub(
         epub,
         [("a.xhtml", "A", []), ("b.xhtml", "B", [])],
     )
-    import pytest
-    with pytest.raises(ValueError, match="没有可识别的 page 锚点"):
-        resolve_epub_pages(epub)
+    pages = resolve_epub_pages(epub)
+
+    assert len(pages) == 2
+    assert [p.index for p in pages] == [1, 2]
+    assert [p.chapter_title for p in pages] == ["A", "B"]
+    assert [p.page_anchor for p in pages] == ["", ""]
+    assert [p.page_label for p in pages] == ["", ""]
 
 
 def test_render_page_converts_xhtml_page_anchor_to_inert_marker(tmp_path: Path) -> None:
@@ -132,3 +158,26 @@ def test_render_page_converts_xhtml_page_anchor_to_inert_marker(tmp_path: Path) 
     assert '<a id="page_i"' not in html
     assert '<a href="notes.xhtml#n1">1</a>' in html
     assert "First page" in html
+
+
+def test_render_page_rewrites_svg_image_href_to_asset_endpoint(tmp_path: Path) -> None:
+    epub = tmp_path / "book.epub"
+    _write_minimal_epub(
+        epub,
+        [("cover.xhtml", "Cover", [])],
+        {
+            "cover.xhtml": (
+                '<svg xmlns="http://www.w3.org/2000/svg" '
+                'xmlns:xlink="http://www.w3.org/1999/xlink">'
+                '<image xlink:href="../images/cover.jpg" width="600" height="900"/>'
+                '</svg>'
+            )
+        },
+    )
+    with zipfile.ZipFile(epub, "a", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("images/cover.jpg", b"fake")
+
+    html = render_epub_page_by_anchor(epub, "OEBPS/cover.xhtml", "", "job-1")
+
+    assert 'xlink:href="/api/jobs/job-1/epub/asset?path=images%2Fcover.jpg"' in html
+    assert "../images/cover.jpg" not in html

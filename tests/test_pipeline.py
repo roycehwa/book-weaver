@@ -108,6 +108,94 @@ def test_run_intake_pipeline_writes_bookir_without_translation_cache(tmp_path: P
     assert not (artifacts.output_dir / "translation-cache").exists()
 
 
+def test_translation_pipeline_writes_user_chapter_segment_plan_before_translation(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    source = tmp_path / "source.epub"
+    source.write_text("placeholder", encoding="utf-8")
+    book = {
+        "metadata": {"chapter_source": "automatic"},
+        "pages": [
+            {"page_no": 1, "has_content": True},
+            {"page_no": 2, "has_content": True},
+        ],
+        "chapters": [
+            {
+                "index": 1,
+                "chapter_id": "auto-001",
+                "title": "Automatic",
+                "page_start": 1,
+                "page_end": 2,
+                "source_pages": [1, 2],
+                "markdown": "## First Idea\n\nAlpha paragraph.\n\n## Second Idea\n\nBeta paragraph.",
+                "trace_markdown": "[[page: 1]]\n\n## First Idea\n\nAlpha paragraph.\n\n[[page: 2]]\n\n## Second Idea\n\nBeta paragraph.",
+                "translate": True,
+                "toc": True,
+            }
+        ],
+    }
+    canonical = {
+        "schema": "bookmate_canonical_chapters_v1",
+        "chapters": [
+            {
+                "title": "User Chapter",
+                "page_start": 1,
+                "page_end": 2,
+                "source_pages": [1, 2],
+            }
+        ],
+    }
+    (run_dir / "book.json").write_text(json.dumps(book, ensure_ascii=False), encoding="utf-8")
+    canonical_path = run_dir / "canonical-chapters.json"
+    canonical_path.write_text(json.dumps(canonical, ensure_ascii=False), encoding="utf-8")
+    (run_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "mode": "intake",
+                "source_pdf": str(source),
+                "source_language": "en",
+                "target_language": None,
+                "preflight": {"page_count": 2},
+                "files": {"book_json": str(run_dir / "book.json")},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    artifacts = pipeline_module.run_translation_pipeline(
+        RunSettings(
+            source_pdf=source,
+            output_dir=tmp_path / "runs",
+            target_language="fr",
+            source_language="en",
+            translator="mock",
+            max_chunk_chars=10_000,
+            output_format="none",
+            processing_mode="translate",
+            existing_run_dir=run_dir,
+            canonical_chapters_path=canonical_path,
+        )
+    )
+
+    segment_path = artifacts.output_dir / "chapter-segments.json"
+    assert segment_path.exists()
+    payload = json.loads(segment_path.read_text(encoding="utf-8"))
+    assert payload["schema"] == "bookweaver_chapter_segments_v1"
+    assert [segment["chapter_title"] for segment in payload["segments"]] == [
+        "User Chapter",
+        "User Chapter",
+    ]
+    assert [segment["section_title"] for segment in payload["segments"]] == [
+        "First Idea",
+        "Second Idea",
+    ]
+    progress = json.loads((artifacts.output_dir / "jobs" / "progress.json").read_text(encoding="utf-8"))
+    assert progress["total_chunks"] == 2
+
+
 def test_epub_intake_does_not_apply_pdf_space_merging_to_normal_prose(
     tmp_path: Path,
     monkeypatch,

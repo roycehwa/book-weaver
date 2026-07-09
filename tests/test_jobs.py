@@ -7,6 +7,7 @@ import pytest
 
 from pdf_translator.jobs import BookJobRunner, JobRepository, resolve_text_operation
 from pdf_translator.models import PipelineArtifacts
+from pdf_translator.pipeline import build_artifacts
 
 
 def test_existing_translation_resume_does_not_replay_intake_stages() -> None:
@@ -42,6 +43,58 @@ def test_resolve_text_operation(
 def test_resolve_text_operation_rejects_invalid_mode() -> None:
     with pytest.raises(ValueError, match="processing mode"):
         resolve_text_operation("sometimes", "en", "zh-CN")
+
+
+def test_translate_phase_can_resume_from_translating_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.epub"
+    source.write_bytes(b"epub")
+    repository = JobRepository(tmp_path / "jobs")
+    created = repository.create(source_path=source, processing_mode="translate")
+    repository.update(created["job_id"], state="translating")
+    runner = BookJobRunner(repository)
+    monkeypatch.setattr("pdf_translator.workflow.require_glossary_ready", lambda run_dir: None)
+
+    def fake_full_pipeline(job_id: str, **kwargs):
+        assert job_id == created["job_id"]
+        assert kwargs["existing_run_dir"] == runner._run_output_dir(created["job_id"])
+        assert kwargs["require_glossary_ready"] is True
+        return repository.update(job_id, state="awaiting_human_review")
+
+    monkeypatch.setattr(runner, "_run_full_pipeline", fake_full_pipeline)
+
+    completed = runner.run_translate_phase(created["job_id"])
+
+    assert completed["state"] == "awaiting_human_review"
+
+
+def test_artifact_map_exposes_chapter_segments(tmp_path: Path) -> None:
+    source = tmp_path / "source.epub"
+    source.write_bytes(b"epub")
+    repository = JobRepository(tmp_path / "jobs")
+    created = repository.create(source_path=source, processing_mode="translate")
+    job_dir = repository.job_dir(created["job_id"])
+    run_dir = job_dir / "artifacts" / "run"
+    run_dir.mkdir(parents=True)
+    artifacts = build_artifacts(run_dir, source, "zh-CN")
+    artifacts.manifest_path.write_text("{}", encoding="utf-8")
+    artifacts.normalized_markdown_path.write_text("", encoding="utf-8")
+    artifacts.normalized_json_path.write_text("{}", encoding="utf-8")
+    artifacts.profile_json_path.write_text("{}", encoding="utf-8")
+    artifacts.reconstructed_markdown_path.write_text("", encoding="utf-8")
+    artifacts.translation_input_markdown_path.write_text("", encoding="utf-8")
+    artifacts.translated_markdown_path.write_text("", encoding="utf-8")
+    artifacts.book_json_path.write_text("{}", encoding="utf-8")
+    (run_dir / "chapter-segments.json").write_text(
+        json.dumps({"schema": "bookweaver_chapter_segments_v1", "segments": []}),
+        encoding="utf-8",
+    )
+
+    mapped = BookJobRunner(repository)._artifact_map(created["job_id"], artifacts)
+
+    assert mapped["chapter_segments"]["href"] == "artifacts/run/chapter-segments.json"
 
 
 def test_repository_creates_durable_job_snapshot_and_initial_event(tmp_path: Path) -> None:

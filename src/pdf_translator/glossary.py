@@ -19,6 +19,7 @@ from pdf_translator.glossary_extraction import (
     canonical_source_key,
     canonical_source_term,
     candidate_integrity_rejection,
+    is_generic_stop_phrase,
 )
 from pdf_translator.glossary_profiles import (
     GLOSSARY_PROFILE_LABELS,
@@ -94,6 +95,10 @@ def extract_glossary_candidates(
     corpus, chapter_text = _book_text_corpus(book)
     exclusions = _metadata_exclusions(book)
     existing_policy = _load_extraction_policy(run_dir)
+    # Surface cap follows the corpus size, NOT a hard-coded
+    # constant. The previous hard cap (60) was rolled back because
+    # it was unrelated to book length, domain density, or the
+    # underlying distribution of proper nouns in the source text.
     limit = max_candidates if max_candidates is not None else compute_max_candidates(book)
 
     if profile is None and existing_policy and existing_policy.get("glossary_profile_overridden"):
@@ -244,7 +249,23 @@ def extract_glossary_candidates(
         ranked,
         minimum_score=float(active_policy.min_accept_score),
     )
-    candidates = ranked[:limit]
+    # Keep the generic-stop-phrase filter (cheap, no false positives
+    # on the existing dataset) but DO NOT impose a hard occurrence or
+    # chapter-count floor here. The quality-cutoff filter above already
+    # drops low-score candidates; an additional hard floor would
+    # silently drop legitimate proper nouns in long, slow-paced books
+    # (e.g. 600-page monographs) while leaving noise in short books
+    # (e.g. 100-page children's books) the moment ``limit`` is bumped.
+    # Phase A only filters phrases through the curated
+    # :data:`glossary_extraction.GENERIC_STOP_PHRASES` list.
+    stop_phrase_dropped = 0
+    filtered: list[dict[str, Any]] = []
+    for item in ranked:
+        if is_generic_stop_phrase(str(item.get("source") or "")):
+            stop_phrase_dropped += 1
+            continue
+        filtered.append(item)
+    candidates = filtered[:limit]
 
     policy = {
         "schema": EXTRACTION_POLICY_SCHEMA,
@@ -265,6 +286,7 @@ def extract_glossary_candidates(
             "surfaced": len(candidates),
             "max_candidates_limit": limit,
             "hard_ceiling_reached": len(ranked) > limit,
+            "stop_phrase_dropped": stop_phrase_dropped,
         },
         "metadata_exclusions": sorted(exclusions),
         **detection,
@@ -575,6 +597,8 @@ def select_glossary_entries_for_text(
         if entry.get("status") != "active":
             continue
         source = str(entry.get("source") or "").strip()
+        if not _is_glossary_entry_well_formed(entry):
+            continue
         if not source:
             continue
         first_word = source.split(maxsplit=1)[0].casefold()
@@ -609,6 +633,34 @@ def select_glossary_entries_for_text(
     return [entry for _, entry in selected[:limit]]
 
 
+def _is_glossary_entry_well_formed(entry: dict[str, Any]) -> bool:
+    """Detect user-entered glossary entries that look broken on inspection.
+
+    The translator and review UI both assume that any term carrying
+    ``enforcement=hard`` is one the model must reproduce verbatim in the
+    translated text. When the term itself is malformed (missing internal
+    whitespace, broken target wording) the model cannot honour it without
+    making the prose worse, so we skip it and let the model translate the
+    passage freely. Active status is preserved so the user can fix it.
+    """
+    source = str(entry.get("source") or "").strip()
+    target = str(entry.get("target") or "").strip()
+    if not source or not target:
+        return False
+    if "  " in source or source != source.strip():
+        return False
+    # Two adjacent ASCII letters without whitespace inside the source
+    # usually means a missing space (e.g. "Inthe Roman").
+    if re.search(r"[A-Za-z][A-Z]", source) and " " not in source:
+        return False
+    # Allow common Chinese full-width parens but warn on ASCII parens glued
+    # to CJK characters in the target — they almost always mean a stray
+    # editorial artefact, not a stable gloss.
+    if re.search(r"[\u4e00-\u9fff][(（][\u4e00-\u9fff]", target):
+        return False
+    return True
+
+
 def _is_complete_source_term_match(text: str, start: int, end: int) -> bool:
     if start > 0 and text[start - 1].isalnum():
         return False
@@ -637,6 +689,8 @@ def glossary_terms_missing_in_translation(
         entries,
         chapter_id=chapter_id,
     ):
+        if not _is_glossary_entry_well_formed(entry):
+            continue
         enforcement = str(entry.get("enforcement") or "").strip().lower()
         if enforcement and enforcement != "hard":
             continue

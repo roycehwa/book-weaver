@@ -5,6 +5,7 @@ import {
   workspaceApi,
   type BookJob,
   type CreateJobOptions,
+  type JobEpubPage,
   type JobChapterDraft,
   type JobGlossaryResponse,
   type WorkspaceBook,
@@ -16,6 +17,7 @@ import EpubViewer from './epub-viewer/EpubViewer'
 import { validateChapterQuality } from './chapterQuality'
 import { sectionStartsOpen } from './workspaceSections'
 import { useJobSourceInfo } from './useJobSourceInfo'
+import { chapterEpubPages, summarizeEpubPageRange } from './chapterPagePreview'
 
 const stageLabels: Record<BookJob['state'], string> = {
   created: '任务已创建',
@@ -243,6 +245,8 @@ function JobDetail() {
   const [tocDepth, setTocDepth] = useState('1')
   const [reextractingToc, setReextractingToc] = useState(false)
   const [calibrationPrintedPage, setCalibrationPrintedPage] = useState('1')
+  const [epubPages, setEpubPages] = useState<JobEpubPage[]>([])
+  const [epubPagesError, setEpubPagesError] = useState<string | null>(null)
   const [jobsDir, setJobsDir] = useState<string | null>(null)
   const calibrationInputFocused = useRef(false)
 
@@ -320,6 +324,30 @@ function JobDetail() {
       if (timer) window.clearTimeout(timer)
     }
   }, [loadJob])
+
+  useEffect(() => {
+    if (!id || sourceKind !== 'epub') {
+      setEpubPages([])
+      setEpubPagesError(null)
+      return
+    }
+    let active = true
+    setEpubPagesError(null)
+    jobsApi.getEpubPages(id)
+      .then((result) => {
+        if (!active) return
+        setEpubPages(result.pages || [])
+        setTotalPdfPages(result.total || null)
+      })
+      .catch((loadError) => {
+        if (!active) return
+        setEpubPages([])
+        setEpubPagesError(loadError instanceof Error ? loadError.message : 'EPUB 页面索引加载失败')
+      })
+    return () => {
+      active = false
+    }
+  }, [id, sourceKind])
 
   useEffect(() => {
     let active = true
@@ -629,16 +657,26 @@ function JobDetail() {
     return <div className="text-sm text-slate-600">{error || '正在加载任务...'}</div>
   }
 
-  const artifactLabels: Record<string, string> = {
-    epub: '下载 EPUB',
-    pdf: '下载 PDF',
-    translated_markdown: '下载译文',
-    manifest: '下载处理清单',
-  }
-  const artifactEntries = Object.keys(artifactLabels).filter((name) => job.artifacts[name])
-  const progress = job.progress
   const isPreservePath =
     job.resolved.text_operation === 'preserve' || job.request.processing_mode === 'preserve'
+
+  const artifactLabels: Record<string, string> = {
+    book: 'BookIR (book.json)',
+    book_markdown: 'Book Markdown',
+    normalized_markdown: '规范化 Markdown',
+    reconstructed_markdown: '重建 Markdown',
+    chapter_report: '章节报告',
+    chapter_segments: '章内语义拆分',
+    manifest: '处理清单 (manifest)',
+    epub: isPreservePath ? 'EPUB' : '译版 EPUB',
+    pdf: isPreservePath ? 'PDF' : '译版 PDF',
+    translated_markdown: '译文 Markdown',
+    translated_chapters: '译文章节',
+  }
+  const artifactEntries = Object.keys(artifactLabels)
+    .filter((name) => job.artifacts[name])
+    .map((name) => ({ name, label: artifactLabels[name] }))
+  const progress = job.progress
   const isTranslatePath =
     job.resolved.text_operation === 'translate' || job.request.processing_mode === 'translate'
   const chaptersConfirmed = workspaceBook?.steps.chapter_confirmation.status === 'done'
@@ -677,6 +715,11 @@ function JobDetail() {
       : selectedPageStart
         ? `${selectedPageStart}-?`
         : '未设置'
+  const pageUnitLabel = sourceKind === 'epub' ? 'EPUB 虚拟页' : 'PDF 页码'
+  const previewTargetLabel = sourceKind === 'epub' ? 'EPUB 页面' : 'PDF'
+  const selectedEpubPages = sourceKind === 'epub' && selectedChapter
+    ? chapterEpubPages(selectedChapter, epubPages)
+    : []
   const chapterQuality = validateChapterQuality(chapterDraft, totalPdfPages)
   const qualityErrors = chapterQuality.issues.filter((issue) => issue.severity === 'error')
   const qualityWarnings = chapterQuality.issues.filter((issue) => issue.severity === 'warning')
@@ -908,7 +951,7 @@ function JobDetail() {
             <div className="flex flex-wrap items-center justify-between gap-2">
               <div className="min-w-[16rem] flex-1">
                 <p className="mt-1 text-sm text-slate-600">
-                  对照 PDF 确认每章标题与起止页。用于知识拆分与 PDF 对照，不编辑译文；可与翻译审阅并行。
+                  对照{previewTargetLabel}确认每章标题与起止页。用于知识拆分与页面对照，不编辑译文；可与翻译审阅并行。
                 </p>
               </div>
               <button
@@ -921,7 +964,7 @@ function JobDetail() {
             </div>
             {hasAutoFilledChapterDraft && (
               <p className="mt-3 text-xs text-sky-800">
-                目录已自动填充，请对照 PDF 核对页码。
+                目录已自动填充，请对照{previewTargetLabel}核对页码。
                 {chapterDraftSourceDetail ? `（${chapterDraftSourceDetail}）` : ''}
               </p>
             )}
@@ -986,7 +1029,7 @@ function JobDetail() {
                 </button>
                 <div className="flex flex-wrap items-center gap-2 text-xs text-slate-600">
                   <span>页码校准（随 PDF 预览同步）：</span>
-                  <span>PDF 第 {currentPdfPage} 页 = 印刷第</span>
+                  <span>{pageUnitLabel}第 {currentPdfPage} 页 = 印刷第</span>
                   <input
                     value={calibrationPrintedPage}
                     onChange={(event) => setCalibrationPrintedPage(event.target.value)}
@@ -1054,7 +1097,7 @@ function JobDetail() {
                   <div className="sticky top-0 z-10 grid grid-cols-[3rem_minmax(12rem,1fr)_8rem_5rem] gap-2 border-b border-slate-200 bg-slate-50 px-3 py-2 text-xs font-medium text-slate-500">
                     <div>#</div>
                     <div>章节标题</div>
-                    <div>PDF 页码</div>
+                    <div>{pageUnitLabel}</div>
                     <div>操作</div>
                   </div>
                   {chapterDraft.map((chapter, index) => {
@@ -1124,8 +1167,15 @@ function JobDetail() {
                       当前校准：{selectedChapter?.title || '未选择章节'}
                     </div>
                     <div className="mt-1 text-xs text-slate-500">
-                      页码范围：{selectedPageRange} · PDF 当前页：{currentPdfPage}
+                      页码范围：{selectedPageRange} · {pageUnitLabel}当前页：{currentPdfPage}
                     </div>
+                    {sourceKind === 'epub' && (
+                      <div className="mt-2 rounded-md bg-slate-50 px-2 py-1 text-xs text-slate-600">
+                        <div className="font-medium text-slate-700">当前章节对应 EPUB 页面</div>
+                        <div className="mt-0.5 break-all">{summarizeEpubPageRange(selectedEpubPages)}</div>
+                        {epubPagesError && <div className="mt-1 text-red-600">{epubPagesError}</div>}
+                      </div>
+                    )}
                     <div className="mt-3 flex flex-wrap gap-2">
                       <button
                         type="button"
@@ -1317,13 +1367,13 @@ function JobDetail() {
               </button>
             </>
           )}
-          {artifactEntries.map((name) => (
+          {artifactEntries.map((entry) => (
             <a
-              key={name}
-              href={jobsApi.artifactUrl(job.job_id, name)}
-              className="rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-700"
+              key={entry.name}
+              href={jobsApi.artifactUrl(job.job_id, entry.name)}
+              className="rounded-lg border border-slate-300 px-3 py-1.5 text-xs text-slate-700 hover:border-primary-400 hover:text-primary-700"
             >
-              {artifactLabels[name]}
+              {entry.label}
             </a>
           ))}
         </div>
