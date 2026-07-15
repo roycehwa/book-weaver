@@ -369,7 +369,7 @@ def test_review_skips_map_frontmatter_with_figure_captions() -> None:
     assert items == []
 
 
-def test_glossary_drift_is_owned_by_system_repair() -> None:
+def test_glossary_drift_accepts_paraphrase_without_review_flag() -> None:
     items = detect_review_items(
         [
             {
@@ -398,9 +398,7 @@ def test_glossary_drift_is_owned_by_system_repair() -> None:
         ],
     )
 
-    assert items[0]["issue_type"] == "glossary_drift"
-    assert items[0]["responsibility"] == "system"
-    assert items[0]["suggested_action"] == "auto_retranslate"
+    assert items == []
 
 
 def test_glossary_drift_uses_segment_snapshot_terms_only() -> None:
@@ -418,7 +416,7 @@ def test_glossary_drift_uses_segment_snapshot_terms_only() -> None:
         [
             {
                 "segment_id": "ch-001:r001",
-                "translated_text": "苏维埃联盟影响了政策。",
+                "translated_text": "The Soviet Union 影响了政策。",
             }
         ],
         target_language="zh-CN",
@@ -428,11 +426,28 @@ def test_glossary_drift_uses_segment_snapshot_terms_only() -> None:
         ],
     )
 
-    assert len(items) == 1
-    assert items[0]["issue_type"] == "glossary_drift"
-    assert items[0]["evidence"]["missing_glossary_terms"] == [
-        {"source": "Soviet Union", "target": "苏联"}
-    ]
+    assert items == []
+
+
+def test_mixed_english_ignores_epub_internal_links() -> None:
+    items = detect_review_items(
+        [
+            {
+                "segment_id": "ch-001:r001",
+                "source_text": "See note [67](OEBPS/html/20_Notes.xhtml#id_391).",
+                "translate": True,
+            }
+        ],
+        [
+            {
+                "segment_id": "ch-001:r001",
+                "translated_text": "见注释 [67](OEBPS/html/20_Notes.xhtml#id_391)。",
+            }
+        ],
+        target_language="zh-CN",
+    )
+
+    assert items == []
 
 
 def test_glossary_drift_ignores_terms_found_only_in_image_paths() -> None:
@@ -921,6 +936,24 @@ def test_rewrite_prompt_strips_fail_open_placeholder_from_current_translation() 
     assert "BOOKWEAVER_TRANSLATION_FAIL_OPEN" not in prompt
     assert "BookWeaver：本段自动翻译未通过质量校验" not in prompt
     assert "(none — translate the source text from scratch)" in prompt
+
+
+def test_strip_fail_open_notices_removes_review_placeholder() -> None:
+    from pdf_translator.review import strip_fail_open_notices
+
+    text = (
+        "<!-- BOOKWEAVER_TRANSLATION_FAIL_OPEN chunk=1 "
+        'reason="Translation for chunk 1 looks untranslated (ascii=503, cjk=47)." -->\n\n'
+        "> ⚠️ BookWeaver：本段自动翻译未通过质量校验，已保留原文供审阅修订。"
+        "原因：Translation for chunk 1 looks untranslated (ascii=503, cjk=47).\n\n"
+        "Original English paragraph."
+    )
+
+    cleaned = strip_fail_open_notices(text)
+
+    assert "BOOKWEAVER_TRANSLATION_FAIL_OPEN" not in cleaned
+    assert "BookWeaver" not in cleaned
+    assert cleaned.strip() == "Original English paragraph."
 
 
 def test_is_valid_rewrite_candidate_rejects_placeholder() -> None:

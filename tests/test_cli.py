@@ -83,6 +83,23 @@ def test_review_export_detects_pages_missing_from_book_chapters() -> None:
     assert _uncovered_book_pages(book) == [2]
 
 
+def test_review_export_ignores_skipped_pages_when_checking_coverage() -> None:
+    book = {
+        "pages": [
+            {"page_no": 1, "has_content": True},
+            {
+                "page_no": 2,
+                "has_content": True,
+                "disposition": "skipped",
+                "skip_reason": "page_render_fallback_excluded_from:Chapter 2",
+            },
+        ],
+        "chapters": [{"source_pages": [1]}],
+    }
+
+    assert _uncovered_book_pages(book) == []
+
+
 def test_approved_review_export_rejects_missing_translation() -> None:
     project = {
         "segments": [

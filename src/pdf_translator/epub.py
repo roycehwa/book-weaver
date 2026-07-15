@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, is_dataclass
 from html import escape
+import hashlib
 import mimetypes
 import posixpath
 from pathlib import Path, PurePosixPath
@@ -13,132 +14,23 @@ from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile
 from bs4 import BeautifulSoup
 from markdown import markdown
 
+from pdf_translator.book_views import (
+    dedupe_markdown_image_blocks,
+    normalize_chapter_headings,
+    sanitize_apparatus_chapter_markdown,
+    sanitize_cover_chapter_markdown,
+    strip_scrape_watermarks,
+)
 
-EPUB_CSS = """
-@page {
-  margin: 1.4rem 1.2rem;
-}
-body {
-  font-family: Georgia, "Songti SC", "Noto Serif CJK SC", serif;
-  line-height: 1.82;
-  margin: 0;
-  padding: 1.8rem 1.45rem 2.4rem;
-  color: #222831;
-  background: #fffdf8;
-  font-size: 1.03rem;
-}
-h1, h2, h3 {
-  color: #111827;
-  line-height: 1.28;
-  margin: 2.2em 0 1em;
-  page-break-after: avoid;
-  break-after: avoid;
-}
-h1 {
-  font-size: 1.85rem;
-  margin-top: 0.4em;
-  padding-bottom: 0.45em;
-  border-bottom: 1px solid #d8d2c4;
-  page-break-before: always;
-  break-before: page;
-}
-h1:first-child {
-  page-break-before: auto;
-  break-before: auto;
-}
-h2 {
-  font-size: 1.35rem;
-}
-h3 {
-  font-size: 1.16rem;
-}
-p {
-  margin: 0 0 1.05em;
-  text-align: start;
-}
-img {
-  display: block;
-  max-width: 100%;
-  height: auto;
-  margin: 1.8rem auto 1.1rem;
-  page-break-inside: avoid;
-  break-inside: avoid;
-}
-figure {
-  margin: 1.8rem 0;
-  page-break-inside: avoid;
-  break-inside: avoid;
-}
-blockquote {
-  margin: 1.1rem 0 1.35rem;
-  padding: 0.15rem 0 0.15rem 1rem;
-  border-left: 0.18rem solid #b6ad9c;
-  color: #4b5563;
-}
-table {
-  border-collapse: collapse;
-  width: 100%;
-  margin: 1.4rem 0;
-  font-size: 0.92rem;
-  page-break-inside: avoid;
-  break-inside: avoid;
-}
-td, th {
-  border: 1px solid #d1d5db;
-  padding: 0.5rem;
-  vertical-align: top;
-  word-break: break-word;
-}
-table.worksheet-table {
-  display: block;
-  overflow-x: auto;
-  font-size: 0.84rem;
-  line-height: 1.45;
-}
-table.worksheet-table td,
-table.worksheet-table th {
-  min-width: 7rem;
-}
-li {
-  margin: 0.25rem 0 0.55rem;
-}
-.chapter-notes {
-  margin-top: 2.4rem;
-  padding-top: 1rem;
-  border-top: 1px solid #d8d2c4;
-  color: #4b5563;
-  font-size: 0.86rem;
-  line-height: 1.55;
-}
-.chapter-notes h2 {
-  margin: 0 0 0.85rem;
-  font-size: 1rem;
-  letter-spacing: 0.04em;
-}
-.chapter-notes p {
-  margin: 0 0 0.55em;
-}
-.preserved-apparatus {
-  margin-top: 1.2rem;
-  padding: 1rem 1.05rem;
-  border: 1px solid #e3ded2;
-  background: #fbf7ec;
-  color: #3f4652;
-  font-size: 0.88rem;
-  line-height: 1.5;
-}
-.preserved-apparatus h1,
-.preserved-apparatus h2,
-.preserved-apparatus h3 {
-  page-break-before: auto;
-  break-before: auto;
-  margin-top: 0.6rem;
-}
-.preserved-apparatus p,
-.preserved-apparatus li {
-  margin-bottom: 0.5rem;
-}
-""".strip()
+
+from pdf_translator.epub_typography import (
+    build_epub_css,
+    normalize_epub_language,
+    resolve_embedded_font,
+    resolve_epub_content_language,
+)
+
+
 CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 RAW_HTML_TAG_RE = re.compile(r"</?(?:a|img|br)\b[^<>]*?/?>", re.IGNORECASE)
 NOTE_MARKER_RE = re.compile(r"^(?:\d{1,3}|[¹²³⁴⁵⁶⁷⁸⁹⁰]{1,4})$")
@@ -170,6 +62,7 @@ def _markdown_to_body_html(markdown_text: str) -> str:
         extensions=["tables", "fenced_code", "sane_lists", "footnotes"],
     )
     soup = BeautifulSoup(html, "html.parser")
+    _normalize_typography(soup)
     _annotate_worksheet_tables(soup)
     _compact_trailing_note_cluster(soup)
     ids = {
@@ -182,6 +75,16 @@ def _markdown_to_body_html(markdown_text: str) -> str:
         if isinstance(href, str) and href.startswith("#") and href[1:] not in ids:
             anchor.decompose()
     return "".join(str(child) for child in soup.contents)
+
+
+def _normalize_typography(soup: BeautifulSoup) -> None:
+    for tag in soup.find_all(True):
+        if tag.name == "font":
+            tag.unwrap()
+            continue
+        for attr in ("style", "face", "size", "color"):
+            if tag.has_attr(attr):
+                del tag[attr]
 
 
 def _annotate_worksheet_tables(soup: BeautifulSoup) -> None:
@@ -420,9 +323,13 @@ def _rewrite_images(
     image_map: dict[Path, str],
     image_items: list[tuple[str, Path]],
     image_roots: list[Path],
+    *,
+    hash_map: dict[str, str] | None = None,
 ) -> str:
+    content_hash_map = hash_map if hash_map is not None else {}
     soup = BeautifulSoup(body_html, "html.parser")
     used_names: set[str] = set(image_map.values())
+    used_names.update(content_hash_map.values())
     for image in soup.find_all("img"):
         raw_src = image.get("src")
         if not raw_src or str(raw_src).startswith("#"):
@@ -430,24 +337,40 @@ def _rewrite_images(
         resolved = _resolve_image_source_path(str(raw_src), image_roots)
         if resolved is None:
             continue
-        if resolved not in image_map:
-            base_name = resolved.name
-            candidate = base_name
-            suffix = 1
-            while f"images/{candidate}" in used_names:
-                stem = resolved.stem
-                candidate = f"{stem}-{suffix}{resolved.suffix}"
-                suffix += 1
-            epub_path = f"images/{candidate}"
-            image_map[resolved] = epub_path
-            used_names.add(epub_path)
-            image_items.append((epub_path, resolved))
-        image["src"] = f"../{image_map[resolved]}"
+        if resolved in image_map:
+            image["src"] = f"../{image_map[resolved]}"
+            continue
+        content_key = hashlib.sha256(resolved.read_bytes()).hexdigest()
+        if content_key in content_hash_map:
+            image_map[resolved] = content_hash_map[content_key]
+            image["src"] = f"../{content_hash_map[content_key]}"
+            continue
+        base_name = resolved.name
+        candidate = base_name
+        suffix = 1
+        while f"images/{candidate}" in used_names:
+            stem = resolved.stem
+            candidate = f"{stem}-{suffix}{resolved.suffix}"
+            suffix += 1
+        epub_path = f"images/{candidate}"
+        image_map[resolved] = epub_path
+        content_hash_map[content_key] = epub_path
+        used_names.add(epub_path)
+        image_items.append((epub_path, resolved))
+        image["src"] = f"../{epub_path}"
     return "".join(str(child) for child in soup.contents)
 
 
-def _chapter_xhtml(*, title: str, body_html: str, language: str, body_id: str | None = None) -> str:
+def _chapter_xhtml(
+    *,
+    title: str,
+    body_html: str,
+    language: str,
+    body_id: str | None = None,
+    body_class: str | None = None,
+) -> str:
     id_attr = f' id="{escape(body_id)}"' if body_id else ""
+    class_attr = f' class="{escape(body_class)}"' if body_class else ""
     return f"""<?xml version="1.0" encoding="utf-8"?>
 <html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" xml:lang="{escape(language)}">
 <head>
@@ -455,7 +378,7 @@ def _chapter_xhtml(*, title: str, body_html: str, language: str, body_id: str | 
   <title>{escape(title)}</title>
   <link rel="stylesheet" type="text/css" href="../styles/book.css" />
 </head>
-<body{id_attr}>
+<body{id_attr}{class_attr}>
 {body_html}
 </body>
 </html>
@@ -509,6 +432,7 @@ def _content_opf(
     language: str,
     chapter_files: list[str],
     image_items: list[tuple[str, Path]],
+    font_items: list[tuple[str, Path, str]],
     cover_image_manifest_id: str | None = None,
 ) -> str:
     chapter_manifest = "\n".join(
@@ -525,6 +449,10 @@ def _content_opf(
             f'    <item id="{mid}" href="{escape(epub_path)}" media-type="{escape(_media_type(source_path))}"{props} />'
         )
     image_manifest = "\n".join(image_lines)
+    font_manifest = "\n".join(
+        f'    <item id="font-{index}" href="{escape(epub_path)}" media-type="{escape(media_type)}" />'
+        for index, (epub_path, _source_path, media_type) in enumerate(font_items, 1)
+    )
     cover_meta = (
         f'\n    <meta name="cover" content="{escape(cover_image_manifest_id)}" />'
         if cover_image_manifest_id
@@ -546,6 +474,7 @@ def _content_opf(
     <item id="css" href="styles/book.css" media-type="text/css" />
 {chapter_manifest}
 {image_manifest}
+{font_manifest}
   </manifest>
   <spine>
 {spine_items}
@@ -561,8 +490,23 @@ def render_epub_from_book(
     output_path: Path,
     title: str,
     language: str = "zh-CN",
+    source_language: str | None = None,
+    content_is_translated: bool = True,
     image_roots: list[Path] | None = None,
 ) -> None:
+    content_language = resolve_epub_content_language(
+        source_language=source_language or language,
+        target_language=language,
+        content_is_translated=content_is_translated,
+    )
+    dc_language = normalize_epub_language(content_language)
+    embedded_font = resolve_embedded_font(content_language)
+    epub_css = build_epub_css(language=content_language, embedded_font=embedded_font)
+    font_items: list[tuple[str, Path, str]] = []
+    if embedded_font is not None:
+        font_items.append(
+            (embedded_font.epub_href, embedded_font.source_path, embedded_font.media_type)
+        )
     chapters = [_chapter_payload(chapter) for chapter in translated_chapters]
     if not chapters:
         chapters = [
@@ -583,16 +527,31 @@ def render_epub_from_book(
 
     chapter_documents: list[tuple[str, str]] = []
     image_map: dict[Path, str] = {}
+    image_hash_map: dict[str, str] = {}
     image_items: list[tuple[str, Path]] = []
     resolved_image_roots = [output_path.parent.resolve()]
     resolved_image_roots.extend(root.expanduser().resolve() for root in (image_roots or []))
     semantic_content = book.get("semantic_content")
 
-    for chapter, chapter_file in zip(chapters, chapter_files):
-        index = int(chapter.get("index") or 1)
+    for chapter_index, (chapter, chapter_file) in enumerate(zip(chapters, chapter_files), start=1):
+        index = int(chapter.get("index") or chapter_index)
         chapter_title = str(chapter.get("title") or f"Chapter {index}")
         chapter_id = str(chapter.get("chapter_id") or "").strip() or None
-        markdown_text = str(chapter.get("markdown") or "")
+        markdown_text = strip_scrape_watermarks(str(chapter.get("markdown") or ""))
+        if chapter.get("cover") or chapter_title.casefold() == "cover":
+            markdown_text = sanitize_cover_chapter_markdown(markdown_text)
+        if (
+            chapter.get("preserve_original")
+            or chapter.get("resource_only")
+            or APPARATUS_TITLE_RE.match(chapter_title)
+        ):
+            markdown_text = sanitize_apparatus_chapter_markdown(markdown_text)
+        if chapter.get("toc", True):
+            markdown_text = normalize_chapter_headings(markdown_text, chapter_title)
+        markdown_text = dedupe_markdown_image_blocks(
+            markdown_text,
+            image_roots=resolved_image_roots,
+        )
         body_html = _markdown_to_body_html(markdown_text)
         body_html = rewrite_epub_internal_hrefs(
             body_html,
@@ -604,13 +563,30 @@ def render_epub_from_book(
             chapter=chapter,
             semantic_content=semantic_content if isinstance(semantic_content, dict) else None,
         )
-        body_html = _rewrite_images(body_html, image_map, image_items, resolved_image_roots)
+        body_html = _rewrite_images(
+            body_html,
+            image_map,
+            image_items,
+            resolved_image_roots,
+            hash_map=image_hash_map,
+        )
         if chapter.get("preserve_original") or chapter.get("resource_only") or APPARATUS_TITLE_RE.match(chapter_title):
             body_html = _wrap_preserved_apparatus(body_html)
+        body_class = (
+            "bookweaver-chapter-first"
+            if chapter_index == 1
+            else "bookweaver-chapter-start"
+        )
         chapter_documents.append(
             (
                 chapter_file,
-                _chapter_xhtml(title=chapter_title, body_html=body_html, language=language, body_id=chapter_id),
+                _chapter_xhtml(
+                    title=chapter_title,
+                    body_html=body_html,
+                    language=dc_language,
+                    body_id=chapter_id,
+                    body_class=body_class,
+                ),
             )
         )
 
@@ -621,10 +597,10 @@ def render_epub_from_book(
     with ZipFile(output_path, "w") as archive:
         archive.writestr("mimetype", "application/epub+zip", compress_type=ZIP_STORED)
         archive.writestr("META-INF/container.xml", _container_xml(), compress_type=ZIP_DEFLATED)
-        archive.writestr("OEBPS/styles/book.css", EPUB_CSS, compress_type=ZIP_DEFLATED)
+        archive.writestr("OEBPS/styles/book.css", epub_css, compress_type=ZIP_DEFLATED)
         archive.writestr(
             "OEBPS/nav.xhtml",
-            _nav_xhtml(title, chapters, chapter_files, language=language),
+            _nav_xhtml(title, chapters, chapter_files, language=dc_language),
             compress_type=ZIP_DEFLATED,
         )
         archive.writestr(
@@ -632,9 +608,10 @@ def render_epub_from_book(
             _content_opf(
                 title=title,
                 identifier=identifier,
-                language=language,
+                language=dc_language,
                 chapter_files=chapter_files,
                 image_items=image_items,
+                font_items=font_items,
                 cover_image_manifest_id=cover_manifest_id,
             ),
             compress_type=ZIP_DEFLATED,
@@ -642,6 +619,8 @@ def render_epub_from_book(
         for chapter_file, chapter_document in chapter_documents:
             archive.writestr(f"OEBPS/{chapter_file}", chapter_document, compress_type=ZIP_DEFLATED)
         for epub_path, source_path in image_items:
+            archive.write(source_path, f"OEBPS/{epub_path}", compress_type=ZIP_DEFLATED)
+        for epub_path, source_path, _media_type in font_items:
             archive.write(source_path, f"OEBPS/{epub_path}", compress_type=ZIP_DEFLATED)
 
 

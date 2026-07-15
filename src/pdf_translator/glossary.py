@@ -363,12 +363,18 @@ def _apply_dynamic_quality_cutoff(
 ) -> tuple[list[dict[str, Any]], float, int]:
     if not ranked:
         return [], minimum_score, 0
-    if len(ranked) <= 20:
+    if len(ranked) <= 30:
         cutoff = minimum_score
     else:
         top_score = float(ranked[0]["score"])
-        cutoff = max(minimum_score, 8.0, top_score - 7.0)
+        # Keep a stable shortlist: avoid swinging between hundreds of
+        # noisy terms and only a handful of ultra-high-score outliers.
+        cutoff = max(minimum_score, min(6.5, top_score - 4.0))
     surfaced = [item for item in ranked if float(item["score"]) >= cutoff]
+    target_floor = 15
+    if len(surfaced) < target_floor and len(ranked) >= target_floor:
+        surfaced = ranked[:target_floor]
+        cutoff = float(surfaced[-1]["score"])
     return surfaced, cutoff, len(ranked) - len(surfaced)
 
 
@@ -673,6 +679,34 @@ def _is_complete_source_term_match(text: str, start: int, end: int) -> bool:
     if re.match(r"^\s*(?:[–—-]\s*)?(?:[A-Z][A-Za-z'’-]*|[IVX]+)\b", after):
         return False
     return True
+
+
+def apply_glossary_source_substitutions(
+    source_text: str,
+    translated_text: str,
+    entries: list[dict[str, Any]],
+    *,
+    chapter_id: str | None = None,
+) -> str:
+    """Replace English glossary sources still present in translation with their targets.
+
+    When the model leaves a mandatory source term untranslated, patch it in place
+    instead of waiting for another model pass.
+    """
+    result = translated_text
+    missing = glossary_terms_missing_in_translation(
+        source_text,
+        result,
+        entries,
+        chapter_id=chapter_id,
+    )
+    for item in sorted(missing, key=lambda entry: len(entry["source"]), reverse=True):
+        source = item["source"]
+        target = item["target"]
+        pattern = re.compile(re.escape(source), re.IGNORECASE)
+        if pattern.search(result):
+            result = pattern.sub(target, result)
+    return result
 
 
 def glossary_terms_missing_in_translation(

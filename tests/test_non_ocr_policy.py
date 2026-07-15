@@ -57,3 +57,14 @@ def test_enforce_non_ocr_policy_rejects_unresolved_ocr_quarantine() -> None:
 
     with pytest.raises(InputGateError, match="suspect OCR"):
         enforce_non_ocr_translatable_policy(book)
+
+
+def test_assert_translatable_pages_reject_empty_embedded_text() -> None:
+    from pdf_translator.guardrails import assert_translatable_pages_have_extractable_text
+
+    with pytest.raises(InputGateError, match="no extractable embedded text"):
+        assert_translatable_pages_have_extractable_text(
+            chapter_title="Body",
+            pages=[4],
+            page_markdown={4: "![Figure 1](figure.png)"},
+        )

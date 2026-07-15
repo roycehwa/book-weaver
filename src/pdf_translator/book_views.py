@@ -19,7 +19,10 @@ keys remain stable.
 
 from __future__ import annotations
 
+import hashlib
 import re
+from pathlib import Path
+from urllib.parse import unquote
 
 from .chapter_kind import (
     NON_TRANSLATABLE_BLOCK_KINDS,
@@ -39,6 +42,9 @@ def render_book_markdown(book: dict, *, include_trace: bool = False) -> str:
 
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
 _ASSET_KEEP_RE = re.compile(r"!\[(?P<label>[^\]]*)\]\((?P<path>[^)]+)\)")
+_H1_PREFIX_RE = re.compile(r"^#\s+\S")
+_IMAGE_REF_RE = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
+_ORIGINAL_PAGE_IMAGE_RE = re.compile(r"original-page-p\d+\.png", re.IGNORECASE)
 
 
 def _heading_line(level: int, title: str, chapter_index: int | None) -> str:
@@ -120,8 +126,199 @@ def render_translation_input_markdown(book: dict) -> str:
     return "\n".join(out).rstrip() + "\n"
 
 
+def normalize_chapter_headings(markdown: str, title: str) -> str:
+    """Ensure exactly one top-level heading per chapter for EPUB delivery."""
+
+    safe_title = str(title or "").strip() or "Chapter"
+    body = str(markdown or "").strip()
+    if not body:
+        return f"# {safe_title}\n"
+
+    kept_blocks: list[str] = []
+    for block in body.split("\n\n"):
+        stripped = block.strip()
+        if not stripped:
+            continue
+        heading = _HEADING_RE.match(stripped)
+        if heading and len(heading.group(1)) == 1:
+            continue
+        kept_blocks.append(stripped)
+    body = "\n\n".join(kept_blocks).strip()
+    if not body:
+        return f"# {safe_title}\n"
+    return f"# {safe_title}\n\n{body}\n"
+
+
+def ensure_chapter_top_heading(markdown: str, title: str) -> str:
+    """Ensure deliverable chapter markdown begins with a single ``#`` heading."""
+
+    return normalize_chapter_headings(markdown, title)
+
+
+def _resolve_delivery_image_path(raw_src: str, image_roots: list[Path]) -> Path | None:
+    source_path = Path(unquote(raw_src)).expanduser()
+    candidates = [source_path]
+    if not source_path.is_absolute():
+        candidates.extend(root / source_path for root in image_roots)
+        candidates.extend(root / "book-images" / source_path.name for root in image_roots)
+    if source_path.parent.name:
+        candidates.extend(root / source_path.parent.name / source_path.name for root in image_roots)
+    candidates.extend(root / source_path.name for root in image_roots)
+    seen: set[Path] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if candidate.is_file():
+            return candidate.resolve()
+    return None
+
+
+def dedupe_markdown_image_blocks(markdown: str, *, image_roots: list[Path] | None = None) -> str:
+    """Drop repeated image blocks that resolve to the same file content."""
+
+    roots = [root.expanduser().resolve() for root in (image_roots or [])]
+    seen_hashes: set[str] = set()
+    kept_blocks: list[str] = []
+    for block in str(markdown or "").split("\n\n"):
+        stripped = block.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("!["):
+            match = _IMAGE_REF_RE.search(stripped)
+            if match is not None:
+                resolved = _resolve_delivery_image_path(match.group(1), roots)
+                if resolved is not None:
+                    content_hash = hashlib.sha256(resolved.read_bytes()).hexdigest()
+                    if content_hash in seen_hashes:
+                        continue
+                    seen_hashes.add(content_hash)
+        kept_blocks.append(stripped)
+    if not kept_blocks:
+        return ""
+    return "\n\n".join(kept_blocks).strip() + "\n"
+
+
+def sanitize_cover_chapter_markdown(markdown: str) -> str:
+    """Keep a single cover image when page-level figure crops were also embedded."""
+
+    blocks = [block.strip() for block in str(markdown or "").split("\n\n") if block.strip()]
+    if not blocks:
+        return markdown
+    heading = next((block for block in blocks if _H1_PREFIX_RE.match(block)), "")
+    image_blocks = [block for block in blocks if block.startswith("![")]
+    if not image_blocks:
+        return markdown
+    cover_blocks = [
+        block
+        for block in image_blocks
+        if "cover-p" in block.lower() or re.search(r"!\[Cover\]", block, re.IGNORECASE)
+    ]
+    chosen = cover_blocks[0] if cover_blocks else image_blocks[0]
+    if heading:
+        return f"{heading}\n\n{chosen}\n"
+    return f"{chosen}\n"
+
+
+def sanitize_apparatus_chapter_markdown(markdown: str) -> str:
+    """When full-page apparatus renders exist, drop duplicate extracted crops/lists."""
+
+    text = str(markdown or "").strip()
+    if not text or not _ORIGINAL_PAGE_IMAGE_RE.search(text):
+        return markdown
+    kept: list[str] = []
+    for block in text.split("\n\n"):
+        stripped = block.strip()
+        if not stripped:
+            continue
+        if _ORIGINAL_PAGE_IMAGE_RE.search(stripped):
+            kept.append(stripped)
+            continue
+        if _HEADING_RE.match(stripped):
+            kept.append(stripped)
+    if not kept:
+        return markdown
+    return "\n\n".join(kept).strip() + "\n"
+
+
+_SCRAPE_WATERMARK_INLINE_RE = re.compile(
+    r"\b(?:ocean\s*of\s*pdf(?:\s*\.\s*f\s*)?|oceanofpdf)\.\s*com\b",
+    re.IGNORECASE,
+)
+_STRAY_RULE_HEADING_RE = re.compile(r"^#{1,6}\s*[-–—\s]{1,6}$")
+
+
+def _compact_scrape_watermark_text(text: str) -> str:
+    cleaned = _SCRAPE_WATERMARK_INLINE_RE.sub("", text)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    return cleaned
+
+
+def is_scrape_watermark_block(block: str) -> bool:
+    """Detect pirate-PDF site watermarks and other scrape-only heading noise."""
+
+    stripped = str(block or "").strip()
+    if not stripped:
+        return False
+    if _STRAY_RULE_HEADING_RE.match(stripped):
+        return True
+    body = re.sub(r"^#{1,6}\s+", "", stripped)
+    remainder = _compact_scrape_watermark_text(body).strip()
+    if not remainder:
+        return True
+    compact = re.sub(r"[\s.#]", "", body.casefold())
+    if compact in {"oceanofpdfcom", "zlibrary", "zlibraryorg"}:
+        return True
+    return False
+
+
+def strip_scrape_watermarks(markdown: str) -> str:
+    """Remove OceanofPDF/Z-Library watermarks from chapter markdown before export."""
+
+    kept_blocks: list[str] = []
+    for block in str(markdown or "").split("\n\n"):
+        stripped = block.strip()
+        if not stripped or is_scrape_watermark_block(stripped):
+            continue
+        lines: list[str] = []
+        for line in stripped.splitlines():
+            cleaned = _compact_scrape_watermark_text(line)
+            if cleaned:
+                lines.append(cleaned)
+        if lines:
+            kept_blocks.append("\n".join(lines))
+    if not kept_blocks:
+        return ""
+    return "\n\n".join(kept_blocks).strip() + "\n"
+
+
+def join_chapter_delivery_markdown(chapters: list[dict]) -> str:
+    """Join translated chapter payloads into one markdown file with stable H1 anchors."""
+
+    parts: list[str] = []
+    for chapter in chapters:
+        markdown = str(chapter.get("markdown") or "").strip()
+        if not markdown:
+            continue
+        title = str(chapter.get("title") or "")
+        if chapter.get("toc", True):
+            markdown = normalize_chapter_headings(markdown, title).strip()
+        parts.append(markdown)
+    if not parts:
+        return ""
+    return "\n\n".join(parts) + "\n"
+
+
 # kept for backward-compatibility with other call sites
 __all__ = [
+    "dedupe_markdown_image_blocks",
+    "ensure_chapter_top_heading",
+    "is_scrape_watermark_block",
+    "join_chapter_delivery_markdown",
+    "normalize_chapter_headings",
     "render_book_markdown",
     "render_translation_input_markdown",
+    "sanitize_apparatus_chapter_markdown",
+    "sanitize_cover_chapter_markdown",
+    "strip_scrape_watermarks",
 ]

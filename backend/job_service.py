@@ -1693,6 +1693,28 @@ class BookJobService:
         self._require_glossary_ready_for_translation(job_id)
         return snapshot
 
+    def start_export(self, job_id: str) -> dict[str, Any]:
+        snapshot = self.get(job_id)
+        request = snapshot.get("request") if isinstance(snapshot.get("request"), dict) else {}
+        if str(request.get("processing_mode") or "") != "convert":
+            raise JobServiceError("仅「解析并导出 EPUB」任务可在确认章节后直接导出。")
+        self._require_user_confirmed_canonical_chapters(job_id)
+        state = str(snapshot.get("state") or "")
+        if state not in {"awaiting_glossary", "failed", "exporting"}:
+            raise JobServiceError(f"当前状态无法导出 EPUB：{state}")
+        return snapshot
+
+    def run_export(self, job_id: str) -> None:
+        self._validate_job_id(job_id)
+        self._acquire_worker_lock(job_id)
+        try:
+            self._run(
+                ["job", "export", job_id, "--jobs-dir", str(self.jobs_dir), "--json"],
+                timeout_seconds=-1,
+            )
+        finally:
+            self._release_worker_lock(job_id)
+
     def _require_user_confirmed_canonical_chapters(self, job_id: str) -> None:
         try:
             canonical = self._read_json_any(self.artifact_path(job_id, "canonical_chapters"))

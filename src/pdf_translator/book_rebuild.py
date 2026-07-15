@@ -24,7 +24,10 @@ from pdf_translator.semantic_content import (
     stable_semantic_id,
 )
 from pdf_translator.ocr_quality import assess_ocr_block
-from pdf_translator.guardrails import assert_translatable_pages_have_no_original_fallback
+from pdf_translator.guardrails import (
+    ORIGINAL_PAGE_FALLBACK_RE,
+    _translatable_page_text_chars,
+)
 
 
 TOP_TITLE_BAND = 450.0
@@ -1273,10 +1276,127 @@ def _is_placeholder_title(title: str) -> bool:
     return title.startswith("Untitled Section")
 
 
+def _is_cover_chapter_title(title: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", " ", str(title or "").lower()).strip()
+    return normalized in {
+        "cover",
+        "half title",
+        "title page",
+        "title pages",
+        "front matter",
+        "frontmatter",
+    }
+
+
+def _is_title_pages_chapter_title(title: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", " ", str(title or "").lower()).strip()
+    return "title page" in normalized
+
+
+def _resolve_canonical_chapter_pages(
+    *,
+    chapter_title: str,
+    pages: list[int],
+    page_markdown: dict[int, str],
+    base_preserve_original: bool,
+) -> tuple[list[int], bool, dict[str, list[int]]]:
+    """Pick canonical pages and decide whether the chapter stays translatable."""
+
+    exclusions = {"excluded_blank_pages": [], "excluded_fallback_pages": []}
+    if base_preserve_original:
+        return pages, True, exclusions
+
+    fallback_pages = [
+        page
+        for page in pages
+        if ORIGINAL_PAGE_FALLBACK_RE.search(str(page_markdown.get(page) or ""))
+    ]
+    candidate_pages = [page for page in pages if page not in fallback_pages]
+    if fallback_pages:
+        exclusions["excluded_fallback_pages"] = fallback_pages
+
+    text_pages = [
+        page
+        for page in candidate_pages
+        if _translatable_page_text_chars(page_markdown, page) >= 1
+    ]
+    blank_pages = [page for page in candidate_pages if page not in text_pages]
+    if blank_pages:
+        exclusions["excluded_blank_pages"] = blank_pages
+
+    if text_pages:
+        return text_pages, False, exclusions
+
+    if (
+        _is_placeholder_title(chapter_title)
+        or _is_cover_chapter_title(chapter_title)
+        or _is_resource_chapter_title(chapter_title)
+        or _is_title_pages_chapter_title(chapter_title)
+    ):
+        return pages, True, exclusions
+
+    # Blank or image-only chapters (e.g. dedication pages) should not block confirmation.
+    return pages, True, exclusions
+
+
+def _mark_excluded_canonical_pages(
+    pages: list[dict[str, Any]],
+    chapters: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Record pages dropped from translatable chapters so page integrity can pass."""
+
+    excluded_blank: dict[int, str] = {}
+    excluded_fallback: dict[int, str] = {}
+    for chapter in chapters:
+        exclusions = chapter.get("page_exclusions")
+        if not isinstance(exclusions, dict):
+            continue
+        title = str(chapter.get("title") or "chapter")
+        for page_no in exclusions.get("excluded_blank_pages", []):
+            try:
+                excluded_blank[int(page_no)] = title
+            except (TypeError, ValueError):
+                continue
+        for page_no in exclusions.get("excluded_fallback_pages", []):
+            try:
+                excluded_fallback[int(page_no)] = title
+            except (TypeError, ValueError):
+                continue
+
+    marked: list[dict[str, Any]] = []
+    for page in pages:
+        if not isinstance(page, dict):
+            continue
+        payload = dict(page)
+        try:
+            page_no = int(payload.get("page_no") or 0)
+        except (TypeError, ValueError):
+            marked.append(payload)
+            continue
+        if page_no in excluded_fallback:
+            payload["disposition"] = "skipped"
+            payload["skip_reason"] = (
+                f"page_render_fallback_excluded_from:{excluded_fallback[page_no]}"
+            )
+        elif page_no in excluded_blank:
+            payload["disposition"] = "skipped"
+            payload["skip_reason"] = (
+                f"no_embedded_text_excluded_from:{excluded_blank[page_no]}"
+            )
+        marked.append(payload)
+    return marked
+
+
 def _is_resource_chapter_title(title: str) -> bool:
     normalized = re.sub(r"[^a-z0-9]+", " ", str(title or "").lower()).strip()
     return normalized in {
         "cover",
+        "dedication",
+        "acknowledgments",
+        "acknowledgements",
+        "epigraph",
+        "copyright",
+        "colophon",
         "contents",
         "table of contents",
         "maps",
@@ -1291,6 +1411,7 @@ def _is_resource_chapter_title(title: str) -> bool:
         "notes",
         "endnotes",
         "bibliography",
+        "reference",
         "references",
         "works cited",
         "index",
@@ -1302,9 +1423,12 @@ def _canonical_chapter_preserve_original(
     title: str,
     pages: list[int],
     page_policy: dict[int, dict[str, bool]],
+    user_confirmed: bool = False,
 ) -> bool:
     if _is_resource_chapter_title(title):
         return True
+    if user_confirmed:
+        return False
     policies = [page_policy.get(page, {}) for page in pages if page in page_policy]
     return bool(policies) and all(
         policy.get("preserve_original") or policy.get("resource_only") or policy.get("translate") is False
@@ -1312,37 +1436,67 @@ def _canonical_chapter_preserve_original(
     )
 
 
-def apply_canonical_chapter_plan(book: dict[str, Any], canonical: dict[str, Any]) -> dict[str, Any]:
+def apply_canonical_chapter_plan(
+    book: dict[str, Any],
+    canonical: dict[str, Any],
+    *,
+    source_path: Path | None = None,
+    asset_dir: Path | None = None,
+) -> dict[str, Any]:
+    canonical_source = str(canonical.get("source_artifact") or "")
+    user_confirmed = canonical_source == "user_confirmation"
+    use_epub_reader_pages = bool(
+        user_confirmed
+        and source_path is not None
+        and source_path.suffix.lower() == ".epub"
+    )
+
     page_markdown: dict[int, str] = {}
     page_policy: dict[int, dict[str, bool]] = {}
-    for chapter in book.get("chapters", []):
-        for page_no in chapter.get("source_pages", []):
-            try:
-                page_number = int(page_no)
-            except (TypeError, ValueError):
-                continue
-            page_policy[page_number] = {
-                "preserve_original": bool(chapter.get("preserve_original")),
-                "resource_only": bool(chapter.get("resource_only")),
-                "translate": bool(chapter.get("translate", True)),
-            }
-        trace = str(chapter.get("trace_markdown") or "")
-        matches = list(TRACE_PAGE_RE.finditer(trace))
-        for index, match in enumerate(matches):
-            end = matches[index + 1].start() if index + 1 < len(matches) else len(trace)
-            page_markdown[int(match.group(1))] = trace[match.end():end].strip()
 
-    for asset in book.get("assets", []):
-        if not isinstance(asset, dict) or not isinstance(asset.get("page_no"), int):
-            continue
-        asset_markdown = str(asset.get("text") or "").strip()
-        if not asset_markdown and asset.get("path"):
-            label = "Table" if asset.get("kind") == "table" else "Figure"
-            asset_markdown = f"![{label}]({asset['path']})"
-        if asset_markdown and asset_markdown not in page_markdown.get(asset["page_no"], ""):
-            page_markdown[asset["page_no"]] = "\n\n".join(
-                part for part in (page_markdown.get(asset["page_no"], ""), asset_markdown) if part
-            )
+    if use_epub_reader_pages:
+        from pdf_translator.epub_reader_pages import build_epub_reader_page_markdown
+
+        page_markdown = build_epub_reader_page_markdown(
+            source_path,
+            asset_dir=asset_dir,
+        )
+    else:
+        for chapter in book.get("chapters", []):
+            for page_no in chapter.get("source_pages", []):
+                try:
+                    page_number = int(page_no)
+                except (TypeError, ValueError):
+                    continue
+                page_policy[page_number] = {
+                    "preserve_original": bool(chapter.get("preserve_original")),
+                    "resource_only": bool(chapter.get("resource_only")),
+                    "translate": bool(chapter.get("translate", True)),
+                }
+            trace = str(chapter.get("trace_markdown") or "")
+            matches = list(TRACE_PAGE_RE.finditer(trace))
+            for index, match in enumerate(matches):
+                end = matches[index + 1].start() if index + 1 < len(matches) else len(trace)
+                page_markdown[int(match.group(1))] = trace[match.end():end].strip()
+
+    if not use_epub_reader_pages:
+        for asset in book.get("assets", []):
+            if not isinstance(asset, dict) or not isinstance(asset.get("page_no"), int):
+                continue
+            page_no = int(asset["page_no"])
+            policy = page_policy.get(page_no, {})
+            if policy.get("preserve_original") or policy.get("resource_only"):
+                continue
+            if "original-page-p" in page_markdown.get(page_no, ""):
+                continue
+            asset_markdown = str(asset.get("text") or "").strip()
+            if not asset_markdown and asset.get("path"):
+                label = "Table" if asset.get("kind") == "table" else "Figure"
+                asset_markdown = f"![{label}]({asset['path']})"
+            if asset_markdown and asset_markdown not in page_markdown.get(asset["page_no"], ""):
+                page_markdown[asset["page_no"]] = "\n\n".join(
+                    part for part in (page_markdown.get(asset["page_no"], ""), asset_markdown) if part
+                )
 
     canonical_chapters = [
         chapter
@@ -1352,6 +1506,26 @@ def apply_canonical_chapter_plan(book: dict[str, Any], canonical: dict[str, Any]
     if not canonical_chapters:
         raise ValueError("Canonical chapter plan contains no chapters.")
 
+    if use_epub_reader_pages:
+        available_pages = sorted(page_markdown)
+    else:
+        available_pages = sorted(
+            int(page["page_no"])
+            for page in book.get("pages", [])
+            if isinstance(page, dict)
+            and isinstance(page.get("page_no"), int)
+            and (
+                page.get("has_content") is True
+                or (
+                    "has_content" not in page
+                    and (
+                        int(page["page_no"]) in page_markdown
+                        or int(page.get("figure_count") or 0) > 0
+                        or int(page.get("table_count") or 0) > 0
+                    )
+                )
+            )
+        )
     planned_pages = {
         int(page_no)
         for chapter in canonical_chapters
@@ -1360,64 +1534,48 @@ def apply_canonical_chapter_plan(book: dict[str, Any], canonical: dict[str, Any]
             or range(int(chapter.get("page_start") or 0), int(chapter.get("page_end") or 0) + 1)
         )
     }
-    available_pages = sorted(
-        int(page["page_no"])
-        for page in book.get("pages", [])
-        if isinstance(page, dict)
-        and isinstance(page.get("page_no"), int)
-        and (
-            page.get("has_content") is True
-            or (
-                "has_content" not in page
-                and (
-                    int(page["page_no"]) in page_markdown
-                    or int(page.get("figure_count") or 0) > 0
-                    or int(page.get("table_count") or 0) > 0
-                )
-            )
-        )
-    )
     chapters: list[dict[str, Any]] = []
 
-    uncovered = [page_no for page_no in available_pages if page_no not in planned_pages]
-    if uncovered:
-        groups: list[list[int]] = []
-        for page_no in uncovered:
-            if (
-                groups
-                and page_no == groups[-1][-1] + 1
-                and page_policy.get(page_no, {}) == page_policy.get(groups[-1][-1], {})
-            ):
-                groups[-1].append(page_no)
-            else:
-                groups.append([page_no])
-        first_planned = min(planned_pages) if planned_pages else 1
-        for group in groups:
-            title = "Front Matter" if group[-1] < first_planned else "Supplementary Material"
-            policies = [page_policy.get(page, {}) for page in group]
-            preserve_original = bool(policies) and all(
-                policy.get("preserve_original", False) for policy in policies
-            )
-            chapters.append(
-                {
-                    "title": title,
-                    "page_start": group[0],
-                    "page_end": group[-1],
-                    "source_pages": group,
-                    "markdown": "\n\n".join(
-                        page_markdown.get(page, "")
-                        for page in group
-                        if page_markdown.get(page, "")
-                    ).strip(),
-                    "trace_markdown": "\n\n".join(
-                        f"[[page: {page}]]\n\n{page_markdown.get(page, '')}" for page in group
-                    ).strip(),
-                    "translate": not preserve_original,
-                    "preserve_original": preserve_original,
-                    "resource_only": True,
-                    "toc": False,
-                }
-            )
+    if not user_confirmed:
+        uncovered = [page_no for page_no in available_pages if page_no not in planned_pages]
+        if uncovered:
+            groups: list[list[int]] = []
+            for page_no in uncovered:
+                if (
+                    groups
+                    and page_no == groups[-1][-1] + 1
+                    and page_policy.get(page_no, {}) == page_policy.get(groups[-1][-1], {})
+                ):
+                    groups[-1].append(page_no)
+                else:
+                    groups.append([page_no])
+            first_planned = min(planned_pages) if planned_pages else 1
+            for group in groups:
+                title = "Front Matter" if group[-1] < first_planned else "Supplementary Material"
+                policies = [page_policy.get(page, {}) for page in group]
+                preserve_original = bool(policies) and all(
+                    policy.get("preserve_original", False) for policy in policies
+                )
+                chapters.append(
+                    {
+                        "title": title,
+                        "page_start": group[0],
+                        "page_end": group[-1],
+                        "source_pages": group,
+                        "markdown": "\n\n".join(
+                            page_markdown.get(page, "")
+                            for page in group
+                            if page_markdown.get(page, "")
+                        ).strip(),
+                        "trace_markdown": "\n\n".join(
+                            f"[[page: {page}]]\n\n{page_markdown.get(page, '')}" for page in group
+                        ).strip(),
+                        "translate": not preserve_original,
+                        "preserve_original": preserve_original,
+                        "resource_only": True,
+                        "toc": False,
+                    }
+                )
 
     for canonical_chapter in canonical_chapters:
         pages = [
@@ -1431,17 +1589,22 @@ def apply_canonical_chapter_plan(book: dict[str, Any], canonical: dict[str, Any]
             )
         ]
         chapter_title = str(canonical_chapter.get("title") or f"Chapter {len(chapters) + 1}")
-        preserve_original = _canonical_chapter_preserve_original(
+        base_preserve_original = _canonical_chapter_preserve_original(
             title=chapter_title,
             pages=pages,
             page_policy=page_policy,
+            user_confirmed=user_confirmed,
         )
-        if not preserve_original:
-            assert_translatable_pages_have_no_original_fallback(
-                chapter_title=chapter_title,
-                pages=pages,
-                page_markdown=page_markdown,
-            )
+        if not pages:
+            continue
+        pages, preserve_original, page_exclusions = _resolve_canonical_chapter_pages(
+            chapter_title=chapter_title,
+            pages=pages,
+            page_markdown=page_markdown,
+            base_preserve_original=base_preserve_original,
+        )
+        if not pages:
+            continue
         markdown = "\n\n".join(page_markdown.get(page, "") for page in pages).strip()
         trace_markdown = "\n\n".join(
             f"[[page: {page}]]\n\n{page_markdown.get(page, '')}"
@@ -1459,6 +1622,7 @@ def apply_canonical_chapter_plan(book: dict[str, Any], canonical: dict[str, Any]
                 "preserve_original": preserve_original,
                 "resource_only": preserve_original,
                 "toc": True,
+                "page_exclusions": page_exclusions,
             }
         )
 
@@ -1496,10 +1660,11 @@ def apply_canonical_chapter_plan(book: dict[str, Any], canonical: dict[str, Any]
         **dict(book.get("metadata") or {}),
         "chapter_source": "user_confirmed_canonical",
         "canonical_chapter_count": len(canonical_chapters),
+        "page_coordinate_system": "epub_reader" if use_epub_reader_pages else "book_ir",
     }
     result["chapters"] = chapters
     result["chapter_count"] = len(chapters)
-    result["pages"] = [
+    raw_pages = [
         {
             **page,
             "has_content": (
@@ -1511,6 +1676,7 @@ def apply_canonical_chapter_plan(book: dict[str, Any], canonical: dict[str, Any]
         for page in book.get("pages", [])
         if isinstance(page, dict)
     ]
+    result["pages"] = _mark_excluded_canonical_pages(raw_pages, chapters)
     result["full_markdown"] = "\n\n".join(part for part in full_parts if part).strip()
     result["trace_markdown"] = "\n\n".join(part for part in trace_parts if part).strip()
     return result

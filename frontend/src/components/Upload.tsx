@@ -43,6 +43,7 @@ const Upload = () => {
   })
   const isPreserveMode = options.processingMode === 'preserve'
   const isTranslateMode = options.processingMode === 'translate'
+  const isConvertMode = options.processingMode === 'convert'
 
   const acceptFile = async (candidate: File) => {
     if (!/\.(pdf|epub)$/i.test(candidate.name)) {
@@ -68,9 +69,9 @@ const Upload = () => {
     setOptions((current) => ({
       ...current,
       processingMode,
-      sourceLanguage: processingMode === 'preserve' ? undefined : current.sourceLanguage,
+      sourceLanguage: processingMode === 'preserve' || processingMode === 'convert' ? undefined : current.sourceLanguage,
       translator:
-        processingMode === 'preserve'
+        processingMode === 'preserve' || processingMode === 'convert'
           ? 'mock'
           : current.translator === 'mock'
             ? 'minimax'
@@ -125,7 +126,7 @@ const Upload = () => {
 
       <div className="mb-6 rounded-xl border border-slate-200 bg-white p-4">
         <div className="text-sm font-semibold text-slate-900">处理方式</div>
-        <div className="mt-3 grid gap-3 sm:grid-cols-2">
+        <div className="mt-3 grid gap-3 sm:grid-cols-3">
           <label
             className={`cursor-pointer rounded-xl border-2 p-4 transition-colors ${
               isTranslateMode
@@ -143,6 +144,26 @@ const Upload = () => {
             />
             <div className="font-medium text-slate-900">翻译并进入审阅</div>
             <div className="mt-1 text-xs leading-5 text-slate-600">生成中文译本，走术语定稿与审阅。</div>
+          </label>
+          <label
+            className={`cursor-pointer rounded-xl border-2 p-4 transition-colors ${
+              isConvertMode
+                ? 'border-sky-500 bg-sky-50'
+                : 'border-slate-200 bg-slate-50 hover:border-slate-300'
+            }`}
+          >
+            <input
+              type="radio"
+              name="processingMode"
+              value="convert"
+              checked={options.processingMode === 'convert'}
+              onChange={() => updateProcessingMode('convert')}
+              className="sr-only"
+            />
+            <div className="font-medium text-slate-900">解析并导出 EPUB</div>
+            <p className="mt-1 text-xs leading-5 text-slate-600">
+              不翻译：确认章节后直接生成原文 EPUB。
+            </p>
           </label>
           <label
             className={`cursor-pointer rounded-xl border-2 p-4 transition-colors ${
@@ -182,6 +203,11 @@ const Upload = () => {
         {isTranslateMode && (
           <div className="mt-3 rounded-lg border border-primary-200 bg-primary-50/80 px-3 py-2 text-xs text-primary-900">
             已选择译本路径：目标语言 {options.targetLanguage}，翻译引擎 MiniMax。
+          </div>
+        )}
+        {isConvertMode && (
+          <div className="mt-3 rounded-lg border border-sky-200 bg-sky-50/80 px-3 py-2 text-xs text-sky-900">
+            已选择解析导出路径：确认章节目录后生成原文 EPUB，不进入术语或翻译审阅。
           </div>
         )}
         {isPreserveMode && (
@@ -342,7 +368,12 @@ const Upload = () => {
       <div className="mt-6 flex gap-3">
         <button
           onClick={handleUpload}
-          disabled={!file || uploading || checkingDuplicate}
+          disabled={
+            !file ||
+            uploading ||
+            checkingDuplicate ||
+            Boolean(duplicateCheck?.has_matches && !allowDuplicate)
+          }
           className="rounded-lg bg-primary-600 px-6 py-3 font-medium text-white disabled:cursor-not-allowed disabled:opacity-50"
         >
           {uploading

@@ -9,6 +9,7 @@ import time
 import copy
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict, replace
 import re
 from pathlib import Path
 from typing import Protocol
@@ -16,10 +17,20 @@ from typing import Protocol
 from openai import OpenAI
 import requests
 
+from pdf_translator.book_views import ensure_chapter_top_heading, join_chapter_delivery_markdown
 from pdf_translator.chunking import split_markdown_into_chunks
+from pdf_translator.segment_conservation import (
+    translatable_segment_ids,
+    verify_segment_processing_order,
+    write_segment_conservation_report,
+)
 from pdf_translator.chapter_kind import classify_chapter, should_translate_chapter
 from pdf_translator.chapter_segments import chapter_segments_for_translation
-from pdf_translator.glossary import glossary_terms_missing_in_translation, select_glossary_entries_for_text
+from pdf_translator.glossary import (
+    apply_glossary_source_substitutions,
+    glossary_terms_missing_in_translation,
+    select_glossary_entries_for_text,
+)
 from pdf_translator.provider_traffic import ProviderTrafficController
 from pdf_translator.glossary_convergence import sanitize_translation_output
 from pdf_translator.config import (
@@ -486,16 +497,19 @@ def _apply_deterministic_glossary_repairs(
     translated_text: str,
     glossary_entries: list[dict] | None,
 ) -> str:
-    """Apply deterministic glossary repairs that do not change meaning.
+    """Apply deterministic glossary repairs without another model call.
 
-    This is intentionally limited to conservative Chinese connector variants.
-    Missing hard terms must still go through the glossary quality gate and,
-    when possible, a model repair pass. Appending a missing term in parentheses
-    hides glossary drift without actually fixing the translation.
+    Connector variants (与/和/及) and leftover English source terms are patched
+    in place. Remaining drift is accepted later rather than blocking the job.
     """
     if not glossary_entries:
         return translated_text
-    return _swap_connector_variants(translated_text, glossary_entries)
+    repaired = _swap_connector_variants(translated_text, glossary_entries)
+    return apply_glossary_source_substitutions(
+        source_text,
+        repaired,
+        glossary_entries,
+    )
 
 
 def _is_hard_glossary_entry(entry: dict) -> bool:
@@ -605,9 +619,17 @@ def _persist_chunk_translation(
     cache_path: Path | None,
     observer: TranslationObserver | None,
     input_hash: str,
+    allow_glossary_drift: bool = False,
+    allow_failed_placeholder: bool = False,
 ) -> str:
     if cache_path is not None:
-        _write_chunk_cache(cache_path, chunk=chunk, translated=translated)
+        _write_chunk_cache(
+            cache_path,
+            chunk=chunk,
+            translated=translated,
+            allow_glossary_drift=allow_glossary_drift,
+            allow_failed_placeholder=allow_failed_placeholder,
+        )
     if observer is not None:
         observer.attempt_success(
             chunk_index=chunk.index,
@@ -863,31 +885,18 @@ def _translate_chunk_resumable(
                         legacy,
                         chunk.glossary_entries or [],
                     )
-                    try:
-                        repaired = sanitize_translation_output(
-                            _repair_glossary_in_chunk(
-                                chunk=chunk,
-                                translated=legacy,
-                                missing=missing,
-                                source_language=source_language,
-                                target_language=target_language,
-                                translator=translator,
-                            )
-                        )
-                        _assert_translation_quality(
-                            chunk=chunk,
-                            translated=repaired,
-                            target_language=target_language,
-                            translator_name=translator.name,
-                        )
-                    except Exception:
-                        continue
+                    repaired = _apply_deterministic_glossary_repairs(
+                        source_text=chunk.markdown,
+                        translated_text=legacy,
+                        glossary_entries=chunk.glossary_entries,
+                    )
                     return _persist_chunk_translation(
                         chunk=chunk,
                         translated=repaired,
                         cache_path=cache_path,
                         observer=observer,
                         input_hash=input_hash,
+                        allow_glossary_drift=bool(missing),
                     )
 
     last_error: Exception | None = None
@@ -930,13 +939,19 @@ def _translate_chunk_resumable(
         except Exception as exc:
             last_error = exc
             if _is_glossary_quality_error(exc):
-                # The deterministic repair runs inside _assert_translation_quality's
-                # preamble (``_apply_deterministic_glossary_repairs``); if the gate
-                # still fires here the repair could not satisfy the term injection
-                # (e.g. malformed glossary entry). Do not retry — surface the
-                # failure immediately so the rest of the book can keep moving.
-                last_glossary_candidate = translated
-                break
+                substituted = _apply_deterministic_glossary_repairs(
+                    source_text=chunk.markdown,
+                    translated_text=translated,
+                    glossary_entries=chunk.glossary_entries,
+                )
+                return _persist_chunk_translation(
+                    chunk=chunk,
+                    translated=substituted,
+                    cache_path=cache_path,
+                    observer=observer,
+                    input_hash=input_hash,
+                    allow_glossary_drift=True,
+                )
             if "new_sensitive" in str(exc).lower():
                 had_sensitive_failure = True
             permanent = _is_permanent_translation_error(exc)
@@ -1062,41 +1077,19 @@ def _translate_chunk_resumable(
             split_error = exc
 
     if last_error and _is_glossary_quality_error(last_error) and last_glossary_candidate:
-        missing = glossary_terms_missing_in_translation(
-            chunk.markdown,
-            last_glossary_candidate,
-            chunk.glossary_entries or [],
+        substituted = _apply_deterministic_glossary_repairs(
+            source_text=chunk.markdown,
+            translated_text=last_glossary_candidate,
+            glossary_entries=chunk.glossary_entries,
         )
-        if missing:
-            try:
-                repaired = _strip_generated_english_chinese_glosses(
-                    chunk.markdown,
-                    _repair_glossary_in_chunk(
-                        chunk=chunk,
-                        translated=last_glossary_candidate,
-                        missing=missing,
-                        source_language=source_language,
-                        target_language=target_language,
-                        translator=translator,
-                    ),
-                    target_language,
-                )
-                _assert_translation_quality(
-                    chunk=chunk,
-                    translated=repaired,
-                    target_language=target_language,
-                    translator_name=translator.name,
-                    require_glossary=True,
-                )
-                return _persist_chunk_translation(
-                    chunk=chunk,
-                    translated=repaired,
-                    cache_path=cache_path,
-                    observer=observer,
-                    input_hash=input_hash,
-                )
-            except Exception:
-                pass
+        return _persist_chunk_translation(
+            chunk=chunk,
+            translated=substituted,
+            cache_path=cache_path,
+            observer=observer,
+            input_hash=input_hash,
+            allow_glossary_drift=True,
+        )
     raise ValueError(f"Translation failed for chunk {chunk.index} after {retry_count} attempts: {last_error}") from last_error
 
 
@@ -2230,6 +2223,7 @@ def translate_book_chapters(
     pages = pages if isinstance(pages, list) else []
     segment_plan = chapter_segments_for_translation(book, max_chars=settings.max_chunk_chars)
     segments_by_chapter: dict[str, list[dict]] = {}
+    processed_segment_ids: list[str] = []
     for segment in segment_plan:
         segments_by_chapter.setdefault(str(segment.get("chapter_id") or ""), []).append(segment)
 
@@ -2265,6 +2259,11 @@ def translate_book_chapters(
             segment_markdown = str(planned_segment.get("markdown") or "").strip()
             if not segment_markdown:
                 continue
+            segment_id = str(planned_segment.get("segment_id") or "").strip()
+            if segment_id and bool(planned_segment.get("translate", True)):
+                role = str(planned_segment.get("role") or "prose")
+                if role not in {"figure", "table"}:
+                    processed_segment_ids.append(segment_id)
             if not bool(planned_segment.get("translate", True)):
                 translated_parts.append(segment_markdown)
                 continue
@@ -2458,9 +2457,24 @@ def translate_book_chapters(
                     span["translated_text"] = part
             chunk_index += len(semantic_chunks) + fallback_chunk_count
 
+    delivery_chapters: list[TranslatedChapter] = []
+    for chapter in translated_chapters:
+        markdown = str(chapter.markdown or "").strip()
+        if markdown and chapter.toc:
+            markdown = ensure_chapter_top_heading(markdown, chapter.title).strip()
+        if markdown:
+            markdown += "\n"
+        delivery_chapters.append(replace(chapter, markdown=markdown))
+
+    conservation_failures = verify_segment_processing_order(
+        expected_ids=translatable_segment_ids(segment_plan),
+        processed_ids=processed_segment_ids,
+    )
+    write_segment_conservation_report(run_dir, failures=conservation_failures)
+
     return BookTranslationResult(
-        translated_markdown="\n\n".join(translated_markdown_parts).strip() + "\n",
-        translated_chapters=translated_chapters,
+        translated_markdown=join_chapter_delivery_markdown([asdict(chapter) for chapter in delivery_chapters]),
+        translated_chapters=delivery_chapters,
         source_language=settings.source_language,
         target_language=settings.target_language,
         translator=translator.name,

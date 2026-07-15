@@ -5,6 +5,36 @@
 
 const API_BASE = '/api'
 
+/** Normalize FastAPI error payloads (string, {message}, or validation array) for display. */
+export function formatApiDetail(detail: unknown, fallback: string): string {
+  if (detail == null || detail === '') return fallback
+  if (typeof detail === 'string') return detail
+  if (Array.isArray(detail)) {
+    const parts = detail
+      .map((item) => {
+        if (typeof item === 'string') return item
+        if (item && typeof item === 'object') {
+          const record = item as Record<string, unknown>
+          if (typeof record.msg === 'string') return record.msg
+          if (typeof record.message === 'string') return record.message
+        }
+        return null
+      })
+      .filter((part): part is string => Boolean(part))
+    return parts.length > 0 ? parts.join('；') : fallback
+  }
+  if (typeof detail === 'object') {
+    const record = detail as Record<string, unknown>
+    if (typeof record.message === 'string') return record.message
+    try {
+      return JSON.stringify(detail)
+    } catch {
+      return fallback
+    }
+  }
+  return String(detail)
+}
+
 // 通用错误类型
 export class ApiError extends Error {
   constructor(
@@ -60,7 +90,7 @@ async function request<T>(
     if (!response.ok) {
       const errorData = await response.json().catch(() => ({}))
       throw new ApiError(
-        errorData.detail || `HTTP ${response.status}: ${response.statusText}`,
+        formatApiDetail(errorData.detail, `HTTP ${response.status}: ${response.statusText}`),
         response.status,
         errorData.code
       )
@@ -354,7 +384,7 @@ export interface BookJob {
     size_bytes: number
   }
   request: {
-    processing_mode: 'auto' | 'translate' | 'preserve'
+    processing_mode: 'auto' | 'translate' | 'preserve' | 'convert'
     source_language?: string | null
     target_language: string
     translator: string
@@ -645,7 +675,7 @@ export interface JobEpubPagesResponse {
 }
 
 export interface CreateJobOptions {
-  processingMode: 'auto' | 'translate' | 'preserve'
+  processingMode: 'auto' | 'translate' | 'preserve' | 'convert'
   sourceLanguage?: string
   targetLanguage: string
   translator: 'openai' | 'mock' | 'minimax' | 'compatible' | 'openai-compatible'
@@ -757,7 +787,7 @@ export const uploadApi = {
           resolve(JSON.parse(xhr.responseText))
         } else {
           const errorData = JSON.parse(xhr.responseText || '{}')
-          reject(new ApiError(errorData.detail || '上传失败', xhr.status))
+          reject(new ApiError(formatApiDetail(errorData.detail, '上传失败'), xhr.status))
         }
       })
 
@@ -800,7 +830,7 @@ export const jobsApi = {
           return
         }
         const errorData = JSON.parse(xhr.responseText || '{}')
-        reject(new ApiError(errorData.detail || '创建任务失败', xhr.status))
+        reject(new ApiError(formatApiDetail(errorData.detail, '创建任务失败'), xhr.status))
       })
       xhr.addEventListener('error', () => {
         reject(new ApiError('网络错误，创建任务失败', undefined, 'NETWORK_ERROR'))
@@ -927,6 +957,10 @@ export const jobsApi = {
     }),
   startTranslation: (jobId: string) =>
     request<{ job: BookJob; workspace_book: WorkspaceBook }>(`/jobs/${encodeURIComponent(jobId)}/translate`, {
+      method: 'POST',
+    }),
+  startExport: (jobId: string) =>
+    request<{ job: BookJob; workspace_book: WorkspaceBook }>(`/jobs/${encodeURIComponent(jobId)}/export`, {
       method: 'POST',
     }),
   artifactUrl: (jobId: string, artifactName: string) =>

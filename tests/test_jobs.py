@@ -424,7 +424,65 @@ def test_job_runner_marks_invalid_source_non_retryable(tmp_path: Path) -> None:
     assert failed["error"]["retryable"] is False
 
 
-def test_job_runner_records_translation_configuration_error_reason(tmp_path: Path) -> None:
+def test_run_export_phase_completes_after_validating(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.pdf"
+    source.write_bytes(b"%PDF")
+    repository = JobRepository(tmp_path / "jobs")
+    created = repository.create(
+        source_path=source,
+        processing_mode="convert",
+        output_format="epub",
+    )
+    job_id = created["job_id"]
+    repository.update(job_id, state="awaiting_glossary")
+
+    job_dir = repository.job_dir(job_id)
+    run_dir = job_dir / "artifacts" / "source"
+    run_dir.mkdir(parents=True)
+    book_json = run_dir / "book.json"
+    book_json.write_text(
+        json.dumps(
+            {
+                "metadata": {},
+                "pages": [],
+                "chapters": [{"index": 1, "title": "Intro", "markdown": "Hello"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    manifest = run_dir / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "source_pdf": str(job_dir / "source" / source.name),
+                "files": {"book_json": str(book_json)},
+            }
+        ),
+        encoding="utf-8",
+    )
+    canonical = job_dir / "artifacts" / "canonical-chapters.json"
+    canonical.write_text("{}", encoding="utf-8")
+
+    runner = BookJobRunner(repository)
+    monkeypatch.setattr(runner, "_run_output_dir", lambda _job_id: run_dir)
+
+    def fake_export_pipeline(settings, on_stage):
+        on_stage("exporting", {"stage_percent": 100})
+        on_stage("validating", {"stage_percent": 100})
+        return _pipeline_artifacts(run_dir, manifest, run_dir / "translated.md")
+
+    monkeypatch.setattr("pdf_translator.pipeline.run_export_pipeline", fake_export_pipeline)
+
+    completed = runner.run_export_phase(job_id)
+
+    assert completed["state"] == "completed"
+    assert completed["error"] is None
+    assert "export_completed" in [event["type"] for event in repository.list_events(job_id)]
+
+
     source = tmp_path / "source.pdf"
     source.write_bytes(b"%PDF")
     repository = JobRepository(tmp_path / "jobs")

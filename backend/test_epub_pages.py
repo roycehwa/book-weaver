@@ -125,6 +125,28 @@ def test_resolve_epub_pages_accepts_span_pagebreak_anchors(tmp_path: Path) -> No
     assert [p.page_label for p in pages] == ["1", "2"]
 
 
+def test_resolve_epub_pages_accepts_compact_page_ids_without_underscore(tmp_path: Path) -> None:
+    epub = tmp_path / "book.epub"
+    _write_minimal_epub(
+        epub,
+        [("ch01.xhtml", "ch01", [])],
+        {
+            "ch01.xhtml": (
+                '<p><span aria-label="3" epub:type="pagebreak" id="page3" role="doc-pagebreak"/>'
+                "First page.</p>"
+                '<p><span aria-label="4" epub:type="pagebreak" id="page4" role="doc-pagebreak"/>'
+                "Second page.</p>"
+            )
+        },
+    )
+
+    pages = resolve_epub_pages(epub)
+
+    assert [p.page_anchor for p in pages] == ["page3", "page4"]
+    assert [p.page_label for p in pages] == ["3", "4"]
+    assert [p.page_number for p in pages] == [3, 4]
+
+
 def test_resolve_epub_pages_falls_back_to_spine_when_no_anchors_anywhere(tmp_path: Path) -> None:
     epub = tmp_path / "book.epub"
     _write_minimal_epub(

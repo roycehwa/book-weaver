@@ -445,6 +445,23 @@ def enforce_non_ocr_translatable_policy(book: dict[str, Any]) -> None:
     )
 
 
+def _translatable_page_text_chars(page_markdown: dict[int, str], page: int) -> int:
+    markdown = str(page_markdown.get(page) or "")
+    if ORIGINAL_PAGE_FALLBACK_RE.search(markdown):
+        return 0
+    cleaned = ORIGINAL_PAGE_FALLBACK_RE.sub("", markdown)
+    cleaned = re.sub(r"!\[[^\]]*\]\([^)]+\)", " ", cleaned)
+    cleaned = re.sub(r"\[\[[^\]]+\]\]", " ", cleaned)
+    return _visible_text_chars(cleaned)
+
+
+def _format_blocked_page_list(blocked_pages: list[int]) -> str:
+    page_list = ", ".join(str(page) for page in blocked_pages[:12])
+    if len(blocked_pages) > 12:
+        page_list += f", and {len(blocked_pages) - 12} more"
+    return page_list
+
+
 def assert_translatable_pages_have_no_original_fallback(
     *,
     chapter_title: str,
@@ -460,11 +477,32 @@ def assert_translatable_pages_have_no_original_fallback(
     ]
     if not blocked_pages:
         return
-    page_list = ", ".join(str(page) for page in blocked_pages[:12])
-    if len(blocked_pages) > 12:
-        page_list += f", and {len(blocked_pages) - 12} more"
+    page_list = _format_blocked_page_list(blocked_pages)
     raise InputGateError(
         f"Non-OCR input policy rejected canonical chapter {chapter_title!r}: "
         f"translatable pages {page_list} contain page-render fallback. "
         "Move these pages to preserve_original scope or fix the source PDF text layer."
+    )
+
+
+def assert_translatable_pages_have_extractable_text(
+    *,
+    chapter_title: str,
+    pages: list[int],
+    page_markdown: dict[int, str],
+) -> None:
+    """Reject canonical chapter assembly when translatable pages lack embedded text."""
+
+    blocked_pages = [
+        page
+        for page in pages
+        if _translatable_page_text_chars(page_markdown, page) < 1
+    ]
+    if not blocked_pages:
+        return
+    page_list = _format_blocked_page_list(blocked_pages)
+    raise InputGateError(
+        f"Non-OCR input policy rejected canonical chapter {chapter_title!r}: "
+        f"translatable pages {page_list} have no extractable embedded text. "
+        "Adjust the chapter page range or fix the source PDF text layer."
     )

@@ -462,7 +462,24 @@ def test_confirm_chapters_accepts_user_edited_chapters(tmp_path: Path) -> None:
     artifacts_dir = job_dir / "artifacts"
     artifacts_dir.mkdir(parents=True)
     (artifacts_dir / "book.json").write_text(
-        json.dumps({"chapters": [{"index": 1, "chapter_id": "old", "title": "Old"}]}),
+        json.dumps(
+            {
+                "chapters": [
+                    {
+                        "title": "Old",
+                        "source_pages": [10, 11],
+                        "trace_markdown": (
+                            "[[page: 10]]\n\nUser edited opening paragraph.\n\n"
+                            "[[page: 11]]\n\nUser edited closing paragraph."
+                        ),
+                    }
+                ],
+                "pages": [
+                    {"page_no": 10, "has_content": True},
+                    {"page_no": 11, "has_content": True},
+                ],
+            }
+        ),
         encoding="utf-8",
     )
     snapshot = _snapshot("job-1")
@@ -567,7 +584,7 @@ def test_confirm_chapters_preview_error_includes_underlying_reason(tmp_path: Pat
     snapshot["artifacts"] = {"book": {"href": "artifacts/book.json"}}
     (job_dir / "job.json").write_text(json.dumps(snapshot), encoding="utf-8")
 
-    with pytest.raises(JobServiceError, match="Confirmed Body.*page-render fallback"):
+    with pytest.raises(JobServiceError, match="no extractable embedded text"):
         service.confirm_chapters(
             "job-1",
             chapters=[

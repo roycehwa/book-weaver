@@ -34,6 +34,9 @@ def test_render_epub_from_book_writes_epub_structure_and_chapters(tmp_path: Path
         ],
         output_path=output_path,
         title="Sample Book",
+        language="en",
+        source_language="en",
+        content_is_translated=False,
     )
 
     with ZipFile(output_path) as archive:
@@ -60,7 +63,67 @@ def test_render_epub_from_book_writes_epub_structure_and_chapters(tmp_path: Path
         assert "x &lt; y" in chapter or "x < y" in chapter
         css = archive.read("OEBPS/styles/book.css").decode("utf-8")
         assert "line-height: 1.82" in css
-        assert "break-before: page" in css
+        assert "bookweaver-chapter-start" in css
+        assert "Songti SC" not in css or "@font-face" in css
+        second = archive.read("OEBPS/chapters/002-second-chapter.xhtml").decode("utf-8")
+        assert 'class="bookweaver-chapter-start"' in second
+
+
+def test_render_epub_dedupes_identical_image_bytes(tmp_path: Path) -> None:
+    image_a = tmp_path / "book-images" / "figure-a.png"
+    image_b = tmp_path / "images" / "figure-b.png"
+    image_a.parent.mkdir(parents=True)
+    image_b.parent.mkdir(parents=True)
+    payload = b"same-image-bytes"
+    image_a.write_bytes(payload)
+    image_b.write_bytes(payload)
+    output_path = tmp_path / "book.epub"
+
+    render_epub_from_book(
+        book={"chapters": []},
+        translated_chapters=[
+            {
+                "index": 1,
+                "title": "Chapter",
+                "markdown": (
+                    f"![Figure A]({image_a})\n\n"
+                    f"![Figure B]({image_b})"
+                ),
+            }
+        ],
+        output_path=output_path,
+        title="Dedup Book",
+        image_roots=[tmp_path],
+    )
+
+    with ZipFile(output_path) as archive:
+        image_names = [name for name in archive.namelist() if name.startswith("OEBPS/images/")]
+        assert len(image_names) == 1
+
+
+def test_render_epub_strips_oceanpdf_watermarks(tmp_path: Path) -> None:
+    output_path = tmp_path / "book.epub"
+
+    render_epub_from_book(
+        book={"chapters": []},
+        translated_chapters=[
+            {
+                "index": 1,
+                "title": "Chapter 1",
+                "markdown": "# Chapter 1\n\nBody text.\n\n## —\n\n## OceanofPDF.com",
+            }
+        ],
+        output_path=output_path,
+        title="Sample Book",
+        language="en",
+        source_language="en",
+        content_is_translated=False,
+    )
+
+    with ZipFile(output_path) as archive:
+        chapter = archive.read("OEBPS/chapters/001-chapter-1.xhtml").decode("utf-8")
+        assert "OceanofPDF" not in chapter
+        assert "Body text." in chapter
 
 
 def test_render_epub_resolves_relative_original_page_from_book_images(

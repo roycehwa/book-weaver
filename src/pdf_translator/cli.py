@@ -28,6 +28,7 @@ from pdf_translator.review import (
     review_project_from_run,
     restore_review_chapter_apparatus,
     rewrite_review_requests,
+    strip_fail_open_notices,
     summarize_review_state,
     translated_segments_to_chapters,
     write_versioned_outputs,
@@ -69,7 +70,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--mode",
         dest="processing_mode",
         default="auto",
-        choices=["auto", "translate", "preserve"],
+        choices=["auto", "translate", "preserve", "convert"],
         help="Choose automatic language-based behavior, force translation, or preserve source text.",
     )
     job_run_parser.add_argument("--source-lang", default=None)
@@ -102,7 +103,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--mode",
         dest="processing_mode",
         default="auto",
-        choices=["auto", "translate", "preserve"],
+        choices=["auto", "translate", "preserve", "convert"],
     )
     job_create_parser.add_argument("--source-lang", default=None)
     job_create_parser.add_argument("--target-lang", default="zh-CN")
@@ -149,6 +150,13 @@ def build_parser() -> argparse.ArgumentParser:
     job_translate_parser.add_argument("job_id")
     job_translate_parser.add_argument("--jobs-dir", type=Path, default=Path("jobs"))
     job_translate_parser.add_argument("--json", dest="as_json", action="store_true")
+    job_export_parser = job_subparsers.add_parser(
+        "export",
+        help="Render EPUB after chapter confirmation for convert-mode jobs.",
+    )
+    job_export_parser.add_argument("job_id")
+    job_export_parser.add_argument("--jobs-dir", type=Path, default=Path("jobs"))
+    job_export_parser.add_argument("--json", dest="as_json", action="store_true")
 
     job_progress_parser = job_subparsers.add_parser(
         "progress",
@@ -640,6 +648,7 @@ def _uncovered_book_pages(book: dict[str, object]) -> list[int]:
         for page in raw_pages
         if isinstance(page, dict)
         and isinstance(page.get("page_no"), int)
+        and page.get("disposition") != "skipped"
         and (
             page.get("has_content") is True
             or (
@@ -784,7 +793,7 @@ def _run_review_export(
     )
     delivery_markdown_parts: list[str] = []
     for chapter in delivery_chapters:
-        body = str(chapter.get("markdown") or "").strip()
+        body = strip_fail_open_notices(str(chapter.get("markdown") or "")).strip()
         title = str(chapter.get("title") or "").strip()
         if title and body and not body.startswith("#"):
             body = f"# {title}\n\n{body}"
@@ -911,6 +920,8 @@ def run_job_command(args: argparse.Namespace) -> dict[str, object]:
         snapshot = BookJobRunner(repository).resume(args.job_id)
     elif args.job_command == "translate":
         snapshot = BookJobRunner(repository).run_translate_phase(args.job_id)
+    elif args.job_command == "export":
+        snapshot = BookJobRunner(repository).run_export_phase(args.job_id)
     else:
         raise ValueError(f"Unsupported job command: {args.job_command!r}.")
 

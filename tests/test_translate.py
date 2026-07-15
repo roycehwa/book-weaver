@@ -155,7 +155,7 @@ def test_short_translation_cannot_bypass_mandatory_glossary_validation() -> None
         )
 
 
-def test_known_glossary_drift_is_never_cached_as_success(
+def test_known_glossary_drift_is_cached_with_drift_flag(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -191,21 +191,46 @@ def test_known_glossary_drift_is_never_cached_as_success(
         lambda **_kwargs: None,
     )
 
-    with pytest.raises(ValueError, match="missing mandatory glossary terms"):
-        translate_markdown(
-            chunks=[
-                TranslationChunk(
-                    index=0,
-                    markdown="The Swiss Confederation negotiated with its neighbours.",
-                )
-            ],
-            settings=settings,
-            translator=AlwaysDriftingTranslator(),
-            cache_dir=tmp_path / "cache",
-            retry_count=1,
-        )
+    result = translate_markdown(
+        chunks=[
+            TranslationChunk(
+                index=0,
+                markdown="The Swiss Confederation negotiated with its neighbours.",
+            )
+        ],
+        settings=settings,
+        translator=AlwaysDriftingTranslator(),
+        cache_dir=tmp_path / "cache",
+        retry_count=1,
+    )
 
-    assert list((tmp_path / "cache").glob("chunk-*.md")) == []
+    assert "瑞士联邦" not in result.translated_markdown
+    cache_files = list((tmp_path / "cache").glob("chunk-*.md"))
+    assert len(cache_files) == 1
+    metadata = json.loads(cache_files[0].with_suffix(".source.json").read_text(encoding="utf-8"))
+    assert metadata["allow_glossary_drift"] is True
+
+
+def test_glossary_source_term_is_substituted_in_place_without_model_repair() -> None:
+    from pdf_translator.translate import _apply_deterministic_glossary_repairs
+
+    entries = [
+        {
+            "source": "Gregory Falkovich",
+            "target": "格里戈里·法尔科维奇",
+            "status": "active",
+            "enforcement": "hard",
+        }
+    ]
+    source = "Gregory Falkovich wrote this book."
+    translated = "Gregory Falkovich 写了这本书。"
+    fixed = _apply_deterministic_glossary_repairs(
+        source_text=source,
+        translated_text=translated,
+        glossary_entries=entries,
+    )
+    assert "格里戈里·法尔科维奇" in fixed
+    assert "Gregory Falkovich" not in fixed
 
 
 def test_legacy_glossary_entry_without_enforcement_is_preferred(
@@ -302,7 +327,7 @@ def test_preferred_glossary_drift_does_not_fail_translation(
     assert "共同体" in result.translated_markdown
 
 
-def test_legacy_cache_with_glossary_drift_uses_local_repair(
+def test_legacy_cache_with_glossary_drift_accepts_without_model_repair(
     tmp_path: Path,
 ) -> None:
     from pdf_translator.translate import (
@@ -337,9 +362,7 @@ def test_legacy_cache_with_glossary_drift_uses_local_repair(
             source_language: str | None,
             target_language: str,
         ) -> str:
-            assert chunk.prompt_instruction is not None
-            assert "CURRENT TRANSLATION TO REVISE" in chunk.prompt_instruction
-            return "瑞士联邦与邻国进行了谈判。"
+            raise AssertionError("legacy cache should be reused without another model call")
 
     translated = _translate_chunk_resumable(
         chunk=TranslationChunk(
@@ -360,12 +383,9 @@ def test_legacy_cache_with_glossary_drift_uses_local_repair(
         retry_count=1,
     )
 
-    assert translated == "瑞士联邦与邻国进行了谈判。"
-    assert any(
-        path.name != "chunk-000042-legacy.md"
-        and path.read_text(encoding="utf-8").strip() == translated
-        for path in cache_dir.glob("chunk-000000-*.md")
-    )
+    assert translated == "这个邦联与邻国进行了谈判。"
+    metadata = json.loads(next(cache_dir.glob("chunk-000000-*.source.json")).read_text(encoding="utf-8"))
+    assert metadata["allow_glossary_drift"] is True
 
 
 def test_legacy_cache_is_ignored_when_source_fingerprint_differs(
@@ -408,7 +428,7 @@ def test_legacy_cache_is_ignored_when_source_fingerprint_differs(
     assert translated == "当前源文本的正确译文。"
 
 
-def test_first_translation_glossary_drift_is_repaired_immediately(
+def test_first_translation_glossary_drift_accepts_without_model_repair(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -416,7 +436,7 @@ def test_first_translation_glossary_drift_is_repaired_immediately(
 
     calls: list[TranslationChunk] = []
 
-    class RepairingTranslator(BaseTranslator):
+    class DriftingTranslator(BaseTranslator):
         name = "minimax"
 
         def translate_chunk(
@@ -426,8 +446,6 @@ def test_first_translation_glossary_drift_is_repaired_immediately(
             target_language: str,
         ) -> str:
             calls.append(chunk)
-            if chunk.prompt_instruction:
-                return "瑞士联邦与邻国进行了谈判。"
             return "这个邦联与邻国进行了谈判。"
 
     monkeypatch.setattr(
@@ -448,14 +466,15 @@ def test_first_translation_glossary_drift_is_repaired_immediately(
         ),
         source_language="en",
         target_language="zh-CN",
-        translator=RepairingTranslator(),
+        translator=DriftingTranslator(),
         cache_dir=tmp_path,
         retry_count=6,
     )
 
-    assert translated == "瑞士联邦与邻国进行了谈判。"
-    assert len(calls) == 2
-    assert calls[1].prompt_instruction is not None
+    assert translated == "这个邦联与邻国进行了谈判。"
+    assert len(calls) == 1
+    metadata = json.loads(next(tmp_path.glob("chunk-*.source.json")).read_text(encoding="utf-8"))
+    assert metadata["allow_glossary_drift"] is True
 
 
 def test_glossary_conjunction_drift_is_repaired_without_another_model_call(
@@ -505,13 +524,13 @@ def test_glossary_conjunction_drift_is_repaired_without_another_model_call(
     assert translator.calls == 1
 
 
-def test_glossary_repair_rewrites_only_affected_paragraph(
+def test_glossary_drift_accepts_without_model_repair(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from pdf_translator.translate import _translate_chunk_resumable
 
-    class ParagraphRepairTranslator(BaseTranslator):
+    class ParagraphDriftTranslator(BaseTranslator):
         name = "minimax"
 
         def __init__(self) -> None:
@@ -524,12 +543,9 @@ def test_glossary_repair_rewrites_only_affected_paragraph(
             target_language: str,
         ) -> str:
             self.calls.append(chunk)
-            if chunk.prompt_instruction:
-                assert chunk.markdown == "World War II reshaped industrial policy."
-                return "第二次世界大战重塑了工业政策。"
             return "第一段已经正确翻译。\n\n二战重塑了工业政策。"
 
-    translator = ParagraphRepairTranslator()
+    translator = ParagraphDriftTranslator()
     monkeypatch.setattr(
         "pdf_translator.translate._resolve_fallback_translator",
         lambda **_kwargs: None,
@@ -557,8 +573,8 @@ def test_glossary_repair_rewrites_only_affected_paragraph(
         retry_count=6,
     )
 
-    assert translated == "第一段已经正确翻译。\n\n第二次世界大战重塑了工业政策。"
-    assert len(translator.calls) == 2
+    assert translated == "第一段已经正确翻译。\n\n二战重塑了工业政策。"
+    assert len(translator.calls) == 1
 
 
 def test_semantic_footnote_translates_only_explanatory_spans() -> None:

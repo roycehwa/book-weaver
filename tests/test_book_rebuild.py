@@ -1,4 +1,6 @@
 import pdf_translator.book_rebuild as book_rebuild
+from pathlib import Path
+
 from pdf_translator.book_rebuild import apply_canonical_chapter_plan, build_book_reconstruction
 
 
@@ -89,11 +91,7 @@ def test_apply_canonical_chapter_plan_preserves_asset_only_pages() -> None:
     assert all(3 not in chapter["source_pages"] for chapter in result["chapters"])
 
 
-def test_canonical_translatable_chapters_reject_original_page_fallback() -> None:
-    import pytest
-
-    from pdf_translator.guardrails import InputGateError
-
+def test_canonical_translatable_chapters_strip_original_page_fallback() -> None:
     book = {
         "chapters": [
             {
@@ -123,8 +121,180 @@ def test_canonical_translatable_chapters_reject_original_page_fallback() -> None
         ]
     }
 
-    with pytest.raises(InputGateError, match="page-render fallback"):
-        apply_canonical_chapter_plan(book, canonical)
+    result = apply_canonical_chapter_plan(book, canonical)
+    chapter = result["chapters"][0]
+    assert chapter["source_pages"] == [32]
+    assert chapter["translate"] is True
+    assert chapter["page_exclusions"]["excluded_fallback_pages"] == [31]
+    skipped = {int(page["page_no"]): page for page in result["pages"] if page.get("disposition") == "skipped"}
+    assert skipped[31]["skip_reason"].startswith("page_render_fallback_excluded_from:")
+
+
+def test_canonical_translatable_chapters_strip_blank_pages() -> None:
+    book = {
+        "chapters": [
+            {
+                "title": "Automatic Body",
+                "source_pages": [10, 11],
+                "trace_markdown": (
+                    "[[page: 10]]\n\nChapter opening paragraph.\n\n"
+                    "[[page: 11]]\n\n"
+                ),
+                "translate": True,
+                "preserve_original": False,
+            }
+        ],
+        "pages": [
+            {"page_no": 10, "has_content": True},
+            {"page_no": 11, "has_content": False},
+        ],
+    }
+    canonical = {
+        "chapters": [
+            {
+                "title": "Confirmed Body",
+                "source_pages": [10, 11],
+                "page_start": 10,
+                "page_end": 11,
+            }
+        ]
+    }
+
+    result = apply_canonical_chapter_plan(book, canonical)
+    chapter = result["chapters"][0]
+    assert chapter["source_pages"] == [10]
+    assert chapter["translate"] is True
+
+
+def test_canonical_excluded_pages_are_marked_skipped_for_page_integrity() -> None:
+    from pdf_translator.page_integrity import build_page_ledger
+
+    book = {
+        "chapters": [
+            {
+                "chapter_id": "body",
+                "title": "Body",
+                "source_pages": [32],
+                "trace_markdown": "[[page: 32]]\n\nExtracted body text.",
+                "translate": True,
+                "preserve_original": False,
+            }
+        ],
+        "pages": [
+            {"page_no": 31, "has_content": True},
+            {"page_no": 32, "has_content": True},
+        ],
+    }
+    canonical = {
+        "chapters": [
+            {
+                "title": "Body",
+                "source_pages": [31, 32],
+                "page_start": 31,
+                "page_end": 32,
+            }
+        ]
+    }
+
+    result = apply_canonical_chapter_plan(book, canonical)
+
+    ledger = build_page_ledger(result)
+
+    assert ledger["pages"][0]["disposition"] == "skipped"
+    assert ledger["pages"][1]["disposition"] == "content"
+
+
+def test_canonical_placeholder_chapter_without_text_is_preserved() -> None:
+    book = {
+        "chapters": [
+            {
+                "title": "Untitled Section 2",
+                "source_pages": [1],
+                "trace_markdown": "[[page: 1]]\n\n",
+                "translate": True,
+                "preserve_original": False,
+            }
+        ],
+        "pages": [{"page_no": 1, "has_content": False}],
+    }
+    canonical = {
+        "chapters": [
+            {
+                "title": "Untitled Section 2",
+                "source_pages": [1],
+                "page_start": 1,
+                "page_end": 1,
+            }
+        ]
+    }
+
+    result = apply_canonical_chapter_plan(book, canonical)
+    chapter = result["chapters"][0]
+    assert chapter["preserve_original"] is True
+    assert chapter["translate"] is False
+
+
+def test_canonical_empty_text_chapter_is_preserved_instead_of_blocked() -> None:
+    book = {
+        "chapters": [
+            {
+                "title": "Automatic Body",
+                "source_pages": [11],
+                "trace_markdown": "[[page: 11]]\n\n",
+                "translate": True,
+                "preserve_original": False,
+            }
+        ],
+        "pages": [{"page_no": 11, "has_content": False}],
+    }
+    canonical = {
+        "chapters": [
+            {
+                "title": "Confirmed Body",
+                "source_pages": [11],
+                "page_start": 11,
+                "page_end": 11,
+            }
+        ]
+    }
+
+    result = apply_canonical_chapter_plan(book, canonical)
+    chapter = result["chapters"][0]
+    assert chapter["preserve_original"] is True
+    assert chapter["translate"] is False
+
+
+def test_canonical_dedication_without_text_is_preserved() -> None:
+    book = {
+        "chapters": [
+            {
+                "title": "Front Matter",
+                "source_pages": [8, 9],
+                "trace_markdown": "[[page: 8]]\n\n[[page: 9]]\n\n",
+                "translate": True,
+                "preserve_original": False,
+            }
+        ],
+        "pages": [
+            {"page_no": 8, "has_content": False},
+            {"page_no": 9, "has_content": False},
+        ],
+    }
+    canonical = {
+        "chapters": [
+            {
+                "title": "Dedication",
+                "source_pages": [8, 9],
+                "page_start": 8,
+                "page_end": 9,
+            }
+        ]
+    }
+
+    result = apply_canonical_chapter_plan(book, canonical)
+    chapter = result["chapters"][0]
+    assert chapter["preserve_original"] is True
+    assert chapter["translate"] is False
 
 
 def test_canonical_resource_chapter_preserves_original_page_fallback() -> None:
@@ -1319,3 +1489,55 @@ def test_book_rebuild_does_not_start_apparatus_from_copyright_citations(monkeypa
 
     assert all(chapter["title"] != "References" for chapter in result["chapters"])
     assert result["pages"][0]["page_kind"] != "references"
+
+
+def test_apply_canonical_honors_epub_user_confirmed_virtual_pages(monkeypatch) -> None:
+    from pdf_translator import book_rebuild as book_rebuild_module
+
+    reader_pages = {
+        7: "Opening in 2023.",
+        8: "Still in 2023.",
+        43: "Flashback in 2018.",
+        44: "More 2018.",
+    }
+
+    def fake_reader_pages(_path, *, asset_dir=None):
+        return reader_pages
+
+    monkeypatch.setattr(
+        "pdf_translator.epub_reader_pages.build_epub_reader_page_markdown",
+        fake_reader_pages,
+    )
+
+    book = {
+        "metadata": {"chapter_source": "epub_spine"},
+        "pages": [{"page_no": index, "has_content": True} for index in range(1, 6)],
+        "chapters": [
+            {"index": 1, "title": "Cover", "source_pages": [1], "preserve_original": True, "trace_markdown": "[[page: 1]]\n\nCover"},
+            {"index": 2, "title": "2023", "source_pages": [2], "translate": True, "trace_markdown": "[[page: 2]]\n\nWrong spine text"},
+            {"index": 3, "title": "2018", "source_pages": [3], "translate": True, "trace_markdown": "[[page: 3]]\n\nWrong spine text"},
+        ],
+    }
+    canonical = {
+        "source_artifact": "user_confirmation",
+        "chapters": [
+            {"title": "Cover", "source_pages": [1], "page_start": 1, "page_end": 1},
+            {"title": "2023", "source_pages": [7, 8], "page_start": 7, "page_end": 8},
+            {"title": "2018", "source_pages": [43, 44], "page_start": 43, "page_end": 44},
+        ],
+    }
+
+    result = book_rebuild_module.apply_canonical_chapter_plan(
+        book,
+        canonical,
+        source_path=Path("book.epub"),
+    )
+
+    by_title = {chapter["title"]: chapter for chapter in result["chapters"]}
+    assert by_title["2023"]["source_pages"] == [7, 8]
+    assert "Opening in 2023" in by_title["2023"]["markdown"]
+    assert by_title["2023"]["translate"] is True
+    assert by_title["2018"]["source_pages"] == [43, 44]
+    assert "Flashback in 2018" in by_title["2018"]["markdown"]
+    assert by_title["2018"]["translate"] is True
+    assert result["metadata"]["page_coordinate_system"] == "epub_reader"

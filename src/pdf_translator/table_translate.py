@@ -184,12 +184,7 @@ def translate_tables_in_markdown(
     return "\n\n".join(output_blocks) + ("\n" if markdown.endswith("\n") else ""), translated_count, skipped_count
 
 
-def _join_chapter_markdown(chapters: list[dict[str, Any]]) -> str:
-    parts = [str(chapter.get("markdown") or "").strip() for chapter in chapters if str(chapter.get("markdown") or "").strip()]
-    return "\n\n".join(parts) + "\n"
-
-
-def run_translate_tables(
+from pdf_translator.book_views import join_chapter_delivery_markdown
     *,
     run_dir: Path,
     target_language: str = "zh-CN",
@@ -240,7 +235,7 @@ def run_translate_tables(
         patched_chapters.append({**chapter, "markdown": updated})
 
     chapters_path.write_text(json.dumps(patched_chapters, ensure_ascii=False, indent=2), encoding="utf-8")
-    translated_markdown = _join_chapter_markdown(patched_chapters)
+    translated_markdown = join_chapter_delivery_markdown(patched_chapters)
     translated_markdown_path = run_dir / "translated.md"
     polished_markdown_path = run_dir / "translated.polished.md"
     translated_markdown_path.write_text(translated_markdown, encoding="utf-8")

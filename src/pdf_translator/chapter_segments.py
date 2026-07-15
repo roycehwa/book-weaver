@@ -106,7 +106,24 @@ def _split_chapter_sections(markdown: str) -> list[tuple[str | None, str]]:
         current_blocks.append(block)
     if current_blocks:
         sections.append((current_title, current_blocks))
-    return [(title, "\n\n".join(parts).strip()) for title, parts in sections if parts]
+    merged: list[tuple[str | None, str]] = []
+    for title, parts in sections:
+        if not parts:
+            continue
+        content = "\n\n".join(parts).strip()
+        if _is_heading_only_section(content) and merged:
+            prev_title, prev_content = merged[-1]
+            merged[-1] = (prev_title, f"{prev_content}\n\n{content}".strip())
+            continue
+        merged.append((title, content))
+    return merged
+
+
+def _is_heading_only_section(content: str) -> bool:
+    lines = [line.strip() for line in content.splitlines() if line.strip()]
+    if len(lines) != 1:
+        return False
+    return bool(_HEADING_RE.match(lines[0]))
 
 
 def _split_to_max_chars(markdown: str, max_chars: int) -> list[str]:

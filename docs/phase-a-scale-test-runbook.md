@@ -19,12 +19,13 @@ items. A successful render of one book is not an entry criterion.
 Run the complete automated suites:
 
 ```bash
-uv run pytest -q
-cd ../bookmate-review
-uv run pytest backend -q
+cd /path/to/book-weaver
+uv sync --extra dev --extra workspace
+uv run pytest tests/ -q
+uv run pytest backend/ -q
 cd frontend
-pnpm exec vitest run
-pnpm build
+npm run test -- --run
+npm run build
 ```
 
 Record the exact commit, Python/Node versions, fixture version, and test counts.

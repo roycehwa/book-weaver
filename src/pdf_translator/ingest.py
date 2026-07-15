@@ -14,6 +14,7 @@ from bs4 import BeautifulSoup, NavigableString, Tag
 from langdetect import LangDetectException, detect
 
 from pdf_translator.models import NormalizedDocument
+from pdf_translator.book_views import is_scrape_watermark_block
 from pdf_translator.reconstruct import reconstruct_markdown
 
 
@@ -242,6 +243,8 @@ def clean_book_reflow_markdown(markdown_text: str) -> str:
     decontaminated: list[str] = []
     seen_running_text: set[str] = set()
     for block in blocks:
+        if is_scrape_watermark_block(block):
+            continue
         if _is_repeatable_running_text(block):
             key = _normalize_running_text(block)
             if running_counts.get(key, 0) >= 3:

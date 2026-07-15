@@ -10,7 +10,12 @@ import re
 from typing import Any
 
 from pdf_translator.book_rebuild import apply_canonical_chapter_plan, build_book_reconstruction
-from pdf_translator.book_views import render_book_markdown, render_translation_input_markdown
+from pdf_translator.book_views import (
+    ensure_chapter_top_heading,
+    join_chapter_delivery_markdown,
+    render_book_markdown,
+    render_translation_input_markdown,
+)
 from pdf_translator.chapter_segments import build_chapter_segments
 from pdf_translator.chunking import split_markdown_into_chunks
 from pdf_translator.config import RunSettings
@@ -51,9 +56,12 @@ from pdf_translator.translate import (
     translate_book_chapters,
     translate_markdown,
 )
+from pdf_translator.segment_conservation import write_segment_order_ledger
 from pdf_translator.workflow import (
+    STAGE_AWAITING_CHAPTER_CONFIRMATION,
     STAGE_AWAITING_GLOSSARY,
     STAGE_AWAITING_HUMAN_REVIEW,
+    STAGE_COMPLETED,
     begin_translation,
     require_glossary_ready,
     write_workflow,
@@ -178,6 +186,14 @@ def _write_page_ledger(run_dir: Path, book: dict[str, Any]) -> Path:
     return path
 
 
+def _load_segment_conservation_report(run_dir: Path) -> dict[str, Any] | None:
+    path = run_dir / "segment-conservation.json"
+    if not path.is_file():
+        return None
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    return payload if isinstance(payload, dict) else None
+
+
 def _write_integrity_ledger(
     run_dir: Path,
     book: dict[str, Any],
@@ -191,6 +207,7 @@ def _write_integrity_ledger(
         epub_validation=epub_validation,
         pdf_validation=pdf_validation,
         review_items=review_items,
+        segment_conservation=_load_segment_conservation_report(run_dir),
     )
     path = run_dir / "integrity-ledger.json"
     path.write_text(
@@ -326,7 +343,13 @@ def _load_existing_run_context(
             canonical = json.loads(
                 settings.canonical_chapters_path.expanduser().resolve().read_text(encoding="utf-8")
             )
-            book = apply_canonical_chapter_plan(book, canonical)
+            images_dir = run_dir / "book-images"
+            book = apply_canonical_chapter_plan(
+                book,
+                canonical,
+                source_path=source_pdf,
+                asset_dir=images_dir if images_dir.is_dir() else None,
+            )
         page_ledger_path = _write_page_ledger(run_dir, book)
         integrity_ledger_path = _write_integrity_ledger(run_dir, book)
         artifacts.book_json_path.write_text(json.dumps(book, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -363,6 +386,8 @@ def _load_existing_run_context(
             encoding="utf-8",
         )
         extra_files["chapter_segments"] = str(chapter_segments_path)
+        segment_order_path = write_segment_order_ledger(run_dir, segment_plan)
+        extra_files["segment_order"] = str(segment_order_path)
     profile: dict[str, Any] = {}
     if artifacts.profile_json_path.exists():
         profile = json.loads(artifacts.profile_json_path.read_text(encoding="utf-8"))
@@ -489,18 +514,19 @@ def _estimated_translation_total(
 
 def _book_without_translation(book: dict, settings: RunSettings) -> BookTranslationResult:
     translated_chapters: list[TranslatedChapter] = []
-    translated_markdown_parts: list[str] = []
     for chapter in book.get("chapters", []):
+        title = str(chapter.get("title") or f"Chapter {len(translated_chapters) + 1}")
         markdown = str(chapter.get("markdown") or "").strip()
+        if markdown and bool(chapter.get("toc", True)):
+            markdown = ensure_chapter_top_heading(markdown, title).strip()
         if markdown:
             markdown += "\n"
-            translated_markdown_parts.append(markdown.strip())
         sip = chapter.get("source_internal_path")
         translated_chapters.append(
             TranslatedChapter(
                 index=int(chapter.get("index", len(translated_chapters) + 1)),
                 chapter_id=str(chapter.get("chapter_id") or "") or None,
-                title=str(chapter.get("title") or f"Chapter {len(translated_chapters) + 1}"),
+                title=title,
                 page_start=chapter.get("page_start"),
                 page_end=chapter.get("page_end"),
                 markdown=markdown,
@@ -509,8 +535,9 @@ def _book_without_translation(book: dict, settings: RunSettings) -> BookTranslat
                 toc=bool(chapter.get("toc", True)),
             )
         )
+    chapter_payloads = [asdict(chapter) for chapter in translated_chapters]
     return BookTranslationResult(
-        translated_markdown="\n\n".join(translated_markdown_parts).strip() + "\n",
+        translated_markdown=join_chapter_delivery_markdown(chapter_payloads),
         translated_chapters=translated_chapters,
         source_language=settings.source_language,
         target_language=settings.target_language,
@@ -566,18 +593,121 @@ def run_intake_pipeline(settings: RunSettings) -> PipelineArtifacts:
         encoding="utf-8",
     )
     if (artifacts.output_dir / "book.json").exists():
-        extract_glossary_candidates(artifacts.output_dir)
-        write_workflow(artifacts.output_dir, stage=STAGE_AWAITING_GLOSSARY)
-        glossary_files = glossary_manifest_files(artifacts.output_dir)
-        workflow_path = artifacts.output_dir / "workflow.json"
-        if workflow_path.exists():
-            glossary_files["workflow"] = str(workflow_path)
-        manifest = json.loads(artifacts.manifest_path.read_text(encoding="utf-8"))
-        manifest["files"] = {**manifest.get("files", {}), **glossary_files}
-        artifacts.manifest_path.write_text(
-            json.dumps(manifest, ensure_ascii=False, indent=2),
-            encoding="utf-8",
+        if settings.processing_mode == "convert":
+            write_workflow(artifacts.output_dir, stage=STAGE_AWAITING_CHAPTER_CONFIRMATION)
+        else:
+            extract_glossary_candidates(artifacts.output_dir)
+            write_workflow(artifacts.output_dir, stage=STAGE_AWAITING_GLOSSARY)
+            glossary_files = glossary_manifest_files(artifacts.output_dir)
+            workflow_path = artifacts.output_dir / "workflow.json"
+            if workflow_path.exists():
+                glossary_files["workflow"] = str(workflow_path)
+            manifest = json.loads(artifacts.manifest_path.read_text(encoding="utf-8"))
+            manifest["files"] = {**manifest.get("files", {}), **glossary_files}
+            artifacts.manifest_path.write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+    return artifacts
+
+
+def run_export_pipeline(
+    settings: RunSettings,
+    on_stage: Callable[[str, dict[str, Any]], None] | None = None,
+) -> PipelineArtifacts:
+    """Apply confirmed chapters and render a source EPUB without translation."""
+
+    def enter_stage(stage: str, **data: Any) -> None:
+        if on_stage is not None:
+            on_stage(stage, {"stage_percent": 0, **data})
+
+    if settings.existing_run_dir is None:
+        raise ValueError("existing_run_dir is required for export pipeline.")
+
+    enter_stage("exporting", text_operation="preserve")
+    artifacts, book, _translation_input_markdown, _profile, extra_files, preflight = _load_existing_run_context(
+        settings
+    )
+    if book is None:
+        raise ValueError("book.json is required for export pipeline.")
+
+    if settings.canonical_chapters_path is not None and settings.canonical_chapters_path.is_file():
+        canonical = json.loads(
+            settings.canonical_chapters_path.expanduser().resolve().read_text(encoding="utf-8")
         )
+        images_dir = artifacts.output_dir / "book-images"
+        book = apply_canonical_chapter_plan(
+            book,
+            canonical,
+            source_path=settings.source_pdf,
+            asset_dir=images_dir if images_dir.is_dir() else None,
+        )
+        artifacts.book_json_path.write_text(json.dumps(book, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        extra_files["book_json"] = str(artifacts.book_json_path)
+        extra_files["page_ledger"] = str(_write_page_ledger(artifacts.output_dir, book))
+
+    translated = _book_without_translation(book, settings)
+    translated_chapters_path = artifacts.output_dir / "translated-chapters.json"
+    chapter_payloads = [asdict(chapter) for chapter in translated.translated_chapters]
+    translated_chapters_path.write_text(
+        json.dumps({"chapters": chapter_payloads}, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    artifacts.translated_markdown_path.write_text(translated.translated_markdown, encoding="utf-8")
+    extra_files["translated_chapters"] = str(translated_chapters_path)
+    extra_files["translated_markdown"] = str(artifacts.translated_markdown_path)
+
+    rendered_files: dict[str, str] = {}
+    epub_validation: dict[str, Any] | None = None
+    normalized_images_dir = artifacts.output_dir / "book-images"
+    if settings.output_format in {"epub", "both"}:
+        render_epub_from_book(
+            book=book,
+            translated_chapters=chapter_payloads,
+            output_path=artifacts.translated_epub_path,
+            title=f"{settings.source_pdf.stem} ({settings.target_language})",
+            language=settings.target_language,
+            source_language=settings.source_language,
+            content_is_translated=False,
+            image_roots=[normalized_images_dir] if normalized_images_dir.exists() else None,
+        )
+        rendered_files["translated_epub"] = str(artifacts.translated_epub_path)
+        epub_validation = validate_epub_internal_hrefs(artifacts.translated_epub_path)
+        rendered_files["epub_href_validation"] = epub_validation
+
+    enter_stage("validating")
+    integrity_ledger_path = _write_integrity_ledger(
+        artifacts.output_dir,
+        book,
+        epub_validation=epub_validation,
+        review_items=(),
+    )
+    extra_files["integrity_ledger"] = str(integrity_ledger_path)
+    write_workflow(artifacts.output_dir, stage=STAGE_COMPLETED)
+
+    manifest = {
+        "mode": "convert",
+        "source_pdf": str(settings.source_pdf),
+        "output_dir": str(artifacts.output_dir),
+        "translator": "skipped",
+        "processing_mode": settings.processing_mode,
+        "text_operation": "preserve",
+        "source_language": settings.source_language,
+        "target_language": settings.target_language,
+        "chunk_count": 0,
+        "translation": {"mode": "not_requested", "cache_dir": None},
+        "preflight": preflight if isinstance(preflight, dict) else {},
+        "render": {
+            "format": settings.output_format,
+            "policy": book.get("render_policy", {}),
+        },
+        "files": {
+            **extra_files,
+            **rendered_files,
+        },
+    }
+    artifacts.manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    enter_stage("validating", stage_percent=100)
     return artifacts
 
 
@@ -814,6 +944,8 @@ def run_translation_pipeline(
             output_path=artifacts.translated_epub_path,
             title=f"{settings.source_pdf.stem} ({translated.target_language})",
             language=translated.target_language,
+            source_language=translated.source_language,
+            content_is_translated=True,
         )
         rendered_files["translated_epub"] = str(artifacts.translated_epub_path)
         epub_validation = validate_epub_internal_hrefs(artifacts.translated_epub_path)

@@ -25,9 +25,9 @@ dependencies = [
 
 [project.optional-dependencies]
 workspace = [
-  "fastapi==0.109.0",
-  "uvicorn==0.27.0",
-  "python-multipart==0.0.6",
+  "fastapi==0.115.6",
+  "uvicorn>=0.27.0",
+  "python-multipart>=0.0.6",
   "pymupdf==1.23.8",
   "httpx>=0.28",
   "pydantic-settings>=2.3.0",
@@ -40,6 +40,7 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "backend"]
+pythonpath = ["backend"]
 norecursedirs = ["backend/archive", ".venv"]
 asyncio_mode = "auto"
 

@@ -7,7 +7,9 @@ import re
 from pathlib import Path
 from typing import Any
 
+from pdf_translator.book_views import ensure_chapter_top_heading
 from pdf_translator.glossary import (
+    apply_glossary_source_substitutions,
     glossary_terms_missing_in_translation,
     load_active_entries_for_translation,
     select_glossary_entries_for_text,
@@ -41,6 +43,9 @@ LOGIC_SYMBOL_LINE = re.compile(r"[◻◇φ∀∃⊢⊨≤≥]")
 LATIN_WORD_RE = re.compile(r"\b[A-Za-z][A-Za-z'’-]{3,}\b")
 URL_OR_EMAIL_RE = re.compile(r"(?:https?://|www\.)\S+|\S+@\S+")
 MARKDOWN_LINK_DEST_RE = re.compile(r"\]\([^)]+\)")
+MARKDOWN_IMAGE_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
+MARKDOWN_INLINE_LINK_RE = re.compile(r"\[([^\]]*)\]\([^)]*\)")
+EPUB_INTERNAL_PATH_RE = re.compile(r"\b(?:OEBPS|OPS)/\S+", re.IGNORECASE)
 ALLOWED_MIXED_LATIN_WORDS = {
     "analytic",
     "analyticity",
@@ -89,8 +94,8 @@ MODEL_REFUSAL_PATTERNS = (
 FAIL_OPEN_MARKER = "BOOKWEAVER_TRANSLATION_FAIL_OPEN"
 FAIL_OPEN_COMMENT_RE = re.compile(r"<!--\s*BOOKWEAVER_TRANSLATION_FAIL_OPEN\b.*?-->\s*", re.DOTALL)
 FAIL_OPEN_WARNING_RE = re.compile(
-    r"(?:^|\n)>?\s*⚠️\s*BookWeaver：本段自动翻译未通过质量校验.*?(?:\n\s*\n|$)",
-    re.DOTALL,
+    r"(?:^|\n)>?\s*⚠️\s*BookWeaver[^\n]*(?:\n|$)",
+    re.MULTILINE,
 )
 
 
@@ -477,6 +482,15 @@ def _cjk_count(text: str) -> int:
     return len(CJK_RE.findall(text))
 
 
+def _strip_line_for_mixed_english_scan(line: str) -> str:
+    cleaned = MARKDOWN_IMAGE_RE.sub(" ", line)
+    cleaned = MARKDOWN_INLINE_LINK_RE.sub(r"\1", cleaned)
+    cleaned = URL_OR_EMAIL_RE.sub(" ", cleaned)
+    cleaned = EPUB_INTERNAL_PATH_RE.sub(" ", cleaned)
+    cleaned = re.sub(r"\b(?:book-images|OEBPS|OPS|xhtml|html)\b", " ", cleaned, flags=re.IGNORECASE)
+    return cleaned
+
+
 def _mixed_english_signal(text: str) -> tuple[int, int]:
     suspect_words = 0
     mixed_lines = 0
@@ -492,15 +506,14 @@ def _mixed_english_signal(text: str) -> tuple[int, int]:
             continue
         if LOGIC_SYMBOL_LINE.search(line):
             continue
-        if not CJK_RE.search(line):
+        cleaned = _strip_line_for_mixed_english_scan(line)
+        if not CJK_RE.search(cleaned):
             if in_notes:
-                words = list(LATIN_WORD_RE.finditer(line))
+                words = list(LATIN_WORD_RE.finditer(cleaned))
                 if len(words) >= 6:
                     mixed_lines += 1
                     suspect_words += len(words)
             continue
-        cleaned = URL_OR_EMAIL_RE.sub(" ", line)
-        cleaned = MARKDOWN_LINK_DEST_RE.sub("]", cleaned)
         line_suspects = 0
         for match in LATIN_WORD_RE.finditer(cleaned):
             original = match.group(0)
@@ -546,7 +559,10 @@ def _is_non_prose_review_segment(text: str) -> bool:
     image_or_caption = image_lines + sum(
         1 for line in lines if line.lower().startswith(("figure ", "table ", "map "))
     )
-    link_destinations = len(MARKDOWN_LINK_DEST_RE.findall(stripped))
+    link_destinations = len(MARKDOWN_INLINE_LINK_RE.findall(stripped))
+    prose_chars = len(re.sub(r"\s+", "", _strip_line_for_mixed_english_scan(stripped)))
+    if link_destinations >= 3 and prose_chars < 40:
+        return True
     if re.search(r"^#\s*地图\s*$", stripped, re.MULTILINE):
         return True
     if re.search(r"^#\s*maps?\s*$", stripped, re.IGNORECASE | re.MULTILINE):
@@ -588,8 +604,9 @@ def detect_review_items(
         if resource_chapter:
             continue
         has_fail_open_placeholder = FAIL_OPEN_MARKER in translated_text
-        if _is_non_prose_review_segment(source_text) and not has_fail_open_placeholder:
-            continue
+        if _is_non_prose_review_segment(source_text) or _is_non_prose_review_segment(translated_text):
+            if not has_fail_open_placeholder:
+                continue
         if not bool(source.get("translate", True)) and text_operation == "translate":
             continue
         if has_fail_open_placeholder:
@@ -660,18 +677,30 @@ def detect_review_items(
             else:
                 entries_to_check = []
             if entries_to_check:
-                missing_terms = glossary_terms_missing_in_translation(
+                normalized_translated = apply_glossary_source_substitutions(
                     source_text,
                     translated_text,
                     entries_to_check,
                     chapter_id=str(source.get("chapter_id") or "") or None,
                 )
-                if missing_terms:
+                missing_terms = glossary_terms_missing_in_translation(
+                    source_text,
+                    normalized_translated,
+                    entries_to_check,
+                    chapter_id=str(source.get("chapter_id") or "") or None,
+                )
+                actionable = [
+                    item
+                    for item in missing_terms
+                    if re.search(re.escape(item["source"]), normalized_translated, flags=re.IGNORECASE)
+                ]
+                if actionable:
                     issue_type = "glossary_drift"
-                    severity = "high"
+                    severity = "low"
                     evidence = {
                         **evidence,
-                        "missing_glossary_terms": missing_terms,
+                        "missing_glossary_terms": actionable,
+                        "glossary_policy": "deterministic_substitution_applied",
                     }
 
         if issue_type is None:
@@ -988,6 +1017,12 @@ def _rewrite_prompt(
     return prompt
 
 
+def strip_fail_open_notices(text: str) -> str:
+    """Remove fail-open review placeholders from deliverable markdown."""
+
+    return _strip_fail_open_notice(text)
+
+
 def _strip_fail_open_notice(text: str) -> str:
     if FAIL_OPEN_MARKER not in text:
         return text.strip()
@@ -1207,8 +1242,8 @@ def translated_segments_to_markdown(translated_segments_payload: Any) -> str:
             for segment in sorted(chapter_segments, key=lambda item: int(item.get("block_index") or 0))
             if str(segment.get("translated_text") or "").strip()
         ).strip()
-        if title and not body.startswith("#"):
-            chapter_parts.append(f"# {title}\n\n{body}".strip())
+        if title and not re.match(r"^#\s+\S", body):
+            chapter_parts.append(ensure_chapter_top_heading(body, title).strip())
         else:
             chapter_parts.append(body)
     return "\n\n".join(part for part in chapter_parts if part).strip() + "\n"

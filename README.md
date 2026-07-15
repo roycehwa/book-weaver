@@ -68,6 +68,19 @@ cd frontend && npm install && npm run dev
 
 Jobs default to `~/Desktop/文档/Bookmate/Jobs`. No `BOOK_WEAVER_HOME` needed in this unified repo.
 
+### Verification (Codex baseline)
+
+Single venv for engine + workspace API. Docling requires `httpx>=0.28`, so workspace uses `fastapi==0.115.6` (not `0.109`) for `TestClient` compatibility.
+
+```bash
+uv sync --extra dev --extra workspace
+uv run pytest tests/ -q
+uv run pytest backend/ -q
+cd frontend && npm run test -- --run && npm run build
+```
+
+Expected on current `main` after env alignment: engine ~517 passed; backend ~121 passed (4 skipped). CHANGELOG `515 passed` refers to the engine/core matrix at Codex handoff; a small number of segment-plan and workspace-step tests may still fail until separately triaged — do not “fix” by weakening production logic for dev-env drift.
+
 ### Legacy pip install
 
 ```bash

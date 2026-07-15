@@ -179,13 +179,10 @@ class EpubPage:
     page_anchor: str  # 锚点 id，如 "page_141"，无锚点章节留空
 
 
-_PAGE_ANCHOR_RE = re.compile(
-    rb"""<(?P<tag>[a-zA-Z][\w:.-]*)\b(?=[^>]*\bid=["'](?P<anchor>page_(?P<label>[0-9]+|[ivxlcdm]+))["'])(?![^>]*\bhref=)[^>]*>""",
-    re.IGNORECASE,
-)
-_PAGE_MARKER_TAG_RE = re.compile(
-    rb"""<(?P<tag>[a-zA-Z][\w:.-]*)\b(?=[^>]*\bid=["'](?P<anchor>page_(?:[0-9]+|[ivxlcdm]+))["'])(?![^>]*\bhref=)[^>]*(?:/>\s*|>\s*</(?P=tag)\s*>)""",
-    re.IGNORECASE,
+from pdf_translator.epub_page_anchors import (
+    EPUB_PAGE_ANCHOR_RE as _PAGE_ANCHOR_RE,
+    EPUB_PAGE_MARKER_TAG_RE as _PAGE_MARKER_TAG_RE,
+    page_label_from_anchor as _page_label_from_anchor,
 )
 
 _ROMAN_ORDER = {s: i for i, s in enumerate(
@@ -256,7 +253,7 @@ def resolve_epub_pages(path: Path) -> list[EpubPage]:
             )
             continue
         for anchor_id in anchor_ids:
-            num_str = anchor_id[len("page_"):]
+            num_str = _page_label_from_anchor(anchor_id)
             if num_str.isdigit():
                 page_number = int(num_str)
             else:

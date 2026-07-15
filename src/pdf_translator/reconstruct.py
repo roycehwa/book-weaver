@@ -137,6 +137,10 @@ def _is_noise_block(block: LayoutBlock) -> bool:
         return True
     if "NEWSWEEK.COM" in upper:
         return True
+    if re.sub(r"[\s.]", "", upper) == "OCEANOFPDFCOM":
+        return True
+    if "OCEANOFPDF" in re.sub(r"[\s.]", "", upper):
+        return True
     if "FOLLOW HIM ON" in upper or "EMAIL HIM" in upper or "@NEWSWEEK.COM" in upper:
         return True
     if "GETTY IMAGES" in upper or "TRIBUNE/GETTY" in upper:

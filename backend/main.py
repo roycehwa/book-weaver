@@ -362,7 +362,7 @@ class JobChapterConfirmationRequest(BaseModel):
 
 
 class JobReprocessRequest(BaseModel):
-    processing_mode: Literal["auto", "translate", "preserve"]
+    processing_mode: Literal["auto", "translate", "preserve", "convert"]
     source_language: Optional[str] = None
     target_language: str = "zh-CN"
     translator: Literal["openai", "mock", "minimax", "compatible", "openai-compatible"] = "minimax"
@@ -587,6 +587,13 @@ def _run_translate_in_background(service: BookJobService, job_id: str) -> None:
         logger.exception("Background translation failed: %s", job_id)
 
 
+def _run_export_in_background(service: BookJobService, job_id: str) -> None:
+    try:
+        service.run_export(job_id)
+    except Exception:
+        logger.exception("Background EPUB export failed: %s", job_id)
+
+
 def _run_glossary_suggest_in_background(
     service: BookJobService,
     job_id: str,
@@ -753,10 +760,11 @@ def _workspace_book_from_job(job: dict[str, Any]) -> dict[str, Any]:
     artifacts = job.get("artifacts") if isinstance(job.get("artifacts"), dict) else {}
     progress = job.get("progress") if isinstance(job.get("progress"), dict) else {}
     text_operation = resolved.get("text_operation")
-    if not text_operation and request.get("processing_mode") in {"translate", "preserve"}:
+    if not text_operation and request.get("processing_mode") in {"translate", "preserve", "convert"}:
         text_operation = request.get("processing_mode")
     is_translation_path = text_operation == "translate"
     is_preserve_path = text_operation == "preserve"
+    is_convert_path = str(request.get("processing_mode") or "") == "convert"
 
     has_structure = "book" in artifacts or state in {
         "awaiting_glossary",
@@ -803,7 +811,28 @@ def _workspace_book_from_job(job: dict[str, Any]) -> dict[str, Any]:
     lifecycle_stage = _canonical_lifecycle_stage(job)
     lifecycle_state = "failed" if state == "failed" else "active"
 
-    if is_translation_path:
+    if is_convert_path:
+        workflow_path = "convert_edition"
+        workflow_summary = (
+            "解析并导出 EPUB：确认源书章节目录后直接生成原文 EPUB，不进入术语或翻译审阅。"
+        )
+        workflow_step_order = [
+            "import",
+            "structure",
+            "chapter_confirmation",
+            "text_processing",
+            "knowledge_handoff",
+        ]
+        text_processing_label = "导出 EPUB"
+        text_processing_desc = "按已确认章节目录渲染原文 EPUB。"
+        chapter_confirmation_desc = (
+            "确认源书章节目录（标题与起止页）；导出将严格按此结构分章。"
+        )
+        text_processing_done = state in {"exporting", "completed"} or (
+            state == "failed" and failed_stage == "exporting"
+        )
+        text_processing_failed = state == "failed" and failed_stage == "exporting"
+    elif is_translation_path:
         workflow_path = "translation_edition"
         workflow_summary = (
             "译本路径：先定稿术语并机器翻译，再进入翻译审阅；源书章节目录可在审阅前后确认，"
@@ -869,7 +898,11 @@ def _workspace_book_from_job(job: dict[str, Any]) -> dict[str, Any]:
     steps["text_processing"] = _step(
         "done" if text_processing_done else (
             "failed" if text_processing_failed else (
-                "running" if state in {"translating", "preserving"} else "blocked"
+                "running" if state in {"translating", "preserving", "exporting"} else (
+                    "action_required"
+                    if is_convert_path and chapters_confirmed and state == "awaiting_glossary"
+                    else "blocked"
+                )
             )
         ),
         text_processing_label,
@@ -897,11 +930,11 @@ def _workspace_book_from_job(job: dict[str, Any]) -> dict[str, Any]:
             polish_desc = "等待机器翻译完成后执行润色。"
         steps["polish"] = _step(polish_status, "润色", polish_desc)
 
-    if is_preserve_path:
+    if is_preserve_path or is_convert_path:
         steps["translation_review"] = _step(
             "skipped",
             "翻译审阅",
-            "原文路径不需要翻译审阅。",
+            "原文路径不需要翻译审阅。" if is_preserve_path else "解析导出路径不需要翻译审阅。",
         )
     elif is_translation_path and review_done:
         steps["translation_review"] = _step(
@@ -934,7 +967,9 @@ def _workspace_book_from_job(job: dict[str, Any]) -> dict[str, Any]:
         chapter_confirmation_desc,
     )
 
-    knowledge_ready = chapters_confirmed and (is_preserve_path or review_done)
+    knowledge_ready = chapters_confirmed and (
+        is_preserve_path or review_done or (is_convert_path and text_processing_done)
+    )
     steps["knowledge_handoff"] = _step(
         "ready" if knowledge_ready else "blocked",
         "知识解析入口",
@@ -1341,7 +1376,7 @@ def _duplicate_matches_for_source(
 async def create_job(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    processing_mode: Literal["auto", "translate", "preserve"] = Form(default="preserve"),
+    processing_mode: Literal["auto", "translate", "preserve", "convert"] = Form(default="preserve"),
     source_language: Optional[str] = Form(default=None),
     target_language: str = Form(default="zh-CN"),
     translator: Literal["openai", "mock", "minimax", "compatible", "openai-compatible"] = Form(
@@ -1382,7 +1417,7 @@ async def create_job(
                     "matches": [match.dict() for match in duplicate_matches],
                 },
             )
-        effective_translator = "mock" if processing_mode == "preserve" else translator
+        effective_translator = "mock" if processing_mode in {"preserve", "convert"} else translator
         snapshot = service.create(
             source_path=incoming_path,
             processing_mode=processing_mode,
@@ -2089,6 +2124,19 @@ async def start_job_translation(job_id: str, background_tasks: BackgroundTasks):
         service = get_job_service()
         snapshot = await asyncio.to_thread(service.start_translation, job_id)
         background_tasks.add_task(_run_translate_in_background, service, job_id)
+        return {"job": snapshot, "workspace_book": _workspace_book_from_job(snapshot)}
+    except JobNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except JobServiceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@api_router.post("/jobs/{job_id}/export", status_code=status.HTTP_202_ACCEPTED)
+async def start_job_export(job_id: str, background_tasks: BackgroundTasks):
+    try:
+        service = get_job_service()
+        snapshot = await asyncio.to_thread(service.start_export, job_id)
+        background_tasks.add_task(_run_export_in_background, service, job_id)
         return {"job": snapshot, "workspace_book": _workspace_book_from_job(snapshot)}
     except JobNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

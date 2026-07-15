@@ -15,7 +15,7 @@ import zipfile
 from typing import Any
 
 
-PROCESSING_MODES = frozenset({"auto", "translate", "preserve"})
+PROCESSING_MODES = frozenset({"auto", "translate", "preserve", "convert"})
 TEXT_OPERATIONS = frozenset({"translate", "preserve"})
 JOB_STATES = frozenset(
     {
@@ -61,6 +61,8 @@ def resolve_text_operation(
         raise ValueError(f"Unsupported processing mode {processing_mode!r}; expected one of: {allowed}.")
     if mode in TEXT_OPERATIONS:
         return mode
+    if mode == "convert":
+        return "preserve"
 
     source_family = normalize_language_family(source_language)
     target_family = normalize_language_family(target_language)
@@ -301,6 +303,9 @@ class BookJobRunner:
             request.get("source_language"),
             str(request.get("target_language") or "zh-CN"),
         )
+        mode = str(request.get("processing_mode") or "auto")
+        if mode == "convert":
+            return self.run_intake_phase(job_id)
         if defer_translation and text_operation == "translate" and self._uses_default_pipeline:
             return self.run_intake_phase(job_id)
         return self._run_full_pipeline(job_id)
@@ -397,6 +402,97 @@ class BookJobRunner:
             existing_run_dir=run_dir,
             require_glossary_ready=True,
         )
+
+    def run_export_phase(self, job_id: str) -> dict[str, Any]:
+        snapshot = self.repository.load(job_id)
+        request = snapshot.get("request") if isinstance(snapshot.get("request"), dict) else {}
+        if str(request.get("processing_mode") or "") != "convert":
+            raise ValueError(f"Job {job_id} is not a convert-mode job.")
+        if snapshot["state"] not in {"awaiting_glossary", "failed", "exporting", "completed"}:
+            raise ValueError(f"Job {job_id} cannot export from state {snapshot['state']!r}.")
+        run_dir = self._run_output_dir(job_id)
+        current_stage: str | None = None
+
+        def on_stage(stage: str, data: dict[str, Any]) -> None:
+            nonlocal current_stage
+            if stage not in JOB_STATES or stage in {"created", "failed", "completed"}:
+                raise ValueError(f"Unsupported pipeline job stage: {stage!r}.")
+            if current_stage is not None and current_stage != stage:
+                self._complete_stage(job_id, current_stage)
+            if current_stage != stage:
+                self.repository.append_event(
+                    job_id,
+                    event_type="stage_started",
+                    stage=stage,
+                    data={},
+                )
+            current_stage = stage
+            self.repository.update(
+                job_id,
+                state=stage if stage != "completed" else "completed",
+                failed_stage=None,
+                error=None,
+                progress={
+                    "stage_percent": int(data.get("stage_percent", 0)),
+                    "overall_percent": self._OVERALL_PERCENT.get(stage, 100),
+                },
+            )
+
+        try:
+            from pdf_translator.pipeline import run_export_pipeline
+
+            settings = self._settings(snapshot)
+            settings = replace(
+                settings,
+                existing_run_dir=run_dir,
+                canonical_chapters_path=(
+                    self.repository.job_dir(job_id) / "artifacts" / "canonical-chapters.json"
+                ),
+            )
+            artifacts = run_export_pipeline(settings, on_stage)
+            if current_stage is not None and current_stage != "completed":
+                self._complete_stage(job_id, current_stage)
+            artifact_map = self._artifact_map(job_id, artifacts)
+            completed = self.repository.update(
+                job_id,
+                state="completed",
+                failed_stage=None,
+                error=None,
+                artifacts=artifact_map,
+                progress={"stage_percent": 100, "overall_percent": 100},
+            )
+            self.repository.append_event(
+                job_id,
+                event_type="export_completed",
+                stage="completed",
+                data={"artifacts": sorted(artifact_map)},
+            )
+            return completed
+        except Exception as exc:
+            failed_stage = current_stage or snapshot.get("failed_stage") or "exporting"
+            error_code, retryable = self._classify_failure(exc, failed_stage)
+            reason = self._safe_failure_reason(exc, error_code)
+            details = {"stage": failed_stage}
+            if reason:
+                details["reason"] = reason
+            self.repository.update(
+                job_id,
+                state="failed",
+                failed_stage=failed_stage,
+                error={
+                    "code": error_code,
+                    "message": f"Job failed during {failed_stage}.",
+                    "retryable": retryable,
+                    "details": details,
+                },
+            )
+            self.repository.append_event(
+                job_id,
+                event_type="job_failed",
+                stage=failed_stage,
+                data={"code": error_code, "retryable": retryable},
+            )
+            raise
 
     def _run_output_dir(self, job_id: str) -> Path:
         snapshot = self.repository.load(job_id)

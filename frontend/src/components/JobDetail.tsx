@@ -38,6 +38,7 @@ const stageLabels: Record<BookJob['state'], string> = {
 const processingModeLabels: Record<BookJob['request']['processing_mode'], string> = {
   preserve: '保留原文',
   translate: '翻译审阅',
+  convert: '解析并导出 EPUB',
   auto: '自动判断',
 }
 
@@ -659,6 +660,7 @@ function JobDetail() {
 
   const isPreservePath =
     job.resolved.text_operation === 'preserve' || job.request.processing_mode === 'preserve'
+  const isConvertPath = job.request.processing_mode === 'convert'
 
   const artifactLabels: Record<string, string> = {
     book: 'BookIR (book.json)',
@@ -668,7 +670,7 @@ function JobDetail() {
     chapter_report: '章节报告',
     chapter_segments: '章内语义拆分',
     manifest: '处理清单 (manifest)',
-    epub: isPreservePath ? 'EPUB' : '译版 EPUB',
+    epub: isPreservePath || isConvertPath ? 'EPUB' : '译版 EPUB',
     pdf: isPreservePath ? 'PDF' : '译版 PDF',
     translated_markdown: '译文 Markdown',
     translated_chapters: '译文章节',
@@ -689,7 +691,7 @@ function JobDetail() {
     workspaceBook?.steps.chapter_confirmation.status !== 'blocked'
   const showChapterConfirmButton =
     canSaveChapterConfirmation
-    && (isPreservePath || isTranslatePath)
+    && (isPreservePath || isTranslatePath || isConvertPath)
     && chapterDraft.length > 0
     && (needsChapterConfirmation || chaptersConfirmed)
   const errorReason =
@@ -1284,6 +1286,24 @@ function JobDetail() {
         )}
 
         <div className="mt-6 flex flex-wrap gap-3">
+          {job.state === 'awaiting_glossary'
+            && isConvertPath
+            && chaptersConfirmed && (
+            <button
+              type="button"
+              className="rounded-lg bg-primary-600 px-4 py-2 text-sm font-medium text-white"
+              onClick={async () => {
+                try {
+                  await jobsApi.startExport(id!)
+                  await loadJob()
+                } catch (startError) {
+                  setError(startError instanceof Error ? startError.message : '启动 EPUB 导出失败')
+                }
+              }}
+            >
+              导出 EPUB
+            </button>
+          )}
           {job.state === 'awaiting_glossary'
             && glossary?.workflow?.stage === 'glossary_ready'
             && chaptersConfirmed && (

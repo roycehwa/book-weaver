@@ -13,6 +13,7 @@ from pdf_translator.glossary import (
 
 WORKFLOW_SCHEMA = "phase_a_workflow_v1"
 STAGE_AWAITING_GLOSSARY = "awaiting_glossary"
+STAGE_AWAITING_CHAPTER_CONFIRMATION = "awaiting_chapter_confirmation"
 STAGE_GLOSSARY_READY = "glossary_ready"
 STAGE_TRANSLATING = "translating"
 STAGE_PRE_REVIEW = "pre_review"

@@ -13,6 +13,7 @@ class IntegrityGateError(ValueError):
 _FAILURE_KEYS = (
     "missing_pages",
     "missing_translations",
+    "segment_order",
     "unresolved_ocr",
     "missing_assets",
     "broken_footnote_links",
@@ -32,6 +33,7 @@ def build_integrity_ledger(
     epub_validation: dict[str, Any] | None = None,
     pdf_validation: dict[str, Any] | None = None,
     review_items: list[dict[str, Any]] | tuple[dict[str, Any], ...] = (),
+    segment_conservation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     failures = {key: [] for key in _FAILURE_KEYS}
     try:
@@ -67,6 +69,11 @@ def build_integrity_ledger(
         if not str(span.get("translated_text") or "").strip()
     ]
     failures["missing_translations"].extend(missing_translations)
+
+    segment_conservation = segment_conservation if isinstance(segment_conservation, dict) else {}
+    failures["segment_order"].extend(
+        str(value) for value in segment_conservation.get("failures", []) if str(value).strip()
+    )
 
     for record in semantic.get("ocr_quarantine", []):
         if not isinstance(record, dict):
@@ -136,6 +143,14 @@ def build_integrity_ledger(
             "ratio": _ratio(max(link_total - link_missing, 0), link_total),
         },
     }
+    segment_total = int(segment_conservation.get("translatable_segment_count") or 0)
+    segment_failures = len(failures["segment_order"])
+    if segment_total:
+        dimensions["segment_order"] = {
+            "covered": max(segment_total - segment_failures, 0),
+            "total": segment_total,
+            "ratio": _ratio(max(segment_total - segment_failures, 0), segment_total),
+        }
     technical_failures = {
         key: values
         for key, values in failures.items()
