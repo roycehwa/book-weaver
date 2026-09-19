@@ -14,7 +14,7 @@ from pdf_translator.content_policy_dependencies import (
 
 
 def _synthetic_epub_book() -> dict:
-    body_markdown = "See [the note](OPS/Text/notes.xhtml#n1)."
+    body_markdown = "See [the note](notes.xhtml#n1)."
     return {
         "metadata": {"chapter_source": "epub_spine"},
         "chapters": [
@@ -32,7 +32,7 @@ def _synthetic_epub_book() -> dict:
                         "char_start": 0,
                         "char_end": 20,
                         "element_id": "p1",
-                        "link_targets": ["OPS/Text/notes.xhtml#n1"],
+                        "link_targets": ["notes.xhtml#n1"],
                     }
                 ],
             },
@@ -78,7 +78,7 @@ def test_collect_evidence_resolves_relative_epub_href_and_fragment() -> None:
     assert any(
         item["source_chapter_id"] == "body"
         and item["target_chapter_id"] == "notes"
-        and item["link_evidence"] == "OPS/Text/notes.xhtml#n1"
+        and item["link_evidence"] == "notes.xhtml#n1"
         for item in evidence
     )
 
@@ -121,6 +121,30 @@ def test_validate_rejects_unknown_acknowledgement_ids() -> None:
     findings = [{"dependency_id": "cpd-abc"}]
     with pytest.raises(ValueError):
         validate_acknowledged_dependencies(findings, ["cpd-stale"])
+
+
+def test_validate_rejects_acknowledgement_when_no_dependency_exists() -> None:
+    with pytest.raises(ValueError):
+        validate_acknowledged_dependencies([], ["cpd-invented"])
+
+
+def test_collect_evidence_resolves_parent_relative_and_same_resource_fragment() -> None:
+    book = _synthetic_epub_book()
+    body = book["chapters"][0]
+    body["dom_units"][0]["link_targets"] = ["../Text/notes.xhtml#n1"]
+    evidence = collect_content_policy_dependency_evidence(book)
+    assert len(evidence) == 1
+    assert evidence[0]["target_chapter_id"] == "notes"
+
+    shared = _synthetic_epub_book()
+    shared["chapters"][0]["source_internal_path"] = "OPS/Text/shared.xhtml"
+    shared["chapters"][0]["dom_units"][0]["resource_path"] = "OPS/Text/shared.xhtml"
+    shared["chapters"][0]["dom_units"][0]["link_targets"] = ["#n1"]
+    shared["chapters"][1]["source_internal_path"] = "OPS/Text/shared.xhtml"
+    shared["chapters"][1]["dom_units"][0]["resource_path"] = "OPS/Text/shared.xhtml"
+    shared_evidence = collect_content_policy_dependency_evidence(shared)
+    assert len(shared_evidence) == 1
+    assert shared_evidence[0]["link_evidence"] == "#n1"
 
 
 def test_job_service_blocks_before_canonical_write(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -199,3 +223,50 @@ def test_job_service_blocks_before_canonical_write(tmp_path: Path, monkeypatch: 
     )
     assert (run_dir / "content-policy-dependencies.json").is_file()
     assert (job_dir / "artifacts" / "canonical-chapters.json").is_file()
+
+
+def test_job_service_preview_failure_leaves_no_dependency_or_canonical_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from job_service import BookJobService
+
+    service = BookJobService(project_home=tmp_path, jobs_dir=tmp_path / "jobs")
+    job_dir = service.jobs_dir / "job-1"
+    run_dir = job_dir / "artifacts" / "run-1"
+    run_dir.mkdir(parents=True)
+    (run_dir / "book.json").write_text(json.dumps(_synthetic_epub_book()), encoding="utf-8")
+    (job_dir / "job.json").write_text(
+        json.dumps({
+            "schema": "book_job_v1",
+            "job_id": "job-1",
+            "updated_at": "2026-06-12T10:00:00Z",
+            "state": "awaiting_chapter_confirmation",
+            "revision": 1,
+            "artifacts": {"book": {"href": "artifacts/run-1/book.json"}},
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        service,
+        "_build_confirmed_book",
+        lambda *_args, **_kwargs: {"chapters": [], "metadata": {}},
+    )
+    monkeypatch.setattr(
+        service,
+        "_write_chapter_segment_preview",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("preview failed")),
+    )
+    chapters = [
+        {"chapter_id": "body", "title": "Body", "content_policy": "translate"},
+        {"chapter_id": "notes", "title": "Notes", "content_policy": "exclude"},
+    ]
+    finding = analyze_content_policy_dependencies(_synthetic_epub_book(), chapters)["findings"][0]
+    with pytest.raises(ValueError, match="preview failed"):
+        service.confirm_chapters(
+            "job-1",
+            chapters=chapters,
+            acknowledged_dependency_ids=[finding["dependency_id"]],
+        )
+    assert not (run_dir / "content-policy-dependencies.json").exists()
+    assert not (job_dir / "artifacts" / "canonical-chapters.json").exists()

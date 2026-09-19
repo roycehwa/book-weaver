@@ -1,6 +1,7 @@
 import type { JobChapterDraft } from '../api'
 
 export interface ContentPolicyDependencyEvidence {
+  dependency_id: string
   source_chapter_id: string
   source_location?: string | null
   target_chapter_id: string
@@ -18,25 +19,10 @@ export interface ContentPolicyDependencyFinding {
   recommended_policy: 'preserve'
 }
 
-async function stableDependencyId(
-  sourceChapterId: string,
-  targetChapterId: string,
-  linkEvidence: string,
-): Promise<string> {
-  const payload = `${sourceChapterId}\0${targetChapterId}\0${linkEvidence}`
-  const data = new TextEncoder().encode(payload)
-  const digest = await crypto.subtle.digest('SHA-256', data)
-  const hex = Array.from(new Uint8Array(digest))
-    .map(byte => byte.toString(16).padStart(2, '0'))
-    .join('')
-    .slice(0, 16)
-  return `cpd-${hex}`
-}
-
-export async function activeContentPolicyDependencies(
+export function activeContentPolicyDependencies(
   chapters: JobChapterDraft[],
   evidence: ContentPolicyDependencyEvidence[],
-): Promise<ContentPolicyDependencyFinding[]> {
+): ContentPolicyDependencyFinding[] {
   const policyById = new Map(
     chapters.map(chapter => [chapter.chapter_id, chapter.content_policy || 'auto']),
   )
@@ -48,11 +34,8 @@ export async function activeContentPolicyDependencies(
     const sourcePolicy = policyById.get(item.source_chapter_id)
     const targetPolicy = policyById.get(item.target_chapter_id)
     if (sourcePolicy === 'exclude' || targetPolicy !== 'exclude') continue
-    const dependencyId = await stableDependencyId(
-      item.source_chapter_id,
-      item.target_chapter_id,
-      item.link_evidence,
-    )
+    const dependencyId = item.dependency_id
+    if (!dependencyId) continue
     if (seen.has(dependencyId)) continue
     seen.add(dependencyId)
     const targetTitle = titleById.get(item.target_chapter_id) || item.target_chapter_id

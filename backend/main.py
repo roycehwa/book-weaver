@@ -346,6 +346,8 @@ class DuplicateBookCheckResponse(BaseModel):
 class JobChapterDraftResponse(BaseModel):
     job_id: str
     chapters: List[dict[str, Any]]
+    content_policy_dependency_evidence: List[dict[str, Any]] = Field(default_factory=list)
+    content_policy_dependencies: List[dict[str, Any]] = Field(default_factory=list)
     draft_source: str = "book_structure"
     draft_source_detail: Optional[str] = None
     suggested_page_offset: int = 0

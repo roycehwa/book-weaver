@@ -325,13 +325,7 @@ function JobDetail() {
   }, [syncCalibrationFromPdf])
 
   useEffect(() => {
-    let cancelled = false
-    void activeContentPolicyDependencies(chapterDraft, dependencyEvidence).then(findings => {
-      if (!cancelled) setDependencyFindings(findings)
-    })
-    return () => {
-      cancelled = true
-    }
+    setDependencyFindings(activeContentPolicyDependencies(chapterDraft, dependencyEvidence))
   }, [chapterDraft, dependencyEvidence])
 
   const loadJob = useCallback(async () => {
@@ -659,7 +653,7 @@ function JobDetail() {
       return
     }
     const normalized = normalizeChapterDraft()
-    const pendingFindings = await activeContentPolicyDependencies(normalized, dependencyEvidence)
+    const pendingFindings = activeContentPolicyDependencies(normalized, dependencyEvidence)
     if (pendingFindings.length > 0) {
       setDependencyAckDialog({ chapters: normalized, findings: pendingFindings })
       setDependencyAckChecked(false)

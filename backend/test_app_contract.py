@@ -1385,8 +1385,17 @@ def test_confirm_job_chapters_marks_preserved_job_phase_a_complete(tmp_path, mon
     calls = []
 
     class Service:
-        def confirm_chapters(self, job_id, *, chapters=None):
+        def confirm_chapters(
+            self,
+            job_id,
+            *,
+            chapters=None,
+            expected_source_revision=0,
+            acknowledged_dependency_ids=None,
+        ):
             assert chapters is None
+            assert expected_source_revision == 0
+            assert acknowledged_dependency_ids is None
             calls.append(job_id)
             return snapshot
 
@@ -1418,6 +1427,35 @@ def test_get_job_chapter_draft_returns_editable_chapters(tmp_path, monkeypatch):
 
     assert response.status_code == 200
     assert response.json()["chapters"][0]["title"] == "Intro"
+
+
+def test_get_job_chapter_draft_keeps_content_policy_dependency_evidence(monkeypatch):
+    module = importlib.import_module("main")
+
+    class Service:
+        def chapter_draft(self, job_id, **_kwargs):
+            assert job_id == "job-1"
+            return {
+                "job_id": job_id,
+                "chapters": [
+                    {"index": 1, "chapter_id": "body", "title": "Body"},
+                    {"index": 2, "chapter_id": "notes", "title": "Notes"},
+                ],
+                "content_policy_dependency_evidence": [
+                    {
+                        "dependency_id": "cpd-123",
+                        "source_chapter_id": "body",
+                        "target_chapter_id": "notes",
+                        "link_evidence": "notes.xhtml#n1",
+                    }
+                ],
+                "content_policy_dependencies": [],
+            }
+
+    monkeypatch.setattr(module, "get_job_service", lambda: Service())
+    response = TestClient(module.app).get("/api/jobs/job-1/chapters/draft")
+    assert response.status_code == 200
+    assert response.json()["content_policy_dependency_evidence"][0]["dependency_id"] == "cpd-123"
 
 
 def test_get_job_source_returns_original_file(tmp_path, monkeypatch):
@@ -1454,7 +1492,14 @@ def test_confirm_job_chapters_passes_user_edited_chapters(tmp_path, monkeypatch)
     observed = {}
 
     class Service:
-        def confirm_chapters(self, job_id, *, chapters=None):
+        def confirm_chapters(
+            self,
+            job_id,
+            *,
+            chapters=None,
+            expected_source_revision=0,
+            acknowledged_dependency_ids=None,
+        ):
             observed["job_id"] = job_id
             observed["chapters"] = chapters
             return snapshot

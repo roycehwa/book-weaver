@@ -1321,9 +1321,9 @@ class BookJobService:
         except JobNotFound:
             pass
 
-        dependency_artifact_href: str | None = None
+        dependency_record: dict[str, Any] | None = None
         if source_artifact == "user_confirmation":
-            dependency_artifact_href = self._enforce_content_policy_dependencies(
+            dependency_record = self._enforce_content_policy_dependencies(
                 job_id,
                 canonical["chapters"],
                 acknowledged_dependency_ids=acknowledged_dependency_ids,
@@ -1345,6 +1345,22 @@ class BookJobService:
             canonical_book=canonical_book,
         )
         # Do not publish a confirmation if preview construction failed.
+        dependency_artifact_path: Path | None = None
+        if source_artifact == "user_confirmation":
+            run_dir = self.artifact_path(job_id, "book").parent
+            dependency_artifact_path = run_dir / "content-policy-dependencies.json"
+            if dependency_record is not None:
+                from pdf_translator.content_policy_dependencies import (
+                    write_content_policy_dependencies_artifact,
+                )
+
+                write_content_policy_dependencies_artifact(
+                    dependency_artifact_path,
+                    findings=dependency_record["findings"],
+                    acknowledged_dependency_ids=dependency_record["acknowledged_dependency_ids"],
+                )
+            else:
+                dependency_artifact_path.unlink(missing_ok=True)
         self._write_json_atomic(canonical_path, canonical)
         from pdf_translator.source_workspace import chapter_fingerprint
         chapter_scope_changed = True
@@ -1366,10 +1382,12 @@ class BookJobService:
                 "href": segment_path.relative_to(job_dir).as_posix(),
                 "source_artifact": source_artifact,
             }
-        if dependency_artifact_href:
+        if dependency_artifact_path is not None and dependency_artifact_path.is_file():
             snapshot.setdefault("artifacts", {})["content_policy_dependencies"] = {
-                "href": dependency_artifact_href,
+                "href": dependency_artifact_path.relative_to(job_dir).as_posix(),
             }
+        else:
+            snapshot.setdefault("artifacts", {}).pop("content_policy_dependencies", None)
         if source_artifact == "user_confirmation":
             request = snapshot.get("request") if isinstance(snapshot.get("request"), dict) else {}
             resolved = snapshot.get("resolved") if isinstance(snapshot.get("resolved"), dict) else {}
@@ -1499,8 +1517,8 @@ class BookJobService:
 
         try:
             book = self._load_source_book(job_id)
-        except JobServiceError:
-            return {"evidence": [], "findings": []}
+        except JobServiceError as exc:
+            raise JobServiceError("无法读取当前书籍结构，不能检查尾注引用依赖。") from exc
         return analyze_content_policy_dependencies(book, canonical_chapters)
 
     def _enforce_content_policy_dependencies(
@@ -1509,18 +1527,15 @@ class BookJobService:
         canonical_chapters: list[dict[str, Any]],
         *,
         acknowledged_dependency_ids: list[str] | None,
-    ) -> str | None:
+    ) -> dict[str, Any] | None:
         from pdf_translator.content_policy_dependencies import (
             analyze_content_policy_dependencies,
             validate_acknowledged_dependencies,
-            write_content_policy_dependencies_artifact,
         )
 
         book = self._load_source_book(job_id)
         analysis = analyze_content_policy_dependencies(book, canonical_chapters)
         findings = analysis.get("findings") if isinstance(analysis.get("findings"), list) else []
-        if not findings:
-            return None
         try:
             missing = validate_acknowledged_dependencies(findings, acknowledged_dependency_ids)
         except ValueError:
@@ -1546,8 +1561,8 @@ class BookJobService:
                     ],
                 },
             )
-        run_dir = self.artifact_path(job_id, "book").parent
-        artifact_path = run_dir / "content-policy-dependencies.json"
+        if not findings:
+            return None
         acknowledged = sorted(
             {
                 str(value)
@@ -1555,13 +1570,10 @@ class BookJobService:
                 if str(value).strip()
             }
         )
-        write_content_policy_dependencies_artifact(
-            artifact_path,
-            findings=findings,
-            acknowledged_dependency_ids=acknowledged,
-        )
-        job_dir = self._job_dir(job_id)
-        return artifact_path.relative_to(job_dir).as_posix()
+        return {
+            "findings": findings,
+            "acknowledged_dependency_ids": acknowledged,
+        }
 
     def _build_confirmed_book(self, job_id: str, canonical: dict[str, Any]) -> dict[str, Any]:
         book = self._load_source_book(job_id)

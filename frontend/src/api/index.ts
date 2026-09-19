@@ -695,6 +695,7 @@ export interface JobChapterDraft {
 }
 
 export interface ContentPolicyDependencyEvidence {
+  dependency_id: string
   source_chapter_id: string
   source_location?: string | null
   target_chapter_id: string
