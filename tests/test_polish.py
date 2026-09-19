@@ -7,10 +7,12 @@ from zipfile import ZipFile
 from pdf_translator.models import TranslationChunk
 from pdf_translator.polish import (
     POLISH_PROMPT_VERSION,
+    _parse_polish_response,
     _safe_accept_polish,
     _split_polished_markdown_into_chapters,
     run_polish,
     scan_polish_candidates,
+    scan_polish_candidates_internal,
 )
 from pdf_translator.polish import PolishAcceptContext
 from pdf_translator.translate import BaseTranslator
@@ -106,6 +108,64 @@ class PartialThenCompletePolishTranslator(BaseTranslator):
             {"line": item["line"], "polished_text": item["text"].replace(" active ", " 活跃的 ")}
             for item in payload
         ]
+        return json.dumps(results, ensure_ascii=False)
+
+
+class UnchangedPolishTranslator(BaseTranslator):
+    name = "unchanged-polish"
+
+    def translate_chunk(
+        self,
+        chunk: TranslationChunk,
+        source_language: str | None,
+        target_language: str,
+    ) -> str:
+        payload = json.loads(chunk.markdown.split("\n\n", 1)[1])
+        return json.dumps(
+            [{"line": item["line"], "polished_text": item["text"]} for item in payload],
+            ensure_ascii=False,
+        )
+
+
+class MixedPolishTranslator(BaseTranslator):
+    name = "mixed-polish"
+
+    def translate_chunk(
+        self,
+        chunk: TranslationChunk,
+        source_language: str | None,
+        target_language: str,
+    ) -> str:
+        payload = json.loads(chunk.markdown.split("\n\n", 1)[1])
+        results = []
+        for index, item in enumerate(payload):
+            text = item["text"]
+            if index == 0:
+                polished = text.replace(" active ", " 活跃的 ")
+            else:
+                polished = text
+            results.append({"line": item["line"], "polished_text": polished})
+        return json.dumps(results, ensure_ascii=False)
+
+
+class LinkLabelPolishTranslator(BaseTranslator):
+    name = "link-label-polish"
+
+    def translate_chunk(
+        self,
+        chunk: TranslationChunk,
+        source_language: str | None,
+        target_language: str,
+    ) -> str:
+        payload = json.loads(chunk.markdown.split("\n\n", 1)[1])
+        results = []
+        for item in payload:
+            text = item["text"]
+            polished = text.replace("active", "活跃").replace(
+                "[active 链接](https://example.com/x?ref=(nested))",
+                "[活跃 链接](https://example.com/x?ref=(nested))",
+            )
+            results.append({"line": item["line"], "polished_text": polished})
         return json.dumps(results, ensure_ascii=False)
 
 
@@ -406,6 +466,168 @@ def test_safe_accept_polish_rejects_numeric_and_glossary_changes():
     ok, reason = _safe_accept_polish(before, after, context=context, whole_before=before, whole_after=after)
     assert ok is False
     assert reason in {"numeric_literal_changed", "glossary_term_changed", "non_suspect_latin_changed"}
+
+
+def test_scan_polish_candidates_internal_counts_protected_skips() -> None:
+    source = (
+        "中文 active 行。\n"
+        "```python\n"
+        "中文 active 行\n"
+        "```\n"
+    )
+    result = scan_polish_candidates_internal(source)
+    assert len(result.candidates) == 1
+    assert result.protected_skip_count == 1
+    assert result.detected_candidate_count == 2
+
+
+def test_scan_polish_candidates_preserves_line_whitespace() -> None:
+    source = "  这是一个 active 的核心假设。\n"
+    candidates = scan_polish_candidates(source)
+    assert candidates[0].text == "  这是一个 active 的核心假设。"
+
+
+def test_parse_polish_response_preserves_leading_and_trailing_spaces() -> None:
+    parsed = _parse_polish_response(
+        json.dumps([{"line": 1, "polished_text": "  活跃的  核心  "}], ensure_ascii=False)
+    )
+    assert parsed[1] == "  活跃的  核心  "
+
+
+def test_run_polish_unchanged_candidates_need_review(tmp_path: Path) -> None:
+    run_dir = _write_run_dir(tmp_path, "# Chapter 1\n\n这是一个 active 的核心假设。\n")
+    result = run_polish(run_dir=run_dir, translator=UnchangedPolishTranslator(), target_language="zh-CN")
+    report = json.loads(result.report_path.read_text(encoding="utf-8"))
+    assert report["unchanged_count"] == 1
+    assert report["needs_review_count"] == 1
+    assert result.outcome == "needs_review"
+
+
+def test_run_polish_mixed_accepted_and_unchanged_needs_review(tmp_path: Path) -> None:
+    run_dir = _write_run_dir(
+        tmp_path,
+        "# Chapter 1\n\n这是一个 active 的核心假设。\n\n这是另一个 active 的例子。\n",
+    )
+    result = run_polish(run_dir=run_dir, translator=MixedPolishTranslator(), target_language="zh-CN")
+    report = json.loads(result.report_path.read_text(encoding="utf-8"))
+    assert report["accepted_count"] == 1
+    assert report["unchanged_count"] == 1
+    assert result.outcome == "needs_review"
+
+
+def test_run_polish_retries_after_model_unavailable_without_poisoning_cache(tmp_path: Path) -> None:
+    run_dir = _write_run_dir(tmp_path, "# Chapter 1\n\n这是一个 active 的核心假设。\n")
+    failing = FailingPolishTranslator()
+    first = run_polish(run_dir=run_dir, translator=failing, target_language="zh-CN", concurrency=1)
+    assert first.outcome == "needs_review"
+    assert failing.calls == 3
+    assert not list((run_dir / "polish-cache").glob("*.json"))
+    recovering = FakePolishTranslator()
+    second = run_polish(run_dir=run_dir, translator=recovering, target_language="zh-CN", concurrency=1)
+    assert recovering.calls == 1
+    assert second.outcome == "applied"
+    assert "活跃的" in second.polished_markdown_path.read_text(encoding="utf-8")
+
+
+def test_run_polish_skips_build_translator_without_actionable_candidates(tmp_path: Path, monkeypatch) -> None:
+    run_dir = _write_run_dir(tmp_path, "# Chapter 1\n\n纯中文段落，没有英文夹杂。\n")
+
+    def fail_build(_name: str):
+        raise AssertionError("build_translator should not run without actionable candidates")
+
+    monkeypatch.setattr("pdf_translator.polish.build_translator", fail_build)
+    result = run_polish(run_dir=run_dir, target_language="zh-CN")
+    assert result.candidate_count == 0
+    assert result.outcome == "no_candidates"
+
+
+def test_safe_accept_polish_allows_suspect_replacement_with_other_latin_words():
+    before = "在 PDF active 流程里保留 API 不变。"
+    after = "在 PDF 活跃的 流程里保留 API 不变。"
+    context = PolishAcceptContext(
+        suspects=["active"],
+        protected_literals=[],
+        glossary_terms=[],
+        book_title=None,
+        book_author=None,
+    )
+    ok, reason = _safe_accept_polish(before, after, context=context, whole_before=before, whole_after=after)
+    assert ok is True
+    assert reason == "accepted"
+
+
+def test_safe_accept_polish_rejects_non_suspect_latin_change_on_same_line():
+    before = "在 PDF active 流程里保留 API 不变。"
+    after = "在 PDF 活跃的 流程里保留 REST 不变。"
+    context = PolishAcceptContext(
+        suspects=["active"],
+        protected_literals=[],
+        glossary_terms=[],
+        book_title=None,
+        book_author=None,
+    )
+    ok, reason = _safe_accept_polish(before, after, context=context, whole_before=before, whole_after=after)
+    assert ok is False
+    assert reason == "non_suspect_latin_changed"
+
+
+def test_safe_accept_polish_rejects_excessive_rewrite():
+    before = "这是一个 active 的核心假设。"
+    after = before.replace("active", "活跃") + "并且额外扩写了很多无关中文解释。" * 8
+    context = PolishAcceptContext(
+        suspects=["active"],
+        protected_literals=[],
+        glossary_terms=[],
+        book_title=None,
+        book_author=None,
+    )
+    ok, reason = _safe_accept_polish(before, after, context=context, whole_before=before, whole_after=after)
+    assert ok is False
+    assert reason == "excessive_edit"
+
+
+def test_safe_accept_polish_allows_markdown_link_label_translation_with_nested_destination():
+    before = "见 [active 链接](https://example.com/x?ref=(nested)) 结束。"
+    after = "见 [活跃 链接](https://example.com/x?ref=(nested)) 结束。"
+    context = PolishAcceptContext(suspects=["active"], protected_literals=[], glossary_terms=[], book_title=None, book_author=None)
+    ok, reason = _safe_accept_polish(before, after, context=context, whole_before=before, whole_after=after)
+    assert ok is True
+    assert reason == "accepted"
+
+
+def test_run_polish_uses_glossary_constraints_chunks_in_prompt_and_cache(tmp_path: Path) -> None:
+    line = "术语 Alpha 与 active 并存。"
+    run_dir = _write_run_dir(tmp_path, f"# Chapter 1\n\n{line}\n")
+    jobs_dir = run_dir / "jobs"
+    jobs_dir.mkdir(parents=True)
+    (jobs_dir / "glossary-constraints.json").write_text(
+        json.dumps(
+            {
+                "schema": "translation_glossary_constraints_v1",
+                "chunks": [{"chunk_index": 0, "terms": [{"source": "Alpha", "target": "阿尔法"}]}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    translator = FakePolishTranslator()
+    run_polish(run_dir=run_dir, translator=translator, target_language="zh-CN")
+    cache_files = list((run_dir / "polish-cache").glob("*.json"))
+    assert cache_files
+    cached = json.loads(cache_files[0].read_text(encoding="utf-8"))
+    assert cached["decision"] == "model_suggested"
+    assert translator.calls == 1
+
+
+def test_run_polish_accepts_link_label_translation(tmp_path: Path) -> None:
+    run_dir = _write_run_dir(
+        tmp_path,
+        "# Chapter 1\n\n这是 active [active 链接](https://example.com/x?ref=(nested)) 文本。\n",
+    )
+    result = run_polish(run_dir=run_dir, translator=LinkLabelPolishTranslator(), target_language="zh-CN")
+    polished = result.polished_markdown_path.read_text(encoding="utf-8")
+    assert "https://example.com/x?ref=(nested)" in polished
+    assert "活跃" in polished
+    assert result.outcome == "applied"
 
 
 def test_run_polish_preserves_crlf_and_missing_final_newline(tmp_path: Path) -> None:

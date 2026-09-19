@@ -1093,6 +1093,29 @@ def test_workspace_books_keeps_glossary_open_after_translation_started_without_f
     assert book["steps"]["glossary_finalization"]["status"] == "blocked"
 
 
+def test_workspace_books_reports_polish_needs_review_as_done(monkeypatch):
+    module = importlib.import_module("main")
+    snapshot = _job_snapshot(
+        "job-polish-review",
+        filename="Policy Book.epub",
+        state="pre_review",
+        text_operation="translate",
+        artifacts={
+            "book": {"href": "artifacts/book.json"},
+            "review_items": {"href": "artifacts/review_items.json"},
+        },
+    )
+    snapshot["progress"] = {"polish_outcome": "needs_review"}
+    monkeypatch.setattr(module, "get_job_service", lambda: SimpleNamespace(list=lambda: [snapshot]))
+
+    response = TestClient(module.app).get("/api/workspace/books")
+
+    assert response.status_code == 200
+    book = response.json()["books"][0]
+    assert book["steps"]["polish"]["status"] == "done"
+    assert "人工复核" in book["steps"]["polish"]["description"]
+
+
 def test_workspace_books_reports_polish_outcome_and_step_done(monkeypatch):
     module = importlib.import_module("main")
     snapshot = _job_snapshot(

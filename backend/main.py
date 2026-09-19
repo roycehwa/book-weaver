@@ -718,7 +718,7 @@ def _polish_outcome(job: dict[str, Any]) -> str | None:
         resolved.get("polish_outcome"),
         request.get("polish_outcome"),
     ]
-    valid = {"applied", "no_candidates", "waived", "failed"}
+    valid = {"applied", "no_candidates", "needs_review", "waived", "failed"}
     for candidate in candidates:
         if isinstance(candidate, str) and candidate in valid:
             return candidate
@@ -797,7 +797,7 @@ def _workspace_book_from_job(job: dict[str, Any]) -> dict[str, Any]:
     review_done = bool(review_completion.get("review_completed"))
     chapters_confirmed = _chapters_confirmed_by_user(job, artifacts)
     polish_outcome = _polish_outcome(job)
-    polish_finished = polish_outcome in {"applied", "no_candidates", "waived"}
+    polish_finished = polish_outcome in {"applied", "no_candidates", "needs_review", "waived"}
     polish_failed = state == "failed" and failed_stage == "polishing" or polish_outcome == "failed"
     lifecycle_stage = _canonical_lifecycle_stage(job)
     lifecycle_state = "failed" if state == "failed" else "active"
@@ -902,6 +902,7 @@ def _workspace_book_from_job(job: dict[str, Any]) -> dict[str, Any]:
             polish_desc = {
                 "applied": "润色建议已应用，译文进入预审与人工审阅。",
                 "no_candidates": "未发现需要润色的段落，直接进入预审与人工审阅。",
+                "needs_review": "部分润色结果需人工复核，机器译文已保留并进入预审与人工审阅。",
                 "waived": "已明确跳过润色，直接进入预审与人工审阅。",
             }.get(polish_outcome or "", "润色阶段已完成。")
             polish_status = "done"

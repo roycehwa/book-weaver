@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 import hashlib
 import json
 import os
@@ -129,16 +130,22 @@ HIGH_CONFIDENCE_ENGLISH_WORDS = {
     "cross-fertilization",
 }
 
-ENGLISH_WORD_RE = re.compile(r"(?<![A-Za-z])([A-Za-z][A-Za-z''-]{1,30})(?![A-Za-z])")
+_APOSTROPHE = "''\u2019"
+ENGLISH_WORD_RE = re.compile(
+    rf"(?<![A-Za-z])([A-Za-z][A-Za-z{_APOSTROPHE}-]{{1,30}})(?![A-Za-z])"
+)
 ENGLISH_THEN_CHINESE_RE = re.compile(
-    r"(?P<english>[A-Za-z][A-Za-z''\-/]*(?:\s+[A-Za-z][A-Za-z''\-/]*){0,6})\s*[（(](?P<chinese>[\u4e00-\u9fff][^（）()A-Za-z]{0,80})[）)]"
+    rf"(?P<english>[A-Za-z][A-Za-z{_APOSTROPHE}\-/]*(?:\s+[A-Za-z][A-Za-z{_APOSTROPHE}\-/]*){{0,6}})\s*[（(](?P<chinese>[\u4e00-\u9fff][^（）()A-Za-z]{{0,80}})[）)]"
 )
 CJK_RE = re.compile(r"[\u4e00-\u9fff]")
-LATIN_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z''\-/]*(?:\s+[A-Za-z][A-Za-z''\-/]*)*")
+LATIN_WORD_RE = re.compile(
+    rf"(?<![A-Za-z])([A-Za-z][A-Za-z{_APOSTROPHE}\-/]*)(?![A-Za-z])"
+)
 NUMERIC_LITERAL_RE = re.compile(
     r"(?<![A-Za-z0-9])(?:\d{1,3}(?:,\d{3})+|\d+\.\d+|\d+)(?![A-Za-z0-9])"
 )
-MARKDOWN_LINK_RE = re.compile(r"(!?\[[^\]]*\]\([^)]*\))")
+EXCESSIVE_EDIT_MIN_RATIO = 0.72
+EXCESSIVE_EDIT_MAX_GROWTH = 1.35
 PolishOutcome = Literal["applied", "needs_review", "no_candidates"]
 
 
@@ -172,6 +179,7 @@ class PolishResult:
     polished_markdown_path: Path
     polished_epub_path: Path
     report_path: Path
+    detected_candidate_count: int
     candidate_count: int
     accepted_count: int
     rejected_count: int
@@ -181,6 +189,13 @@ class PolishResult:
     outcome: PolishOutcome
     protected_skip_count: int
     manual_skip_count: int
+
+
+@dataclass(slots=True)
+class PolishScanResult:
+    candidates: list[PolishCandidate]
+    detected_candidate_count: int
+    protected_skip_count: int
 
 
 class IncompletePolishBatchError(ValueError):
@@ -256,9 +271,22 @@ def _scan_line_candidates(line: str) -> list[str]:
     return suspects
 
 
-def scan_polish_candidates(markdown_text: str) -> list[PolishCandidate]:
+def _line_is_structurally_protected(
+    content: str,
+    *,
+    in_fence: bool,
+    prev_line: str | None,
+    next_line: str | None,
+) -> bool:
+    if in_fence or is_indented_code_line(content):
+        return True
+    return is_table_row(content, prev_line=prev_line, next_line=next_line)
+
+
+def scan_polish_candidates_internal(markdown_text: str) -> PolishScanResult:
     bare_lines = [piece.rstrip("\r\n") for piece in markdown_text.splitlines(keepends=True)]
     candidates: list[PolishCandidate] = []
+    protected_skip_count = 0
     in_fence = False
     fence_marker: str | None = None
     line_no = 0
@@ -282,16 +310,27 @@ def scan_polish_candidates(markdown_text: str) -> list[PolishCandidate]:
                 protected = True
         elif in_fence:
             protected = True
-        if (
-            protected
-            or is_indented_code_line(content)
-            or is_table_row(content, prev_line=prev_line, next_line=next_line)
-        ):
-            continue
         suspects = _scan_line_candidates(content)
-        if suspects:
-            candidates.append(PolishCandidate(line=line_no, text=content.strip(), suspects=suspects))
-    return candidates
+        if not suspects:
+            continue
+        if _line_is_structurally_protected(
+            content,
+            in_fence=protected or in_fence,
+            prev_line=prev_line,
+            next_line=next_line,
+        ):
+            protected_skip_count += 1
+            continue
+        candidates.append(PolishCandidate(line=line_no, text=content, suspects=suspects))
+    return PolishScanResult(
+        candidates=candidates,
+        detected_candidate_count=len(candidates) + protected_skip_count,
+        protected_skip_count=protected_skip_count,
+    )
+
+
+def scan_polish_candidates(markdown_text: str) -> list[PolishCandidate]:
+    return scan_polish_candidates_internal(markdown_text).candidates
 
 
 def _candidate_cache_path(
@@ -308,12 +347,13 @@ def _candidate_cache_path(
     return cache_dir / f"line-{candidate.line:06d}-{digest}.json"
 
 
-def _build_polish_prompt(candidates: list[PolishCandidate]) -> str:
+def _build_polish_prompt(candidates: list[PolishCandidate], *, protected_terms: dict[int, list[str]]) -> str:
     payload = [
         {
             "line": candidate.line,
             "suspects": candidate.suspects,
             "text": candidate.text,
+            "protected_terms": protected_terms.get(candidate.line, []),
         }
         for candidate in candidates
     ]
@@ -417,8 +457,10 @@ def _parse_polish_response(text: str) -> dict[int, str]:
             continue
         line = item.get("line")
         polished = item.get("polished_text")
-        if isinstance(line, int) and isinstance(polished, str) and polished.strip():
-            parsed[line] = polished.strip()
+        if isinstance(line, int) and isinstance(polished, str):
+            if not polished.strip():
+                continue
+            parsed[line] = polished
     return parsed
 
 
@@ -427,15 +469,76 @@ def _protected_literals(line: str) -> list[str]:
     return [line[start:end] for start, end in spans]
 
 
-def _latin_tokens(text: str, spans: list[tuple[int, int]]) -> list[str]:
+def _find_matching_paren(text: str, open_index: int) -> int:
+    depth = 0
+    for index in range(open_index, len(text)):
+        char = text[index]
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return index
+    return -1
+
+
+def _markdown_link_specs(text: str) -> list[tuple[bool, str]]:
+    specs: list[tuple[bool, str]] = []
+    index = 0
+    while index < len(text):
+        is_image = text.startswith("![", index)
+        if is_image or text[index] == "[":
+            start = index + 2 if is_image else index + 1
+            close = text.find("]", start)
+            if close != -1 and close + 1 < len(text) and text[close + 1] == "(":
+                end = _find_matching_paren(text, close + 1)
+                if end != -1:
+                    destination = text[close + 2 : end]
+                    specs.append((is_image, destination))
+                    index = end + 1
+                    continue
+        index += 1
+    return specs
+
+
+def _mask_suspect_phrases(text: str, suspects: list[str]) -> str:
+    masked = text
+    for suspect in sorted({item for item in suspects if item.strip()}, key=len, reverse=True):
+        pattern = re.compile(re.escape(suspect), re.IGNORECASE)
+        masked = pattern.sub(lambda match: " " * len(match.group(0)), masked)
+    return masked
+
+
+def _latin_word_tokens(text: str, spans: list[tuple[int, int]]) -> list[str]:
     tokens: list[str] = []
-    for match in LATIN_TOKEN_RE.finditer(text):
+    for match in LATIN_WORD_RE.finditer(text):
         if _span_overlaps(match.start(), match.end(), spans):
             continue
-        token = match.group(0).strip()
+        token = match.group(1)
         if token:
             tokens.append(token)
     return tokens
+
+
+def _non_suspect_latin_tokens(text: str, suspects: list[str], spans: list[tuple[int, int]]) -> list[str]:
+    suspect_set = _normalize_suspects(suspects)
+    masked = _mask_suspect_phrases(text, suspects)
+    return [
+        token
+        for token in _latin_word_tokens(masked, spans)
+        if token.lower() not in suspect_set
+    ]
+
+
+def _suspect_still_present(text: str, suspects: list[str], spans: list[tuple[int, int]]) -> bool:
+    for suspect in suspects:
+        if not suspect.strip():
+            continue
+        pattern = re.compile(re.escape(suspect), re.IGNORECASE)
+        for match in pattern.finditer(text):
+            if not _span_overlaps(match.start(), match.end(), spans):
+                return True
+    return False
 
 
 def _numeric_literals(text: str, spans: list[tuple[int, int]]) -> list[str]:
@@ -445,10 +548,6 @@ def _numeric_literals(text: str, spans: list[tuple[int, int]]) -> list[str]:
             continue
         values.append(match.group(0))
     return values
-
-
-def _markdown_links(text: str) -> list[str]:
-    return MARKDOWN_LINK_RE.findall(text)
 
 
 def _ascii_letter_count(text: str) -> int:
@@ -481,7 +580,7 @@ def _safe_accept_polish(
         return False, "structural"
     if markdown_block_structure(before) != markdown_block_structure(after):
         return False, "markdown_structure_changed"
-    if _markdown_links(before) != _markdown_links(after):
+    if _markdown_link_specs(before) != _markdown_link_specs(after):
         return False, "link_structure_changed"
     if before.count("![") != after.count("!["):
         return False, "image_marker_changed"
@@ -493,12 +592,9 @@ def _safe_accept_polish(
         return False, "protected_literal_changed"
     if _numeric_literals(before, before_spans) != _numeric_literals(after, after_spans):
         return False, "numeric_literal_changed"
-    suspect_set = _normalize_suspects(context.suspects)
-    before_tokens = _latin_tokens(before, before_spans)
-    after_tokens = _latin_tokens(after, after_spans)
-    before_non_suspect = [token for token in before_tokens if token.lower() not in suspect_set]
-    after_non_suspect = [token for token in after_tokens if token.lower() not in suspect_set]
-    if before_non_suspect != after_non_suspect:
+    if _non_suspect_latin_tokens(before, context.suspects, before_spans) != _non_suspect_latin_tokens(
+        after, context.suspects, after_spans
+    ):
         return False, "non_suspect_latin_changed"
     for term in context.glossary_terms:
         if term and term in before and term not in after:
@@ -513,6 +609,11 @@ def _safe_accept_polish(
         return False, "cjk_drop"
     if len(after) < len(before) * 0.62 and _ascii_letter_count(before) < len(before) * 0.35:
         return False, "length_drop"
+    if len(after) > int(len(before) * EXCESSIVE_EDIT_MAX_GROWTH) + 8:
+        return False, "excessive_edit"
+    if before and len(after) >= len(before):
+        if SequenceMatcher(None, before, after).ratio() < EXCESSIVE_EDIT_MIN_RATIO and len(after) - len(before) > 12:
+            return False, "excessive_edit"
     if re.search(r"^(以下是|精修|修改后|译文)", after):
         return False, "commentary"
     if markdown_block_structure(whole_before) != markdown_block_structure(whole_after):
@@ -522,8 +623,25 @@ def _safe_accept_polish(
     return True, "accepted"
 
 
-def _load_glossary_terms(run_dir: Path) -> list[str]:
-    terms: list[str] = []
+def _append_glossary_entry_terms(entries: list[dict[str, str]], entry: object) -> None:
+    if not isinstance(entry, dict):
+        return
+    source = entry.get("source")
+    target = entry.get("target")
+    preferred = entry.get("preferred_translation")
+    record: dict[str, str] = {}
+    if isinstance(source, str) and source.strip():
+        record["source"] = source.strip()
+    if isinstance(target, str) and target.strip():
+        record["target"] = target.strip()
+    if isinstance(preferred, str) and preferred.strip():
+        record["preferred_translation"] = preferred.strip()
+    if record:
+        entries.append(record)
+
+
+def _load_glossary_entries(run_dir: Path) -> list[dict[str, str]]:
+    entries: list[dict[str, str]] = []
     for relative in ("glossary/active.json", "jobs/glossary-constraints.json"):
         path = run_dir / relative
         if not path.is_file():
@@ -534,21 +652,49 @@ def _load_glossary_terms(run_dir: Path) -> list[str]:
             continue
         if relative.endswith("active.json") and isinstance(payload.get("entries"), list):
             for entry in payload["entries"]:
-                if not isinstance(entry, dict):
-                    continue
-                for key in ("source", "target", "preferred_translation"):
-                    value = entry.get(key)
-                    if isinstance(value, str) and value.strip():
-                        terms.append(value.strip())
-        if relative.endswith("glossary-constraints.json") and isinstance(payload.get("terms"), list):
-            for entry in payload["terms"]:
-                if not isinstance(entry, dict):
-                    continue
-                for key in ("source", "target"):
-                    value = entry.get(key)
-                    if isinstance(value, str) and value.strip():
-                        terms.append(value.strip())
+                _append_glossary_entry_terms(entries, entry)
+        if relative.endswith("glossary-constraints.json"):
+            if isinstance(payload.get("terms"), list):
+                for entry in payload["terms"]:
+                    _append_glossary_entry_terms(entries, entry)
+            if isinstance(payload.get("chunks"), list):
+                for chunk in payload["chunks"]:
+                    if not isinstance(chunk, dict):
+                        continue
+                    for entry in chunk.get("terms") or []:
+                        _append_glossary_entry_terms(entries, entry)
+    return entries
+
+
+def _load_glossary_terms(run_dir: Path) -> list[str]:
+    terms: list[str] = []
+    for entry in _load_glossary_entries(run_dir):
+        for key in ("source", "target", "preferred_translation"):
+            value = entry.get(key)
+            if isinstance(value, str) and value.strip():
+                terms.append(value.strip())
     return terms
+
+
+def _protected_terms_for_candidate(
+    candidate: PolishCandidate,
+    glossary_entries: list[dict[str, str]],
+    *,
+    book_title: str | None,
+    book_author: str | None,
+) -> list[str]:
+    protected: list[str] = []
+    haystack = candidate.text
+    for entry in glossary_entries:
+        for key in ("source", "target", "preferred_translation"):
+            value = entry.get(key)
+            if isinstance(value, str) and value and value in haystack:
+                protected.append(value)
+    if book_title and book_title in haystack:
+        protected.append(book_title)
+    if book_author and book_author in haystack:
+        protected.append(book_author)
+    return sorted(set(protected))
 
 
 def _load_cleanup_version(run_dir: Path) -> str:
@@ -564,9 +710,9 @@ def _load_cleanup_version(run_dir: Path) -> str:
     return RULES_VERSION
 
 
-def _prompt_context_for_candidate(candidate: PolishCandidate, glossary_terms: list[str]) -> str:
+def _prompt_context_for_candidate(candidate: PolishCandidate, protected_terms: list[str]) -> str:
     return json.dumps(
-        {"suspects": candidate.suspects, "glossary_terms": sorted(set(glossary_terms))[:40]},
+        {"suspects": candidate.suspects, "protected_terms": protected_terms},
         ensure_ascii=False,
         sort_keys=True,
     )
@@ -582,13 +728,16 @@ def _translate_candidates(
     concurrency: int,
     request_timeout_seconds: float | None,
     cleanup_rules_version: str,
-    glossary_terms: list[str],
+    protected_terms_by_line: dict[int, list[str]],
 ) -> dict[int, CandidateModelResult]:
     cache_dir.mkdir(parents=True, exist_ok=True)
     results: dict[int, CandidateModelResult] = {}
     uncached: list[PolishCandidate] = []
     for candidate in candidates:
-        prompt_context = _prompt_context_for_candidate(candidate, glossary_terms)
+        prompt_context = _prompt_context_for_candidate(
+            candidate,
+            protected_terms_by_line.get(candidate.line, []),
+        )
         cache_path = _candidate_cache_path(
             cache_dir,
             candidate,
@@ -602,10 +751,14 @@ def _translate_candidates(
                 cached = {}
             polished = cached.get("polished_text")
             decision = cached.get("decision")
-            if isinstance(polished, str) and isinstance(decision, str):
+            if (
+                isinstance(polished, str)
+                and isinstance(decision, str)
+                and decision == "model_suggested"
+            ):
                 results[candidate.line] = CandidateModelResult(
                     line=candidate.line,
-                    polished_text=polished.strip() if polished.strip() else None,
+                    polished_text=polished if polished.strip() else None,
                     decision=decision,
                 )
                 continue
@@ -614,7 +767,7 @@ def _translate_candidates(
     batches = [uncached[index : index + batch_size] for index in range(0, len(uncached), batch_size)]
 
     def run_batch(batch_index: int, batch: list[PolishCandidate]) -> dict[int, str]:
-        prompt = _build_polish_prompt(batch)
+        prompt = _build_polish_prompt(batch, protected_terms=protected_terms_by_line)
         expected_lines = {candidate.line for candidate in batch}
         last_error: Exception | None = None
         for attempt in range(3):
@@ -684,13 +837,16 @@ def _translate_candidates(
 
     for candidate in candidates:
         model_result = results.get(candidate.line)
-        if model_result is None:
+        if model_result is None or model_result.decision != "model_suggested":
             continue
         cache_path = _candidate_cache_path(
             cache_dir,
             candidate,
             cleanup_rules_version=cleanup_rules_version,
-            prompt_context=_prompt_context_for_candidate(candidate, glossary_terms),
+            prompt_context=_prompt_context_for_candidate(
+                candidate,
+                protected_terms_by_line.get(candidate.line, []),
+            ),
         )
         cache_path.write_text(
             json.dumps(
@@ -931,14 +1087,15 @@ def _compute_outcome(
     accepted_count: int,
     rejected_count: int,
     unresolved_count: int,
+    unchanged_count: int,
 ) -> PolishOutcome:
     if candidate_count == 0:
         return "no_candidates"
-    if rejected_count > 0 or unresolved_count > 0:
+    if rejected_count > 0 or unresolved_count > 0 or unchanged_count > 0:
         return "needs_review"
-    if accepted_count > 0:
+    if accepted_count == candidate_count and accepted_count > 0:
         return "applied"
-    return "no_candidates"
+    return "needs_review"
 
 
 def run_polish(
@@ -963,29 +1120,46 @@ def run_polish(
     markdown_text = _read_text_preserve_newlines(cleaned_path)
     cleaned_input_sha256 = _sha256(markdown_text)
     cleanup_rules_version = _load_cleanup_version(run_dir)
+    glossary_entries = _load_glossary_entries(run_dir)
     glossary_terms = _load_glossary_terms(run_dir)
     metadata = book.get("metadata") if isinstance(book.get("metadata"), dict) else {}
     book_title = metadata.get("title") if isinstance(metadata.get("title"), str) else None
     book_author = metadata.get("author") if isinstance(metadata.get("author"), str) else None
 
-    all_candidates = scan_polish_candidates(markdown_text)
+    scan_result = scan_polish_candidates_internal(markdown_text)
+    all_candidates = scan_result.candidates
+    protected_skip_count = scan_result.protected_skip_count
+    detected_candidate_count = scan_result.detected_candidate_count
     protected_lines, manual_skip_count = _collect_protected_manual_lines(run_dir)
     candidates = [candidate for candidate in all_candidates if candidate.text.strip() not in protected_lines]
-    protected_skip_count = max(0, len(all_candidates) - len(candidates))
+    protected_terms_by_line = {
+        candidate.line: _protected_terms_for_candidate(
+            candidate,
+            glossary_entries,
+            book_title=book_title,
+            book_author=book_author,
+        )
+        for candidate in candidates
+    }
 
-    translator = translator or build_translator(translator_name)
     cache_dir = run_dir / "polish-cache"
-    model_results = _translate_candidates(
-        candidates=candidates,
-        translator=translator,
-        target_language=target_language,
-        cache_dir=cache_dir,
-        batch_size=max(1, batch_size),
-        concurrency=max(1, concurrency),
-        request_timeout_seconds=request_timeout_seconds,
-        cleanup_rules_version=cleanup_rules_version,
-        glossary_terms=glossary_terms,
-    )
+    model_results: dict[int, CandidateModelResult] = {}
+    if candidates:
+        active_translator = translator or build_translator(translator_name)
+        model_results = _translate_candidates(
+            candidates=candidates,
+            translator=active_translator,
+            target_language=target_language,
+            cache_dir=cache_dir,
+            batch_size=max(1, batch_size),
+            concurrency=max(1, concurrency),
+            request_timeout_seconds=request_timeout_seconds,
+            cleanup_rules_version=cleanup_rules_version,
+            protected_terms_by_line=protected_terms_by_line,
+        )
+        translator_name_for_report = active_translator.name
+    else:
+        translator_name_for_report = translator.name if translator is not None else translator_name
 
     bare_lines, endings, newline_style, has_final_newline = _document_line_parts(markdown_text)
     polished_bare = list(bare_lines)
@@ -1021,6 +1195,7 @@ def run_polish(
             )
             continue
         after = model_result.polished_text if model_result.polished_text is not None else before
+        candidate_glossary_terms = protected_terms_by_line.get(candidate.line, glossary_terms)
         if after == before:
             unchanged.append(
                 {
@@ -1031,10 +1206,22 @@ def run_polish(
                 }
             )
             continue
+        after_spans = protected_spans(after)
+        if _suspect_still_present(after, candidate.suspects, after_spans):
+            rejected.append(
+                {
+                    "line": candidate.line,
+                    "suspects": candidate.suspects,
+                    "before": before,
+                    "after": after,
+                    "decision": "suspect_unresolved",
+                }
+            )
+            continue
         accept_context = PolishAcceptContext(
             suspects=candidate.suspects,
             protected_literals=_protected_literals(before),
-            glossary_terms=glossary_terms,
+            glossary_terms=candidate_glossary_terms,
             book_title=book_title,
             book_author=book_author,
         )
@@ -1086,22 +1273,24 @@ def run_polish(
         language=target_language,
     )
 
-    needs_review_count = len(rejected) + len(unresolved)
+    needs_review_count = len(rejected) + len(unresolved) + len(unchanged)
     outcome = _compute_outcome(
         candidate_count=len(candidates),
         accepted_count=len(accepted),
         rejected_count=len(rejected),
         unresolved_count=len(unresolved),
+        unchanged_count=len(unchanged),
     )
     report = {
         "schema": "polish_report_v1",
         "run_dir": str(run_dir),
         "target_language": target_language,
-        "translator": translator.name,
+        "translator": translator_name_for_report,
         "polish_prompt_version": POLISH_PROMPT_VERSION,
         "zh_cleanup_rules_version": cleanup_rules_version,
         "cleaned_input_sha256": cleaned_input_sha256,
         "output_sha256": _sha256(polished_markdown),
+        "detected_candidate_count": detected_candidate_count,
         "candidate_count": len(candidates),
         "accepted_count": len(accepted),
         "rejected_count": len(rejected),
@@ -1130,6 +1319,7 @@ def run_polish(
         polished_markdown_path=polished_markdown_path,
         polished_epub_path=polished_epub_path,
         report_path=report_path,
+        detected_candidate_count=detected_candidate_count,
         candidate_count=len(candidates),
         accepted_count=len(accepted),
         rejected_count=len(rejected),

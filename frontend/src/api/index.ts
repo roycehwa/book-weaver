@@ -616,7 +616,7 @@ export interface WorkspaceBook {
   job_state?: JobState
   lifecycle_stage?: string
   lifecycle_state?: 'active' | 'failed'
-  polish_outcome?: 'applied' | 'no_candidates' | 'waived' | 'failed' | null
+  polish_outcome?: 'applied' | 'no_candidates' | 'needs_review' | 'waived' | 'failed' | null
 }
 
 export interface WorkspaceTextVersion {
