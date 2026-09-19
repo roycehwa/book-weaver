@@ -134,8 +134,9 @@ def test_page_header_noise_does_not_merge_with_body() -> None:
 
     decision = result["continuation_decisions"]["decisions"][0]
     assert decision["right_source_node_id"] == "#/texts/2"
-    assert decision["status"] == "rejected"
-    assert "page_boundary_noise" in decision["reasons"]
+    assert decision["status"] == "accepted"
+    assert decision["evidence"].get("ignored_boundary_noise")
+    assert "page_boundary_noise" not in decision["reasons"]
 
 
 def test_cross_node_hyphenation_merge() -> None:
@@ -308,6 +309,182 @@ def test_missing_page_dimensions_fail_closed_for_cross_node_merge() -> None:
     assert "missing_page_dimensions" in decision["reasons"]
     assert "The movement began" in result["chapters"][0]["markdown"]
     assert "region during" in result["chapters"][0]["markdown"]
+
+
+def test_cross_node_section_heading_before_lowercase_body_is_rejected() -> None:
+    structured = {
+        "pages": _docling_pages(),
+        "body": {"children": [{"$ref": "#/texts/0"}, {"$ref": "#/texts/1"}, {"$ref": "#/texts/2"}]},
+        "texts": [
+            {
+                "label": "text",
+                "text": "The argument continues without ending",
+                "prov": _prov(1, 50, 320, bottom=280),
+            },
+            {
+                "label": "section_header",
+                "text": "Chapter Two",
+                "prov": _prov(2, 50, 680, bottom=650),
+            },
+            {
+                "label": "text",
+                "text": "in the next section of the narrative.",
+                "prov": _prov(2, 50, 560, bottom=520),
+            },
+        ],
+        "pictures": [],
+        "tables": [],
+    }
+
+    result = build_book_reconstruction(structured)
+    decision = result["continuation_decisions"]["decisions"][0]
+
+    assert decision["status"] == "rejected"
+    assert "section_heading_boundary" in decision["reasons"]
+    assert "structural_content_between_endpoints" in decision["reasons"]
+
+
+def test_cross_node_table_at_page_boundary_blocks_merge() -> None:
+    structured = {
+        "pages": _docling_pages(),
+        "body": {"children": [{"$ref": "#/texts/0"}, {"$ref": "#/tables/0"}, {"$ref": "#/texts/1"}]},
+        "texts": [
+            {
+                "label": "text",
+                "text": "Results continue across the",
+                "prov": _prov(1, 50, 320, bottom=280),
+            },
+            {
+                "label": "text",
+                "text": "page without interruption.",
+                "prov": _prov(2, 50, 680, bottom=640),
+            },
+        ],
+        "tables": [
+            {
+                "label": "table",
+                "prov": [{"page_no": 1, "bbox": {"l": 50, "t": 250, "b": 200, "r": 500}}],
+                "data": {"grid": [[{"text": "A"}]]},
+            }
+        ],
+        "pictures": [],
+    }
+
+    result = build_book_reconstruction(structured)
+    decision = result["continuation_decisions"]["decisions"][0]
+
+    assert decision["status"] == "rejected"
+    assert "structural_content_between_endpoints" in decision["reasons"]
+
+
+def test_cross_node_figure_caption_before_body_blocks_merge() -> None:
+    structured = {
+        "pages": _docling_pages(),
+        "body": {
+            "children": [
+                {"$ref": "#/texts/0"},
+                {"$ref": "#/pictures/0"},
+                {"$ref": "#/texts/1"},
+                {"$ref": "#/texts/2"},
+            ]
+        },
+        "texts": [
+            {
+                "label": "text",
+                "text": "The diagram illustrates how the process",
+                "prov": _prov(1, 50, 320, bottom=280),
+            },
+            {
+                "label": "caption",
+                "text": "Figure 3.1 Process overview",
+                "prov": _prov(2, 50, 680, bottom=660),
+            },
+            {
+                "label": "text",
+                "text": "continues on the following page.",
+                "prov": _prov(2, 50, 560, bottom=520),
+            },
+        ],
+        "pictures": [
+            {
+                "label": "picture",
+                "prov": [{"page_no": 2, "bbox": {"l": 50, "t": 640, "b": 580, "r": 300}}],
+            }
+        ],
+        "tables": [],
+    }
+
+    result = build_book_reconstruction(structured)
+    decision = result["continuation_decisions"]["decisions"][0]
+
+    assert decision["status"] == "rejected"
+    assert "structural_content_between_endpoints" in decision["reasons"]
+
+
+def test_cross_node_left_page_trailing_structural_content_blocks_merge() -> None:
+    structured = {
+        "pages": _docling_pages(),
+        "body": {"children": [{"$ref": "#/texts/0"}, {"$ref": "#/texts/1"}, {"$ref": "#/texts/2"}]},
+        "texts": [
+            {
+                "label": "text",
+                "text": "The paragraph continues without ending",
+                "prov": _prov(1, 50, 320, bottom=300),
+            },
+            {
+                "label": "list_item",
+                "text": "1. A trailing list item on the page.",
+                "prov": _prov(1, 50, 260, bottom=230),
+            },
+            {
+                "label": "text",
+                "text": "and should not join across the break.",
+                "prov": _prov(2, 50, 680, bottom=640),
+            },
+        ],
+        "pictures": [],
+        "tables": [],
+    }
+
+    result = build_book_reconstruction(structured)
+    decision = result["continuation_decisions"]["decisions"][0]
+
+    assert decision["status"] == "rejected"
+    assert "structural_content_between_endpoints" in decision["reasons"]
+
+
+def test_scaled_pages_accept_proportional_alignment_drift() -> None:
+    def scaled_structured(scale: float, *, right_left_delta: float) -> dict:
+        return {
+            "pages": _docling_pages(height=792.0 * scale, width=612.0 * scale),
+            "body": {"children": [{"$ref": "#/texts/0"}, {"$ref": "#/texts/1"}]},
+            "texts": [
+                {
+                    "label": "text",
+                    "text": "The movement began to gather momentum across the",
+                    "prov": _prov(1, 50 * scale, 320 * scale, bottom=280 * scale, right=500 * scale),
+                },
+                {
+                    "label": "text",
+                    "text": "region during the following decade.",
+                    "prov": _prov(
+                        2,
+                        50 * scale + right_left_delta,
+                        680 * scale,
+                        bottom=640 * scale,
+                        right=500 * scale + right_left_delta,
+                    ),
+                },
+            ],
+            "pictures": [],
+            "tables": [],
+        }
+
+    baseline = build_book_reconstruction(scaled_structured(1.0, right_left_delta=8.0))
+    scaled = build_book_reconstruction(scaled_structured(2.0, right_left_delta=16.0))
+
+    assert baseline["continuation_decisions"]["decisions"][0]["status"] == "accepted"
+    assert scaled["continuation_decisions"]["decisions"][0]["status"] == "accepted"
 
 
 def test_ledger_fingerprint_changes_when_joined_text_changes() -> None:

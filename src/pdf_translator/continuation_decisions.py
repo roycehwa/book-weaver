@@ -17,11 +17,29 @@ SCHEMA = "bookweaver_continuation_decisions_v1"
 STATUSES = frozenset({"accepted", "rejected", "uncertain"})
 PROVENANCE = "pdf_docling_page_boundary_v1"
 
-# Reference geometry on a ~792pt page; decisions use page-relative ratios instead.
+# Reference geometry on a ~792×612pt page; decisions use page-relative ratios.
 PAGE_BOTTOM_MAX_RATIO = 320.0 / 792.0
 PAGE_TOP_MIN_RATIO = 520.0 / 792.0
-COLUMN_ALIGN_TOLERANCE = 14.0
-INDENT_TOLERANCE = 22.0
+COLUMN_ALIGN_TOLERANCE_RATIO = 14.0 / 612.0
+INDENT_TOLERANCE_RATIO = 22.0 / 612.0
+
+BODY_TEXT_LABELS = frozenset({"text"})
+BOUNDARY_NOISE_LABELS = frozenset({"page_header", "page_footer"})
+STRUCTURAL_TEXT_LABELS = frozenset({
+    "section_header",
+    "title",
+    "document_title",
+    "list_item",
+    "caption",
+    "code",
+    "formula",
+    "form",
+    "checkbox",
+    "radio",
+    "page_number",
+})
+STRUCTURAL_KINDS = frozenset({"figure", "table"})
+SECTION_HEADING_LABELS = frozenset({"section_header", "title", "document_title"})
 
 TERMINAL_PUNCT_RE = re.compile(r'[.!?]["\'\)\]]*\s*$')
 HEADING_LINE_RE = re.compile(r"^#{1,6}\s+\S")
@@ -133,7 +151,28 @@ def _layout_block_from_item(item: dict[str, Any]) -> LayoutBlock:
     )
 
 
-def _columns_compatible(left: dict[str, Any], right: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+def _alignment_tolerance(*widths: float) -> float:
+    positive = [width for width in widths if width > 0]
+    if not positive:
+        return 0.0
+    return max(positive) * COLUMN_ALIGN_TOLERANCE_RATIO
+
+
+def _indent_tolerance(page_width: float) -> float:
+    if page_width <= 0:
+        return 0.0
+    return page_width * INDENT_TOLERANCE_RATIO
+
+
+def _columns_compatible(
+    left: dict[str, Any],
+    right: dict[str, Any],
+    *,
+    left_page_width: float,
+    right_page_width: float,
+) -> tuple[bool, dict[str, Any]]:
+    if left_page_width <= 0 or right_page_width <= 0:
+        return False, {"available": False}
     left_geo = _item_geometry(left)
     right_geo = _item_geometry(right)
     left_block = _layout_block_from_item(left)
@@ -142,15 +181,19 @@ def _columns_compatible(left: dict[str, Any], right: dict[str, Any]) -> tuple[bo
     left_col = _column_index(left_block, columns)
     right_col = _column_index(right_block, columns)
     same_column = left_col == right_col
+    align_tol = _alignment_tolerance(left_page_width, right_page_width)
     aligned = (
-        abs(left_geo["left"] - right_geo["left"]) <= COLUMN_ALIGN_TOLERANCE
-        and abs(left_geo["right"] - right_geo["right"]) <= COLUMN_ALIGN_TOLERANCE
+        abs(left_geo["left"] - right_geo["left"]) <= align_tol
+        and abs(left_geo["right"] - right_geo["right"]) <= align_tol
     )
     return same_column and aligned, {
         "left_column": left_col,
         "right_column": right_col,
         "left_bbox": left_geo,
         "right_bbox": right_geo,
+        "alignment_tolerance": round(align_tol, 6),
+        "left_page_width": left_page_width,
+        "right_page_width": right_page_width,
     }
 
 
@@ -286,43 +329,177 @@ def evaluate_same_source_node_boundary(
     return decision
 
 
-def _structured_page_boundary_noise(
-    structured: dict[str, Any] | None,
-    *,
-    page_no: int,
-    first_body_top: float,
-) -> bool:
-    if not structured:
+def _page_items_in_order(page: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(page, dict):
+        return []
+    items = [item for item in page.get("content_items") or [] if isinstance(item, dict)]
+    return sorted(
+        items,
+        key=lambda item: (
+            bool(item.get("from_page_footer")),
+            -float(item.get("top") or 0.0),
+            float(item.get("left") or 0.0),
+            str(item.get("source_node_id") or ""),
+        ),
+    )
+
+
+def _matches_left_endpoint(item: dict[str, Any], left: dict[str, Any]) -> bool:
+    return (
+        str(item.get("source_node_id") or "") == str(left.get("source_node_id") or "")
+        and int(item.get("source_char_end") or -1) == int(left.get("source_char_end") or -1)
+    )
+
+
+def _matches_right_endpoint(item: dict[str, Any], right: dict[str, Any]) -> bool:
+    return (
+        str(item.get("source_node_id") or "") == str(right.get("source_node_id") or "")
+        and int(item.get("source_char_start") or -1) == int(right.get("source_char_start") or -1)
+    )
+
+
+def _is_boundary_noise_item(item: dict[str, Any]) -> bool:
+    return str(item.get("source_label") or "") in BOUNDARY_NOISE_LABELS
+
+
+def _is_structural_barrier_item(item: dict[str, Any]) -> bool:
+    if _is_boundary_noise_item(item):
         return False
-    noisy_labels = {"page_header", "page_footer", "caption"}
-    for item in structured.get("texts") or []:
-        if not isinstance(item, dict) or str(item.get("label") or "") not in noisy_labels:
-            continue
-        for prov in item.get("prov") or []:
-            if not isinstance(prov, dict) or int(prov.get("page_no") or 0) != page_no:
-                continue
-            bbox = prov.get("bbox") or {}
-            if float(bbox.get("t") or 0.0) >= first_body_top:
-                return True
+    kind = str(item.get("kind") or "")
+    if kind in STRUCTURAL_KINDS or item.get("path"):
+        return True
+    label = str(item.get("source_label") or "text")
+    if label in STRUCTURAL_TEXT_LABELS:
+        return True
+    if kind != "text":
+        return True
+    if label not in BODY_TEXT_LABELS:
+        return True
     return False
 
 
-def _right_page_leading_boundary_noise(
-    right_page: dict[str, Any],
-    first_body: dict[str, Any],
+def _barrier_record(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "kind": item.get("kind"),
+        "source_label": item.get("source_label"),
+        "source_node_id": item.get("source_node_id"),
+        "text": str(item.get("text") or "")[:120],
+        "top": item.get("top"),
+        "left": item.get("left"),
+    }
+
+
+def _boundary_noise_record(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "source_label": item.get("source_label"),
+        "source_node_id": item.get("source_node_id"),
+        "text": str(item.get("text") or "")[:120],
+        "top": item.get("top"),
+    }
+
+
+def _structured_text_ref(index: int) -> str:
+    return f"#/texts/{index}"
+
+
+def _structured_noise_between_endpoints(
+    structured: dict[str, Any] | None,
     *,
-    structured: dict[str, Any] | None = None,
-) -> bool:
-    first_top = float(first_body.get("top") or 0.0)
-    noisy_labels = {"page_header", "page_footer", "caption"}
-    for item in right_page.get("content_items") or []:
+    left_page_no: int,
+    right_page_no: int,
+    left: dict[str, Any],
+    right: dict[str, Any],
+    recorded_noise: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not structured:
+        return []
+    recorded_ids = {str(item.get("source_node_id") or "") for item in recorded_noise}
+    left_bottom = float(_item_geometry(left)["bottom"])
+    right_top = float(_item_geometry(right)["top"])
+    extra: list[dict[str, Any]] = []
+    for index, item in enumerate(structured.get("texts") or []):
         if not isinstance(item, dict):
             continue
-        if str(item.get("source_label") or "") not in noisy_labels:
+        label = str(item.get("label") or "")
+        if label not in BOUNDARY_NOISE_LABELS:
             continue
-        if float(item.get("top") or 0.0) >= first_top:
-            return True
-    return _structured_page_boundary_noise(structured, page_no=int(right_page.get("page_no") or 0), first_body_top=first_top)
+        node_id = _structured_text_ref(index)
+        if node_id in recorded_ids:
+            continue
+        for prov in item.get("prov") or []:
+            if not isinstance(prov, dict):
+                continue
+            page_no = int(prov.get("page_no") or 0)
+            bbox = prov.get("bbox") or {}
+            top = float(bbox.get("t") or 0.0)
+            if page_no == right_page_no and top >= right_top:
+                extra.append(
+                    {
+                        "source_label": label,
+                        "source_node_id": node_id,
+                        "text": str(item.get("text") or "")[:120],
+                        "top": top,
+                        "from_structured": True,
+                    }
+                )
+            elif page_no == left_page_no and top < left_bottom:
+                extra.append(
+                    {
+                        "source_label": label,
+                        "source_node_id": node_id,
+                        "text": str(item.get("text") or "")[:120],
+                        "top": top,
+                        "from_structured": True,
+                    }
+                )
+    return extra
+
+
+def _structural_barriers_between_endpoints(
+    left_page: dict[str, Any] | None,
+    right_page: dict[str, Any] | None,
+    left: dict[str, Any],
+    right: dict[str, Any],
+    *,
+    structured: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+    barriers: list[dict[str, Any]] = []
+    noise: list[dict[str, Any]] = []
+    reasons: list[str] = []
+    left_items = _page_items_in_order(left_page)
+    right_items = _page_items_in_order(right_page)
+    left_index = next((index for index, item in enumerate(left_items) if _matches_left_endpoint(item, left)), None)
+    right_index = next((index for index, item in enumerate(right_items) if _matches_right_endpoint(item, right)), None)
+    if left_index is not None:
+        for item in left_items[left_index + 1 :]:
+            if _is_boundary_noise_item(item):
+                noise.append(_boundary_noise_record(item))
+                continue
+            if _is_structural_barrier_item(item):
+                barriers.append(_barrier_record(item))
+    if right_index is not None:
+        for item in right_items[:right_index]:
+            if _is_boundary_noise_item(item):
+                noise.append(_boundary_noise_record(item))
+                continue
+            if _is_structural_barrier_item(item):
+                barriers.append(_barrier_record(item))
+    if structured and (left_page or right_page):
+        noise.extend(
+            _structured_noise_between_endpoints(
+                structured,
+                left_page_no=int((left_page or {}).get("page_no") or left.get("page_no") or 0),
+                right_page_no=int((right_page or {}).get("page_no") or right.get("page_no") or 0),
+                left=left,
+                right=right,
+                recorded_noise=noise,
+            )
+        )
+    if barriers:
+        reasons.append("structural_content_between_endpoints")
+        if any(str(item.get("source_label") or "") in SECTION_HEADING_LABELS for item in barriers):
+            reasons.append("section_heading_boundary")
+    return barriers, noise, reasons
 
 
 def evaluate_cross_source_node_boundary(
@@ -365,8 +542,18 @@ def evaluate_cross_source_node_boundary(
     }
     left_geo = _item_geometry(left)
     right_geo = _item_geometry(right)
-    if right_page and _right_page_leading_boundary_noise(right_page, right, structured=structured):
-        decision["reasons"].append("page_boundary_noise")
+    structural_barriers, boundary_noise, structural_reasons = _structural_barriers_between_endpoints(
+        left_page,
+        right_page,
+        left,
+        right,
+        structured=structured,
+    )
+    if boundary_noise:
+        decision["evidence"]["ignored_boundary_noise"] = boundary_noise
+    if structural_barriers:
+        decision["evidence"]["structural_barriers"] = structural_barriers
+        decision["reasons"].extend(structural_reasons)
     left_page_size = _page_size_from_payload(left_page)
     right_page_size = _page_size_from_payload(right_page)
     page_geometry_ok = False
@@ -395,12 +582,23 @@ def evaluate_cross_source_node_boundary(
             decision["reasons"].append("left_not_near_page_bottom")
         if right_top_ratio < PAGE_TOP_MIN_RATIO:
             decision["reasons"].append("right_not_near_page_top")
-    columns_ok, column_evidence = _columns_compatible(left, right)
+    columns_ok = False
+    column_evidence: dict[str, Any] = {"available": False}
+    if left_page_size and right_page_size:
+        columns_ok, column_evidence = _columns_compatible(
+            left,
+            right,
+            left_page_width=left_page_size[0],
+            right_page_width=right_page_size[0],
+        )
     decision["evidence"]["geometry"] = {**column_evidence, **page_geometry_evidence}
-    if not columns_ok:
+    if left_page_size and right_page_size:
+        indent_tol = _indent_tolerance(left_page_size[0])
+        decision["evidence"]["geometry"]["indent_tolerance"] = round(indent_tol, 6)
+        if right_geo["left"] > left_geo["left"] + indent_tol:
+            decision["reasons"].append("new_paragraph_indent")
+    if not columns_ok and left_page_size and right_page_size:
         decision["reasons"].append("column_or_alignment_mismatch")
-    if right_geo["left"] > left_geo["left"] + INDENT_TOLERANCE:
-        decision["reasons"].append("new_paragraph_indent")
     style_ok, style_evidence = _style_compatible(structured, left_node, right_node)
     decision["evidence"]["style"] = style_evidence
     if not style_ok:
@@ -421,7 +619,7 @@ def evaluate_cross_source_node_boundary(
             and columns_ok
             and style_ok
             and "missing_page_dimensions" not in decision["reasons"]
-            and "page_boundary_noise" not in decision["reasons"]
+            and "structural_content_between_endpoints" not in decision["reasons"]
             and set(decision["reasons"]).issubset(
                 {"left_not_near_page_bottom", "right_not_near_page_top"}
             )
