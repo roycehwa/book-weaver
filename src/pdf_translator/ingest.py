@@ -572,15 +572,75 @@ def _epub_collect_navpoint_labels(ncx_root: ET.Element, ncx_internal: str) -> di
     return out
 
 
-def _epub_collect_toc_labels(zipf: ZipFile, opf_path: str) -> dict[str, str]:
-    ncx_internal = _epub_locate_ncx_internal(zipf, opf_path)
-    if not ncx_internal:
-        return {}
+def _epub_register_nav_label(out: dict[str, str], nav_internal: str, href: str, label: str) -> None:
+    cleaned_label = label.strip()[:500]
+    if not cleaned_label:
+        return
+    path_part = href.split("#", 1)[0].strip().replace("\\", "/")
+    if not path_part:
+        return
+    nav_dir = str(PurePosixPath(nav_internal).parent)
+    joined = posixpath.normpath(str(PurePosixPath(nav_dir) / path_part))
+    out.setdefault(joined, cleaned_label)
+    out.setdefault(PurePosixPath(joined).name, cleaned_label)
+
+
+def _epub_collect_epub3_nav_labels(zipf: ZipFile, opf_path: str) -> dict[str, str]:
+    out: dict[str, str] = {}
     try:
-        ncx_root = ET.fromstring(zipf.read(ncx_internal))
+        root = ET.fromstring(zipf.read(opf_path))
     except ET.ParseError:
-        return {}
-    return _epub_collect_navpoint_labels(ncx_root, ncx_internal)
+        return out
+    for child in root:
+        if _xml_local_name(child.tag) != "manifest":
+            continue
+        for item in child:
+            if _xml_local_name(item.tag) != "item":
+                continue
+            props = (item.attrib.get("properties") or "").split()
+            if "nav" not in props:
+                continue
+            href = (item.attrib.get("href") or "").replace("\\", "/")
+            if not href:
+                continue
+            internal = _epub_join(opf_path, href)
+            if internal not in zipf.namelist():
+                continue
+            try:
+                soup = BeautifulSoup(zipf.read(internal).decode("utf-8", errors="replace"), "html.parser")
+            except (OSError, UnicodeError):
+                continue
+            for nav in soup.find_all("nav"):
+                epub_t = (_epub_element_type(nav) or "").lower()
+                role = (nav.get("role") or "").lower()
+                if epub_t not in {"toc", ""} and role not in {"doc-toc", "directory"}:
+                    if epub_t or role:
+                        continue
+                for anchor in nav.find_all("a", href=True):
+                    raw_href = str(anchor.get("href") or "").strip()
+                    if not raw_href or raw_href.startswith("#"):
+                        continue
+                    label = anchor.get_text(" ", strip=True)
+                    if not label:
+                        continue
+                    path_part = raw_href.split("#", 1)[0].strip()
+                    if not path_part:
+                        continue
+                    _epub_register_nav_label(out, internal, path_part, label)
+    return out
+
+
+def _epub_collect_toc_labels(zipf: ZipFile, opf_path: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    ncx_internal = _epub_locate_ncx_internal(zipf, opf_path)
+    if ncx_internal:
+        try:
+            ncx_root = ET.fromstring(zipf.read(ncx_internal))
+            out.update(_epub_collect_navpoint_labels(ncx_root, ncx_internal))
+        except ET.ParseError:
+            pass
+    out.update(_epub_collect_epub3_nav_labels(zipf, opf_path))
+    return out
 
 
 def _epub_dc_title(zipf: ZipFile, opf_path: str) -> str | None:
@@ -886,7 +946,10 @@ def _epub_dom_path(tag: Tag, body: Tag) -> str:
             parts.append(name)
             break
         same_name = [child for child in parent.children if isinstance(child, Tag) and child.name == current.name]
-        position = same_name.index(current) + 1 if current in same_name else 1
+        position = next(
+            (idx for idx, child in enumerate(same_name, start=1) if child is current),
+            1,
+        )
         parts.append(f"{name}[{position}]")
         if current is body:
             break
@@ -1016,7 +1079,7 @@ def _extract_epub_body_chapter(
     nav_title: str | None = None,
     book_title: str | None = None,
     provenance_out: list[dict[str, Any]] | None = None,
-) -> tuple[str, str]:
+) -> tuple[str, str, dict[str, Any]]:
     html = zipf.read(internal_xhtml_path).decode("utf-8", errors="replace")
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup.find_all(["script", "style"]):
@@ -1132,6 +1195,19 @@ def _extract_epub_body_chapter(
         title_guess = fallback_title.strip()[:240] or Path(internal_xhtml_path).stem.replace("_", " ").strip()
     if not title_guess:
         title_guess = "Section"
+    title_element: str | None = None
+    has_explicit_heading = False
+    title_source = "fallback"
+    if title_heading is not None and isinstance(title_heading, Tag):
+        title_element = str(title_heading.name or "").lower() or None
+        if title_element in {"h1", "h2", "h3", "h4"}:
+            has_explicit_heading = True
+    if nav_title and nav_title.strip() and title_guess.strip() == nav_title.strip():
+        title_source = "nav"
+    elif has_explicit_heading:
+        title_source = "heading"
+    elif title_guess.strip() == fallback_title.strip()[:240]:
+        title_source = "spine_id"
     if title_heading is not None:
         title_heading.decompose()
 
@@ -1141,7 +1217,12 @@ def _extract_epub_body_chapter(
     body_md = "\n\n".join(str(unit["markdown"]) for unit in flow_units).strip()
     body_md = _epub_maybe_repair_staccato_toc_lines(body_md)
     body_md = _epub_clean_malformed_html_wrapper_lines(body_md)
-    return title_guess, body_md
+    title_meta = {
+        "title_source": title_source,
+        "has_explicit_heading": has_explicit_heading,
+        "title_element": title_element,
+    }
+    return title_guess, body_md, title_meta
 
 
 def ingest_epub(path: Path) -> NormalizedDocument:
@@ -1170,6 +1251,9 @@ def ingest_epub(path: Path) -> NormalizedDocument:
             dom_units: list[dict[str, Any]] | None = None,
             spine_id: str | None = None,
             nav_label: str | None = None,
+            title_source: str | None = None,
+            has_explicit_heading: bool = False,
+            title_element: str | None = None,
         ) -> None:
             nonlocal page_no, text_index
             page_no += 1
@@ -1189,6 +1273,12 @@ def ingest_epub(path: Path) -> NormalizedDocument:
                 entry["spine_id"] = spine_id
             if nav_label and nav_label.strip():
                 entry["nav_label"] = nav_label.strip()[:240]
+            if title_source:
+                entry["title_source"] = title_source
+            if has_explicit_heading:
+                entry["has_explicit_heading"] = True
+            if title_element:
+                entry["title_element"] = title_element
             if dom_units:
                 entry["dom_units"] = dom_units
             spine_chapters.append(entry)
@@ -1234,7 +1324,7 @@ def ingest_epub(path: Path) -> NormalizedDocument:
                 continue
             nav_title = toc_labels.get(internal) or toc_labels.get(PurePosixPath(internal).name)
             dom_units: list[dict[str, Any]] = []
-            title, body_md = _extract_epub_body_chapter(
+            title, body_md, title_meta = _extract_epub_body_chapter(
                 zipf,
                 opf_path=opf_path,
                 internal_xhtml_path=internal,
@@ -1252,6 +1342,9 @@ def ingest_epub(path: Path) -> NormalizedDocument:
                 dom_units=dom_units,
                 spine_id=sid,
                 nav_label=nav_title,
+                title_source=str(title_meta.get("title_source") or ""),
+                has_explicit_heading=bool(title_meta.get("has_explicit_heading")),
+                title_element=title_meta.get("title_element"),
             )
 
     if page_no == 0:

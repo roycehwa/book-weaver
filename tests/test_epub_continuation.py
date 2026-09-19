@@ -22,6 +22,8 @@ def _write_spine_epub(
     opf_manifest: str,
     xhtml_files: dict[str, str],
     ncx_xml: str | None = None,
+    opf_version: str = "2.0",
+    nav_manifest_line: str = "",
 ) -> None:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
@@ -43,7 +45,7 @@ def _write_spine_epub(
         z.writestr(
             "OEBPS/content.opf",
             f"""<?xml version="1.0" encoding="utf-8"?>
-<package xmlns="http://www.idpf.org/2007/opf" unique-identifier="bookid" version="2.0">
+<package xmlns="http://www.idpf.org/2007/opf" unique-identifier="bookid" version="{opf_version}">
   <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
     <dc:identifier id="bookid">urn:test</dc:identifier>
     <dc:title>Synthetic</dc:title>
@@ -51,7 +53,7 @@ def _write_spine_epub(
   </metadata>
   <manifest>
 {opf_manifest}
-{ncx_manifest}  </manifest>
+{nav_manifest_line}{ncx_manifest}  </manifest>
   <spine toc="ncx">
 {opf_spine_items}
   </spine>
@@ -75,6 +77,22 @@ def _decision_pair(book: dict, kind: str) -> dict:
     raise AssertionError(f"Missing decision kind {kind}")
 
 
+def _shared_chapter_ncx_xml(*resource_names: str, label: str = "Shared Chapter") -> str:
+    points = []
+    for index, name in enumerate(resource_names, 1):
+        points.append(
+            f'    <navPoint id="np{index}"><navLabel><text>{label}</text></navLabel>'
+            f'<content src="{name}"/></navPoint>'
+        )
+    body = "\n".join(points)
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
+  <navMap>
+{body}
+  </navMap>
+</ncx>"""
+
+
 def test_epub_groups_split_chapter_at_paragraph_boundary(tmp_path: Path) -> None:
     epub = tmp_path / "split-chapter.epub"
     _write_spine_epub(
@@ -83,6 +101,7 @@ def test_epub_groups_split_chapter_at_paragraph_boundary(tmp_path: Path) -> None
     <item id="p2" href="part2.xhtml" media-type="application/xhtml+xml" />""",
         opf_spine_items="""    <itemref idref="p1" />
     <itemref idref="p2" />""",
+        ncx_xml=_shared_chapter_ncx_xml("part1.xhtml", "part2.xhtml", label="One Logical Chapter"),
         xhtml_files={
             "OEBPS/part1.xhtml": """<?xml version="1.0" encoding="utf-8"?>
 <html xmlns="http://www.w3.org/1999/xhtml"><body>
@@ -103,8 +122,10 @@ def test_epub_groups_split_chapter_at_paragraph_boundary(tmp_path: Path) -> None
     ]
     group = _decision_pair(book, "epub_chapter_group")
     assert group["status"] == "accepted"
+    assert "shared_nav_label" in group["reasons"]
     join = _decision_pair(book, "epub_paragraph_join")
     assert join["status"] == "rejected"
+    assert join["reasons"] == ["terminal_punctuation"]
     assert "Opening paragraph ends here." in book["chapters"][0]["markdown"]
     assert "Third paragraph opens the next resource." in book["chapters"][0]["markdown"]
 
@@ -313,6 +334,7 @@ def test_epub_continuation_fingerprints_stable_and_invalidate_on_boundary_change
     <item id="s2" href="s2.xhtml" media-type="application/xhtml+xml" />""",
         opf_spine_items="""    <itemref idref="s1" />
     <itemref idref="s2" />""",
+        ncx_xml=_shared_chapter_ncx_xml("s1.xhtml", "s2.xhtml", label="Shared Chapter"),
         xhtml_files={
             "OEBPS/s1.xhtml": """<?xml version="1.0" encoding="utf-8"?>
 <html xmlns="http://www.w3.org/1999/xhtml"><body>
@@ -360,9 +382,7 @@ def test_epub_continuation_fingerprints_stable_and_invalidate_on_boundary_change
     assert changed_units["document_fingerprint"] != units_first["document_fingerprint"]
 
 
-def test_epub_intake_persists_continuation_ledger(tmp_path: Path, monkeypatch) -> None:
-    from tests.test_pipeline import _patch_intake_dependencies
-
+def test_epub_intake_persists_continuation_ledger(tmp_path: Path) -> None:
     epub = tmp_path / "ledger.epub"
     _write_spine_epub(
         epub,
@@ -377,7 +397,6 @@ def test_epub_intake_persists_continuation_ledger(tmp_path: Path, monkeypatch) -
 <html xmlns="http://www.w3.org/1999/xhtml"><body><p>beta in the next file.</p></body></html>""",
         },
     )
-    _patch_intake_dependencies(monkeypatch)
     settings = RunSettings(
         source_pdf=epub,
         output_dir=tmp_path / "runs",
@@ -394,3 +413,134 @@ def test_epub_intake_persists_continuation_ledger(tmp_path: Path, monkeypatch) -
     ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
     validate_continuation_decisions(ledger)
     assert ledger["provenance"] == "epub_spine_resource_boundary_v1"
+
+
+def test_epub3_nav_label_boundary_splits_chapter(tmp_path: Path) -> None:
+    nav_xhtml = """<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+<body>
+<nav epub:type="toc"><ol>
+<li><a href="alpha.xhtml">Alpha Chapter</a></li>
+<li><a href="beta.xhtml">Beta Chapter</a></li>
+</ol></nav>
+</body></html>"""
+    epub = tmp_path / "epub3-nav-boundary.epub"
+    _write_spine_epub(
+        epub,
+        opf_version="3.0",
+        opf_manifest="""    <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav" />
+    <item id="a" href="alpha.xhtml" media-type="application/xhtml+xml" />
+    <item id="b" href="beta.xhtml" media-type="application/xhtml+xml" />""",
+        opf_spine_items="""    <itemref idref="a" />
+    <itemref idref="b" />""",
+        xhtml_files={
+            "OEBPS/nav.xhtml": nav_xhtml,
+            "OEBPS/alpha.xhtml": """<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><body><p>Alpha body.</p></body></html>""",
+            "OEBPS/beta.xhtml": """<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><body><p>Beta body.</p></body></html>""",
+        },
+    )
+    book = _rebuild(epub)
+    assert len(book["chapters"]) == 2
+    group = _decision_pair(book, "epub_chapter_group")
+    assert group["status"] == "rejected"
+    assert "nav_chapter_boundary" in group["reasons"]
+
+
+def test_epub3_nav_shared_label_groups_without_paragraph_join(tmp_path: Path) -> None:
+    nav_xhtml = """<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+<body>
+<nav epub:type="toc"><ol>
+<li><a href="one.xhtml">Long Chapter</a></li>
+<li><a href="two.xhtml">Long Chapter</a></li>
+</ol></nav>
+</body></html>"""
+    epub = tmp_path / "epub3-nav-continuation.epub"
+    _write_spine_epub(
+        epub,
+        opf_version="3.0",
+        opf_manifest="""    <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav" />
+    <item id="o1" href="one.xhtml" media-type="application/xhtml+xml" />
+    <item id="o2" href="two.xhtml" media-type="application/xhtml+xml" />""",
+        opf_spine_items="""    <itemref idref="o1" />
+    <itemref idref="o2" />""",
+        xhtml_files={
+            "OEBPS/nav.xhtml": nav_xhtml,
+            "OEBPS/one.xhtml": """<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><body><p>Part one ends here.</p></body></html>""",
+            "OEBPS/two.xhtml": """<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><body><p>Part two begins here.</p></body></html>""",
+        },
+    )
+    book = _rebuild(epub)
+    assert len(book["chapters"]) == 1
+    group = _decision_pair(book, "epub_chapter_group")
+    assert group["status"] == "accepted"
+    join = _decision_pair(book, "epub_paragraph_join")
+    assert join["status"] == "rejected"
+
+
+def test_epub_image_barrier_blocks_paragraph_endpoint(tmp_path: Path) -> None:
+    png_1x1 = (
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+        b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01"
+        b"\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
+    )
+    epub = tmp_path / "image-barrier.epub"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        z.writestr("mimetype", "application/epub+zip", compress_type=zipfile.ZIP_STORED)
+        z.writestr(
+            "META-INF/container.xml",
+            """<?xml version="1.0" encoding="utf-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml" />
+  </rootfiles>
+</container>
+""",
+        )
+        z.writestr("OEBPS/images/pix.png", png_1x1)
+        z.writestr(
+            "OEBPS/content.opf",
+            """<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" unique-identifier="bookid" version="2.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="bookid">urn:test</dc:identifier>
+    <dc:title>Synthetic</dc:title>
+    <dc:language>en</dc:language>
+  </metadata>
+  <manifest>
+    <item id="i1" href="i1.xhtml" media-type="application/xhtml+xml" />
+    <item id="i2" href="i2.xhtml" media-type="application/xhtml+xml" />
+    <item id="pix" href="images/pix.png" media-type="image/png" />
+  </manifest>
+  <spine>
+    <itemref idref="i1" />
+    <itemref idref="i2" />
+  </spine>
+</package>
+""",
+        )
+        z.writestr(
+            "OEBPS/i1.xhtml",
+            """<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><body>
+<p>Sentence continues without ending</p>
+</body></html>""",
+        )
+        z.writestr(
+            "OEBPS/i2.xhtml",
+            """<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><body>
+<p><img src="images/pix.png" alt="Figure"/></p>
+<p>and finishes here.</p>
+</body></html>""",
+        )
+    epub.write_bytes(buf.getvalue())
+    book = _rebuild(epub)
+    join = _decision_pair(book, "epub_paragraph_join")
+    assert join["status"] == "rejected"
+    assert "structural_barrier" in join["reasons"]

@@ -33,6 +33,7 @@ from pdf_translator.continuation_decisions import (
     validate_continuation_decisions,
 )
 from pdf_translator.epub_continuation import apply_epub_spine_continuations
+from pdf_translator.chapter_kind import classify_blocks, classify_chapter, should_translate_chapter
 from pdf_translator.guardrails import (
     ORIGINAL_PAGE_FALLBACK_RE,
     _translatable_page_text_chars,
@@ -2338,6 +2339,12 @@ def _build_book_from_epub_meta(meta: dict[str, Any], source_path: Path | None) -
             spine_entry["spine_id"] = entry["spine_id"]
         if isinstance(entry.get("nav_label"), str):
             spine_entry["nav_label"] = entry["nav_label"]
+        if isinstance(entry.get("title_source"), str):
+            spine_entry["title_source"] = entry["title_source"]
+        if entry.get("has_explicit_heading"):
+            spine_entry["has_explicit_heading"] = True
+        if isinstance(entry.get("title_element"), str):
+            spine_entry["title_element"] = entry["title_element"]
         spine_entries.append(spine_entry)
 
     chapters, logical_continuations, continuation_decisions = apply_epub_spine_continuations(spine_entries)

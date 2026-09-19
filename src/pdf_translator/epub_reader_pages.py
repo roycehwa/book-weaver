@@ -133,7 +133,7 @@ def build_epub_reader_page_records(
             anchors = list(_PAGE_ANCHOR_RE.finditer(xhtml))
             if not anchors:
                 page_index += 1
-                _title, body_md = _extract_epub_body_chapter(
+                _title, body_md, _title_meta = _extract_epub_body_chapter(
                     zipf,
                     opf_path=opf_path,
                     internal_xhtml_path=internal,

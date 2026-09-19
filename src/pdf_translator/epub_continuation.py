@@ -75,26 +75,29 @@ def _is_paragraph_barrier_unit(unit: dict[str, Any]) -> bool:
     return False
 
 
-def _body_units(chapter: dict[str, Any]) -> list[dict[str, Any]]:
-    return [
-        dict(unit)
-        for unit in chapter.get("dom_units") or []
-        if isinstance(unit, dict) and _unit_markdown(unit)
-    ]
+def _dom_units_ordered(chapter: dict[str, Any]) -> list[dict[str, Any]]:
+    return [dict(unit) for unit in chapter.get("dom_units") or [] if isinstance(unit, dict)]
 
 
-def _final_paragraph_unit(chapter: dict[str, Any]) -> dict[str, Any] | None:
-    for unit in reversed(_body_units(chapter)):
-        if not _is_paragraph_barrier_unit(unit):
-            return unit
-    return None
+def _literal_final_dom_unit(chapter: dict[str, Any]) -> dict[str, Any] | None:
+    units = _dom_units_ordered(chapter)
+    if not units:
+        return None
+    return units[-1]
 
 
-def _first_paragraph_unit(chapter: dict[str, Any]) -> dict[str, Any] | None:
-    for unit in _body_units(chapter):
-        if not _is_paragraph_barrier_unit(unit):
-            return unit
-    return None
+def _literal_first_dom_unit(chapter: dict[str, Any]) -> dict[str, Any] | None:
+    units = _dom_units_ordered(chapter)
+    if not units:
+        return None
+    return units[0]
+
+
+def _explicit_nav_label(nav_label: str | None, spine_id: str | None) -> bool:
+    cleaned = str(nav_label or "").strip()
+    if not cleaned:
+        return False
+    return not _weak_fallback_title(cleaned, spine_id or "")
 
 
 def _weak_fallback_title(title: str, spine_id: str | None) -> bool:
@@ -132,11 +135,51 @@ def _nav_chapter_boundary(left: dict[str, Any], right: dict[str, Any]) -> bool:
     return True
 
 
-def _heading_boundary(right: dict[str, Any]) -> bool:
-    units = _body_units(right)
-    if not units:
-        return False
-    return _is_heading_unit(units[0])
+def _explicit_chapter_title_boundary(right: dict[str, Any]) -> bool:
+    if right.get("has_explicit_heading"):
+        element = str(right.get("title_element") or "").lower()
+        if element in {"h1", "h2", "h3", "h4"}:
+            return True
+    first = _literal_first_dom_unit(right)
+    if first and _is_heading_unit(first):
+        return True
+    return False
+
+
+def _hard_spine_boundary(left: dict[str, Any], right: dict[str, Any]) -> str | None:
+    if _explicit_chapter_title_boundary(right):
+        return "heading_boundary"
+    if _nav_chapter_boundary(left, right):
+        return "nav_chapter_boundary"
+    if _resource_policy_class(left) != _resource_policy_class(right):
+        return "policy_transition"
+    return None
+
+
+def _positive_chapter_group_evidence(
+    left: dict[str, Any],
+    right: dict[str, Any],
+    paragraph_join: dict[str, Any] | None,
+) -> bool:
+    if isinstance(paragraph_join, dict) and paragraph_join.get("status") == "accepted":
+        return True
+    left_nav = str(left.get("nav_label") or "").strip()
+    right_nav = str(right.get("nav_label") or "").strip()
+    left_spine = str(left.get("spine_id") or "")
+    right_spine = str(right.get("spine_id") or "")
+    if (
+        _explicit_nav_label(left_nav, left_spine)
+        and _explicit_nav_label(right_nav, right_spine)
+        and left_nav == right_nav
+    ):
+        return True
+    if _explicit_nav_label(left_nav, left_spine) and (
+        not right_nav.strip()
+        or _weak_fallback_title(right_nav, right_spine)
+        or not _explicit_nav_label(right_nav, right_spine)
+    ):
+        return True
+    return False
 
 
 def evaluate_epub_chapter_group(
@@ -145,6 +188,7 @@ def evaluate_epub_chapter_group(
     *,
     from_page: int,
     to_page: int,
+    paragraph_join: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     left_path = str(left.get("source_internal_path") or "")
     right_path = str(right.get("source_internal_path") or "")
@@ -170,28 +214,19 @@ def evaluate_epub_chapter_group(
     if not left_path or not right_path:
         decision["reasons"].append("missing_resource_path")
         return decision
-    if _heading_boundary(right):
-        decision["reasons"].append("heading_boundary")
+    hard = _hard_spine_boundary(left, right)
+    if hard:
+        decision["reasons"].append(hard)
         return decision
-    if _nav_chapter_boundary(left, right):
-        decision["reasons"].append("nav_chapter_boundary")
+    if _positive_chapter_group_evidence(left, right, paragraph_join):
+        decision["status"] = "accepted"
+        if isinstance(paragraph_join, dict) and paragraph_join.get("status") == "accepted":
+            decision["reasons"] = ["cross_resource_paragraph_continuation"]
+        else:
+            decision["reasons"] = ["shared_nav_label"]
         return decision
-    left_policy = _resource_policy_class(left)
-    right_policy = _resource_policy_class(right)
-    if left_policy != right_policy:
-        decision["reasons"].append("policy_transition")
-        return decision
-    decision["status"] = "accepted"
-    decision["reasons"] = ["spine_order_continuation"]
+    decision["reasons"].append("insufficient_positive_evidence")
     return decision
-
-
-def _link_targets_compatible(left: dict[str, Any], right: dict[str, Any]) -> bool:
-    left_targets = {str(target) for target in left.get("link_targets") or []}
-    right_targets = {str(target) for target in right.get("link_targets") or []}
-    if not left_targets and not right_targets:
-        return True
-    return left_targets == right_targets
 
 
 def evaluate_epub_paragraph_join(
@@ -202,7 +237,6 @@ def evaluate_epub_paragraph_join(
     *,
     from_page: int,
     to_page: int,
-    chapter_group_accepted: bool,
 ) -> dict[str, Any]:
     left_path = str(left.get("source_internal_path") or "")
     right_path = str(right.get("source_internal_path") or "")
@@ -239,14 +273,12 @@ def evaluate_epub_paragraph_join(
         "reasons": [],
         "evidence": {"axis": "paragraph_join"},
     }
-    if not chapter_group_accepted:
-        decision["reasons"].append("chapter_boundary")
+    hard = _hard_spine_boundary(left, right)
+    if hard:
+        decision["reasons"].append(hard)
         return decision
     if _is_paragraph_barrier_unit(left_unit) or _is_paragraph_barrier_unit(right_unit):
         decision["reasons"].append("structural_barrier")
-        return decision
-    if not _link_targets_compatible(left_unit, right_unit):
-        decision["reasons"].append("incompatible_link_targets")
         return decision
     left_text = _unit_markdown(left_unit)
     right_text = _unit_markdown(right_unit)
@@ -295,7 +327,6 @@ def _decision_fingerprint_entry(decision: dict[str, Any]) -> dict[str, Any]:
 
 def build_epub_continuation_ledger(spine_chapters: list[dict[str, Any]]) -> dict[str, Any]:
     decisions: list[dict[str, Any]] = []
-    accepted_groups: dict[tuple[int, int], bool] = {}
     for left, right in zip(spine_chapters, spine_chapters[1:]):
         if not isinstance(left, dict) or not isinstance(right, dict):
             continue
@@ -303,23 +334,28 @@ def build_epub_continuation_ledger(spine_chapters: list[dict[str, Any]]) -> dict
         to_page = int(right.get("page_no") or right.get("page_start") or 0)
         if from_page <= 0 or to_page <= 0:
             continue
-        group_decision = evaluate_epub_chapter_group(left, right, from_page=from_page, to_page=to_page)
-        decisions.append(group_decision)
-        accepted_groups[(from_page, to_page)] = group_decision.get("status") == "accepted"
-        left_unit = _final_paragraph_unit(left)
-        right_unit = _first_paragraph_unit(right)
+        left_unit = _literal_final_dom_unit(left)
+        right_unit = _literal_first_dom_unit(right)
+        paragraph_decision: dict[str, Any] | None = None
         if left_unit and right_unit:
-            decisions.append(
-                evaluate_epub_paragraph_join(
-                    left,
-                    right,
-                    left_unit,
-                    right_unit,
-                    from_page=from_page,
-                    to_page=to_page,
-                    chapter_group_accepted=accepted_groups[(from_page, to_page)],
-                )
+            paragraph_decision = evaluate_epub_paragraph_join(
+                left,
+                right,
+                left_unit,
+                right_unit,
+                from_page=from_page,
+                to_page=to_page,
             )
+        group_decision = evaluate_epub_chapter_group(
+            left,
+            right,
+            from_page=from_page,
+            to_page=to_page,
+            paragraph_join=paragraph_decision,
+        )
+        decisions.append(group_decision)
+        if paragraph_decision is not None:
+            decisions.append(paragraph_decision)
     fingerprint_payload = [_decision_fingerprint_entry(item) for item in decisions]
     return {
         "schema": SCHEMA,
@@ -366,47 +402,9 @@ def _merge_trace_markdown(left_trace: str, right_trace: str) -> str:
 def _merge_dom_units(
     left_units: list[dict[str, Any]],
     right_units: list[dict[str, Any]],
-    paragraph_join: dict[str, Any] | None,
+    _paragraph_join: dict[str, Any] | None,
 ) -> list[dict[str, Any]]:
     merged = [dict(unit) for unit in left_units if isinstance(unit, dict)]
-    if paragraph_join and paragraph_join.get("status") == "accepted":
-        evidence = paragraph_join.get("evidence") if isinstance(paragraph_join.get("evidence"), dict) else {}
-        joined = str(evidence.get("joined_text") or "")
-        left_dom = str(paragraph_join.get("left_dom_path") or "")
-        right_dom = str(paragraph_join.get("right_dom_path") or "")
-        if joined and left_dom and right_dom:
-            for unit in merged:
-                if str(unit.get("dom_path") or "") != left_dom:
-                    continue
-                unit["markdown"] = joined
-                unit["char_end"] = len(joined)
-                left_targets = [str(target) for target in unit.get("link_targets") or []]
-                right_unit = next(
-                    (item for item in right_units if str(item.get("dom_path") or "") == right_dom),
-                    None,
-                )
-                if isinstance(right_unit, dict):
-                    for target in right_unit.get("link_targets") or []:
-                        target_text = str(target)
-                        if target_text and target_text not in left_targets:
-                            left_targets.append(target_text)
-                if left_targets:
-                    unit["link_targets"] = left_targets
-                unit["continuation"] = {
-                    "decision_id": paragraph_join.get("decision_id"),
-                    "right_resource_path": paragraph_join.get("right_resource_path"),
-                    "right_dom_path": right_dom,
-                    "right_char_start": paragraph_join.get("right_char_start"),
-                    "right_char_end": paragraph_join.get("right_char_end"),
-                }
-                break
-            skip_dom = {right_dom}
-            merged.extend(
-                dict(unit)
-                for unit in right_units
-                if isinstance(unit, dict) and str(unit.get("dom_path") or "") not in skip_dom
-            )
-            return merged
     merged.extend(dict(unit) for unit in right_units if isinstance(unit, dict))
     return merged
 
@@ -464,7 +462,7 @@ def apply_epub_spine_continuations(
             right_path = str(right.get("source_internal_path") or "").replace("\\", "/")
             if right_path:
                 current["source_internal_paths"] = list(
-                    dict.fromkeys([*current.get("source_internal_paths") or [], right_path])
+                    dict.fromkeys([*(current.get("source_internal_paths") or []), right_path])
                 )
             current["page_end"] = right_page
             current["source_pages"] = list(range(page_no, right_page + 1))

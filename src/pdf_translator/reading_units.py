@@ -335,6 +335,23 @@ def _epub_dom_span(unit: dict[str, Any], fallback_resource: str) -> dict[str, An
     return span
 
 
+def _epub_take_block_provenance(
+    block: str,
+    candidates: dict[str, list[list[dict[str, Any]]]],
+    ordered_units: list[tuple[str, list[dict[str, Any]]]],
+) -> list[dict[str, Any]] | None:
+    block_text = block.strip()
+    pooled = candidates.get(block_text) or []
+    if pooled:
+        return pooled.pop(0)
+    for index, (markdown, spans) in enumerate(ordered_units):
+        if markdown != block_text:
+            continue
+        ordered_units.pop(index)
+        return spans
+    return None
+
+
 def _epub_block_span_candidates(
     chapter: dict[str, Any],
     *,
@@ -449,16 +466,28 @@ def build_reading_units(
             if source_format == "epub"
             else {}
         )
+        epub_ordered_units: list[tuple[str, list[dict[str, Any]]]] = []
+        if source_format == "epub":
+            fallback_resource = str(chapter.get("source_internal_path") or "").replace("\\", "/")
+            for unit in chapter.get("dom_units") or []:
+                if not isinstance(unit, dict):
+                    continue
+                markdown = str(unit.get("markdown") or "").strip()
+                span = _epub_dom_span(unit, fallback_resource)
+                if markdown and span is not None:
+                    epub_ordered_units.append((markdown, [span]))
         unit_ids: list[str] = []
         for block_index, block in enumerate(blocks, 1):
             unit_id = f"{chapter_id}:unit{block_index:05d}"
             unit_ids.append(unit_id)
-            exact_candidates = (
-                pdf_span_candidates.get(block)
-                or epub_span_candidates.get(block)
-                or []
-            )
-            provenance = exact_candidates.pop(0) if exact_candidates else _source_spans(chapter, source_format)
+            if source_format == "epub":
+                provenance = (
+                    _epub_take_block_provenance(block, epub_span_candidates, epub_ordered_units)
+                    or _source_spans(chapter, source_format)
+                )
+            else:
+                exact_candidates = pdf_span_candidates.get(block) or []
+                provenance = exact_candidates.pop(0) if exact_candidates else _source_spans(chapter, source_format)
             boundary_before = "chapter" if block_index == 1 else "paragraph"
             continuation_match = _continuation_for_provenance(chapter_continuations, provenance)
             unit_payload: dict[str, Any] = {
