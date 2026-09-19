@@ -16,12 +16,15 @@ from pdf_translator.source_workspace import atomic_json
 
 RULES_VERSION = "zh_markdown_cleanup_v1"
 REPORT_SCHEMA = "zh_markdown_cleanup_report_v1"
+TRANSLATION_CLEANUP_REPORT_FILENAME = "translation-cleanup-report.json"
 EXCERPT_RADIUS = 32
 
 CJK_RE = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff]")
 
-ZH_CLOSING_PUNCT = frozenset("，。；：！？）、】」』》\"'…")
-ZH_OPENING_PUNCT = frozenset("（【「『《\"'…、")
+ZH_CLOSING_PUNCT = frozenset("，。；：！？）、】」』》")
+ZH_OPENING_PUNCT = frozenset("（【「『《")
+ZH_CLOSING_BRACKETS_QUOTES = frozenset("）】」』》")
+ZH_OPENING_BRACKETS_QUOTES = frozenset("（【「『《")
 
 ASCII_TO_ZH = {
     ",": "，",
@@ -42,6 +45,11 @@ INLINE_CODE_RE = re.compile(r"`+[^`\n]+`+")
 IMAGE_MARKER_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
 FENCE_LINE_RE = re.compile(r"^( {0,3})(`{3,}|~{3,})(.*)$")
 VERSIONISH_RE = re.compile(r"(?<![A-Za-z0-9])[vV]?\d+(?:\.\d+)+(?![A-Za-z0-9])")
+TABLE_SEPARATOR_RE = re.compile(
+    r"^\s*\|?(?:\s*:?-+:?\s*\|)+\s*:?-+:?\s*\|?\s*$"
+)
+WS_BEFORE_CLOSE_RE = re.compile(r"[\t ]+(?=[，。；：！？）、】」』》])")
+WS_AFTER_OPEN_RE = re.compile(r"(?<=[（【「『《])[\t ]+")
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,10 +73,37 @@ def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def _excerpt(line: str, start: int, end: int) -> tuple[str, str]:
-    before_start = max(0, start - EXCERPT_RADIUS)
-    after_end = min(len(line), end + EXCERPT_RADIUS)
-    return line[before_start:start], line[end:after_end]
+def _excerpt(line: str, start: int, end: int) -> str:
+    clip_start = max(0, start - EXCERPT_RADIUS)
+    clip_end = min(len(line), end + EXCERPT_RADIUS)
+    return line[clip_start:clip_end]
+
+
+def _line_has_unescaped_pipe(line: str) -> bool:
+    escaped = False
+    for char in line:
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if char == "|":
+            return True
+    return False
+
+
+def _find_matching_paren(text: str, open_index: int) -> int:
+    depth = 0
+    for index in range(open_index, len(text)):
+        char = text[index]
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return index
+    return -1
 
 
 def _markdown_link_destination_spans(line: str) -> list[tuple[int, int]]:
@@ -78,7 +113,7 @@ def _markdown_link_destination_spans(line: str) -> list[tuple[int, int]]:
         if line.startswith("![", index):
             close = line.find("]", index + 2)
             if close != -1 and close + 1 < len(line) and line[close + 1] == "(":
-                end = line.find(")", close + 2)
+                end = _find_matching_paren(line, close + 1)
                 if end != -1:
                     spans.append((close + 1, end + 1))
                     index = end + 1
@@ -86,7 +121,7 @@ def _markdown_link_destination_spans(line: str) -> list[tuple[int, int]]:
         if line[index] == "[":
             close = line.find("]", index + 1)
             if close != -1 and close + 1 < len(line) and line[close + 1] == "(":
-                end = line.find(")", close + 2)
+                end = _find_matching_paren(line, close + 1)
                 if end != -1:
                     spans.append((close + 1, end + 1))
                     index = end + 1
@@ -131,9 +166,24 @@ def _in_spans(index: int, spans: list[tuple[int, int]]) -> bool:
     return any(start <= index < end for start, end in spans)
 
 
-def _is_table_row(line: str) -> bool:
+def _span_overlaps(start: int, end: int, spans: list[tuple[int, int]]) -> bool:
+    return any(not (end <= span_start or start >= span_end) for span_start, span_end in spans)
+
+
+def _is_indented_code_line(line: str) -> bool:
+    return line.startswith("\t") or line.startswith("    ")
+
+
+def _is_table_row(line: str, *, prev_line: str | None, next_line: str | None) -> bool:
+    if _line_has_unescaped_pipe(line):
+        return True
     stripped = line.lstrip()
-    return stripped.startswith("|") and stripped.count("|") >= 2
+    if stripped.startswith("|") and stripped.count("|") >= 2:
+        return True
+    for neighbor in (prev_line, next_line):
+        if neighbor is not None and TABLE_SEPARATOR_RE.match(neighbor.strip()):
+            return True
+    return False
 
 
 def _is_decimal_dot(line: str, index: int) -> bool:
@@ -164,6 +214,16 @@ def _is_ascii_word_char(char: str) -> bool:
     return char.isascii() and (char.isalnum() or char in {"_", "-"})
 
 
+def _nearest_non_whitespace(line: str, index: int, *, direction: int) -> str | None:
+    pos = index + direction
+    while 0 <= pos < len(line):
+        char = line[pos]
+        if not char.isspace():
+            return char
+        pos += direction
+    return None
+
+
 def _ascii_punct_in_identifier(line: str, index: int) -> bool:
     char = line[index]
     if char not in ASCII_TO_ZH:
@@ -183,54 +243,98 @@ def _ascii_punct_in_identifier(line: str, index: int) -> bool:
     return False
 
 
-def _local_cjk_context(line: str, index: int) -> bool:
-    left = line[max(0, index - 4) : index]
-    right = line[index + 1 : min(len(line), index + 5)]
-    return bool(CJK_RE.search(left) or CJK_RE.search(right))
+def _latin_token_before_chinese(line: str, index: int) -> bool:
+    left = _nearest_non_whitespace(line, index, direction=-1)
+    right = _nearest_non_whitespace(line, index, direction=1)
+    if left is None or right is None:
+        return False
+    if not CJK_RE.match(right):
+        return False
+    if not left.isascii() or not left.isalnum():
+        return False
+    pos = index - 1
+    while pos >= 0 and line[pos].isspace():
+        pos -= 1
+    while pos >= 0 and _is_ascii_word_char(line[pos]):
+        pos -= 1
+    return pos < index - 1
+
+
+def _qualifying_neighbor(char: str | None, *, side: str) -> bool:
+    if char is None:
+        return False
+    if CJK_RE.match(char):
+        return True
+    if side == "left":
+        return char in ZH_CLOSING_BRACKETS_QUOTES
+    return char in ZH_OPENING_BRACKETS_QUOTES
+
+
+def _punct_specific_safe(char: str, line: str, index: int) -> bool:
+    left = _nearest_non_whitespace(line, index, direction=-1)
+    right = _nearest_non_whitespace(line, index, direction=1)
+    if char in {",", ".", ";", ":"}:
+        if left is not None and left.isdigit() and right is not None and right.isdigit():
+            return False
+        if char in {",", "."} and _latin_token_before_chinese(line, index):
+            return False
+    if char == ".":
+        if _is_decimal_dot(line, index):
+            return False
+        if right is not None and right.isdigit() and left is not None and left.isdigit():
+            return False
+    if char == "," and _is_grouped_number_comma(line, index):
+        return False
+    if char == ":":
+        if left is not None and left.isdigit() and right is not None and right.isdigit():
+            return False
+    return True
 
 
 def _can_convert_ascii_punct(line: str, index: int, spans: list[tuple[int, int]]) -> bool:
     char = line[index]
     if char not in ASCII_TO_ZH or _in_spans(index, spans):
         return False
-    if _is_decimal_dot(line, index) or _is_grouped_number_comma(line, index):
-        return False
     if _ascii_punct_in_identifier(line, index):
         return False
-    if not _local_cjk_context(line, index):
+    if not _punct_specific_safe(char, line, index):
         return False
-    if char == "." and index + 1 < len(line) and line[index + 1].isdigit() and index > 0 and line[index - 1].isdigit():
+    left = _nearest_non_whitespace(line, index, direction=-1)
+    right = _nearest_non_whitespace(line, index, direction=1)
+    if not (
+        _qualifying_neighbor(left, side="left") or _qualifying_neighbor(right, side="right")
+    ):
         return False
     return True
 
 
 def _apply_replacements(
-    line: str,
+    original_line: str,
+    final_line: str,
     line_no: int,
-    spans: list[tuple[int, int]],
     replacements: list[tuple[int, int, str, str]],
 ) -> tuple[str, list[CleanupChange]]:
     if not replacements:
-        return line, []
-    ordered = sorted(replacements, key=lambda item: item[0], reverse=True)
-    current = line
+        return final_line, []
+    ordered = sorted(replacements, key=lambda item: item[0])
     changes: list[CleanupChange] = []
+    cursor = 0
     for start, end, rule_id, new_text in ordered:
-        old_text = current[start:end]
-        before_excerpt, after_excerpt = _excerpt(current, start, end)
+        old_text = original_line[start:end]
+        mapped_start = start + cursor
+        mapped_end = mapped_start + len(new_text)
         changes.append(
             CleanupChange(
                 rule_id=rule_id,
                 line=line_no,
                 original=old_text,
                 replacement=new_text,
-                before_excerpt=before_excerpt,
-                after_excerpt=after_excerpt,
+                before_excerpt=_excerpt(original_line, start, end),
+                after_excerpt=_excerpt(final_line, mapped_start, mapped_end),
             )
         )
-        current = current[:start] + new_text + current[end:]
-    changes.reverse()
-    return current, changes
+        cursor += len(new_text) - (end - start)
+    return final_line, changes
 
 
 def _collect_ascii_punct_rules(line: str, spans: list[tuple[int, int]]) -> list[tuple[int, int, str, str]]:
@@ -243,63 +347,54 @@ def _collect_ascii_punct_rules(line: str, spans: list[tuple[int, int]]) -> list[
     return replacements
 
 
+def _span_safe_replacement(
+    start: int,
+    end: int,
+    spans: list[tuple[int, int]],
+) -> bool:
+    return not _span_overlaps(start, end, spans)
+
+
 def _collect_whitespace_rules(line: str, spans: list[tuple[int, int]]) -> list[tuple[int, int, str, str]]:
     replacements: list[tuple[int, int, str, str]] = []
+
+    for match in WS_BEFORE_CLOSE_RE.finditer(line):
+        start, end = match.span()
+        if _span_safe_replacement(start, end, spans):
+            replacements.append((start, end, "zh_ws_before_close", ""))
+
+    for match in WS_AFTER_OPEN_RE.finditer(line):
+        start, end = match.span()
+        if _span_safe_replacement(start, end, spans):
+            replacements.append((start, end, "zh_ws_after_open", ""))
+
     index = 0
     while index < len(line):
         if _in_spans(index, spans):
             index += 1
             continue
         char = line[index]
-        if char.isspace() and index + 1 < len(line):
-            next_char = line[index + 1]
-            if next_char in ZH_CLOSING_PUNCT and not _in_spans(index + 1, spans):
-                replacements.append((index, index + 1, "zh_ws_before_close", ""))
-                index += 1
-                continue
-        if char in ZH_OPENING_PUNCT and index + 1 < len(line) and line[index + 1].isspace():
-            run_end = index + 1
-            while run_end < len(line) and line[run_end].isspace() and not _in_spans(run_end, spans):
-                run_end += 1
-            if run_end > index + 1:
-                replacements.append((index + 1, run_end, "zh_ws_after_open", ""))
-                index = run_end
-                continue
         if char in ZH_CLOSING_PUNCT and index + 1 < len(line) and line[index + 1].isspace():
             run_end = index + 1
             while run_end < len(line) and line[run_end].isspace() and not _in_spans(run_end, spans):
                 run_end += 1
             if run_end > index + 1 and run_end < len(line) and CJK_RE.match(line[run_end]):
-                replacements.append((index + 1, run_end, "zh_ws_after_close", ""))
+                if _span_safe_replacement(index + 1, run_end, spans):
+                    replacements.append((index + 1, run_end, "zh_ws_after_close", ""))
                 index = run_end
                 continue
         index += 1
 
-    punct_class = "".join(ZH_CLOSING_PUNCT | ZH_OPENING_PUNCT)
-    pattern = re.compile(
-        rf"(?P<left>\s{{2,}})(?P<punct>[{re.escape(punct_class)}])"
-        rf"|(?P<open>[{re.escape(''.join(ZH_OPENING_PUNCT))}])(?P<right>\s{{2,}})"
-    )
-    for match in pattern.finditer(line):
-        if match.group("left") is not None:
-            start, end = match.start("left"), match.end("left")
-            if not any(_in_spans(pos, spans) for pos in range(start, end)):
-                replacements.append((start, end, "zh_ws_adjacent_punct", " "))
-        else:
-            start, end = match.start("right"), match.end("right")
-            if not any(_in_spans(pos, spans) for pos in range(start, end)):
-                replacements.append((start, end, "zh_ws_adjacent_punct", " "))
     return replacements
 
 
 def _merge_non_overlapping(
-    line: str,
     spans: list[tuple[int, int]],
     replacements: list[tuple[int, int, str, str]],
 ) -> list[tuple[int, int, str, str]]:
     merged: list[tuple[int, int, str, str]] = []
     for start, end, rule_id, new_text in sorted(replacements, key=lambda item: item[0]):
-        if any(_in_spans(pos, spans) for pos in range(start, max(end, start + 1))):
+        if not _span_safe_replacement(start, end, spans):
             continue
         overlap = False
         for existing_start, existing_end, _, _ in merged:
@@ -311,19 +406,32 @@ def _merge_non_overlapping(
     return merged
 
 
+def _build_replaced_line(
+    line: str,
+    replacements: list[tuple[int, int, str, str]],
+) -> str:
+    if not replacements:
+        return line
+    current = line
+    for start, end, _, new_text in sorted(replacements, key=lambda item: item[0], reverse=True):
+        current = current[:start] + new_text + current[end:]
+    return current
+
+
 def _process_line(line: str, line_no: int) -> tuple[str, list[CleanupChange]]:
-    if _is_table_row(line):
-        return line, []
     spans = _protected_spans(line)
     if spans and spans[0][0] == 0 and spans[-1][1] == len(line):
         return line, []
     all_changes: list[CleanupChange] = []
     current = line
     for collector in (_collect_ascii_punct_rules, _collect_whitespace_rules):
+        before_pass = current
         active_spans = _protected_spans(current)
-        replacements = _merge_non_overlapping(current, active_spans, collector(current, active_spans))
-        current, changes = _apply_replacements(current, line_no, active_spans, replacements)
+        replacements = _merge_non_overlapping(active_spans, collector(current, active_spans))
+        updated = _build_replaced_line(current, replacements)
+        _, changes = _apply_replacements(before_pass, updated, line_no, replacements)
         all_changes.extend(changes)
+        current = updated
     return current, all_changes
 
 
@@ -335,10 +443,13 @@ def cleanup_zh_markdown(text: str) -> tuple[str, dict[str, Any]]:
     in_fence = False
     fence_marker: str | None = None
     line_no = 0
-    for piece in lines:
+    bare_lines = [piece.rstrip("\r\n") for piece in lines]
+    for line_index, piece in enumerate(lines):
         line_no += 1
-        content = piece.rstrip("\r\n")
+        content = bare_lines[line_index]
         ending = piece[len(content) :]
+        prev_line = bare_lines[line_index - 1] if line_index > 0 else None
+        next_line = bare_lines[line_index + 1] if line_index + 1 < len(bare_lines) else None
         protected = False
         fence_match = FENCE_LINE_RE.match(content)
         if fence_match:
@@ -356,7 +467,9 @@ def cleanup_zh_markdown(text: str) -> tuple[str, dict[str, Any]]:
         elif in_fence:
             protected = True
 
-        if protected or _is_table_row(content):
+        if protected or _is_indented_code_line(content) or _is_table_row(
+            content, prev_line=prev_line, next_line=next_line
+        ):
             cleaned = content
         else:
             cleaned, line_changes = _process_line(content, line_no)
@@ -403,10 +516,13 @@ def publish_translation_zh_cleanup(
     run_dir = run_dir.expanduser().resolve()
     raw_path = run_dir / "translated.raw.md"
     cleaned_path = run_dir / "translated.cleaned.md"
-    report_path = run_dir / "cleanup-report.json"
+    report_path = run_dir / TRANSLATION_CLEANUP_REPORT_FILENAME
 
     raw_path.write_text(raw_markdown, encoding="utf-8")
     cleaned, report = cleanup_zh_markdown(raw_markdown)
+    idempotent_cleaned, idempotent_report = cleanup_zh_markdown(cleaned)
+    if idempotent_cleaned != cleaned or idempotent_report["changed_count"] != 0:
+        raise RuntimeError("zh markdown cleanup must be idempotent before publication")
     report["target_language"] = target_language
     cleaned_path.write_text(cleaned, encoding="utf-8")
     atomic_json(report_path, report)
@@ -414,5 +530,5 @@ def publish_translation_zh_cleanup(
     return cleaned, {
         "translated_raw_markdown": str(raw_path),
         "translated_cleaned_markdown": str(cleaned_path),
-        "cleanup_report": str(report_path),
+        "translation_cleanup_report": str(report_path),
     }
