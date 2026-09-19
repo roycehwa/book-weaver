@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "book-weaver"
 version = "0.1.0"
-description = "BookWeaver Phase A: ingestion, translation, review workspace, and handoff to Phase B."
+description = "BookWeaver Phase A: ingestion, logical reconstruction, translation, review, and export."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -13,6 +13,7 @@ authors = [
   { name = "Codex" }
 ]
 dependencies = [
+  "pillow>=10.0",
   "docling>=2.90.0",
   "markdown>=3.8",
   "reportlab>=4.4.0",

@@ -3,6 +3,7 @@ from __future__ import annotations
 import html as html_lib
 import os
 import re
+from io import BytesIO
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
@@ -88,6 +89,7 @@ def _build_styles() -> StyleSheet1:
         styles[heading_name].leading = size + 6
         styles[heading_name].spaceBefore = space_before
         styles[heading_name].spaceAfter = space_after
+        styles[heading_name].keepWithNext = True
 
     styles.add(
         ParagraphStyle(
@@ -320,13 +322,15 @@ def _resolve_image_path(src: str, images_dir: Path | None = None, base_dir: Path
     return None
 
 
-def _image_flowable(src: str, *, styles: StyleSheet1, images_dir: Path | None = None, base_dir: Path | None = None) -> list:
+def _image_flowable(src: str, *, styles: StyleSheet1, images_dir: Path | None = None, base_dir: Path | None = None, original_page: bool = False) -> list:
     path = _resolve_image_path(src, images_dir=images_dir, base_dir=base_dir)
     if path is None:
         return [Paragraph("[Image missing]", styles["BlockQuote"])]
     try:
-        img = Image(str(path))
-        scale = min(CONTENT_WIDTH / img.imageWidth, CONTENT_HEIGHT * 0.72 / img.imageHeight, 1.0)
+        from pdf_translator.epub import _export_image_bytes
+        img = Image(BytesIO(_export_image_bytes(path)))
+        height_limit = CONTENT_HEIGHT - 30 if original_page else CONTENT_HEIGHT * 0.72
+        scale = min(CONTENT_WIDTH / img.imageWidth, height_limit / img.imageHeight, 1.0)
         img.drawWidth = img.imageWidth * scale
         img.drawHeight = img.imageHeight * scale
         return [img, Spacer(1, 4)]
@@ -506,11 +510,14 @@ def _story_from_html(
                     story.append(_paragraph_with_inline_image_placeholder(node, styles["BodyText"]))
                 else:
                     src = img_tag.attrs.get("src", "")
-                    flowables = _image_flowable(src, styles=styles, images_dir=images_dir, base_dir=base_dir)
+                    flowables = _image_flowable(src, styles=styles, images_dir=images_dir, base_dir=base_dir,
+                        original_page=bool(re.fullmatch(r"Original page \d+", str(img_tag.attrs.get("alt", "")))))
                     alt = _caption_text(img_tag.attrs.get("alt", ""))
                     if alt:
                         flowables.append(Paragraph(html_lib.escape(alt), styles["Caption"]))
-                    story.append(KeepTogether(flowables))
+                    for flowable in flowables[:-1]:
+                        flowable.keepWithNext = True
+                    story.extend(flowables)
             else:
                 story.append(_paragraph_from_tag(node, styles["BodyText"]))
         elif node.name == "blockquote":
@@ -525,17 +532,23 @@ def _story_from_html(
             story.append(Spacer(1, 8))
         elif node.name == "img":
             src = node.attrs.get("src", "")
-            flowables = _image_flowable(src, styles=styles, images_dir=images_dir, base_dir=base_dir)
+            flowables = _image_flowable(src, styles=styles, images_dir=images_dir, base_dir=base_dir,
+                original_page=bool(re.fullmatch(r"Original page \d+", str(node.attrs.get("alt", "")))))
             alt = _caption_text(node.attrs.get("alt", ""))
             if alt:
                 flowables.append(Paragraph(html_lib.escape(alt), styles["Caption"]))
-            story.append(KeepTogether(flowables))
+            for flowable in flowables[:-1]:
+                flowable.keepWithNext = True
+            story.extend(flowables)
         else:
             text = node.get_text(" ", strip=True)
             if text:
                 story.append(Paragraph(text, styles["BodyText"]))
 
-        story.append(Spacer(1, 4))
+        # A spacer would satisfy the heading's keepWithNext and leave the
+        # actual following image/paragraph on the next page.
+        if node.name not in {"h1", "h2", "h3", "h4", "h5", "h6"}:
+            story.append(Spacer(1, 4))
 
     return story
 

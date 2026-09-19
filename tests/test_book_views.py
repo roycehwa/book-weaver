@@ -130,13 +130,13 @@ def test_keeps_caption_block():
     assert "Trade routes" in out
 
 
-def test_falls_back_to_full_markdown_when_no_chapters():
+def test_uses_current_full_markdown_when_reconstruction_has_no_chapters():
     book = {"full_markdown": "Free-form content."}
     out = render_translation_input_markdown(book)
     assert "Free-form content." in out
 
 
-def test_legacy_markdown_with_image_lines_filtered():
+def test_unstructured_chapter_markdown_with_image_lines_filtered():
     book = {
         "chapters": [
             _chapter("Chapter 1", "Prose.\n\n![Table 1](t1.png)\n\nMore prose."),

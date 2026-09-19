@@ -7,6 +7,8 @@ import subprocess
 import sys
 import time
 import copy
+import uuid
+import threading
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, replace
@@ -18,7 +20,7 @@ from openai import OpenAI
 import requests
 
 from pdf_translator.book_views import ensure_chapter_top_heading, join_chapter_delivery_markdown
-from pdf_translator.chunking import split_markdown_into_chunks
+from pdf_translator.chunking import split_markdown_into_chunks, join_chunk_texts, markdown_block_structure, untranslated_prose_blocks, markdown_source_blocks
 from pdf_translator.segment_conservation import (
     translatable_segment_ids,
     verify_segment_processing_order,
@@ -78,7 +80,9 @@ Rules:
 - If a source English term should be translated, write only the Chinese translation. If the original text did not contain parentheses, do not add parentheses just to show the source English.
 - Keep source English only for names, titles, citations, identifiers, or terms that genuinely should remain untranslated.
 - Translate completely. Do not summarize, shorten, skip paragraphs, or replace content with an overview.
+- Preserve paragraph boundaries: do not merge separate paragraphs or split a paragraph into extra paragraphs.
 - Return only translated Markdown, with no commentary.
+- Never invent link destinations or add translation notes. Preserve existing link targets exactly.
 """
 
 
@@ -117,7 +121,10 @@ def build_translation_prompt(
         f"Source language: {source}\n"
         f"Target language: {target_language}\n"
         f"Markdown chunk index: {chunk_index}\n\n"
-        f"{FOOTNOTE_TRANSLATION_INSTRUCTION}"
+        "Translate every natural-language sentence and clause, including quoted prose, "
+        "into the target language. Preserve URLs, citation identifiers and code. "
+        "A fragment may start or end mid-sentence: translate the supplied fragment "
+        "without inventing missing text. Do not copy source prose into the translation."
     )
     if glossary_entries:
         hard_entries = [
@@ -166,6 +173,13 @@ def _translation_prompt(
     quality_retry: str | None = None,
 ) -> str:
     retry_note = ""
+    if chunk.preserve_block_structure:
+        retry_note = (
+            "\nPreserve the exact source block sequence: "
+            + ", ".join(markdown_block_structure(chunk.markdown))
+            + ". Keep every paragraph separate; do not split a source paragraph. "
+            "Preserve Markdown heading levels, lists, tables and code blocks.\n"
+        )
     if quality_retry:
         if "missing mandatory glossary terms" in quality_retry:
             missing_terms = re.findall(r"([^\s,]+)\s*=>\s*([^,)]+)", quality_retry)
@@ -173,13 +187,17 @@ def _translation_prompt(
                 f"- {src_term}：must contain the literal Chinese target term `{tgt_term}`"
                 for src_term, tgt_term in missing_terms[:6]
             ) if missing_terms else ""
-            retry_note = (
+            retry_note += (
                 f"\nGlossary retry: the previous translation was rejected because the literal Chinese target terms were missing.\n"
                 f"{terms_list}\n"
                 "Rewrite your translation so each listed source term is rendered with its exact Chinese target verbatim. Do not paraphrase, do not use a synonym, do not omit the term.\n"
             )
+        elif "paragraph/block structure" in quality_retry:
+            retry_note += "\nStructure retry: restore the exact source block sequence. Do not add or remove paragraphs or heading markers.\n"
+        elif "translator meta response" in quality_retry or "invented link targets" in quality_retry:
+            retry_note += "\nFidelity retry: return only translated source content. Do not add translator notes or invent Markdown links for footnote numbers. Preserve source link destinations exactly.\n"
         else:
-            retry_note = (
+            retry_note += (
                 "\nQuality retry: the previous output failed validation because it was not fully translated. "
                 "Translate every natural-language sentence completely into the target language now. "
                 "Do not return the source text unchanged.\n"
@@ -260,7 +278,14 @@ def _chunk_source_fingerprint(markdown: str) -> str:
 
 
 def _chunk_cache_path(cache_dir: Path, chunk: TranslationChunk) -> Path:
-    return cache_dir / f"chunk-{chunk.index:06d}-{_chunk_input_hash(chunk)}.md"
+    digest = _chunk_input_hash(chunk)
+    preferred = cache_dir / f"chunk-{chunk.index:06d}-{digest}.md"
+    if preferred.exists():
+        return preferred
+    # An earlier chapter edit can shift global indices. Reuse only an identical
+    # prompt/source/glossary fingerprint, still subject to the normal quality gate.
+    matches = sorted(cache_dir.glob(f"chunk-*-{digest}.md"))
+    return matches[0] if matches else preferred
 
 
 def _read_chunk_cache(cache_dir: Path, chunk: TranslationChunk) -> str:
@@ -436,8 +461,24 @@ def _assert_translation_quality(
 ) -> None:
     if translator_name == "mock":
         return
-    if _looks_like_translator_meta_response(translated):
+    if chunk.preserve_block_structure and markdown_block_structure(chunk.markdown) != markdown_block_structure(translated):
+        raise ValueError(f"Translation for chunk {chunk.index} changed paragraph/block structure.")
+    if target_language.lower().startswith("zh") and untranslated_prose_blocks(chunk.markdown, translated):
+        raise ValueError(f"Translation for chunk {chunk.index} contains copied untranslated prose paragraphs.")
+    if _looks_like_translator_meta_response(translated) and not _looks_like_translator_meta_response(chunk.markdown):
         raise ValueError(f"Translation for chunk {chunk.index} contains translator meta response.")
+    # Parse rendered links, including reference-style and raw HTML anchors. A
+    # numeric footnote marker is not a filename and must not become one.
+    import markdown as markdown_renderer
+    from bs4 import BeautifulSoup
+    def link_targets(text: str) -> set[str]:
+        soup = BeautifulSoup(markdown_renderer.markdown(text), "html.parser")
+        return {str(a["href"]) for a in soup.find_all("a", href=True)}
+    source_targets = link_targets(chunk.markdown) | {
+        url.rstrip(".,;:!?)]") for url in re.findall(r"https?://[^\s<>]+", chunk.markdown)
+    }
+    if link_targets(translated) - source_targets:
+        raise ValueError(f"Translation for chunk {chunk.index} contains invented link targets.")
     if _looks_untranslated_for_target(chunk.markdown, translated, target_language):
         raise ValueError(
             f"Translation for chunk {chunk.index} looks untranslated "
@@ -546,7 +587,10 @@ def _is_untranslated_quality_error(exc: Exception) -> bool:
     if not isinstance(exc, ValueError):
         return False
     message = str(exc).lower()
-    return "looks untranslated" in message or "looks incomplete" in message
+    return any(marker in message for marker in (
+        "looks untranslated", "looks incomplete", "copied untranslated prose paragraphs",
+        "translator meta response", "invented link targets",
+    ))
 
 
 def _looks_untranslated_split_part(source: str, translated: str, target_language: str) -> bool:
@@ -564,6 +608,8 @@ def _looks_untranslated_split_part(source: str, translated: str, target_language
 
 def _looks_like_translator_meta_response(translated: str) -> bool:
     lowered = translated.lower()
+    if re.search(r"(?im)^\s*[*_\[]*\s*(?:translation notes?|translator(?:'s)? notes?)\s*:", translated):
+        return True
     meta_markers = (
         "this is a translation job",
         "please provide the actual markdown content",
@@ -583,7 +629,7 @@ def _should_try_fallback_translation(exc: Exception | None, *, had_sensitive_fai
 
 
 def _translation_fail_open_enabled() -> bool:
-    value = os.getenv("TRANSLATION_FAIL_OPEN", "1").strip().lower()
+    value = os.getenv("TRANSLATION_FAIL_OPEN", "0").strip().lower()
     return value not in {"0", "false", "no", "off"}
 
 
@@ -647,22 +693,18 @@ def _write_chunk_cache(
     allow_glossary_drift: bool = False,
     allow_failed_placeholder: bool = False,
 ) -> None:
-    tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = cache_path.with_name(f'.{cache_path.name}.{uuid.uuid4().hex}.tmp')
     tmp_path.write_text(translated + "\n", encoding="utf-8")
     tmp_path.replace(cache_path)
-    cache_path.with_suffix(".source.json").write_text(
-        json.dumps(
+    from pdf_translator.source_workspace import atomic_json
+    atomic_json(cache_path.with_suffix('.source.json'),
             {
                 "schema": "translation_cache_source_v1",
                 "source_fingerprint": _chunk_source_fingerprint(chunk.markdown),
                 "allow_glossary_drift": allow_glossary_drift,
                 "allow_failed_placeholder": allow_failed_placeholder,
             },
-            ensure_ascii=False,
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
     )
 
 
@@ -753,7 +795,15 @@ def _is_transient_translation_error(exc: Exception) -> bool:
 
 def _is_permanent_translation_error(exc: Exception) -> bool:
     message = str(exc).lower()
-    return "token plan" in message or "(2062)" in message
+    return any(marker in message for marker in (
+        "token plan", "(2062)", "http 401", "http 403", "http 404",
+        "invalid api key", "unauthorized", "insufficient_quota",
+    ))
+
+
+def _require_translation_not_paused(cache_dir: Path | None) -> None:
+    if cache_dir is not None and (cache_dir.parent / 'translation-pause.json').exists():
+        raise RuntimeError('翻译已按用户要求暂停；已完成片段保留，可修改输入或手动继续。')
 
 
 def _translate_chunk_resumable(
@@ -767,143 +817,59 @@ def _translate_chunk_resumable(
     allow_sensitive_split: bool = True,
     observer: TranslationObserver | None = None,
 ) -> str:
+    _require_translation_not_paused(cache_dir)
     input_hash = _chunk_input_hash(chunk)
     cache_path: Path | None = None
     if cache_dir is not None:
         cache_dir.mkdir(parents=True, exist_ok=True)
         cache_path = _chunk_cache_path(cache_dir, chunk)
         if cache_path.exists():
-                cached = cache_path.read_text(encoding="utf-8").strip()
-                if cached:
-                    cached = _strip_generated_english_chinese_glosses(chunk.markdown, cached, target_language)
-                    cached = _apply_deterministic_glossary_repairs(
-                        source_text=chunk.markdown,
-                        translated_text=cached,
-                        glossary_entries=chunk.glossary_entries,
-                    )
-                try:
-                    source_metadata_path = cache_path.with_suffix(".source.json")
-                    source_metadata = (
-                        json.loads(source_metadata_path.read_text(encoding="utf-8"))
-                        if source_metadata_path.exists()
-                        else {}
-                    )
-                    _assert_translation_quality(
-                        chunk=chunk,
-                        translated=cached,
-                        target_language=target_language,
-                        translator_name=translator.name,
-                        require_glossary=not bool(source_metadata.get("allow_glossary_drift")),
-                    )
-                except ValueError as exc:
-                    if source_metadata.get("allow_failed_placeholder") or "BOOKWEAVER_TRANSLATION_FAIL_OPEN" in cached:
-                        if observer is not None:
-                            observer.cache_hit(chunk_index=chunk.index, input_hash=input_hash, cache_path=cache_path)
-                        return cached
-                    if observer is not None:
-                        observer.cache_invalidated(
-                            chunk_index=chunk.index,
-                            input_hash=input_hash,
-                            cache_path=cache_path,
-                            reason=str(exc),
-                        )
-                    cache_path.unlink(missing_ok=True)
-                else:
+            cached = cache_path.read_text(encoding="utf-8").strip()
+            if cached:
+                cached = _strip_generated_english_chinese_glosses(chunk.markdown, cached, target_language)
+                cached = _apply_deterministic_glossary_repairs(
+                    source_text=chunk.markdown,
+                    translated_text=cached,
+                    glossary_entries=chunk.glossary_entries,
+                )
+            source_metadata: dict[str, Any] = {}
+            try:
+                source_metadata_path = cache_path.with_suffix(".source.json")
+                source_metadata = (
+                    json.loads(source_metadata_path.read_text(encoding="utf-8"))
+                    if source_metadata_path.exists()
+                    else {}
+                )
+                _assert_translation_quality(
+                    chunk=chunk,
+                    translated=cached,
+                    target_language=target_language,
+                    translator_name=translator.name,
+                    require_glossary=not bool(source_metadata.get("allow_glossary_drift")),
+                )
+            except ValueError as exc:
+                if _translation_fail_open_enabled() and (source_metadata.get("allow_failed_placeholder") or "BOOKWEAVER_TRANSLATION_FAIL_OPEN" in cached):
                     if observer is not None:
                         observer.cache_hit(chunk_index=chunk.index, input_hash=input_hash, cache_path=cache_path)
                     return cached
-        else:
-            source_fingerprint = _chunk_source_fingerprint(chunk.markdown)
-            legacy_path_set = set(
-                cache_dir.glob(f"chunk-{chunk.index:06d}-*.md")
-            )
-            for source_metadata_path in cache_dir.glob("chunk-*.source.json"):
-                try:
-                    source_metadata = json.loads(
-                        source_metadata_path.read_text(encoding="utf-8")
-                    )
-                except json.JSONDecodeError:
-                    continue
-                if source_metadata.get("source_fingerprint") != source_fingerprint:
-                    continue
-                translated_path = Path(
-                    str(source_metadata_path)[: -len(".source.json")] + ".md"
-                )
-                if translated_path.exists():
-                    legacy_path_set.add(translated_path)
-            legacy_paths = sorted(
-                legacy_path_set,
-                key=lambda path: path.stat().st_mtime,
-                reverse=True,
-            )
-            for legacy_path in legacy_paths:
-                source_path = legacy_path.with_suffix(".source.json")
-                if not source_path.exists():
-                    continue
-                try:
-                    source_metadata = json.loads(
-                        source_path.read_text(encoding="utf-8")
-                    )
-                except json.JSONDecodeError:
-                    continue
-                if source_metadata.get(
-                    "source_fingerprint"
-                ) != source_fingerprint:
-                    continue
-                legacy = sanitize_translation_output(
-                    legacy_path.read_text(encoding="utf-8")
-                )
-                legacy = _apply_deterministic_glossary_repairs(
-                    source_text=chunk.markdown,
-                    translated_text=legacy,
-                    glossary_entries=chunk.glossary_entries,
-                )
-                if not legacy:
-                    continue
-                try:
-                    _assert_translation_quality(
-                        chunk=chunk,
-                        translated=legacy,
-                        target_language=target_language,
-                        translator_name=translator.name,
-                        require_glossary=not bool(
-                            source_metadata.get("allow_glossary_drift")
-                        ),
-                    )
-                    return _persist_chunk_translation(
-                        chunk=chunk,
-                        translated=legacy,
-                        cache_path=cache_path,
-                        observer=observer,
+                if observer is not None:
+                    observer.cache_invalidated(
+                        chunk_index=chunk.index,
                         input_hash=input_hash,
-                    )
-                except ValueError as exc:
-                    if not _is_glossary_quality_error(exc):
-                        continue
-                    missing = glossary_terms_missing_in_translation(
-                        chunk.markdown,
-                        legacy,
-                        chunk.glossary_entries or [],
-                    )
-                    repaired = _apply_deterministic_glossary_repairs(
-                        source_text=chunk.markdown,
-                        translated_text=legacy,
-                        glossary_entries=chunk.glossary_entries,
-                    )
-                    return _persist_chunk_translation(
-                        chunk=chunk,
-                        translated=repaired,
                         cache_path=cache_path,
-                        observer=observer,
-                        input_hash=input_hash,
-                        allow_glossary_drift=bool(missing),
+                        reason=str(exc),
                     )
-
+                cache_path.unlink(missing_ok=True)
+            else:
+                if observer is not None:
+                    observer.cache_hit(chunk_index=chunk.index, input_hash=input_hash, cache_path=cache_path)
+                return cached
     last_error: Exception | None = None
     had_sensitive_failure = False
     last_glossary_candidate: str | None = None
     max_attempts = max(1, retry_count) + 4
     for attempt in range(max_attempts):
+        _require_translation_not_paused(cache_dir)
         attempt_no = attempt + 1
         try:
             if observer is not None:
@@ -918,6 +884,7 @@ def _translate_chunk_resumable(
             if not translated:
                 raise ValueError(f"Empty translation returned for chunk {chunk.index}.")
             translated = _strip_generated_english_chinese_glosses(chunk.markdown, translated, target_language)
+            translated = _restore_single_prose_boundary(chunk, translated)
             translated = _apply_deterministic_glossary_repairs(
                 source_text=chunk.markdown,
                 translated_text=translated,
@@ -955,7 +922,8 @@ def _translate_chunk_resumable(
             if "new_sensitive" in str(exc).lower():
                 had_sensitive_failure = True
             permanent = _is_permanent_translation_error(exc)
-            retryable = attempt_no < max_attempts and not permanent
+            attempt_limit = max_attempts if _is_transient_translation_error(exc) else max(1, retry_count)
+            retryable = attempt_no < attempt_limit and not permanent
             if allow_sensitive_split and "new_sensitive" in str(exc).lower():
                 retryable = False
                 try:
@@ -964,12 +932,14 @@ def _translate_chunk_resumable(
                         source_language=source_language,
                         target_language=target_language,
                         translator=translator,
+                        cache_dir=cache_dir,
                     )
                     _assert_translation_quality(
                         chunk=chunk,
                         translated=translated,
                         target_language=target_language,
                         translator_name=translator.name,
+                        require_glossary=False,
                     )
                     return _persist_chunk_translation(
                         chunk=chunk,
@@ -977,6 +947,7 @@ def _translate_chunk_resumable(
                         cache_path=cache_path,
                         observer=observer,
                         input_hash=input_hash,
+                        allow_glossary_drift=bool(glossary_terms_missing_in_translation(chunk.markdown, translated, chunk.glossary_entries or [])),
                     )
                 except Exception as split_exc:
                     last_error = split_exc
@@ -1004,6 +975,58 @@ def _translate_chunk_resumable(
                 break
             time.sleep(min(2**attempt, 8))
 
+    _require_translation_not_paused(cache_dir)
+    # A model may merge paragraphs repeatedly despite the correction prompt.
+    # Retry isolated source blocks, never infer missing boundaries from output.
+    if last_error and not had_sensitive_failure and ("changed paragraph/block structure" in str(last_error)
+                       or _is_untranslated_quality_error(last_error)):
+        blocks = markdown_source_blocks(chunk.markdown)
+        if len(blocks) > 1:
+            # Keep the whole context while giving the model explicit ownership
+            # boundaries. Page-fragment prose often cannot be translated alone.
+            try:
+                result = _translate_tagged_blocks(chunk=chunk, blocks=blocks,
+                    source_language=source_language, target_language=target_language,
+                    translator=translator, cache_dir=cache_dir)
+                return _persist_chunk_translation(chunk=chunk, translated=result,
+                    cache_path=cache_path, observer=observer, input_hash=input_hash,
+                    allow_glossary_drift=bool(glossary_terms_missing_in_translation(chunk.markdown, result, chunk.glossary_entries or [])))
+            except ValueError as exc:
+                if _is_permanent_translation_error(exc) or _is_transient_translation_error(exc):
+                    raise
+            recovered = []
+            for offset, block in enumerate(blocks):
+                _require_translation_not_paused(cache_dir)
+                part = replace(chunk, index=chunk.index * 1000 + offset,
+                               markdown=block,
+                               prompt_instruction=(chunk.prompt_instruction or "") +
+                               "\nThe following neighboring source is context ONLY; do not translate or include it in your output. "
+                               "Use it to understand incomplete sentences caused by page boundaries.\n"
+                               + json.dumps({"previous": blocks[offset - 1][-1200:] if offset else "",
+                                             "next": blocks[offset + 1][:1200] if offset + 1 < len(blocks) else ""}, ensure_ascii=False)
+                               + "\nTranslate only the requested Markdown chunk, preserving its boundary.")
+                try:
+                    result = _translate_sensitive_part(
+                        chunk=part, source_language=source_language,
+                        target_language=target_language, translator=translator,
+                        retry_count=max(1, retry_count), cache_dir=cache_dir,
+                    )
+                except ValueError as exc:
+                    if _is_permanent_translation_error(exc) or _is_transient_translation_error(exc):
+                        raise
+                    last_error = exc
+                    break
+                _assert_translation_quality(chunk=part, translated=result,
+                    target_language=target_language, translator_name=translator.name, require_glossary=False)
+                recovered.append(result)
+            if len(recovered) == len(blocks):
+                result = "\n\n".join(recovered)
+                _assert_translation_quality(chunk=chunk, translated=result,
+                    target_language=target_language, translator_name=translator.name, require_glossary=False)
+                return _persist_chunk_translation(chunk=chunk, translated=result,
+                    cache_path=cache_path, observer=observer, input_hash=input_hash,
+                    allow_glossary_drift=bool(glossary_terms_missing_in_translation(chunk.markdown, result, chunk.glossary_entries or [])))
+
     fallback_translated: str | None = None
     if _should_try_fallback_translation(last_error, had_sensitive_failure=had_sensitive_failure):
         fallback_translated = _try_fallback_translation(
@@ -1017,6 +1040,33 @@ def _translate_chunk_resumable(
         if observer is not None:
             observer.attempt_success(chunk_index=chunk.index, input_hash=input_hash, cache_path=cache_path)
         return fallback_translated
+
+    split_error: Exception | None = None
+    if last_error and _is_untranslated_quality_error(last_error):
+        try:
+            split_translated = _translate_sensitive_chunk_parts(
+                chunk=chunk, source_language=source_language,
+                target_language=target_language, translator=translator,
+                cache_dir=cache_dir,
+            )
+            split_translated = _strip_generated_english_chinese_glosses(
+                chunk.markdown, split_translated, target_language,
+            )
+            split_translated = _apply_deterministic_glossary_repairs(
+                source_text=chunk.markdown, translated_text=split_translated,
+                glossary_entries=chunk.glossary_entries,
+            )
+            _assert_translation_quality(
+                chunk=chunk, translated=split_translated,
+                target_language=target_language, translator_name=translator.name,
+                require_glossary=True,
+            )
+            return _persist_chunk_translation(
+                chunk=chunk, translated=split_translated, cache_path=cache_path,
+                observer=observer, input_hash=input_hash,
+            )
+        except Exception as exc:
+            split_error = exc
 
     if last_error and _is_untranslated_quality_error(last_error) and _translation_fail_open_enabled():
         placeholder = _failed_chunk_placeholder(
@@ -1039,42 +1089,6 @@ def _translate_chunk_resumable(
                 cache_path=cache_path,
             )
         return placeholder
-
-    split_error: Exception | None = None
-    if last_error and _is_untranslated_quality_error(last_error):
-        try:
-            split_translated = _translate_sensitive_chunk_parts(
-                chunk=chunk,
-                source_language=source_language,
-                target_language=target_language,
-                translator=translator,
-            )
-            split_translated = _strip_generated_english_chinese_glosses(
-                chunk.markdown,
-                split_translated,
-                target_language,
-            )
-            split_translated = _apply_deterministic_glossary_repairs(
-                source_text=chunk.markdown,
-                translated_text=split_translated,
-                glossary_entries=chunk.glossary_entries,
-            )
-            _assert_translation_quality(
-                chunk=chunk,
-                translated=split_translated,
-                target_language=target_language,
-                translator_name=translator.name,
-                require_glossary=True,
-            )
-            return _persist_chunk_translation(
-                chunk=chunk,
-                translated=split_translated,
-                cache_path=cache_path,
-                observer=observer,
-                input_hash=input_hash,
-            )
-        except Exception as exc:
-            split_error = exc
 
     if last_error and _is_glossary_quality_error(last_error) and last_glossary_candidate:
         substituted = _apply_deterministic_glossary_repairs(
@@ -1208,8 +1222,10 @@ def _try_fallback_translation(
             source_language=source_language,
             target_language=target_language,
             translator=fallback,
+            cache_dir=cache_path.parent if cache_path is not None else None,
         ),
     ):
+        _require_translation_not_paused(cache_path.parent if cache_path is not None else None)
         try:
             translated = attempt().strip()
             if not translated:
@@ -1376,59 +1392,81 @@ def _split_sensitive_source(source: str, *, max_part_chars: int) -> list[str]:
     return parts
 
 
+def _translate_tagged_blocks(*, chunk: TranslationChunk, blocks: list[str],
+                            source_language: str | None, target_language: str,
+                            translator: BaseTranslator, cache_dir: Path | None) -> str:
+    markers = [f"<!-- BW_BLOCK_{i}_{hashlib.sha256(block.encode()).hexdigest()[:10]} -->"
+               for i, block in enumerate(blocks)]
+    marked = "\n\n".join(f"{marker}\n{block}" for marker, block in zip(markers, blocks))
+    request = replace(chunk, markdown=marked, preserve_block_structure=False,
+        prompt_instruction=(chunk.prompt_instruction or "") +
+        "\nContext-preserving recovery: translate ALL prose, including incomplete fragments. "
+        "Keep each BW_BLOCK comment exactly once in the same order. "
+        "Each comment owns the following source block: do not move content across comments. "
+        "Use neighboring blocks to understand broken sentences but preserve every boundary. "
+        "Do not add commentary or links.")
+    _require_translation_not_paused(cache_dir)
+    output = translator.translate_chunk(request, source_language, target_language).strip()
+    found = re.findall(r"<!-- BW_BLOCK_\d+_[0-9a-f]{10} -->", output)
+    if found != markers or output.split(markers[0], 1)[0].strip():
+        raise ValueError("Context recovery changed block ownership markers.")
+    parts = re.split(r"<!-- BW_BLOCK_\d+_[0-9a-f]{10} -->", output)[1:]
+    translated = []
+    for block, part in zip(blocks, parts):
+        owned = replace(chunk, markdown=block)
+        if not part.strip():
+            raise ValueError("Context recovery omitted a source block.")
+        part = _restore_single_prose_boundary(owned, part.strip())
+        part = _apply_deterministic_glossary_repairs(source_text=block, translated_text=part,
+                                                   glossary_entries=chunk.glossary_entries)
+        _assert_translation_quality(chunk=owned, translated=part, target_language=target_language,
+                                    translator_name=translator.name, require_glossary=False)
+        translated.append(part)
+    result = "\n\n".join(translated)
+    _assert_translation_quality(chunk=chunk, translated=result, target_language=target_language,
+                                translator_name=translator.name, require_glossary=False)
+    return result
+
+
 def _translate_sensitive_chunk_parts(
     *,
     chunk: TranslationChunk,
     source_language: str | None,
     target_language: str,
     translator: BaseTranslator,
+    cache_dir: Path | None = None,
 ) -> str:
     last_error: Exception | None = None
     split_sizes = (2800, 1400, 900, 500, 240)
     for max_part_chars in split_sizes:
         try:
             translated_parts: list[str] = []
-            preserved_sensitive_part = False
+            source_chunks = split_markdown_into_chunks(chunk.markdown, max_part_chars)
             if max_part_chars == split_sizes[-1]:
-                source_parts = [
-                    part
-                    for paragraph in chunk.markdown.split("\n\n")
-                    if paragraph.strip()
-                    for part in _split_sensitive_source(
-                        paragraph.strip(),
-                        max_part_chars=max_part_chars,
-                    )
-                ]
-            else:
-                source_parts = _split_sensitive_source(
-                    chunk.markdown,
-                    max_part_chars=max_part_chars,
-                )
+                source_chunks = [part for paragraph in chunk.markdown.split("\n\n")
+                                 if paragraph.strip()
+                                 for part in split_markdown_into_chunks(paragraph, max_part_chars)]
+            source_parts = [part.markdown for part in source_chunks]
             for offset, part in enumerate(source_parts):
                 try:
                     translated_part = _translate_sensitive_part(
                         chunk=TranslationChunk(
                             index=chunk.index * 1000 + offset,
                             markdown=part,
+                            preserve_block_structure=chunk.preserve_block_structure,
                         ),
                         source_language=source_language,
                         target_language=target_language,
                         translator=translator,
                         retry_count=3,
+                        cache_dir=cache_dir,
+                        allow_fragment_recovery=False,
                     )
-                except ValueError as exc:
-                    if (
-                        max_part_chars == split_sizes[-1]
-                        and "new_sensitive" in str(exc).lower()
-                    ):
-                        translated_part = part
-                        preserved_sensitive_part = True
-                    else:
-                        raise
+                except ValueError:
+                    # Original-text preservation requires a recorded human decision.
+                    raise
                 translated_parts.append(translated_part)
-            translated = "\n\n".join(part.strip() for part in translated_parts if part.strip())
-            if preserved_sensitive_part:
-                return translated
+            translated = join_chunk_texts(translated_parts, [part.separator_before for part in source_chunks])
             _assert_translation_quality(
                 chunk=chunk,
                 translated=translated,
@@ -1453,9 +1491,26 @@ def _translate_sensitive_part(
     target_language: str,
     translator: BaseTranslator,
     retry_count: int,
+    cache_dir: Path | None = None,
+    allow_fragment_recovery: bool = True,
 ) -> str:
+    chunk = replace(chunk, prompt_instruction=(chunk.prompt_instruction or '') +
+        '\nTranslate all natural-language prose in this source fragment, including quoted prose. '
+        'A fragment may start or end mid-sentence. Translate only the supplied text; '
+        'do not invent missing context and do not return the English fragment unchanged. '
+        'Keep genuine bibliographic identifiers and URLs intact.')
+    recovery_path = cache_dir / 'recovery' / f'{_chunk_input_hash(chunk)}.md' if cache_dir is not None else None
+    if recovery_path is not None and recovery_path.exists():
+        cached = recovery_path.read_text(encoding='utf-8')
+        try:
+            _assert_translation_quality(chunk=chunk, translated=cached, target_language=target_language,
+                                        translator_name=translator.name, require_glossary=False)
+            return cached
+        except ValueError:
+            pass
     last_error: Exception | None = None
     for attempt in range(max(1, retry_count)):
+        _require_translation_not_paused(cache_dir)
         try:
             translated = _complete_translation_attempt(
                 translator=translator,
@@ -1471,23 +1526,70 @@ def _translate_sensitive_part(
                 translated,
                 target_language,
             )
+            translated = _restore_single_prose_boundary(chunk, translated)
+            translated = _apply_deterministic_glossary_repairs(
+                source_text=chunk.markdown, translated_text=translated,
+                glossary_entries=chunk.glossary_entries,
+            )
             if _looks_untranslated_split_part(chunk.markdown, translated, target_language):
                 raise ValueError(
                     f"Split translation part {chunk.index} looks untranslated "
                     f"(ascii={_ascii_letter_count(translated)}, cjk={_cjk_count(translated)})."
                 )
+            if chunk.preserve_block_structure and markdown_block_structure(chunk.markdown) != markdown_block_structure(translated):
+                raise ValueError(f"Split translation part {chunk.index} changed paragraph/block structure.")
+            _assert_translation_quality(
+                chunk=chunk, translated=translated,
+                target_language=target_language, translator_name=translator.name, require_glossary=False,
+            )
+            if recovery_path is not None:
+                _write_chunk_cache(recovery_path, chunk=chunk, translated=translated, allow_glossary_drift=True)
             return translated
         except Exception as exc:
             last_error = exc
+            if _is_permanent_translation_error(exc) or _is_transient_translation_error(exc):
+                _require_translation_not_paused(cache_dir)
+                raise
             if "new_sensitive" in str(exc).lower():
                 break
             if attempt + 1 >= max(1, retry_count):
                 break
             time.sleep(min(2**attempt, 8))
+    if (allow_fragment_recovery and last_error and _is_untranslated_quality_error(last_error)
+            and markdown_block_structure(chunk.markdown) == ('p',) and len(chunk.markdown) > 500):
+        fragments = _split_sensitive_source(chunk.markdown, max_part_chars=450)
+        if 1 < len(fragments) <= 12:
+            outputs = []
+            for index, fragment in enumerate(fragments):
+                outputs.append(_translate_sensitive_part(
+                    chunk=replace(chunk, index=chunk.index * 100 + index, markdown=fragment),
+                    source_language=source_language, target_language=target_language,
+                    translator=translator, retry_count=2, cache_dir=cache_dir,
+                    allow_fragment_recovery=False))
+            translated = ' '.join(outputs)
+            _assert_translation_quality(chunk=chunk, translated=translated, target_language=target_language,
+                                        translator_name=translator.name, require_glossary=False)
+            if recovery_path is not None:
+                _write_chunk_cache(recovery_path, chunk=chunk, translated=translated, allow_glossary_drift=True)
+            return translated
     raise ValueError(
         f"Sensitive split translation failed for chunk {chunk.index} "
         f"after {retry_count} attempts: {last_error}"
     ) from last_error
+
+
+def _restore_single_prose_boundary(chunk: TranslationChunk, translated: str) -> str:
+    """A one-paragraph request owns one output paragraph, independent of model wrapping.
+
+    Only remove model-added paragraph breaks in plain prose. Never flatten
+    headings, lists, tables, code or multiple source paragraphs.
+    """
+    if not chunk.preserve_block_structure or markdown_block_structure(chunk.markdown) != ("p",):
+        return translated
+    structure = markdown_block_structure(translated)
+    if len(structure) > 1 and all(kind == "p" for kind in structure):
+        return re.sub(r"\n\s*\n+", " ", translated.strip())
+    return translated
 
 
 def _translate_chunks_ordered(
@@ -1981,6 +2083,8 @@ def translate_markdown(
                 )
                 or None,
                 prompt_instruction=chunk.prompt_instruction,
+                separator_before=chunk.separator_before,
+                preserve_block_structure=chunk.preserve_block_structure,
             )
             for chunk in chunks
         ]
@@ -1997,7 +2101,7 @@ def translate_markdown(
     )
 
     return TranslationResult(
-        translated_markdown="\n\n".join(translated_chunks).strip() + "\n",
+        translated_markdown=join_chunk_texts(translated_chunks, [chunk.separator_before for chunk in chunks]).strip() + "\n",
         source_language=settings.source_language,
         target_language=settings.target_language,
         translator=translator.name,
@@ -2222,16 +2326,19 @@ def translate_book_chapters(
     pages = book.get("pages") if isinstance(book, dict) else []
     pages = pages if isinstance(pages, list) else []
     segment_plan = chapter_segments_for_translation(book, max_chars=settings.max_chunk_chars)
+    from pdf_translator.translation_failures import read_failures, put_failure, clear_failure
+    pending_failures: list[str] = []
+    active_failure_keys: set[str] = set()
     segments_by_chapter: dict[str, list[dict]] = {}
     processed_segment_ids: list[str] = []
     for segment in segment_plan:
         segments_by_chapter.setdefault(str(segment.get("chapter_id") or ""), []).append(segment)
 
-    for chapter in book.get("chapters", []):
+    for fallback_index, chapter in enumerate(book.get("chapters", []), 1):
         if isinstance(chapter, dict) and not chapter.get("kind"):
             chapter["kind"] = classify_chapter(chapter, pages=pages)
         chapter_source_markdown = _chapter_markdown_for_translation(chapter)
-        chapter_id = str(chapter.get("chapter_id") or chapter.get("id") or "") or None
+        chapter_id = str(chapter.get("chapter_id") or chapter.get("id") or f"chapter-{fallback_index:03d}")
         if not should_translate_chapter(chapter):
             translated_markdown = chapter_source_markdown.strip()
             if translated_markdown:
@@ -2241,7 +2348,7 @@ def translate_book_chapters(
             translated_chapters.append(
                 TranslatedChapter(
                     index=int(chapter.get("index", len(translated_chapters) + 1)),
-                    chapter_id=str(chapter.get("chapter_id") or "") or None,
+                    chapter_id=chapter_id,
                     title=str(chapter.get("title") or f"Chapter {len(translated_chapters) + 1}"),
                     page_start=chapter.get("page_start"),
                     page_end=chapter.get("page_end"),
@@ -2254,6 +2361,7 @@ def translate_book_chapters(
             continue
 
         translated_parts: list[str] = []
+        chapter_jobs: list[tuple[int, TranslationChunk, dict, str]] = []
         planned_segments = segments_by_chapter.get(chapter_id or "")
         for planned_segment in planned_segments or []:
             segment_markdown = str(planned_segment.get("markdown") or "").strip()
@@ -2282,24 +2390,90 @@ def translate_book_chapters(
                     index=chunk_index,
                     markdown=segment_markdown,
                     glossary_entries=selected or None,
+                    preserve_block_structure=bool(planned_segment.get("preserve_block_structure", False)),
                 )
             ]
             _write_glossary_constraints(run_dir, global_chunks, reset=False)
-            translated_parts.extend(
-                _translate_chunks_ordered(
-                    chunks=global_chunks,
+            failure_key = segment_id or str(chunk_index)
+            active_failure_keys.add(failure_key)
+            input_hash = _chunk_input_hash(global_chunks[0])
+            previous_failure = read_failures(run_dir)["items"].get(failure_key, {})
+            resolution = previous_failure.get("resolution", {})
+            if previous_failure.get("input_hash") == input_hash and resolution.get("kind") in {"manual_translation", "preserve_source"}:
+                translated_parts.append(resolution["text"])
+                if observer is not None and hasattr(observer, 'human_resolution'):
+                    observer.human_resolution(chunk_index=chunk_index, kind=resolution['kind'])
+                chunk_index += len(global_chunks)
+                continue
+            chapter_jobs.append((len(translated_parts), global_chunks[0], planned_segment, failure_key))
+            translated_parts.append('')
+            chunk_index += len(global_chunks)
+
+        provider_stopped = threading.Event()
+        consecutive_network_failures = 0
+        def translate_one(chunk: TranslationChunk) -> str:
+            if provider_stopped.is_set():
+                raise RuntimeError('Provider unavailable; queued requests stopped.')
+            return _translate_chunks_ordered(
+                    chunks=[chunk],
                     source_language=settings.source_language,
                     target_language=settings.target_language,
                     translator=translator,
                     cache_dir=cache_dir,
                     retry_count=retry_count,
-                    concurrency=concurrency,
+                    concurrency=1,
                     observer=observer,
-                )
-            )
-            chunk_index += len(global_chunks)
+                )[0]
 
-        translated_markdown = "\n\n".join(part.strip() for part in translated_parts if part.strip()).strip()
+        with ThreadPoolExecutor(max_workers=max(1, concurrency)) as executor:
+            futures = {}
+            waiting_jobs = iter(chapter_jobs)
+            def submit_next() -> None:
+                job = next(waiting_jobs, None)
+                if job is not None:
+                    futures[executor.submit(translate_one, job[1])] = job
+            for _ in range(max(1, concurrency)):
+                submit_next()
+            try:
+                while futures:
+                    future = next(as_completed(tuple(futures)))
+                    position, chunk, segment, key = futures.pop(future)
+                    try:
+                        output = future.result()
+                        if 'BOOKWEAVER_TRANSLATION_FAIL_OPEN' in output:
+                            raise ValueError('Translation placeholder requires explicit human intervention.')
+                        translated_parts[position] = output
+                        clear_failure(run_dir, key)
+                        consecutive_network_failures = 0
+                    except Exception as exc:
+                        _require_translation_not_paused(cache_dir)
+                        if _is_permanent_translation_error(exc):
+                            raise
+                        if observer is not None:
+                            observer.attempt_failure(chunk_index=chunk.index, input_hash=_chunk_input_hash(chunk),
+                                attempt=max(1, retry_count), error_type=type(exc).__name__, message=str(exc), retryable=False)
+                        put_failure(run_dir, key, {
+                            'segment_id': key, 'chunk_index': chunk.index,
+                            'chapter_id': chapter_id, 'chapter_title': chapter.get('title'),
+                            'source_pages': segment.get('source_pages', []),
+                            'source': chunk.markdown, 'input_hash': _chunk_input_hash(chunk),
+                            'error': str(exc), 'status': 'failed',
+                        })
+                        pending_failures.append(key)
+                        if _is_transient_translation_error(exc):
+                            consecutive_network_failures += 1
+                            if consecutive_network_failures >= max(3, concurrency):
+                                provider_stopped.set()
+                                from pdf_translator.translation_failures import TranslationProviderUnavailable
+                                raise TranslationProviderUnavailable('模型连接连续失败，已停止后续请求；成功缓存已保留。') from exc
+                    submit_next()
+            except BaseException:
+                provider_stopped.set()
+                for future in futures:
+                    future.cancel()
+                raise
+
+        translated_markdown = join_chunk_texts(translated_parts, [str(part.get("separator_before", "\n\n")) for part in planned_segments or [] if str(part.get("markdown") or "").strip()]).strip()
         if translated_markdown:
             translated_markdown += "\n"
             translated_markdown_parts.append(translated_markdown.strip())
@@ -2308,7 +2482,7 @@ def translate_book_chapters(
         translated_chapters.append(
             TranslatedChapter(
                 index=int(chapter.get("index", len(translated_chapters) + 1)),
-                chapter_id=str(chapter.get("chapter_id") or "") or None,
+                chapter_id=chapter_id,
                 title=str(chapter.get("title") or f"Chapter {len(translated_chapters) + 1}"),
                 page_start=chapter.get("page_start"),
                 page_end=chapter.get("page_end"),
@@ -2318,6 +2492,60 @@ def translate_book_chapters(
                 toc=bool(chapter.get("toc", True)),
             )
         )
+
+    def semantic_translate(**kwargs) -> list[str]:
+        """Keep batching, but isolate failed notes and retain human resolutions."""
+        results = []
+        for chunk in kwargs["chunks"]:
+            sources = chunk.markdown.split(SEMANTIC_SPAN_BOUNDARY)
+            parts = [replace(chunk, index=chunk.index * 10000 + i,
+                             markdown=source.strip(), prompt_instruction=SEMANTIC_TRANSLATION_POLICY)
+                     for i, source in enumerate(sources)]
+            keys = ["footnote:" + _chunk_input_hash(part) for part in parts]
+            active_failure_keys.update(keys)
+            ledger = read_failures(run_dir)["items"]
+            if not any(key in ledger for key in keys):
+                try:
+                    output = _translate_chunks_ordered(**dict(kwargs, chunks=[chunk]))[0]
+                    if "BOOKWEAVER_TRANSLATION_FAIL_OPEN" in output:
+                        raise ValueError("Footnote translation requires human intervention.")
+                    results.append(output)
+                    continue
+                except Exception as exc:
+                    _require_translation_not_paused(cache_dir)
+                    if _is_permanent_translation_error(exc):
+                        raise
+            outputs = []
+            group_failed = False
+            for part, key in zip(parts, keys):
+                item = read_failures(run_dir)["items"].get(key, {})
+                resolution = item.get("resolution", {})
+                if resolution:
+                    outputs.append(resolution["text"])
+                    continue
+                try:
+                    output = _translate_chunks_ordered(**dict(kwargs, chunks=[part], observer=None))[0]
+                    if "BOOKWEAVER_TRANSLATION_FAIL_OPEN" in output:
+                        raise ValueError("Footnote translation requires human intervention.")
+                    outputs.append(output)
+                    clear_failure(run_dir, key)
+                except Exception as exc:
+                    _require_translation_not_paused(cache_dir)
+                    if _is_permanent_translation_error(exc):
+                        raise
+                    put_failure(run_dir, key, {
+                        "segment_id": key, "chunk_index": part.index,
+                        "chapter_title": "脚注", "source_pages": [],
+                        "source": part.markdown, "input_hash": _chunk_input_hash(part),
+                        "error": str(exc), "status": "failed",
+                    })
+                    pending_failures.append(key)
+                    group_failed = True
+                    outputs.append("")
+            if not group_failed and observer is not None:
+                observer.attempt_success(chunk_index=chunk.index, input_hash=_chunk_input_hash(chunk), cache_path=None)
+            results.append(SEMANTIC_SPAN_BOUNDARY.join(outputs))
+        return results
 
     semantic_content = copy.deepcopy(book.get("semantic_content"))
     if isinstance(semantic_content, dict):
@@ -2366,7 +2594,7 @@ def translate_book_chapters(
             for index, group in enumerate(semantic_span_groups)
         ]
         if semantic_chunks:
-            translated_spans = _translate_chunks_ordered(
+            translated_spans = semantic_translate(
                 chunks=semantic_chunks,
                 source_language=settings.source_language,
                 target_language=settings.target_language,
@@ -2411,7 +2639,7 @@ def translate_book_chapters(
                             ),
                         )
                         fallback_chunk_count += 1
-                        fallback_text = _translate_chunks_ordered(
+                        fallback_text = semantic_translate(
                             chunks=[fallback_chunk],
                             source_language=settings.source_language,
                             target_language=settings.target_language,
@@ -2441,7 +2669,7 @@ def translate_book_chapters(
                                 )
                                 for index, span in enumerate(fallback_group)
                             ]
-                            fallback_parts = _translate_chunks_ordered(
+                            fallback_parts = semantic_translate(
                                 chunks=individual_chunks,
                                 source_language=settings.source_language,
                                 target_language=settings.target_language,
@@ -2457,6 +2685,11 @@ def translate_book_chapters(
                     span["translated_text"] = part
             chunk_index += len(semantic_chunks) + fallback_chunk_count
 
+    from pdf_translator.translation_failures import archive_obsolete_failures
+    archive_obsolete_failures(run_dir, active_failure_keys)
+    if pending_failures:
+        from pdf_translator.translation_failures import TranslationInterventionRequired
+        raise TranslationInterventionRequired(len(set(pending_failures)))
     delivery_chapters: list[TranslatedChapter] = []
     for chapter in translated_chapters:
         markdown = str(chapter.markdown or "").strip()

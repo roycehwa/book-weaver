@@ -8,9 +8,11 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from zipfile import ZipFile
 
-from pdf_translator.book_rebuild import build_book_reconstruction
+from pdf_translator.book_rebuild import apply_canonical_chapter_plan, build_book_reconstruction
 from pdf_translator.epub import render_epub_from_book, validate_epub_internal_hrefs
+from pdf_translator.epub_reader_pages import build_epub_reader_page_records
 from pdf_translator.ingest import ingest_epub
+from pdf_translator.reading_units import build_reading_units
 
 
 def _write_two_spine_epub(path: Path) -> None:
@@ -76,6 +78,45 @@ def test_ingest_epub_resolves_cross_chapter_href_to_zip_internal_path(tmp_path: 
     md0 = chapters[0]["markdown"]
     assert "chapter two" in md0
     assert "OEBPS/chapter2.xhtml#note" in md0
+
+
+def test_confirmed_epub_reader_pages_keep_resource_and_dom_provenance(tmp_path: Path) -> None:
+    epub = tmp_path / "two.epub"
+    _write_two_spine_epub(epub)
+    records = build_epub_reader_page_records(epub, asset_dir=tmp_path / "reader-assets")
+    assert records[1]["source_internal_path"] == "OEBPS/chapter1.xhtml"
+    assert records[1]["whole_resource"] is True
+
+    doc = ingest_epub(epub)
+    book = build_book_reconstruction(doc.structured, source_pdf=None)
+    confirmed = apply_canonical_chapter_plan(
+        book,
+        {
+            "source_artifact": "user_confirmation",
+            "chapters": [
+                {"title": "Chapter One", "source_pages": [1], "page_start": 1, "page_end": 1},
+                {"title": "Chapter Two", "source_pages": [2], "page_start": 2, "page_end": 2},
+            ],
+        },
+        source_path=epub,
+        asset_dir=tmp_path / "confirmed-assets",
+    )
+    first = confirmed["chapters"][0]
+    assert first["source_internal_path"] == "OEBPS/chapter1.xhtml"
+    assert first["source_internal_paths"] == ["OEBPS/chapter1.xhtml"]
+    assert first["dom_units"][0]["dom_path"] == "/body[1]/p[1]"
+
+    units = build_reading_units(
+        confirmed,
+        source_path=epub,
+        translation_authority=True,
+    )
+    first_paragraph = next(
+        unit for unit in units["units"]
+        if unit["chapter_id"] == first["chapter_id"] and unit["kind"] == "paragraph"
+    )
+    assert first_paragraph["provenance"][0]["precision"] == "dom"
+    assert first_paragraph["provenance"][0]["link_targets"] == ["OEBPS/chapter2.xhtml#note"]
 
 
 def test_render_epub_rewrites_internal_href_to_output_chapter_basename(tmp_path: Path) -> None:

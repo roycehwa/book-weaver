@@ -9,6 +9,9 @@ __pycache__/
 .env
 node_modules/
 frontend/dist/
+output/
+.cursor/tmp/
+.cursor/worktrees/
 backend/cache/
 backend/storage/books/
 *.log

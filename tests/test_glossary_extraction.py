@@ -3,7 +3,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from pdf_translator.glossary import compute_max_candidates, extract_glossary_candidates
+from pdf_translator.glossary import (
+    compute_max_candidates,
+    extract_glossary_candidates,
+    reconcile_active_glossary_to_book,
+)
+from pdf_translator.glossary import _book_text_corpus
 from pdf_translator.glossary_extraction import (
     _classify_term,
     candidate_integrity_rejection,
@@ -24,6 +29,55 @@ def test_candidate_limit_has_no_minimum_quota() -> None:
     }
 
     assert compute_max_candidates(book) < 60
+
+
+def test_confirmed_glossary_scope_excludes_preserved_chapters() -> None:
+    corpus, chapter_text = _book_text_corpus({
+        "chapters": [
+            {
+                "chapter_id": "body",
+                "markdown": "Embodied Agency shapes the argument.",
+                "translate": True,
+                "translation_policy_confirmed": True,
+            },
+            {
+                "chapter_id": "notes",
+                "markdown": "Reference Noise appears only in notes.",
+                "translate": False,
+                "preserve_original": True,
+                "resource_only": True,
+                "translation_policy_confirmed": True,
+            },
+        ]
+    })
+
+    assert "Embodied Agency" in corpus
+    assert "Reference Noise" not in corpus
+    assert set(chapter_text) == {"body"}
+
+
+def test_reconcile_active_glossary_keeps_only_terms_in_confirmed_scope(tmp_path: Path) -> None:
+    glossary_dir = tmp_path / "glossary"
+    glossary_dir.mkdir()
+    (glossary_dir / "active.json").write_text(json.dumps({
+        "schema": "phase_a_glossary_v1",
+        "entries": [
+            {"source": "Embodied Agency", "target": "具身能动性", "status": "active"},
+            {"source": "Reference Noise", "target": "参考噪声", "status": "active"},
+        ],
+    }), encoding="utf-8")
+    book = {"chapters": [{
+        "chapter_id": "body",
+        "markdown": "Embodied Agency shapes the argument.",
+        "translate": True,
+        "translation_policy_confirmed": True,
+    }]}
+
+    result = reconcile_active_glossary_to_book(tmp_path, book)
+
+    assert result == {"kept": 1, "removed": 1}
+    active = json.loads((glossary_dir / "active.json").read_text(encoding="utf-8"))
+    assert [entry["source"] for entry in active["entries"]] == ["Embodied Agency"]
 
 
 def test_title_case_concepts_are_not_classified_as_people() -> None:

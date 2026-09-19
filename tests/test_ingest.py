@@ -20,6 +20,9 @@ def test_build_pdf_converter_uses_fast_native_pdf_settings() -> None:
     assert pdf_option.pipeline_options.do_table_structure is False
     assert pdf_option.pipeline_options.force_backend_text is True
     assert pdf_option.pipeline_options.accelerator_options.device == "cpu"
+    assert pdf_option.pipeline_options.layout_batch_size == 1
+    assert pdf_option.pipeline_options.queue_max_size == 2
+    assert pdf_option.pipeline_options.accelerator_options.num_threads == 2
 
 
 def test_build_pdf_converter_book_enables_table_structure_and_images() -> None:
@@ -58,7 +61,7 @@ Running Book Header
 6. Nelson, N. C. (2018). Model Behavior.
 """
 
-    cleaned = clean_book_reflow_markdown(markdown)
+    cleaned = clean_book_reflow_markdown(markdown, running_texts=("Running Book Header",))
 
     assert "Running Book Header" not in cleaned
     assert "\n1\n" not in cleaned
@@ -75,7 +78,7 @@ def test_detect_language_prefers_cjk_signal_over_metadata_noise() -> None:
     assert detect_language(text) == "zh-cn"
 
 
-def test_clean_book_reflow_markdown_keeps_first_repeated_section_heading() -> None:
+def test_clean_book_reflow_markdown_keeps_repeated_section_headings() -> None:
     markdown = """
 ## References
 
@@ -92,7 +95,7 @@ C. Third reference.
 
     cleaned = clean_book_reflow_markdown(markdown)
 
-    assert cleaned.count("## References") == 1
+    assert cleaned.count("## References") == 3
     assert "A. First reference." in cleaned
     assert "B. Second reference." in cleaned
     assert "C. Third reference." in cleaned
@@ -121,7 +124,7 @@ and continues after the image.
 Fresh paragraph.
 """
 
-    cleaned = clean_book_reflow_markdown(markdown)
+    cleaned = clean_book_reflow_markdown(markdown, allow_fragment_reflow=True)
 
     assert "This paragraph was broken by the source page layout and should become one paragraph." in cleaned
     assert "![Figure](figure.png)" in cleaned

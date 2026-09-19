@@ -18,6 +18,11 @@ class LayoutBlock:
     left: float
     top: float
     bottom: float = 0.0
+    right: float = 0.0
+    source_node_id: str | None = None
+    source_char_start: int | None = None
+    source_char_end: int | None = None
+    source_separator_before: str = ""
 
 
 def _resolve_ref(structured: dict[str, Any], ref: str) -> tuple[str, dict[str, Any]] | None:
@@ -41,36 +46,75 @@ def _resolve_ref(structured: dict[str, Any], ref: str) -> tuple[str, dict[str, A
 
 def _extract_text_blocks(structured: dict[str, Any]) -> list[LayoutBlock]:
     blocks: list[LayoutBlock] = []
-    children = structured.get("body", {}).get("children", [])
-
-    for child in children:
+    children = list(reversed(structured.get("body", {}).get("children", [])))
+    seen = set()
+    while children:
+        child = children.pop()
         ref = child.get("$ref") if isinstance(child, dict) else None
-        if not ref:
+        if not ref or ref in seen:
             continue
-
+        seen.add(ref)
         resolved = _resolve_ref(structured, ref)
         if not resolved:
             continue
         bucket_name, item = resolved
+        # Lists and other nested body groups have their own child references.
+        # Do not flatten picture/table captions here: those have separate owners.
+        if bucket_name == "groups":
+            children.extend(reversed(item.get("children") or []))
         if bucket_name != "texts":
             continue
 
         prov = item.get("prov") or []
         if not prov:
             continue
-        first_prov = prov[0]
-        bbox = first_prov.get("bbox") or {}
-
-        blocks.append(
-            LayoutBlock(
-                label=item.get("label", "text"),
-                text=item.get("text", ""),
-                page_no=int(first_prov.get("page_no", 0)),
-                left=float(bbox.get("l", 0.0)),
-                top=float(bbox.get("t", 0.0)),
-                bottom=float(bbox.get("b", 0.0)),
+        text = str(item.get("text") or "")
+        spans = [p.get("charspan") for p in prov]
+        valid_spans = all(isinstance(span, (list, tuple)) and len(span) == 2
+                          and 0 <= span[0] < span[1] <= len(text) for span in spans)
+        if len(prov) > 1 and valid_spans:
+            ordered_spans = sorted(spans)
+            cursor = 0
+            for start, end in ordered_spans:
+                if start < cursor or text[cursor:start].strip():
+                    raise ValueError("PDF provenance spans overlap or omit source text; manual parsing review required.")
+                cursor = end
+            if text[cursor:].strip():
+                raise ValueError("PDF provenance spans omit trailing source text.")
+            fragments = []
+            previous_end = 0
+            for location, span in zip(prov, spans):
+                start, end = span
+                fragments.append((location, text[start:end], start, end, text[previous_end:start]))
+                previous_end = end
+        elif len(prov) > 1:
+            raise ValueError("PDF text spans multiple locations without valid character ranges; cannot assign page ownership.")
+        else:
+            span = spans[0] if valid_spans and spans else (0, len(text))
+            fragments = [(prov[0], text, int(span[0]), int(span[1]), "")]
+        for fragment_index, (location, fragment, char_start, char_end, separator_before) in enumerate(fragments):
+            marker = str(item.get("marker") or "").strip()
+            if item.get("label") == "list_item" and marker and fragment_index == 0:
+                if not fragment.lstrip().startswith(marker + " "):
+                    # Literal markers retain source numbering across page breaks.
+                    fragment = marker.replace(".", "\\.") + " " + fragment
+            bbox = location.get("bbox") or {}
+            top = float(bbox.get("t", 0.0))
+            bottom = float(bbox.get("b", 0.0))
+            if str(bbox.get("coord_origin", "")).upper() == "TOPLEFT":
+                pages = structured.get("pages") or {}
+                page = pages.get(str(location.get("page_no")), pages.get(location.get("page_no"), {})) if isinstance(pages, dict) else {}
+                height = float((page.get("size") or {}).get("height", 0))
+                top, bottom = height - top, height - bottom
+            blocks.append(
+                LayoutBlock(label=item.get("label", "text"), text=fragment,
+                    page_no=int(location.get("page_no", 0)), left=float(bbox.get("l", 0.0)),
+                    top=top, bottom=bottom, right=float(bbox.get("r", 0.0)),
+                    source_node_id=ref,
+                    source_char_start=char_start,
+                    source_char_end=char_end,
+                    source_separator_before=separator_before)
             )
-        )
 
     return blocks
 
@@ -82,7 +126,13 @@ def _cluster_columns(blocks: list[LayoutBlock]) -> list[float]:
     clusters: list[list[float]] = [[sorted_lefts[0]]]
     for left in sorted_lefts[1:]:
         if left - clusters[-1][-1] > COLUMN_GAP_THRESHOLD:
-            clusters.append([left])
+            # An indented line inside a full-width paragraph is not a column.
+            crosses_gap = any(block.left < left and getattr(block, "right", 0) > left
+                              for block in blocks)
+            if crosses_gap:
+                clusters[-1].append(left)
+            else:
+                clusters.append([left])
         else:
             clusters[-1].append(left)
     return [sum(cluster) / len(cluster) for cluster in clusters]

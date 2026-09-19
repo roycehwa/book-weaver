@@ -142,8 +142,20 @@ def test_ingest_epub_preserves_external_link_in_paragraph(tmp_path: Path) -> Non
     epub = tmp_path / "links.epub"
     _write_epub(epub, chapter_xhtml=xhtml)
     doc = ingest_epub(epub)
-    md = doc.structured["_epub_meta"]["chapters"][0]["markdown"]
+    chapter = doc.structured["_epub_meta"]["chapters"][0]
+    md = chapter["markdown"]
     assert "[the doc](https://example.org/doc)" in md
+    assert chapter["dom_units"] == [
+        {
+            "markdown": "See [the doc](https://example.org/doc) for details.",
+            "resource_path": "OEBPS/chapter1.xhtml",
+            "dom_path": "/body[1]/p[1]",
+            "char_start": 0,
+            "char_end": len("See the doc for details."),
+            "element_id": None,
+            "link_targets": ["https://example.org/doc"],
+        }
+    ]
 
 
 def test_ingest_epub_repairs_deterministic_word_breaks_without_joining_normal_words(

@@ -80,7 +80,8 @@ def repair_pdf_markdown(text: str) -> str:
     if not text:
         return text
     repaired = text
-    repaired = _BROKEN_WORD.sub(_merge_broken_word, repaired)
+    # Plain text cannot distinguish a broken word from valid short words
+    # ("in the", "of the", "as a"). Report suspicious spacing; never guess here.
     repaired = _ORPHAN_FOOTNOTE_AFTER_SENTENCE.sub(".", repaired)
     repaired = _STANDALONE_FOOTNOTE_LINE.sub("", repaired)
     repaired = _HEADING_TRAILING_FOOTNOTE.sub(r"\1", repaired)

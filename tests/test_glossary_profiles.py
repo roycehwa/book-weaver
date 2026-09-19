@@ -312,7 +312,7 @@ def test_overlapping_candidate_family_keeps_stable_complete_name(tmp_path: Path)
     assert result["policy"]["stats"]["overlap_suppressed"] >= 1
 
 
-def test_dynamic_quality_cutoff_does_not_treat_safety_ceiling_as_target() -> None:
+def test_quality_cutoff_does_not_let_outliers_remove_valid_candidates() -> None:
     ranked = [
         {"source": f"Candidate {index}", "score": score}
         for index, score in enumerate([17.0, 15.0, 13.0, 11.0] + [7.0] * 80)
@@ -323,9 +323,21 @@ def test_dynamic_quality_cutoff_does_not_treat_safety_ceiling_as_target() -> Non
         minimum_score=3.5,
     )
 
-    assert [item["score"] for item in surfaced] == [17.0, 15.0, 13.0, 11.0]
-    assert cutoff == 10.0
-    assert rejected == 80
+    assert surfaced == ranked
+    assert cutoff == 3.5
+    assert rejected == 0
+
+
+def test_glossary_corpus_excludes_paths_but_retains_link_labels_and_index_lines() -> None:
+    from pdf_translator.glossary import _book_text_corpus
+    corpus, _ = _book_text_corpus({"chapters": [{"chapter_id": "body", "markdown":
+        '![Cover](/tmp/Hedgers- How The Global/book-images/cover.png)\n\n'
+        '[Global South](https://example.org/False-Terminology)\n\n'
+        'Cold War, 12\n\nEuropean Union, 20\n\n<img src="/tmp/Invented Concept.png">'}]})
+    assert 'Hedgers' not in corpus and 'Invented Concept' not in corpus
+    assert 'False-Terminology' not in corpus
+    assert 'Global South' in corpus and 'Cold War' in corpus
+    assert '\n' in corpus
 
 
 def test_profile_override_preserves_active_entries(tmp_path: Path) -> None:

@@ -56,13 +56,32 @@ def _now() -> str:
 
 
 def _book_text_corpus(book: dict[str, Any]) -> tuple[str, dict[str, str]]:
+    from bs4 import BeautifulSoup
+    from markdown import markdown as render_markdown
+    from pdf_translator.chapter_kind import should_translate_chapter
+
     chapter_text: dict[str, str] = {}
     parts: list[str] = []
-    for chapter in book.get("chapters", []):
+    chapters = [chapter for chapter in book.get("chapters", []) if isinstance(chapter, dict)]
+    confirmed_scope = any(chapter.get("translation_policy_confirmed") for chapter in chapters)
+    for chapter in chapters:
+        # When a confirmed scope is present, terminology follows that scope.
+        # The workflow gate is responsible for preventing pre-confirmation use.
+        if confirmed_scope and not should_translate_chapter(chapter):
+            continue
         chapter_id = str(chapter.get("chapter_id") or chapter.get("id") or "unknown")
         markdown = str(chapter.get("markdown") or chapter.get("title") or "")
-        chapter_text[chapter_id] = markdown
-        parts.append(markdown)
+        # Extract visible prose, never Markdown destinations, image filenames,
+        # HTML attributes or machine provenance. Link labels remain searchable.
+        soup = BeautifulSoup(render_markdown(markdown), "html.parser")
+        for element in soup.select("img, script, style, pre, code"):
+            element.decompose()
+        for element in soup.select("p, li, h1, h2, h3, h4, h5, h6, tr, br"):
+            element.insert_after("\n")
+        text = soup.get_text().strip()
+        text = re.sub(r"\[\[page:\s*\d+\]\]", " ", text)
+        chapter_text[chapter_id] = text
+        parts.append(text)
     return "\n\n".join(parts), chapter_text
 
 
@@ -87,11 +106,13 @@ def detect_glossary_profile_for_run(run_dir: Path) -> dict[str, Any]:
 def extract_glossary_candidates(
     run_dir: Path,
     *,
+    book: dict[str, Any] | None = None,
     max_candidates: int | None = None,
     profile: str | None = None,
     profile_source: str | None = None,
 ) -> dict[str, Any]:
-    book = json.loads((run_dir / "book.json").read_text(encoding="utf-8"))
+    if book is None:
+        book = json.loads((run_dir / "book.json").read_text(encoding="utf-8"))
     corpus, chapter_text = _book_text_corpus(book)
     exclusions = _metadata_exclusions(book)
     existing_policy = _load_extraction_policy(run_dir)
@@ -325,6 +346,30 @@ def extract_glossary_candidates(
     return payload
 
 
+def reconcile_active_glossary_to_book(run_dir: Path, book: dict[str, Any]) -> dict[str, int]:
+    """Keep confirmed terms that still occur in the new translatable scope."""
+    active_path = _glossary_dir(run_dir) / "active.json"
+    if not active_path.is_file():
+        return {"kept": 0, "removed": 0}
+    payload = json.loads(active_path.read_text(encoding="utf-8"))
+    entries = payload.get("entries") if isinstance(payload, dict) else None
+    if not isinstance(entries, list):
+        return {"kept": 0, "removed": 0}
+    corpus, _ = _book_text_corpus(book)
+    kept = [
+        entry
+        for entry in entries
+        if isinstance(entry, dict)
+        and _count_occurrences(corpus, canonical_source_term(str(entry.get("source") or ""))) > 0
+    ]
+    removed = len(entries) - len(kept)
+    _write_json(
+        active_path,
+        {**payload, "updated_at": _now(), "entries": kept},
+    )
+    return {"kept": len(kept), "removed": removed}
+
+
 def _is_contiguous_word_subset(shorter: str, longer: str) -> bool:
     short_words = canonical_source_key(shorter).split()
     long_words = canonical_source_key(longer).split()
@@ -363,18 +408,11 @@ def _apply_dynamic_quality_cutoff(
 ) -> tuple[list[dict[str, Any]], float, int]:
     if not ranked:
         return [], minimum_score, 0
-    if len(ranked) <= 30:
-        cutoff = minimum_score
-    else:
-        top_score = float(ranked[0]["score"])
-        # Keep a stable shortlist: avoid swinging between hundreds of
-        # noisy terms and only a handful of ultra-high-score outliers.
-        cutoff = max(minimum_score, min(6.5, top_score - 4.0))
+    cutoff = minimum_score
+    # A frequent outlier must not raise the acceptance threshold for every
+    # other term. The profile's absolute quality floor, integrity filters and
+    # overlap suppression decide eligibility; the ranked limit only caps UI size.
     surfaced = [item for item in ranked if float(item["score"]) >= cutoff]
-    target_floor = 15
-    if len(surfaced) < target_floor and len(ranked) >= target_floor:
-        surfaced = ranked[:target_floor]
-        cutoff = float(surfaced[-1]["score"])
     return surfaced, cutoff, len(ranked) - len(surfaced)
 
 

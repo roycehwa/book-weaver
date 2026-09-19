@@ -16,7 +16,7 @@ from pdf_translator.book_views import (
     render_book_markdown,
     render_translation_input_markdown,
 )
-from pdf_translator.chapter_segments import build_chapter_segments
+from pdf_translator.chapter_segments import build_chapter_segments_from_reading_units
 from pdf_translator.chunking import split_markdown_into_chunks
 from pdf_translator.config import RunSettings
 from pdf_translator.epub import render_epub_from_book, validate_epub_internal_hrefs
@@ -48,6 +48,7 @@ from pdf_translator.integrity import build_integrity_ledger
 from pdf_translator.profile import build_document_profile
 from pdf_translator.render import render_pdf_from_markdown
 from pdf_translator.review import build_review_artifacts, write_review_artifacts
+from pdf_translator.reading_units import write_reading_units
 from pdf_translator.translate import (
     build_translator,
     estimate_chapter_segment_translation_chunk_count,
@@ -99,6 +100,7 @@ def build_artifacts(output_dir: Path, source_pdf: Path, target_language: str) ->
         book_json_path=output_dir / "book.json",
         book_markdown_path=output_dir / "book.md",
         book_trace_markdown_path=output_dir / "book-trace.md",
+        reading_units_path=output_dir / "reading-units.json",
     )
 
 
@@ -217,22 +219,6 @@ def _write_integrity_ledger(
     return path
 
 
-def _fallback_book_from_markdown(source_path: Path, markdown: str) -> dict:
-    return {
-        "metadata": {"schema": "markdown_fallback", "schema_version": 1},
-        "chapters": [
-            {
-                "index": 1,
-                "chapter_id": "ch-001-document",
-                "title": source_path.stem,
-                "markdown": markdown,
-                "source_pages": [],
-                "toc": True,
-            }
-        ],
-    }
-
-
 def _translated_chapters_payload(
     *,
     source_path: Path,
@@ -253,47 +239,6 @@ def _translated_chapters_payload(
     ]
 
 
-def _synthesize_legacy_manifest(run_dir: Path, settings: RunSettings) -> dict[str, Any]:
-    """Rebuild intake manifest for runs created before book-weaver wrote manifest.json."""
-    artifacts = build_artifacts(run_dir, settings.source_pdf, settings.target_language)
-    profile: dict[str, Any] = {}
-    if artifacts.profile_json_path.is_file():
-        loaded = json.loads(artifacts.profile_json_path.read_text(encoding="utf-8"))
-        if isinstance(loaded, dict):
-            profile = loaded
-    files: dict[str, str | None] = {}
-    for key, path in {
-        "normalized_markdown": artifacts.normalized_markdown_path,
-        "normalized_json": artifacts.normalized_json_path,
-        "profile_json": artifacts.profile_json_path,
-        "reconstructed_markdown": artifacts.reconstructed_markdown_path,
-        "translation_input_markdown": artifacts.translation_input_markdown_path,
-        "book_json": artifacts.book_json_path,
-        "book_markdown": artifacts.book_markdown_path,
-        "book_trace_markdown": artifacts.book_trace_markdown_path,
-    }.items():
-        if path is not None and path.exists():
-            files[key] = str(path)
-    chapter_report = run_dir / "chapter-report.json"
-    if chapter_report.is_file():
-        files["chapter_report"] = str(chapter_report)
-    files.update(glossary_manifest_files(run_dir))
-    files = {key: value for key, value in files.items() if value}
-    return {
-        "mode": "intake",
-        "source_pdf": str(settings.source_pdf),
-        "output_dir": str(run_dir),
-        "translator": None,
-        "source_language": settings.source_language or profile.get("detected_language"),
-        "target_language": settings.target_language,
-        "chunk_count": 0,
-        "translation": {"mode": "not_requested", "cache_dir": None},
-        "preflight": profile.get("preflight") or {},
-        "render": {"format": "none", "policy": {}},
-        "files": files,
-    }
-
-
 def _load_existing_run_context(
     settings: RunSettings,
 ) -> tuple[PipelineArtifacts, dict | None, str, dict[str, Any], dict[str, str], dict[str, Any]]:
@@ -303,13 +248,11 @@ def _load_existing_run_context(
     run_dir = run_dir.expanduser().resolve()
     manifest_path = run_dir / "manifest.json"
     if not manifest_path.exists():
-        book_path = run_dir / "book.json"
-        if not book_path.is_file():
-            raise ValueError(f"Run directory missing manifest.json: {run_dir}")
-        manifest = _synthesize_legacy_manifest(run_dir, settings)
-        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    else:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        raise ValueError(
+            "Run directory is not a current BookWeaver run: manifest.json is required. "
+            "Create a new task with the current pipeline."
+        )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     source_pdf = Path(str(manifest.get("source_pdf") or settings.source_pdf)).expanduser().resolve()
     artifacts = build_artifacts(run_dir, source_pdf, settings.target_language)
     book: dict | None = None
@@ -336,13 +279,20 @@ def _load_existing_run_context(
         book = rebuilt
     if artifacts.book_json_path.exists():
         if book is None:
-            book = json.loads(artifacts.book_json_path.read_text(encoding="utf-8"))
+            baseline = artifacts.book_json_path.parent / "source-baseline-book.json"
+            book = json.loads((baseline if baseline.exists() else artifacts.book_json_path).read_text(encoding="utf-8"))
             if source_pdf.suffix.lower() == ".pdf":
                 book = repair_book_dict(book)
         if settings.canonical_chapters_path is not None:
             canonical = json.loads(
                 settings.canonical_chapters_path.expanduser().resolve().read_text(encoding="utf-8")
             )
+            if canonical.get("source_artifact") != "user_confirmation":
+                raise ValueError(
+                    "Current translation requires a user-confirmed canonical chapter plan."
+                )
+            from pdf_translator.source_workspace import require_current_source
+            require_current_source(run_dir, canonical)
             images_dir = run_dir / "book-images"
             book = apply_canonical_chapter_plan(
                 book,
@@ -378,7 +328,27 @@ def _load_existing_run_context(
                 source_markdown=repaired_input,
                 block_on_errors=source_pdf.suffix.lower() == ".epub",
             )
-        segment_plan = build_chapter_segments(book, max_chars=settings.max_chunk_chars)
+        confirmed = (
+            isinstance(book.get("metadata"), dict)
+            and book["metadata"].get("chapter_source") == "user_confirmed_canonical"
+        )
+        if confirmed:
+            reading_payload = write_reading_units(
+                artifacts.reading_units_path,
+                book,
+                source_path=source_pdf,
+                translation_authority=True,
+            )
+            extra_files["reading_units"] = str(artifacts.reading_units_path)
+            segment_plan = build_chapter_segments_from_reading_units(
+                reading_payload,
+                max_chars=settings.max_chunk_chars,
+            )
+        else:
+            raise ValueError(
+                "Current translation requires user-confirmed reading units. "
+                "Confirm the reconstructed chapters before starting translation."
+            )
         book["chapter_segments"] = segment_plan["segments"]
         chapter_segments_path = run_dir / "chapter-segments.json"
         chapter_segments_path.write_text(
@@ -466,6 +436,7 @@ def _prepare_intake_artifacts(settings: RunSettings) -> tuple[
         artifacts.book_json_path.write_text(json.dumps(book, ensure_ascii=False, indent=2), encoding="utf-8")
         artifacts.book_markdown_path.write_text(render_book_markdown(book), encoding="utf-8")
         artifacts.book_trace_markdown_path.write_text(render_book_markdown(book, include_trace=True), encoding="utf-8")
+        write_reading_units(artifacts.reading_units_path, book, source_path=settings.source_pdf)
         chapter_report_path = output_dir / "chapter-report.json"
         chapter_report_path.write_text(
             json.dumps(_build_chapter_report(book, max_chunk_chars=settings.max_chunk_chars), ensure_ascii=False, indent=2),
@@ -481,6 +452,7 @@ def _prepare_intake_artifacts(settings: RunSettings) -> tuple[
         extra_files["book_json"] = str(artifacts.book_json_path)
         extra_files["book_markdown"] = str(artifacts.book_markdown_path)
         extra_files["book_trace_markdown"] = str(artifacts.book_trace_markdown_path)
+        extra_files["reading_units"] = str(artifacts.reading_units_path)
         extra_files["chapter_report"] = str(chapter_report_path)
         extra_files["page_ledger"] = str(page_ledger_path)
         extra_files["integrity_ledger"] = str(integrity_ledger_path)
@@ -593,17 +565,11 @@ def run_intake_pipeline(settings: RunSettings) -> PipelineArtifacts:
         encoding="utf-8",
     )
     if (artifacts.output_dir / "book.json").exists():
-        if settings.processing_mode == "convert":
-            write_workflow(artifacts.output_dir, stage=STAGE_AWAITING_CHAPTER_CONFIRMATION)
-        else:
-            extract_glossary_candidates(artifacts.output_dir)
-            write_workflow(artifacts.output_dir, stage=STAGE_AWAITING_GLOSSARY)
-            glossary_files = glossary_manifest_files(artifacts.output_dir)
-            workflow_path = artifacts.output_dir / "workflow.json"
-            if workflow_path.exists():
-                glossary_files["workflow"] = str(workflow_path)
+        write_workflow(artifacts.output_dir, stage=STAGE_AWAITING_CHAPTER_CONFIRMATION)
+        workflow_path = artifacts.output_dir / "workflow.json"
+        if workflow_path.exists():
             manifest = json.loads(artifacts.manifest_path.read_text(encoding="utf-8"))
-            manifest["files"] = {**manifest.get("files", {}), **glossary_files}
+            manifest["files"] = {**manifest.get("files", {}), "workflow": str(workflow_path)}
             artifacts.manifest_path.write_text(
                 json.dumps(manifest, ensure_ascii=False, indent=2),
                 encoding="utf-8",
@@ -635,6 +601,8 @@ def run_export_pipeline(
         canonical = json.loads(
             settings.canonical_chapters_path.expanduser().resolve().read_text(encoding="utf-8")
         )
+        from pdf_translator.source_workspace import require_current_source
+        require_current_source(artifacts.output_dir, canonical)
         images_dir = artifacts.output_dir / "book-images"
         book = apply_canonical_chapter_plan(
             book,
@@ -842,24 +810,34 @@ def run_translation_pipeline(
     polished_markdown = translated.translated_markdown
     if not skip_translation and text_operation == "translate":
         enter_stage("polishing")
+        (artifacts.output_dir / 'polish-warning.json').unlink(missing_ok=True)
         polish_outcome = "no_candidates"
         if settings.target_language.lower().startswith("zh") and book is not None:
             from pdf_translator.polish import run_polish, scan_polish_candidates
 
             if scan_polish_candidates(translated.translated_markdown):
-                polish_result = run_polish(
-                    run_dir=artifacts.output_dir,
-                    target_language=settings.target_language,
-                    translator_name=settings.translator,
-                )
+                try:
+                    polish_result = run_polish(
+                        run_dir=artifacts.output_dir,
+                        target_language=settings.target_language,
+                        translator_name=settings.translator,
+                    )
+                except (ValueError, RuntimeError) as exc:
+                    # Optional polishing must not discard valid machine translation.
+                    from pdf_translator.source_workspace import atomic_json
+                    polish_result = None
+                    warning_path = artifacts.output_dir / 'polish-warning.json'
+                    atomic_json(warning_path, {'status': 'needs_review', 'error': str(exc),
+                                              'message': '自动润色失败，保留机器译文，疑点转交人工审阅。'})
+                    extra_files['polish_warning'] = str(warning_path)
                 polished_path = artifacts.output_dir / "translated.polished.md"
-                if polished_path.exists():
+                if polish_result is not None and polished_path.exists():
                     polished_markdown = polished_path.read_text(encoding="utf-8")
                     artifacts.translated_markdown_path.write_text(polished_markdown, encoding="utf-8")
                     extra_files["translated_polished_markdown"] = str(polished_path)
                     extra_files["polish_report"] = str(artifacts.output_dir / "polish-report.json")
                 polish_outcome = (
-                    "applied" if polish_result.accepted_count > 0 else "no_candidates"
+                    "needs_review" if polish_result is None else "applied" if polish_result.accepted_count > 0 else "no_candidates"
                 )
         if on_stage is not None:
             on_stage(
@@ -888,7 +866,11 @@ def run_translation_pipeline(
         )
         extra_files["translated_semantic_content"] = str(translated_semantic_path)
     enter_stage("pre_review")
-    review_source_book = book or _fallback_book_from_markdown(settings.source_pdf, translation_input_markdown)
+    if book is None:
+        raise ValueError(
+            "Current Phase A review requires a structured book and confirmed reading units."
+        )
+    review_source_book = book
     if isinstance(_translated_semantic, dict):
         review_source_book = dict(review_source_book)
         review_source_book["semantic_content"] = _translated_semantic
@@ -905,6 +887,12 @@ def run_translation_pipeline(
         run_dir=artifacts.output_dir,
     )
     extra_files.update(write_review_artifacts(artifacts.output_dir, review_artifacts))
+    from pdf_translator.source_workspace import atomic_json, glossary_fingerprint
+    atomic_json(artifacts.output_dir / "translation-source-revision.json", {
+        "source_revision": (book or {}).get("metadata", {}).get("source_revision", 0),
+        "chapter_fingerprint": (book or {}).get("metadata", {}).get("chapter_fingerprint"),
+        "glossary_fingerprint": glossary_fingerprint(artifacts.output_dir),
+    })
     rendered_files: dict[str, str] = {}
     epub_validation: dict[str, Any] | None = None
     if settings.output_format in {"pdf", "both"}:

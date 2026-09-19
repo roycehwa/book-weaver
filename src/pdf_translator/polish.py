@@ -340,6 +340,8 @@ def _parse_polish_response(text: str) -> dict[int, str]:
 def _safe_accept_polish(before: str, after: str) -> tuple[bool, str]:
     if not after.strip():
         return False, "empty"
+    if before.count("\n") != after.count("\n"):
+        return False, "paragraph_boundary_changed"
     if _is_structural_line(before):
         return False, "structural"
     before_cjk = _cjk_count(before)
@@ -634,6 +636,20 @@ def run_polish(
     book = json.loads(book_path.read_text(encoding="utf-8"))
     markdown_text = translated_path.read_text(encoding="utf-8")
     candidates = scan_polish_candidates(markdown_text)
+    # Human text is an authority, including an explicit decision to preserve source.
+    from pdf_translator.translation_failures import read_failures
+    protected_lines = {
+        line.strip()
+        for item in read_failures(run_dir)['items'].values()
+        for line in item.get('resolution', {}).get('text', '').splitlines()
+        if line.strip()
+    }
+    review_state_path = run_dir / 'review_state.json'
+    if review_state_path.exists():
+        state = json.loads(review_state_path.read_text(encoding='utf-8'))
+        for decision in state.get('decisions', {}).values():
+            protected_lines.update(line.strip() for line in str(decision.get('approved_text') or '').splitlines() if line.strip())
+    candidates = [candidate for candidate in candidates if candidate.text.strip() not in protected_lines]
     translator = translator or build_translator(translator_name)
     cache_dir = run_dir / "polish-cache"
     polished_by_line = _translate_candidates(

@@ -19,7 +19,7 @@ describe('buildAlignedBlocks', () => {
     ])
   })
 
-  it('keeps legacy segments whole when no persisted alignment exists', () => {
+  it('keeps an unaligned segment whole when persisted parts are absent', () => {
     expect(
       buildAlignedBlocks('source one\n\nsource two', '译文只有一个合并段'),
     ).toEqual([

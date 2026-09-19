@@ -1,4 +1,26 @@
 from pdf_translator.chunking import split_markdown_into_chunks
+from pdf_translator.chunking import join_chunk_texts
+
+
+def test_review_merge_and_export_preserve_continuation_boundaries():
+    from pdf_translator.review import _merge_reading_review_segments, translated_segments_to_chapters
+    source = []
+    translated = []
+    for i, (text, separator) in enumerate([("First.", "\n\n"), ("Continued.", " "), ("Next paragraph.", "\n\n")]):
+        base = dict(segment_id=str(i), chapter_id="c1", chapter_index=1, chapter_title="C", block_index=i,
+                    separator_before=separator, source_location={}, source_path="test")
+        source.append(dict(base, source_text=text))
+        translated.append(dict(base, translated_text=text))
+    _, merged = _merge_reading_review_segments(source, translated, min_chars=1)
+    assert translated_segments_to_chapters(merged)[0]["markdown"] == "First. Continued.\n\nNext paragraph.\n"
+
+
+def test_transport_boundaries_do_not_create_paragraphs() -> None:
+    source = "# Title\n\n" + "One complete sentence. " * 15 + "\n\nA new paragraph."
+    chunks = split_markdown_into_chunks(source, 60)
+    reconstructed = join_chunk_texts([c.markdown for c in chunks], [c.separator_before for c in chunks])
+    assert reconstructed.split("\n\n") == [p.strip() for p in source.split("\n\n")]
+    assert all(len(c.markdown) <= 60 for c in chunks)
 
 
 def test_split_markdown_preserves_code_fence_blocks() -> None:

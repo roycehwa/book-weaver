@@ -3,15 +3,11 @@
 from __future__ import annotations
 
 import json
-import sys
 from pathlib import Path
 
 import pytest
 
-SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
-sys.path.insert(0, str(SCRIPTS))
-
-import translation_supervisor as ts  # noqa: E402
+from scripts import translation_supervisor as ts
 
 
 class FakeClient:

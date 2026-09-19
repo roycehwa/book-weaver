@@ -101,6 +101,12 @@ def test_run_intake_pipeline_writes_bookir_without_translation_cache(tmp_path: P
     assert manifest["mode"] == "intake"
     assert manifest["translation"]["mode"] == "not_requested"
     assert manifest["files"]["book_json"].endswith("book.json")
+    assert manifest["files"]["reading_units"].endswith("reading-units.json")
+    reading_units = json.loads((artifacts.output_dir / "reading-units.json").read_text(encoding="utf-8"))
+    assert reading_units["schema"] == "bookweaver_reading_units_v1"
+    assert reading_units["source_format"] == "epub"
+    assert reading_units["generation"]["translation_authority"] is False
+    assert reading_units["unit_count"] == 2
     assert artifacts.book_json_path and artifacts.book_json_path.exists()
     page_ledger_path = artifacts.output_dir / "page-ledger.json"
     assert page_ledger_path.exists()
@@ -111,6 +117,9 @@ def test_run_intake_pipeline_writes_bookir_without_translation_cache(tmp_path: P
     integrity_ledger = json.loads(integrity_ledger_path.read_text(encoding="utf-8"))
     assert integrity_ledger["schema"] == "integrity_ledger_v1"
     assert not (artifacts.output_dir / "translation-cache").exists()
+    workflow = json.loads((artifacts.output_dir / "workflow.json").read_text(encoding="utf-8"))
+    assert workflow["stage"] == "awaiting_chapter_confirmation"
+    assert not (artifacts.output_dir / "glossary" / "candidates.json").exists()
 
 
 def test_translation_pipeline_writes_user_chapter_segment_plan_before_translation(
@@ -118,7 +127,7 @@ def test_translation_pipeline_writes_user_chapter_segment_plan_before_translatio
 ) -> None:
     run_dir = tmp_path / "run"
     run_dir.mkdir()
-    source = tmp_path / "source.epub"
+    source = tmp_path / "source.pdf"
     source.write_text("placeholder", encoding="utf-8")
     book = {
         "metadata": {"chapter_source": "automatic"},
@@ -143,6 +152,7 @@ def test_translation_pipeline_writes_user_chapter_segment_plan_before_translatio
     }
     canonical = {
         "schema": "bookmate_canonical_chapters_v1",
+        "source_artifact": "user_confirmation",
         "chapters": [
             {
                 "title": "User Chapter",
@@ -189,6 +199,10 @@ def test_translation_pipeline_writes_user_chapter_segment_plan_before_translatio
     assert segment_path.exists()
     payload = json.loads(segment_path.read_text(encoding="utf-8"))
     assert payload["schema"] == "bookweaver_chapter_segments_v1"
+    assert payload["source"] == "confirmed_reading_units"
+    reading_units = json.loads((artifacts.output_dir / "reading-units.json").read_text(encoding="utf-8"))
+    assert reading_units["generation"]["translation_authority"] is True
+    assert payload["reading_units_fingerprint"] == reading_units["document_fingerprint"]
     assert [segment["chapter_title"] for segment in payload["segments"]] == [
         "User Chapter",
         "User Chapter",
@@ -199,6 +213,32 @@ def test_translation_pipeline_writes_user_chapter_segment_plan_before_translatio
     ]
     progress = json.loads((artifacts.output_dir / "jobs" / "progress.json").read_text(encoding="utf-8"))
     assert progress["total_chunks"] == 2
+
+
+def test_translation_pipeline_rejects_pre_manifest_legacy_run(tmp_path: Path) -> None:
+    run_dir = tmp_path / "legacy-run"
+    run_dir.mkdir()
+    source = tmp_path / "source.epub"
+    source.write_text("placeholder", encoding="utf-8")
+    (run_dir / "book.json").write_text(
+        json.dumps({"chapters": [{"title": "Old", "markdown": "Old text."}]}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="manifest.json is required"):
+        pipeline_module.run_translation_pipeline(
+            RunSettings(
+                source_pdf=source,
+                output_dir=tmp_path / "runs",
+                target_language="zh-CN",
+                source_language="en",
+                translator="mock",
+                max_chunk_chars=9000,
+                output_format="none",
+                processing_mode="translate",
+                existing_run_dir=run_dir,
+            )
+        )
 
 
 def test_epub_intake_does_not_apply_pdf_space_merging_to_normal_prose(
@@ -376,8 +416,12 @@ def test_translate_pipeline_does_not_hide_polish_failure(tmp_path: Path, monkeyp
         output_format="none",
     )
 
-    with pytest.raises(RuntimeError, match="polish provider unavailable"):
-        pipeline_module.run_translation_pipeline(settings)
+    artifacts = pipeline_module.run_translation_pipeline(settings)
+    warning = json.loads((artifacts.output_dir / 'polish-warning.json').read_text())
+    assert warning['error'] == 'polish provider unavailable'
+    items = json.loads((artifacts.output_dir / 'review_items.json').read_text())['items']
+    assert any(item['issue_type'] == 'polish_unavailable' for item in items)
+    assert artifacts.translated_markdown_path.read_text().strip()
 
 
 def test_translate_pipeline_writes_translation_job_files(tmp_path: Path, monkeypatch) -> None:

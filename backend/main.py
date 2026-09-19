@@ -237,6 +237,7 @@ class BookInfoResponse(BaseModel):
 
 
 class ReviewDecisionRequest(BaseModel):
+    expected_revision: int = Field(default=0, ge=0)
     """翻译审阅决定"""
     status: Literal["approved", "resolved", "open"] = Field(default="approved", description="approved/resolved/open")
     action: Literal["manual_edit", "model_rewrite"] = Field(default="manual_edit", description="用户处理方式")
@@ -358,6 +359,7 @@ class JobChapterDraftPrefsRequest(BaseModel):
 
 
 class JobChapterConfirmationRequest(BaseModel):
+    expected_source_revision: int = Field(default=0, ge=0)
     chapters: Optional[List[dict[str, Any]]] = None
 
 
@@ -733,22 +735,10 @@ def _canonical_lifecycle_stage(job: dict[str, Any]) -> str:
 
 def _chapters_confirmed_by_user(job: dict[str, Any], artifacts: dict[str, Any]) -> bool:
     canonical = artifacts.get("canonical_chapters")
-    if isinstance(canonical, dict):
-        if canonical.get("source_artifact") == "user_confirmation":
-            return True
-        if "source_artifact" in canonical:
-            return False
-    job_id = job.get("job_id")
-    if not isinstance(job_id, str) or not job_id:
-        return False
-    try:
-        path = get_job_service().artifact_path(job_id, "canonical_chapters")
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return False
-    if not isinstance(payload, dict):
-        return False
-    return payload.get("source_artifact") == "user_confirmation"
+    return (
+        isinstance(canonical, dict)
+        and canonical.get("source_artifact") == "user_confirmation"
+    )
 
 
 def _workspace_book_from_job(job: dict[str, Any]) -> dict[str, Any]:
@@ -767,6 +757,7 @@ def _workspace_book_from_job(job: dict[str, Any]) -> dict[str, Any]:
     is_convert_path = str(request.get("processing_mode") or "") == "convert"
 
     has_structure = "book" in artifacts or state in {
+        "awaiting_chapter_confirmation",
         "awaiting_glossary",
         "validating",
         "pre_review",
@@ -821,7 +812,7 @@ def _workspace_book_from_job(job: dict[str, Any]) -> dict[str, Any]:
             "structure",
             "chapter_confirmation",
             "text_processing",
-            "knowledge_handoff",
+            "delivery",
         ]
         text_processing_label = "导出 EPUB"
         text_processing_desc = "按已确认章节目录渲染原文 EPUB。"
@@ -835,41 +826,39 @@ def _workspace_book_from_job(job: dict[str, Any]) -> dict[str, Any]:
     elif is_translation_path:
         workflow_path = "translation_edition"
         workflow_summary = (
-            "译本路径：先定稿术语并机器翻译，再进入翻译审阅；源书章节目录可在审阅前后确认，"
-            "仅用于知识拆分与 PDF 对照，不编辑译文，也不会自动重译。"
+            "译本路径：先确认重建后的原文、章节与内容策略，再从确认范围定稿术语，随后按逻辑单元翻译并审阅。"
         )
         workflow_step_order = [
             "import",
             "structure",
+            "chapter_confirmation",
             "glossary_finalization",
             "text_processing",
             "polish",
             "translation_review",
-            "chapter_confirmation",
-            "knowledge_handoff",
+            "delivery",
         ]
         text_processing_label = "机器翻译"
-        text_processing_desc = "术语定稿后调用翻译模型，并生成机器预审与审阅工件。"
+        text_processing_desc = "术语定稿且章节确认后调用翻译模型，并生成机器预审与审阅工件。"
         chapter_confirmation_desc = (
-            "确认源书章节目录（标题与起止页），作为知识拆分的权威边界。"
-            "可与翻译审阅并行或在其后完成。"
+            "检查重建后的待翻译文档，并确认章节边界及翻译、保留原文或略过策略。"
         )
     else:
         workflow_path = "source_edition"
         workflow_summary = (
-            "原文路径：保留源书文本，跳过翻译审阅，直接确认源书章节目录后进入知识解析。"
+            "原文路径：保留源书文本，确认重建后的章节与内容策略后完成导出。"
         )
         workflow_step_order = [
             "import",
             "structure",
             "text_processing",
             "chapter_confirmation",
-            "knowledge_handoff",
+            "delivery",
         ]
         text_processing_label = "保留原文"
         text_processing_desc = "按处理模式保留源书正文，不调用翻译模型。"
         chapter_confirmation_desc = (
-            "确认源书章节目录（标题与起止页），作为知识拆分的权威边界。"
+            "确认重建后的源书章节目录、标题、范围和内容策略。"
         )
 
     steps: dict[str, dict[str, str]] = {
@@ -888,12 +877,12 @@ def _workspace_book_from_job(job: dict[str, Any]) -> dict[str, Any]:
     if is_translation_path:
         steps["glossary_finalization"] = _step(
             "done" if glossary_finalized else (
-                "action_required" if state == "awaiting_glossary" else (
+                "action_required" if state == "awaiting_glossary" and chapters_confirmed else (
                     "running" if state in {"ingesting", "reconstructing"} else "blocked"
                 )
             ),
             "术语定稿",
-            "翻译前确定全书关键术语的中文译法，避免译后再改术语。",
+            "从已确认的可翻译范围提取并确定关键术语，避免附录或脏文本污染候选。",
         )
     steps["text_processing"] = _step(
         "done" if text_processing_done else (
@@ -967,13 +956,14 @@ def _workspace_book_from_job(job: dict[str, Any]) -> dict[str, Any]:
         chapter_confirmation_desc,
     )
 
-    knowledge_ready = chapters_confirmed and (
+    phase_a_complete = chapters_confirmed and (
         is_preserve_path or review_done or (is_convert_path and text_processing_done)
     )
-    steps["knowledge_handoff"] = _step(
-        "ready" if knowledge_ready else "blocked",
-        "知识解析入口",
-        "文本版本与章节目录都确认后，交给 BookWeaver 知识拆分。",
+    delivered = state == "completed" or any(key in artifacts for key in ("epub", "pdf"))
+    steps["delivery"] = _step(
+        "done" if delivered else ("ready" if phase_a_complete else "blocked"),
+        "导出与完成",
+        "完成审阅和结构确认后导出，并验证最终文件。",
     )
 
     if state == "failed":
@@ -1040,9 +1030,9 @@ def _workspace_book_from_job(job: dict[str, Any]) -> dict[str, Any]:
     elif steps["chapter_confirmation"]["status"] == "action_required":
         pipeline_status = "needs_chapter_confirmation"
         next_action = {"kind": "confirm_chapters", "label": "确认源书章节目录", "href": f"/jobs/{job.get('job_id')}"}
-    elif knowledge_ready:
-        pipeline_status = "ready_for_knowledge"
-        next_action = {"kind": "start_knowledge", "label": "进入知识解析", "href": f"/jobs/{job.get('job_id')}"}
+    elif phase_a_complete:
+        pipeline_status = "phase_a_complete"
+        next_action = {"kind": "view_delivery", "label": "Phase A 处理已完成", "href": f"/jobs/{job.get('job_id')}"}
     else:
         pipeline_status = "processing"
         next_action = {"kind": "view_progress", "label": "查看处理进度", "href": f"/jobs/{job.get('job_id')}"}
@@ -1065,14 +1055,14 @@ def _workspace_book_from_job(job: dict[str, Any]) -> dict[str, Any]:
         "polish_outcome": polish_outcome,
         "steps": steps,
         "next_action": next_action,
-        "knowledge_ready": knowledge_ready,
+        "phase_a_complete": phase_a_complete,
         "updated_at": job.get("updated_at"),
         "progress_percent": progress.get("overall_percent", 0),
     }
 
 
 _WORKSPACE_STATUS_PRIORITY = {
-    "ready_for_knowledge": 6,
+    "phase_a_complete": 6,
     "needs_chapter_confirmation": 5,
     "needs_translation_review": 4,
     "processing": 2,
@@ -1242,7 +1232,7 @@ def _source_workspace_books_from_jobs(jobs: list[dict[str, Any]]) -> list[dict[s
                     "status_label": version.get("next_action", {}).get("label"),
                     "text_operation": version.get("text_operation"),
                     "processing_mode": version.get("processing_mode"),
-                    "knowledge_ready": version.get("knowledge_ready"),
+                    "phase_a_complete": version.get("phase_a_complete"),
                     "progress_percent": version.get("progress_percent"),
                     "updated_at": version.get("updated_at"),
                     "next_action": version.get("next_action"),
@@ -1514,6 +1504,8 @@ async def delete_job(job_id: str):
         return {"status": "deleted", "job_id": job_id}
     except JobNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except JobServiceError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @api_router.post("/jobs/{job_id}/resume", status_code=status.HTTP_202_ACCEPTED)
@@ -1630,7 +1622,9 @@ async def confirm_job_chapters(
     request: JobChapterConfirmationRequest = JobChapterConfirmationRequest(),
 ):
     try:
-        snapshot = get_job_service().confirm_chapters(job_id, chapters=request.chapters)
+        service = get_job_service()
+        options = {"expected_source_revision": request.expected_source_revision} if request.expected_source_revision else {}
+        snapshot = service.confirm_chapters(job_id, chapters=request.chapters, **options)
         return {
             "job": snapshot,
             "workspace_book": _workspace_book_from_job(snapshot),
@@ -1638,6 +1632,88 @@ async def confirm_job_chapters(
     except JobNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except JobServiceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+class SourceCorrectionRequest(BaseModel):
+    page: int = Field(ge=1)
+    blocks: list[dict[str, Any]] = Field(default_factory=list)
+    expected_revision: int = Field(ge=0)
+    request_id: str = Field(min_length=1, max_length=100)
+    undo: bool = False
+
+
+@api_router.get("/jobs/{job_id}/source-workspace")
+async def get_source_workspace(job_id: str, page: int = Query(ge=1)):
+    try:
+        return get_job_service().source_workspace(job_id, page)
+    except JobNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (ValueError, JobServiceError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@api_router.post("/jobs/{job_id}/source-workspace")
+async def save_source_workspace(job_id: str, request: SourceCorrectionRequest):
+    from pdf_translator.source_workspace import SourceConflict
+    try:
+        return get_job_service().save_source_workspace(job_id, **request.model_dump())
+    except JobNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except SourceConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (ValueError, JobServiceError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+class FailureResolutionRequest(BaseModel):
+    key: str
+    revision: int
+    text: str
+    kind: str = "manual_translation"
+    reason: str = ""
+
+
+@api_router.get("/jobs/{job_id}/translation-failures")
+async def get_translation_failures(job_id: str):
+    from pdf_translator.translation_failures import read_failures
+    service = get_job_service()
+    try:
+        return read_failures(service.artifact_path(job_id, "book").parent)
+    except JobNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except JobServiceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@api_router.post("/jobs/{job_id}/translation-failures")
+async def resolve_translation_failure(job_id: str, request: FailureResolutionRequest):
+    from pdf_translator.translation_failures import resolve_failure
+    from pdf_translator.source_workspace import SourceConflict, source_lock
+    service = get_job_service()
+    try:
+        snapshot = service.get(job_id)
+        run_dir = service.artifact_path(job_id, "book").parent
+    except JobNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except JobServiceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if snapshot.get("state") != "failed":
+        raise HTTPException(status_code=409, detail="请先停止任务，再处理失败片段。")
+    try:
+        service._acquire_worker_lock(job_id)
+        try:
+            if service.get(job_id).get("state") != "failed":
+                raise HTTPException(status_code=409, detail="任务状态已变化，请刷新后重试。")
+            with source_lock(run_dir):
+                return resolve_failure(run_dir, request.key, request.revision, request.text, request.kind, request.reason)
+        finally:
+            service._release_worker_lock(job_id)
+    except JobServiceError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except SourceConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
@@ -2129,6 +2205,16 @@ async def start_job_translation(job_id: str, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except JobServiceError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@api_router.post("/jobs/{job_id}/translation-pause", status_code=status.HTTP_202_ACCEPTED)
+async def pause_job_translation(job_id: str):
+    try:
+        return get_job_service().pause_translation(job_id)
+    except JobNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except JobServiceError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @api_router.post("/jobs/{job_id}/export", status_code=status.HTTP_202_ACCEPTED)
@@ -3255,19 +3341,7 @@ async def get_book_info(book_id: str):
 # ==================== Translation Review Adapter ====================
 
 def _review_roots() -> List[Path]:
-    jobs_root = get_job_service().jobs_dir.resolve()
-    configured_roots = os.getenv("PDF_TRANSLATOR_REVIEW_ROOTS")
-    if configured_roots:
-        roots = [
-            Path(raw).expanduser().resolve()
-            for raw in configured_roots.split(os.pathsep)
-            if raw.strip()
-        ]
-    else:
-        roots = [jobs_root]
-    if jobs_root not in roots:
-        roots.append(jobs_root)
-    return roots
+    return [get_job_service().jobs_dir.resolve()]
 
 
 def _extract_review_title(run_dir: Path, manifest: dict, segments: List[dict]) -> str:
@@ -3329,7 +3403,7 @@ def _collect_exported_versions(run_dir: Path) -> List[str]:
     for child in versions_dir.iterdir():
         if child.is_dir() and (child / "version-manifest.json").exists():
             versions.append(child.name)
-    return sorted(versions)
+    return sorted(versions, key=lambda name: ((versions_dir / name / "version-manifest.json").stat().st_mtime_ns, name))
 
 
 def _discover_review_run_dirs(root: Path) -> List[Path]:
@@ -3443,6 +3517,28 @@ def _review_project_identity(item: ReviewProjectListItem) -> tuple[str, int]:
     return (source_name or item.title.strip().casefold(), item.total_segments)
 
 
+def _is_current_review_run(run_dir: Path) -> bool:
+    required = (
+        run_dir / "manifest.json",
+        run_dir / "reading-units.json",
+        run_dir / "chapter-segments.json",
+        run_dir / "integrity-ledger.json",
+    )
+    if any(not path.is_file() for path in required):
+        return False
+    try:
+        reading_units = json.loads((run_dir / "reading-units.json").read_text(encoding="utf-8"))
+        chapter_segments = json.loads((run_dir / "chapter-segments.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return (
+        reading_units.get("schema") == "bookweaver_reading_units_v1"
+        and (reading_units.get("generation") or {}).get("translation_authority") is True
+        and chapter_segments.get("schema") == "bookweaver_chapter_segments_v1"
+        and chapter_segments.get("source") == "confirmed_reading_units"
+    )
+
+
 def _review_workspace_job_id(run_dir: Path) -> Optional[str]:
     jobs_root = get_job_service().jobs_dir.resolve()
     candidates = [run_dir]
@@ -3487,6 +3583,8 @@ def list_review_projects_sync() -> list[ReviewProjectListItem]:
             resolved = run_dir.resolve()
             if resolved in seen or str(resolved) in hidden:
                 continue
+            if not _is_current_review_run(run_dir) or _review_workspace_job_id(run_dir) is None:
+                continue
             seen.add(resolved)
             item = _build_review_project_item(run_dir)
             if item is None:
@@ -3516,6 +3614,11 @@ def _resolve_review_run_dir(run_dir: str) -> Path:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Review run directory not found: {path}",
+        )
+    if not _is_current_review_run(path) or _review_workspace_job_id(path) is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Review run is not a current Phase A task.",
         )
     required = ["segments.json", "translated_segments.json", "review_items.json", "review_state.json"]
     missing = [name for name in required if not (path / name).exists()]
@@ -3913,6 +4016,17 @@ async def sync_review_projects():
 
 @api_router.post("/review/segments/{segment_id:path}/decision")
 async def save_review_decision(segment_id: str, request: ReviewDecisionRequest, run_dir: str):
+    from pdf_translator.source_workspace import SourceConflict, source_lock, require_current_translation
+    path = _resolve_review_run_dir(run_dir)
+    try:
+        with source_lock(path):
+            require_current_translation(path)
+            return await _save_review_decision_unlocked(segment_id, request, run_dir)
+    except SourceConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+async def _save_review_decision_unlocked(segment_id: str, request: ReviewDecisionRequest, run_dir: str):
     """Save a reviewer decision for one source/translation segment."""
     path = _resolve_review_run_dir(run_dir)
     segments = _read_review_json(path, "segments.json").get("segments", [])
@@ -3923,6 +4037,9 @@ async def save_review_decision(segment_id: str, request: ReviewDecisionRequest, 
             detail=f"Review segment not found: {segment_id}",
         )
     state = _read_review_json(path, "review_state.json")
+    if int(state.get("revision") or 0) != request.expected_revision:
+        raise HTTPException(status_code=409, detail="审阅内容已更新，请刷新后重新保存；当前编辑内容不会被覆盖。")
+    state["revision"] = int(state.get("revision") or 0) + 1
     decisions = state.setdefault("decisions", {})
     previous = decisions.get(segment_id, {})
     if not isinstance(previous, dict):
@@ -3981,19 +4098,6 @@ async def run_review_rewrite(run_dir: str, request: ReviewRewriteRequest):
         and decision.get("status") in {"open", "requested"}
         and (request.segment_id is None or segment_id == request.segment_id)
     ]
-    missing_instruction = [
-        segment_id
-        for segment_id, decision in selected_decisions
-        if not str(decision.get("reviewer_comment") or "").strip()
-    ]
-    if missing_instruction:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=(
-                f"{len(missing_instruction)} 段尚未填写给模型的重译要求。"
-                "请进入该段，填写具体修改要求后再执行重译。"
-            ),
-        )
     if not selected_decisions:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -4073,7 +4177,7 @@ async def run_review_export(run_dir: str, request: ReviewExportRequest):
             delivery_stem = Path(epub_source).stem if isinstance(epub_source, str) else path.name
             destination = delivery_root / f"{delivery_stem} ({request.version}).md"
         else:
-            destination = delivery_root / source_path.name
+            destination = delivery_root / f"{source_path.stem} ({request.version}){source_path.suffix}"
         shutil.copy2(source_path, destination)
         delivered_files[key] = str(destination)
     version_manifest["delivery_dir"] = str(delivery_root)

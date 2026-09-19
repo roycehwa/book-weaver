@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import html
+import hashlib
+import gc
 import posixpath
 import re
 import tempfile
@@ -36,7 +38,11 @@ def build_pdf_converter(
         force_backend_text=True,
         generate_picture_images=generate_picture_images,
         images_scale=2.0 if generate_picture_images else 1.0,
-        accelerator_options=AcceleratorOptions(device=AcceleratorDevice.CPU),
+        layout_batch_size=1,
+        ocr_batch_size=1,
+        table_batch_size=1,
+        queue_max_size=2,
+        accelerator_options=AcceleratorOptions(device=AcceleratorDevice.CPU, num_threads=2),
     )
     return DocumentConverter(
         format_options={
@@ -65,13 +71,54 @@ def _export_book_markdown(document: Any, images_dir: Path) -> str:
     from docling_core.types.doc import ImageRefMode
 
     images_dir.mkdir(parents=True, exist_ok=True)
-    # Save images to disk and get a document copy with absolute URI references.
-    doc_with_refs = document._with_pictures_refs(
-        image_dir=images_dir,
-        page_no=None,
-        reference_path=None,  # None → absolute paths in the markdown
-    )
-    return doc_with_refs.export_to_markdown(image_mode=ImageRefMode.REFERENCED)
+    return document.export_to_markdown(image_mode=ImageRefMode.REFERENCED)
+
+
+def _extract_picture_refs(document: Any, source_pdf: Path, images_dir: Path) -> None:
+    """Render only pages containing pictures, one at a time; keep file refs only."""
+    import pypdfium2 as pdfium
+    from docling_core.types.doc import ImageRef, Size
+
+    by_page: dict[int, list[Any]] = {}
+    for picture in document.pictures:
+        if not picture.prov:
+            raise ValueError("Picture has no page provenance; cannot safely extract it")
+        by_page.setdefault(picture.prov[0].page_no, []).append(picture)
+    images_dir.mkdir(parents=True, exist_ok=True)
+    with pdfium.PdfDocument(source_pdf) as pdf:
+        for page_no, pictures in sorted(by_page.items()):
+            if page_no < 1 or page_no > len(pdf):
+                raise ValueError(f"Picture references invalid page {page_no}")
+            page = pdf[page_no - 1]
+            bitmap = None
+            raster = None
+            try:
+                width, height = page.get_size()
+                if width * height * 4 > 20_000_000:
+                    raise ValueError(f"Picture page {page_no} exceeds the 20 megapixel render budget")
+                bitmap = page.render(scale=2)
+                raster = bitmap.to_pil()
+                size = document.pages[page_no].size
+                for picture in pictures:
+                    bbox = picture.prov[0].bbox.to_top_left_origin(page_height=size.height)
+                    x_scale, y_scale = raster.width / size.width, raster.height / size.height
+                    bounds = (max(0, round(bbox.l * x_scale)), max(0, round(bbox.t * y_scale)),
+                              min(raster.width, round(bbox.r * x_scale)), min(raster.height, round(bbox.b * y_scale)))
+                    if bounds[2] <= bounds[0] or bounds[3] <= bounds[1]:
+                        raise ValueError(f"Invalid picture bounds on page {page_no}: {bounds}")
+                    with raster.crop(bounds) as crop:
+                        digest = hashlib.sha256(crop.tobytes() + str(crop.size).encode()).hexdigest()[:24]
+                        path = (images_dir / f"picture-{digest}.png").resolve()
+                        if not path.exists():
+                            crop.save(path, format="PNG")
+                        picture.image = ImageRef(mimetype="image/png", dpi=144,
+                                                 size=Size(width=crop.width, height=crop.height), uri=path)
+            finally:
+                if raster is not None:
+                    raster.close()
+                if bitmap is not None:
+                    bitmap.close()
+                page.close()
 
 
 def _split_markdown_blocks(markdown_text: str) -> list[str]:
@@ -228,17 +275,14 @@ def _reflow_book_blocks(blocks: list[str]) -> list[str]:
     return reflowed
 
 
-def clean_book_reflow_markdown(markdown_text: str) -> str:
+def clean_book_reflow_markdown(markdown_text: str, *, running_texts: tuple[str, ...] = (),
+                               allow_fragment_reflow: bool = False) -> str:
     blocks = [
         block
         for block in (_normalize_pdf_text_block(block) for block in _split_markdown_blocks(markdown_text))
         if block and not _is_page_number_block(block)
     ]
-    running_counts: dict[str, int] = {}
-    for block in blocks:
-        if _is_repeatable_running_text(block):
-            key = _normalize_running_text(block)
-            running_counts[key] = running_counts.get(key, 0) + 1
+    confirmed_running = {_normalize_running_text(text) for text in running_texts}
 
     decontaminated: list[str] = []
     seen_running_text: set[str] = set()
@@ -247,7 +291,7 @@ def clean_book_reflow_markdown(markdown_text: str) -> str:
             continue
         if _is_repeatable_running_text(block):
             key = _normalize_running_text(block)
-            if running_counts.get(key, 0) >= 3:
+            if key in confirmed_running:
                 if not _is_markdown_heading_block(block):
                     continue
                 if key in seen_running_text:
@@ -258,7 +302,7 @@ def clean_book_reflow_markdown(markdown_text: str) -> str:
             continue
         decontaminated.append(block)
 
-    cleaned = _reflow_book_blocks(decontaminated)
+    cleaned = _reflow_book_blocks(decontaminated) if allow_fragment_reflow else decontaminated
     return _normalize_footnote_reference_spacing("\n\n".join(cleaned).strip()) + "\n"
 
 
@@ -291,22 +335,31 @@ def ingest_pdf(
     # pass; chapter boundaries come from the structured dict anyway.
     converter = build_pdf_converter(
         enable_table_structure=False,
-        generate_picture_images=is_book and output_dir is not None,
+        # Docling retains ALL rendered pages when picture generation is enabled.
+        # Export pictures from their preserved coordinates after text conversion.
+        generate_picture_images=False,
     )
     result = converter.convert(source_pdf)
     document = result.document
-
-    # structured dict is always needed (profile analysis, artifact storage)
-    _, structured = _export_docling_document(document)
+    # Conversion models/page work buffers are no longer needed by the detached
+    # document. Release them before rendering/exporting any picture assets.
+    del result, converter
+    gc.collect()
 
     images_dir: Path | None = None
     if is_book and output_dir is not None:
         images_dir = output_dir / "images"
+        _extract_picture_refs(document, source_pdf, images_dir)
         # Docling handles reading order, tables, and image refs natively for books.
         raw_markdown = _export_book_markdown(document, images_dir)
-        reconstructed_markdown = clean_book_reflow_markdown(raw_markdown)
+        running_texts = tuple(str(item.text) for item in document.texts
+                              if str(item.label) in {"page_header", "page_footer"})
+        reconstructed_markdown = clean_book_reflow_markdown(raw_markdown, running_texts=running_texts)
     else:
         raw_markdown = document.export_to_markdown()
+
+    structured = document.export_to_dict()
+    if images_dir is None:
         reconstructed_markdown = reconstruct_markdown(structured, raw_markdown)
 
     return NormalizedDocument(
@@ -823,20 +876,59 @@ def _clean_epub_prose_markup(body: Tag) -> None:
             line_break.decompose()
 
 
-def _epub_flow_markdown_lines(body: Tag, *, internal_xhtml_path: str) -> list[str]:
-    """Serialize body to markdown lines in document order, including standalone images and inline links."""
+def _epub_dom_path(tag: Tag, body: Tag) -> str:
+    parts: list[str] = []
+    current: Tag | None = tag
+    while current is not None:
+        name = str(current.name or "node").lower()
+        parent = current.parent if isinstance(current.parent, Tag) else None
+        if parent is None:
+            parts.append(name)
+            break
+        same_name = [child for child in parent.children if isinstance(child, Tag) and child.name == current.name]
+        position = same_name.index(current) + 1 if current in same_name else 1
+        parts.append(f"{name}[{position}]")
+        if current is body:
+            break
+        current = parent
+    return "/" + "/".join(reversed(parts))
+
+
+def _epub_flow_markdown_units(body: Tag, *, internal_xhtml_path: str) -> list[dict[str, Any]]:
+    """Serialize semantic blocks with their XHTML DOM and link provenance."""
     prefix = {"h1": "## ", "h2": "### ", "h3": "#### ", "h4": "##### "}
-    out: list[str] = []
+    out: list[dict[str, Any]] = []
+
+    def append(markdown_text: str, tag: Tag | None) -> None:
+        if not markdown_text:
+            return
+        record: dict[str, Any] = {"markdown": markdown_text}
+        if tag is not None:
+            source_text = tag.get_text(" ", strip=True)
+            record.update({
+                "resource_path": internal_xhtml_path,
+                "dom_path": _epub_dom_path(tag, body),
+                "char_start": 0,
+                "char_end": len(source_text),
+                "element_id": str(tag.get("id") or "") or None,
+                "link_targets": [
+                    resolved
+                    for anchor in tag.find_all("a", href=True)
+                    for resolved in [_epub_resolve_link_href(internal_xhtml_path, str(anchor.get("href") or ""))]
+                    if resolved
+                ],
+            })
+        out.append(record)
 
     def walk_children(container: Tag) -> None:
         for child in list(container.children):
             if isinstance(child, NavigableString):
                 t = str(child).strip()
                 if t.startswith("!["):
-                    out.append(t)
+                    append(t, None)
                 elif t:
                     # Injected Markdown (e.g. nav@toc replacement) or other explicit body text nodes
-                    out.append(t)
+                    append(t, None)
                 continue
             if not isinstance(child, Tag):
                 continue
@@ -847,31 +939,31 @@ def _epub_flow_markdown_lines(body: Tag, *, internal_xhtml_path: str) -> list[st
                 inner = "".join(_epub_phrasing_to_markdown(ch, internal_xhtml_path) for ch in child.children)
                 tx = inner.strip() or child.get_text(" ", strip=True)
                 if tx:
-                    out.append(prefix[name] + tx)
+                    append(prefix[name] + tx, child)
                 continue
             if name == "p":
                 inner = "".join(_epub_phrasing_to_markdown(ch, internal_xhtml_path) for ch in child.children)
                 tx = inner.strip() or child.get_text(" ", strip=True)
                 if tx:
-                    out.append(tx)
+                    append(tx, child)
                 continue
             if name == "blockquote":
                 inner = "".join(_epub_phrasing_to_markdown(ch, internal_xhtml_path) for ch in child.children)
                 tx = inner.strip() or child.get_text(" ", strip=True)
                 if tx:
                     q = tx.replace("\n", "\n> ")
-                    out.append("> " + q)
+                    append("> " + q, child)
                 continue
             if name == "li":
                 inner = "".join(_epub_phrasing_to_markdown(ch, internal_xhtml_path) for ch in child.children)
                 tx = inner.strip() or child.get_text(" ", strip=True)
                 if tx:
-                    out.append("- " + tx)
+                    append("- " + tx, child)
                 continue
             if name == "table":
                 md = _html_table_to_markdown(child)
                 if md:
-                    out.append(md)
+                    append(md, child)
                 continue
             if name in {"br", "hr"}:
                 continue
@@ -879,6 +971,14 @@ def _epub_flow_markdown_lines(body: Tag, *, internal_xhtml_path: str) -> list[st
 
     walk_children(body)
     return out
+
+
+def _epub_flow_markdown_lines(body: Tag, *, internal_xhtml_path: str) -> list[str]:
+    """Serialize body to markdown lines in document order, including standalone images and inline links."""
+    return [
+        str(unit["markdown"])
+        for unit in _epub_flow_markdown_units(body, internal_xhtml_path=internal_xhtml_path)
+    ]
 
 
 def read_epub_spine_length(path: Path) -> int:
@@ -915,6 +1015,7 @@ def _extract_epub_body_chapter(
     fallback_title: str,
     nav_title: str | None = None,
     book_title: str | None = None,
+    provenance_out: list[dict[str, Any]] | None = None,
 ) -> tuple[str, str]:
     html = zipf.read(internal_xhtml_path).decode("utf-8", errors="replace")
     soup = BeautifulSoup(html, "html.parser")
@@ -1034,7 +1135,10 @@ def _extract_epub_body_chapter(
     if title_heading is not None:
         title_heading.decompose()
 
-    body_md = "\n\n".join(_epub_flow_markdown_lines(body, internal_xhtml_path=internal_xhtml_path)).strip()
+    flow_units = _epub_flow_markdown_units(body, internal_xhtml_path=internal_xhtml_path)
+    if provenance_out is not None:
+        provenance_out.extend(flow_units)
+    body_md = "\n\n".join(str(unit["markdown"]) for unit in flow_units).strip()
     body_md = _epub_maybe_repair_staccato_toc_lines(body_md)
     body_md = _epub_clean_malformed_html_wrapper_lines(body_md)
     return title_guess, body_md
@@ -1058,7 +1162,13 @@ def ingest_epub(path: Path) -> NormalizedDocument:
         book_title = _epub_dc_title(zipf, opf_path)
         page_no = 0
 
-        def emit_spine_chapter(title: str, body_md: str, *, source_internal_path: str | None = None) -> None:
+        def emit_spine_chapter(
+            title: str,
+            body_md: str,
+            *,
+            source_internal_path: str | None = None,
+            dom_units: list[dict[str, Any]] | None = None,
+        ) -> None:
             nonlocal page_no, text_index
             page_no += 1
             pn = page_no
@@ -1072,6 +1182,8 @@ def ingest_epub(path: Path) -> NormalizedDocument:
             }
             if source_internal_path:
                 entry["source_internal_path"] = source_internal_path.replace("\\", "/")
+            if dom_units:
+                entry["dom_units"] = dom_units
             spine_chapters.append(entry)
             raw_parts.append(combined)
             texts.append(
@@ -1114,6 +1226,7 @@ def ingest_epub(path: Path) -> NormalizedDocument:
             if internal not in zipf.namelist():
                 continue
             nav_title = toc_labels.get(internal) or toc_labels.get(PurePosixPath(internal).name)
+            dom_units: list[dict[str, Any]] = []
             title, body_md = _extract_epub_body_chapter(
                 zipf,
                 opf_path=opf_path,
@@ -1123,8 +1236,9 @@ def ingest_epub(path: Path) -> NormalizedDocument:
                 fallback_title=sid.replace("_", " "),
                 nav_title=nav_title,
                 book_title=book_title,
+                provenance_out=dom_units,
             )
-            emit_spine_chapter(title, body_md, source_internal_path=internal)
+            emit_spine_chapter(title, body_md, source_internal_path=internal, dom_units=dom_units)
 
     if page_no == 0:
         raise ValueError("EPUB spine contains no readable XHTML documents.")

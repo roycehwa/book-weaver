@@ -322,6 +322,28 @@ def test_artifact_path_rejects_traversal(tmp_path: Path) -> None:
         service.artifact_path("job-1", "bad")
 
 
+def test_intervention_keeps_cooldown_and_lock_reason(tmp_path, monkeypatch):
+    from pdf_translator.translation_failures import put_failure
+    service = BookJobService(project_home=tmp_path, jobs_dir=tmp_path / "jobs")
+    job_dir = service.jobs_dir / "job-1"
+    run = job_dir / "artifacts" / "book"
+    run.mkdir(parents=True)
+    (run / "book.json").write_text('{}')
+    snapshot = _snapshot('job-1')
+    snapshot.update(state='failed', failed_stage='translating',
+                    artifacts={'book': {'href': 'artifacts/book/book.json'}})
+    (job_dir / 'job.json').write_text(json.dumps(snapshot))
+    put_failure(run, 's1', {'source': 'Text', 'status': 'failed'})
+    monkeypatch.setattr(service, '_merge_live_translation_progress', lambda s: s)
+    monkeypatch.setattr(service, 'translation_activity', lambda s: None)
+    for reason in ('cooldown', 'already_running', 'human_gate_required'):
+        monkeypatch.setattr(service, 'translation_resume', lambda *a: {'available': False, 'reason': reason, 'detail': 'Do not bypass'})
+        result = service.get('job-1')
+        assert result['translation_resume']['reason'] == reason
+        assert not result['translation_resume']['available']
+        assert result['error']['code'] == 'translation_intervention_required'
+
+
 def test_source_path_returns_stored_source_file(tmp_path: Path) -> None:
     service = BookJobService(project_home=tmp_path, jobs_dir=tmp_path / "jobs")
     job_dir = service.jobs_dir / "job-1"
@@ -554,14 +576,70 @@ def test_confirm_chapters_writes_user_chapter_segment_preview(tmp_path: Path) ->
     assert segment_path.is_file()
     payload = json.loads(segment_path.read_text(encoding="utf-8"))
     assert payload["schema"] == "bookweaver_chapter_segments_v1"
-    assert payload["source"] == "canonical_chapters"
+    assert payload["source"] == "confirmed_reading_units"
     assert {segment["chapter_title"] for segment in payload["segments"]} == {"用户确认章节"}
     assert [segment["section_title"] for segment in payload["segments"]] == ["First Idea", "Second Idea"]
     assert result["artifacts"]["chapter_segments"]["href"] == "artifacts/chapter-segments.json"
     assert result["artifacts"]["chapter_segments"]["source_artifact"] == "user_confirmation"
 
 
-def test_confirm_chapters_preview_error_includes_underlying_reason(tmp_path: Path) -> None:
+def test_confirming_translation_chapters_extracts_glossary_from_confirmed_book(tmp_path: Path) -> None:
+    service = BookJobService(project_home=tmp_path, jobs_dir=tmp_path / "jobs")
+    job_dir = service.jobs_dir / "job-1"
+    artifacts_dir = job_dir / "artifacts"
+    artifacts_dir.mkdir(parents=True)
+    book = {
+        "metadata": {"chapter_source": "automatic"},
+        "chapters": [{
+            "title": "Automatic",
+            "source_pages": [1],
+            "trace_markdown": "[[page: 1]]\n\nEmbodied Agency shapes Embodied Agency in practice.",
+            "markdown": "Embodied Agency shapes Embodied Agency in practice.",
+        }],
+        "pages": [{"page_no": 1, "has_content": True, "page_kind": "body"}],
+    }
+    (artifacts_dir / "book.json").write_text(json.dumps(book), encoding="utf-8")
+    snapshot = _snapshot("job-1")
+    snapshot["state"] = "awaiting_chapter_confirmation"
+    snapshot["request"] = {
+        "processing_mode": "translate",
+        "source_language": "en",
+        "target_language": "zh-CN",
+    }
+    snapshot["resolved"] = {"text_operation": "translate", "source_language": "en"}
+    snapshot["artifacts"] = {"book": {"href": "artifacts/book.json"}}
+    (job_dir / "job.json").write_text(json.dumps(snapshot), encoding="utf-8")
+
+    result = service.confirm_chapters(
+        "job-1",
+        chapters=[{
+            "index": 1,
+            "chapter_id": "body",
+            "title": "Body",
+            "page_start": 1,
+            "page_end": 1,
+            "source_pages": [1],
+            "content_policy": "auto",
+        }],
+    )
+
+    assert result["state"] == "awaiting_glossary"
+    assert result["artifacts"]["glossary_candidates"]["href"] == "artifacts/glossary/candidates.json"
+    assert (artifacts_dir / "glossary" / "candidates.json").is_file()
+    workflow = json.loads((artifacts_dir / "workflow.json").read_text(encoding="utf-8"))
+    assert workflow["stage"] == "awaiting_glossary"
+    canonical = json.loads((artifacts_dir / "canonical-chapters.json").read_text(encoding="utf-8"))
+    assert canonical["chapters"][0]["content_policy"] == "translate"
+    reading_units = json.loads((artifacts_dir / "reading-units.json").read_text(encoding="utf-8"))
+    assert reading_units["chapters"][0]["policy"] == "translate"
+    assert reading_units["units"][0]["policy_confirmed"] is True
+
+
+def test_confirm_chapters_preview_error_includes_underlying_reason(tmp_path: Path, monkeypatch) -> None:
+    def fail_preview(*args, **kwargs):
+        raise ValueError("no extractable embedded text")
+
+    monkeypatch.setattr("pdf_translator.book_rebuild.apply_canonical_chapter_plan", fail_preview)
     service = BookJobService(project_home=tmp_path, jobs_dir=tmp_path / "jobs")
     job_dir = service.jobs_dir / "job-1"
     artifacts_dir = job_dir / "artifacts"
@@ -643,3 +721,70 @@ def test_delete_removes_job_directory(tmp_path: Path) -> None:
     service.delete("job-1")
 
     assert not job_dir.exists()
+def test_worker_claim_is_exclusive_across_service_instances(tmp_path):
+    first = BookJobService(project_home=tmp_path, jobs_dir=tmp_path / 'jobs')
+    second = BookJobService(project_home=tmp_path, jobs_dir=tmp_path / 'jobs')
+    (tmp_path / 'jobs' / 'job-lock').mkdir()
+    first._acquire_worker_lock('job-lock')
+    try:
+        assert second.translation_worker_lock_held('job-lock')
+        with pytest.raises(JobServiceError, match='already running'):
+            second._acquire_worker_lock('job-lock')
+        with pytest.raises(JobServiceError, match='仍在运行'):
+            second.delete('job-lock')
+    finally:
+        first._release_worker_lock('job-lock')
+    second._acquire_worker_lock('job-lock')
+    second._release_worker_lock('job-lock')
+
+
+def test_worker_subprocess_inherits_guard(tmp_path, monkeypatch):
+    import sys
+    (tmp_path/'pyproject.toml').touch()
+    service = BookJobService(project_home=tmp_path, jobs_dir=tmp_path/'jobs')
+    (tmp_path/'jobs'/'job-lock').mkdir()
+    service._acquire_worker_lock('job-lock')
+    observed = {}
+    def run(command, **kwargs):
+        observed.update(command=command, **kwargs)
+        return SimpleNamespace(returncode=0, stdout='', stderr='')
+    monkeypatch.setattr('job_service.subprocess.run', run)
+    try:
+        service._run(['job', 'resume', 'job-lock'])
+        assert observed['command'][0] == sys.executable
+        assert observed['pass_fds'] == (service._worker_handles['job-lock'].fileno(),)
+    finally:
+        service._release_worker_lock('job-lock')
+
+
+def test_guard_survives_parent_death_until_child_exits(tmp_path):
+    import subprocess, sys, time, os, signal
+    guard = tmp_path/'guard'
+    marker = tmp_path/'child.pid'
+    program = '''
+import fcntl, subprocess, sys, time
+from pathlib import Path
+f = open(sys.argv[1], 'a')
+fcntl.flock(f, fcntl.LOCK_EX)
+p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(20)'], pass_fds=(f.fileno(),))
+Path(sys.argv[2]).write_text(str(p.pid))
+time.sleep(20)
+'''
+    parent = subprocess.Popen([sys.executable, '-c', program, str(guard), str(marker)])
+    child_pid = None
+    try:
+        deadline = time.monotonic() + 5
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(.02)
+        assert marker.exists()
+        child_pid = int(marker.read_text())
+        parent.kill(); parent.wait(timeout=5)
+        import fcntl
+        with guard.open('a') as handle:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        if parent.poll() is None:
+            parent.kill(); parent.wait(timeout=5)
+        if child_pid:
+            os.kill(child_pid, signal.SIGTERM)

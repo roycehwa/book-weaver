@@ -58,10 +58,10 @@ const book = (
     text_processing: { status: 'done', label: '文本处理', description: '' },
     translation_review: { status: operation === 'preserve' ? 'skipped' : 'done', label: '翻译审阅', description: '' },
     chapter_confirmation: { status: 'done', label: '章节确认', description: '' },
-    knowledge_handoff: { status: status === 'ready_for_knowledge' ? 'ready' : 'blocked', label: '知识解析', description: '' },
+    delivery: { status: status === 'phase_a_complete' ? 'ready' : 'blocked', label: '导出与完成', description: '' },
   },
   next_action: { kind: 'view_progress', label: '查看处理进度', href: `/jobs/${id}` },
-  knowledge_ready: status === 'ready_for_knowledge',
+  phase_a_complete: status === 'phase_a_complete',
   updated_at: updatedAt,
   progress_percent: 90,
 })
@@ -81,9 +81,9 @@ describe('groupWorkspaceBooks', () => {
     expect(groups[1].hidden_versions_count).toBe(1)
   })
 
-  test('prefers ready-for-knowledge version over newer failed version', () => {
+  test('prefers completed Phase A version over newer failed version', () => {
     const groups = groupWorkspaceBooks([
-      book('ready', 'same', '2026-06-17T08:00:00Z', 'ready_for_knowledge'),
+      book('ready', 'same', '2026-06-17T08:00:00Z', 'phase_a_complete'),
       book('failed', 'same', '2026-06-17T09:00:00Z', 'failed'),
     ])
 
@@ -95,7 +95,7 @@ describe('groupWorkspaceBooks', () => {
 
   test('keeps one visible version for translate and one for preserve', () => {
     const groups = groupWorkspaceBooks([
-      book('preserve', 'same', '2026-06-17T08:00:00Z', 'ready_for_knowledge', 'preserve'),
+      book('preserve', 'same', '2026-06-17T08:00:00Z', 'phase_a_complete', 'preserve'),
       book('translate-old', 'same', '2026-06-17T09:00:00Z', 'failed', 'translate'),
       book('translate-new', 'same', '2026-06-17T10:00:00Z', 'needs_translation_review', 'translate'),
     ])

@@ -8,7 +8,7 @@ export interface WorkspaceBookGroup {
 }
 
 const statusPriority: Record<WorkspaceBook['pipeline_status'], number> = {
-  ready_for_knowledge: 5,
+  phase_a_complete: 5,
   needs_chapter_confirmation: 4,
   needs_translation_review: 3,
   processing: 2,

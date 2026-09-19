@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import shutil
 import threading
+import time
 import uuid
 import zipfile
 from typing import Any
@@ -22,6 +23,7 @@ JOB_STATES = frozenset(
         "created",
         "ingesting",
         "reconstructing",
+        "awaiting_chapter_confirmation",
         "awaiting_glossary",
         "translating",
         "polishing",
@@ -274,6 +276,7 @@ class BookJobRunner:
         "created": 0,
         "ingesting": 5,
         "reconstructing": 15,
+        "awaiting_chapter_confirmation": 20,
         "awaiting_glossary": 20,
         "translating": 25,
         "polishing": 70,
@@ -348,18 +351,27 @@ class BookJobRunner:
             if current_stage is not None:
                 self._complete_stage(job_id, current_stage)
             artifact_map = self._artifact_map(job_id, artifacts)
+            next_state = (
+                "awaiting_chapter_confirmation"
+                if artifacts.book_json_path is not None and artifacts.book_json_path.is_file()
+                else "awaiting_glossary"
+            )
             completed = self.repository.update(
                 job_id,
-                state="awaiting_glossary",
+                state=next_state,
                 failed_stage=None,
                 error=None,
                 artifacts=artifact_map,
-                progress={"stage_percent": 100, "overall_percent": self._OVERALL_PERCENT["awaiting_glossary"]},
+                progress={"stage_percent": 100, "overall_percent": self._OVERALL_PERCENT[next_state]},
             )
             self.repository.append_event(
                 job_id,
-                event_type="glossary_ready_required",
-                stage="awaiting_glossary",
+                event_type=(
+                    "chapter_confirmation_required"
+                    if next_state == "awaiting_chapter_confirmation"
+                    else "glossary_ready_required"
+                ),
+                stage=next_state,
                 data={"artifacts": sorted(artifact_map)},
             )
             return completed
@@ -527,6 +539,7 @@ class BookJobRunner:
             progress_fields["translation_chunks_completed"] = total
             progress_fields["stage_percent"] = 100
         fields.update(progress_fields)
+        fields["overall_percent"] = self._OVERALL_PERCENT["awaiting_human_review"]
         return fields
 
     def _run_full_pipeline(
@@ -601,7 +614,28 @@ class BookJobRunner:
                     else None
                 ),
             )
-            artifacts = self.pipeline_runner(settings, on_stage)
+            from pdf_translator.translation_failures import TranslationInterventionRequired, TranslationProviderUnavailable
+            self.repository.update(job_id, progress={'automatic_recovery_attempt': 0})
+            for recovery_pass in range(3):
+                try:
+                    artifacts = self.pipeline_runner(settings, on_stage)
+                    break
+                except (TranslationInterventionRequired, TranslationProviderUnavailable) as exc:
+                    if recovery_pass == 2:
+                        raise
+                    run_dir = self._run_output_dir(job_id)
+                    from pdf_translator.translate import _require_translation_not_paused
+                    _require_translation_not_paused(run_dir / 'translation-cache')
+                    self.repository.update(job_id, state='translating', error=None,
+                        progress={'automatic_recovery_attempt': recovery_pass + 1, 'automatic_recovery_limit': 2})
+                    self.repository.append_event(job_id, event_type='translation_auto_recovery', stage='translating',
+                        data={'attempt': recovery_pass + 1, 'pending_segments': getattr(exc, 'count', None),
+                              'reason': type(exc).__name__})
+                    # The same worker retains the job lock and frozen inputs.
+                    # Successful chunks (including sub-recovery results) are cached.
+                    time.sleep(2 ** (recovery_pass + 1))
+                    _require_translation_not_paused(run_dir / 'translation-cache')
+                    settings = replace(settings, existing_run_dir=run_dir, resume_translation=True)
             if current_stage is not None:
                 self._complete_stage(job_id, current_stage, current_stage_data)
             artifact_map = self._artifact_map(job_id, artifacts)
@@ -611,7 +645,7 @@ class BookJobRunner:
                 failed_stage=None,
                 error=None,
                 artifacts=artifact_map,
-                progress=self._completion_progress_fields(job_id),
+                progress={**self._completion_progress_fields(job_id), 'automatic_recovery_attempt': 0},
             )
             self.repository.append_event(
                 job_id,
@@ -769,6 +803,7 @@ class BookJobRunner:
             "book": artifacts.book_json_path,
             "book_markdown": artifacts.book_markdown_path,
             "book_trace": artifacts.book_trace_markdown_path,
+            "reading_units": artifacts.reading_units_path,
             "epub": artifacts.translated_epub_path,
             "pdf": artifacts.translated_pdf_path,
         }
@@ -806,6 +841,9 @@ class BookJobRunner:
 
     @staticmethod
     def _classify_failure(exc: Exception, stage: str) -> tuple[str, bool]:
+        from pdf_translator.translation_failures import TranslationInterventionRequired
+        if isinstance(exc, TranslationInterventionRequired):
+            return "translation_intervention_required", True
         message = str(exc)
         if "MINIMAX_API_KEY" in message or "LLM_API_KEY" in message:
             return "configuration_error", True
@@ -825,6 +863,8 @@ class BookJobRunner:
 
     @staticmethod
     def _safe_failure_reason(exc: Exception, error_code: str) -> str | None:
+        if error_code == "translation_intervention_required":
+            return f"{exc.count} 个片段未通过翻译检查；其余结果已保存。可局部重试或人工修正，无需重跑整本书。"
         if error_code != "configuration_error":
             return None
         message = str(exc).strip()

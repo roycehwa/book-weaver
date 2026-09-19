@@ -32,6 +32,31 @@ def test_render_pdf_from_markdown_creates_output(tmp_path: Path) -> None:
     assert output.stat().st_size > 0
 
 
+def test_heading_keeps_with_content_not_spacer() -> None:
+    from pdf_translator.render import _story_from_html
+    from reportlab.platypus import Paragraph
+
+    story = _story_from_html(title="Book", html="<h2>Section</h2><p>Body</p>")
+    heading_index = next(i for i, item in enumerate(story)
+                         if isinstance(item, Paragraph) and item.getPlainText() == "Section")
+    assert story[heading_index].getKeepWithNext()
+    assert isinstance(story[heading_index + 1], Paragraph)
+    assert story[heading_index + 1].getPlainText() == "Body"
+
+
+def test_heading_moves_with_tall_image(tmp_path: Path) -> None:
+    image_path = tmp_path / "tall.png"
+    PILImage.new("RGB", (400, 1600), "white").save(image_path)
+    output = tmp_path / "pagination.pdf"
+    text = "\n\n".join(["An introductory paragraph. " * 12] * 3)
+    render_pdf_from_markdown("Book", text + f"\n\n## TallFigureHeading\n\n![TallFigureCaption]({image_path})", output)
+    with pdfium.PdfDocument(output) as doc:
+        pages = [page.get_textpage().get_text_range() for page in doc]
+    assert len(pages) >= 2
+    assert next(i for i, text in enumerate(pages) if "TallFigureHeading" in text) == next(
+        i for i, text in enumerate(pages) if "TallFigureCaption" in text)
+
+
 def test_render_pdf_embeds_image_when_path_exists(tmp_path: Path) -> None:
     img_path = tmp_path / "figure.png"
     PILImage.new("RGB", (200, 100), color=(128, 128, 128)).save(img_path)
@@ -94,6 +119,18 @@ def test_render_pdf_fits_wide_table_to_page(tmp_path: Path) -> None:
 
     assert output.exists()
     assert output.stat().st_size > 0
+
+
+def test_preserved_page_image_uses_readable_full_height(tmp_path):
+    from PIL import Image as PILImage
+    from pdf_translator.render import _image_flowable, _build_styles, CONTENT_HEIGHT
+    image_path = tmp_path / "page.png"
+    PILImage.new("RGB", (735, 1102), "white").save(image_path)
+    normal = _image_flowable(str(image_path), styles=_build_styles())[0]
+    preserved = _image_flowable(str(image_path), styles=_build_styles(), original_page=True)[0]
+    assert preserved.drawHeight > normal.drawHeight
+    assert preserved.drawHeight < CONTENT_HEIGHT
+    assert abs(preserved.drawWidth / preserved.drawHeight - 735 / 1102) < 1e-6
 
 
 def test_render_pdf_skips_missing_image_gracefully(tmp_path: Path) -> None:

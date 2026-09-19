@@ -10,7 +10,7 @@ from pdf_translator.glossary import apply_glossary_decision, extract_glossary_ca
 from pdf_translator.pipeline import run_intake_pipeline, run_translation_pipeline
 from pdf_translator.workflow import (
     GlossaryNotReadyError,
-    STAGE_AWAITING_GLOSSARY,
+    STAGE_AWAITING_CHAPTER_CONFIRMATION,
     STAGE_GLOSSARY_READY,
     begin_translation,
     glossary_ready_summary,
@@ -122,9 +122,9 @@ def test_translate_from_run_blocked_without_glossary_ready(tmp_path: Path, monke
         run_translation_pipeline(settings)
 
 
-def test_intake_writes_awaiting_glossary_workflow(tmp_path: Path, monkeypatch) -> None:
+def test_intake_waits_for_chapter_confirmation_before_glossary(tmp_path: Path, monkeypatch) -> None:
     _patch_intake_dependencies(monkeypatch)
-    source = tmp_path / "book.epub"
+    source = tmp_path / "book.pdf"
     source.write_text("placeholder", encoding="utf-8")
     settings = RunSettings(
         source_pdf=source,
@@ -138,13 +138,13 @@ def test_intake_writes_awaiting_glossary_workflow(tmp_path: Path, monkeypatch) -
     artifacts = run_intake_pipeline(settings)
     workflow = load_workflow(artifacts.output_dir)
     assert workflow is not None
-    assert workflow["stage"] == STAGE_AWAITING_GLOSSARY
-    assert (artifacts.output_dir / "glossary" / "candidates.json").exists()
+    assert workflow["stage"] == STAGE_AWAITING_CHAPTER_CONFIRMATION
+    assert not (artifacts.output_dir / "glossary" / "candidates.json").exists()
 
 
 def test_glossary_ready_then_translate_from_run(tmp_path: Path, monkeypatch) -> None:
     _patch_intake_dependencies(monkeypatch)
-    source = tmp_path / "book.epub"
+    source = tmp_path / "book.pdf"
     source.write_text("placeholder", encoding="utf-8")
     intake_settings = RunSettings(
         source_pdf=source,
@@ -157,6 +157,27 @@ def test_glossary_ready_then_translate_from_run(tmp_path: Path, monkeypatch) -> 
     )
     artifacts = run_intake_pipeline(intake_settings)
     run_dir = artifacts.output_dir
+    canonical_path = run_dir / "canonical-chapters.json"
+    canonical_path.write_text(
+        json.dumps(
+            {
+                "schema": "bookmate_canonical_chapters_v1",
+                "source_artifact": "user_confirmation",
+                "source_revision": 0,
+                "chapters": [
+                    {
+                        "title": "Shareholder Primacy",
+                        "page_start": 1,
+                        "page_end": 1,
+                        "source_pages": [1],
+                        "content_policy": "translate",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    extract_glossary_candidates(run_dir)
     apply_glossary_decision(
         run_dir,
         source="Shareholder Primacy",
@@ -177,6 +198,7 @@ def test_glossary_ready_then_translate_from_run(tmp_path: Path, monkeypatch) -> 
         max_chunk_chars=9000,
         output_format="none",
         existing_run_dir=run_dir,
+        canonical_chapters_path=canonical_path,
         require_glossary_ready=True,
     )
     translated = run_translation_pipeline(translate_settings)

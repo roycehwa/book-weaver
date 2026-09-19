@@ -11,11 +11,15 @@ def test_repair_pdf_markdown_fixes_common_extraction_artifacts() -> None:
         "Eachofthe modal operators ◻ and ◇ behave syntactically like formalsystems."
     )
     repaired = repair_pdf_markdown(source)
-    assert "singular terms" in repaired
-    assert "s ingular" not in repaired
+    assert "s ingular terms" in repaired
     assert ". y." not in repaired
     assert "formal systems" in repaired
     assert "Each of the" in repaired
+
+
+def test_repair_does_not_glue_normal_short_words():
+    text = "In the beginning we saw a book. It is in the room, on a desk, as an example of the method."
+    assert repair_pdf_markdown(text) == text
 
 
 def test_scan_ingest_quality_reports_issues() -> None:

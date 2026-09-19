@@ -97,6 +97,32 @@ def test_artifact_map_exposes_chapter_segments(tmp_path: Path) -> None:
     assert mapped["chapter_segments"]["href"] == "artifacts/run/chapter-segments.json"
 
 
+def test_intake_phase_stops_for_chapter_confirmation_before_glossary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.epub"
+    source.write_bytes(b"epub")
+    repository = JobRepository(tmp_path / "jobs")
+    created = repository.create(source_path=source, processing_mode="translate")
+    runner = BookJobRunner(repository)
+    run_dir = repository.job_dir(created["job_id"]) / "artifacts" / "source"
+    artifacts = build_artifacts(run_dir, source, "zh-CN")
+
+    def fake_intake(_settings):
+        run_dir.mkdir(parents=True, exist_ok=True)
+        artifacts.book_json_path.write_text('{"chapters": []}', encoding="utf-8")
+        artifacts.manifest_path.write_text("{}", encoding="utf-8")
+        return artifacts
+
+    monkeypatch.setattr("pdf_translator.pipeline.run_intake_pipeline", fake_intake)
+
+    completed = runner.run_intake_phase(created["job_id"])
+
+    assert completed["state"] == "awaiting_chapter_confirmation"
+    assert repository.list_events(created["job_id"])[-1]["type"] == "chapter_confirmation_required"
+
+
 def test_repository_creates_durable_job_snapshot_and_initial_event(tmp_path: Path) -> None:
     source = tmp_path / "source.epub"
     source.write_bytes(b"example epub")
@@ -211,6 +237,14 @@ def test_snapshot_is_valid_json_after_each_update(tmp_path: Path) -> None:
         )
 
 
+def test_review_ready_progress_does_not_regress_to_translation_stage(tmp_path, monkeypatch):
+    runner = BookJobRunner(JobRepository(tmp_path / "jobs"))
+    monkeypatch.setattr(runner, "_read_chunk_progress_file", lambda _: {"total_chunks": 10, "completed_chunks": 10})
+    progress = runner._completion_progress_fields("probe")
+    assert progress["overall_percent"] == 90
+    assert progress["translation_chunks_completed"] == 10
+
+
 def test_job_runner_reaches_review_ready_and_maps_artifacts(tmp_path: Path) -> None:
     source = tmp_path / "source.epub"
     source.write_bytes(b"epub")
@@ -321,6 +355,42 @@ def test_job_runner_records_failure_and_resume_uses_existing_job(tmp_path: Path)
     assert "job_resumed" in [
         event["type"] for event in repository.list_events(created["job_id"])
     ]
+
+
+@pytest.mark.parametrize('persistent', [False, True])
+@pytest.mark.parametrize('network', [False, True])
+def test_quality_recovery_runs_without_manual_resume_and_is_bounded(tmp_path, monkeypatch, persistent, network):
+    from pdf_translator.translation_failures import TranslationInterventionRequired, TranslationProviderUnavailable
+    monkeypatch.setattr('pdf_translator.jobs.time.sleep', lambda _: None)
+    source = tmp_path / 'source.pdf'
+    source.write_bytes(b'pdf')
+    repository = JobRepository(tmp_path / 'jobs')
+    created = repository.create(source_path=source, translator='mock')
+    calls = []
+    def pipeline(settings, on_stage):
+        calls.append(settings)
+        on_stage('translating', {'stage_percent': 90})
+        assert repository.load(created['job_id'])['state'] == 'translating'
+        if len(calls) < 3 or persistent:
+            if network:
+                raise TranslationProviderUnavailable('Provider temporarily unavailable')
+            raise TranslationInterventionRequired(1)
+        output = settings.output_dir / source.stem
+        output.mkdir(parents=True, exist_ok=True)
+        (output/'manifest.json').write_text('{}')
+        (output/'translated.md').write_text('译文')
+        return _pipeline_artifacts(output, output/'manifest.json', output/'translated.md')
+    runner = BookJobRunner(repository, pipeline_runner=pipeline)
+    if persistent:
+        with pytest.raises((TranslationInterventionRequired, TranslationProviderUnavailable)):
+            runner.run(created['job_id'])
+    else:
+        assert runner.run(created['job_id'])['state'] == 'awaiting_human_review'
+    assert len(calls) == 3
+    assert all(c.resume_translation and c.existing_run_dir for c in calls[1:])
+    events = repository.list_events(created['job_id'])
+    assert sum(e['type'] == 'translation_auto_recovery' for e in events) == 2
+    assert sum(e['type'] == 'job_failed' for e in events) == int(persistent)
 
 
 def test_job_runner_persists_canonical_polish_outcome(tmp_path: Path) -> None:

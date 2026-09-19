@@ -79,6 +79,24 @@ def test_translator_meta_response_is_rejected() -> None:
         )
 
 
+@pytest.mark.parametrize("extra", [
+    "\n\n[1](141)",
+    "\n\n*[Translation notes: Footnote markers appear outside the paragraphs.]*",
+    '\n\n<a href="invented.xhtml">注</a>',
+])
+def test_translation_rejects_invented_links_and_commentary(extra: str) -> None:
+    from pdf_translator.translate import _assert_translation_quality
+    with pytest.raises(ValueError, match="invented link targets|translator meta response"):
+        _assert_translation_quality(chunk=TranslationChunk(index=0, markdown="A title"),
+            translated="一个标题" + extra, target_language="zh-CN", translator_name="minimax")
+
+
+def test_translation_retains_real_source_links() -> None:
+    from pdf_translator.translate import _assert_translation_quality
+    _assert_translation_quality(chunk=TranslationChunk(index=0, markdown="[A title](chapter.xhtml#note-1)"),
+        translated="[一个标题](chapter.xhtml#note-1)", target_language="zh-CN", translator_name="minimax")
+
+
 def test_translate_markdown_never_persists_prompt_glossary_appendix(
     tmp_path: Path,
 ) -> None:
@@ -327,7 +345,7 @@ def test_preferred_glossary_drift_does_not_fail_translation(
     assert "共同体" in result.translated_markdown
 
 
-def test_legacy_cache_with_glossary_drift_accepts_without_model_repair(
+def test_noncanonical_cache_is_never_reused_even_when_source_matches(
     tmp_path: Path,
 ) -> None:
     from pdf_translator.translate import (
@@ -353,7 +371,7 @@ def test_legacy_cache_with_glossary_drift_accepts_without_model_repair(
         encoding="utf-8",
     )
 
-    class LocalRepairTranslator(BaseTranslator):
+    class FreshTranslator(BaseTranslator):
         name = "minimax"
 
         def translate_chunk(
@@ -362,7 +380,7 @@ def test_legacy_cache_with_glossary_drift_accepts_without_model_repair(
             source_language: str | None,
             target_language: str,
         ) -> str:
-            raise AssertionError("legacy cache should be reused without another model call")
+            return "瑞士联邦与邻国进行了新的谈判。"
 
     translated = _translate_chunk_resumable(
         chunk=TranslationChunk(
@@ -378,17 +396,16 @@ def test_legacy_cache_with_glossary_drift_accepts_without_model_repair(
         ),
         source_language="en",
         target_language="zh-CN",
-        translator=LocalRepairTranslator(),
+        translator=FreshTranslator(),
         cache_dir=cache_dir,
         retry_count=1,
     )
 
-    assert translated == "这个邦联与邻国进行了谈判。"
-    metadata = json.loads(next(cache_dir.glob("chunk-000000-*.source.json")).read_text(encoding="utf-8"))
-    assert metadata["allow_glossary_drift"] is True
+    assert translated == "瑞士联邦与邻国进行了新的谈判。"
+    assert legacy_path.read_text(encoding="utf-8").strip() == "这个邦联与邻国进行了谈判。"
 
 
-def test_legacy_cache_is_ignored_when_source_fingerprint_differs(
+def test_noncanonical_cache_is_ignored_when_source_fingerprint_differs(
     tmp_path: Path,
 ) -> None:
     from pdf_translator.translate import _chunk_source_fingerprint, _translate_chunk_resumable
@@ -881,7 +898,7 @@ def test_sensitive_split_breaks_long_single_line_at_sentence_boundaries() -> Non
     assert " ".join(parts) == source
 
 
-def test_sensitive_split_preserves_only_refused_minimal_part() -> None:
+def test_sensitive_split_never_silently_preserves_refused_source() -> None:
     from pdf_translator.translate import _translate_sensitive_chunk_parts
 
     class SelectiveSensitiveTranslator(BaseTranslator):
@@ -904,16 +921,12 @@ def test_sensitive_split_preserves_only_refused_minimal_part() -> None:
         "Regional factories then faced new competition."
     )
 
-    translated = _translate_sensitive_chunk_parts(
-        chunk=TranslationChunk(index=5, markdown=source),
-        source_language="en",
-        target_language="zh-CN",
-        translator=SelectiveSensitiveTranslator(),
-    )
-
-    assert "其余内容已翻译。" in translated
-    assert "Deng Xiaoping consolidated power in 1978." in translated
-    assert "Private firms expanded rapidly." not in translated
+    with pytest.raises(ValueError, match="new_sensitive"):
+        _translate_sensitive_chunk_parts(
+            chunk=TranslationChunk(index=5, markdown=source),
+            source_language="en", target_language="zh-CN",
+            translator=SelectiveSensitiveTranslator(),
+        )
 
 
 def test_mock_translator_does_not_add_visible_debug_markers() -> None:
@@ -1013,17 +1026,26 @@ def test_permanent_token_plan_limit_is_not_retried(tmp_path: Path) -> None:
 
 
 def test_translation_prompt_defines_footnote_policy() -> None:
-    from pdf_translator.translate import build_translation_prompt
+    from pdf_translator.translate import build_translation_prompt, SEMANTIC_TRANSLATION_POLICY
 
     prompt = build_translation_prompt(
         markdown="24 William Byrd, explanatory prose.",
         chunk_index=0,
         source_language="en",
         target_language="zh-CN",
+        prompt_instruction=SEMANTIC_TRANSLATION_POLICY,
     )
 
     assert "Translate explanatory footnote prose" in prompt
     assert "bibliographic titles" in prompt
+
+
+def test_body_prompt_does_not_inherit_footnote_quote_exception():
+    from pdf_translator.translate import build_translation_prompt
+    prompt = build_translation_prompt(markdown='Quoted historical prose.', chunk_index=0, source_language='en', target_language='zh-CN')
+    assert 'including quoted prose' in prompt
+    assert 'verbatim quotation' not in prompt
+    assert 'footnote' not in prompt
 
 
 def test_translation_prompt_makes_glossary_mandatory() -> None:
@@ -1251,7 +1273,7 @@ def test_translate_markdown_splits_minimax_sensitive_chunk(tmp_path: Path) -> No
     assert "拆分后生成" in result.translated_markdown
 
 
-def test_translate_book_sends_numbered_citation_blocks_for_translation() -> None:
+def test_translate_book_sends_numbered_citation_blocks_for_translation(tmp_path: Path) -> None:
     class CountingTranslator(BaseTranslator):
         name = "realish"
 
@@ -1265,7 +1287,7 @@ def test_translate_book_sends_numbered_citation_blocks_for_translation() -> None
             target_language: str,
         ) -> str:
             self.sources.append(chunk.markdown)
-            return "这是正文的完整中文翻译。" * 30
+            return "# 第一章\n\n" + "这是正文的完整中文翻译。" * 30 + "\n\n- 引文书目信息。"
 
     citation = (
         "- [**16.**](OPS/chapter.xhtml#note-16) "
@@ -1283,7 +1305,7 @@ def test_translate_book_sends_numbered_citation_blocks_for_translation() -> None
     }
     settings = RunSettings(
         source_pdf=Path("source.epub"),
-        output_dir=Path("out"),
+        output_dir=tmp_path,
         target_language="zh-CN",
         source_language="en",
         translator="realish",
@@ -1806,7 +1828,7 @@ def test_translate_book_chapters_restores_media_blocks_after_translation(tmp_pat
         ) -> str:
             assert "![Figure" not in chunk.markdown
             assert "**Table" not in chunk.markdown
-            return "译文\n\n" + chunk.markdown
+            return chunk.markdown.replace("# Chapter 1", "# 第一章").replace("Opening paragraph.", "开头段落译文。").replace("Closing paragraph.", "结尾段落译文。")
 
     settings = RunSettings(
         source_pdf=tmp_path / "source.pdf",
@@ -1895,7 +1917,7 @@ def test_translate_book_chapters_translates_numbered_note_lists(tmp_path: Path) 
             target_language: str,
         ) -> str:
             self.calls += 1
-            return "译文：" + chunk.markdown
+            return chunk.markdown.replace("# Notes Section", "# 注释").replace("The first note keeps bibliographic context.", "译文：第一条注释保留书目信息。").replace("The second note explains chronology.", "第二条注释解释时间顺序。")
 
     settings = RunSettings(
         source_pdf=tmp_path / "source.epub",
@@ -2435,7 +2457,7 @@ def test_translate_markdown_fail_open_preserves_bad_chunk_for_review(
         ) -> str:
             return "This is still English prose. " * 30
 
-    monkeypatch.delenv("TRANSLATION_FAIL_OPEN", raising=False)
+    monkeypatch.setenv("TRANSLATION_FAIL_OPEN", "1")
     monkeypatch.delenv("TRANSLATION_FALLBACK", raising=False)
     monkeypatch.delenv("DEEPL_AUTH_KEY", raising=False)
     monkeypatch.delenv("DEEPL_API_KEY", raising=False)
@@ -2493,7 +2515,7 @@ def test_translate_markdown_fail_open_preserves_bad_chunk_for_review(
     assert cached.translated_markdown == result.translated_markdown
 
 
-def test_translate_markdown_default_quality_retries_fail_open_after_two_attempts(
+def test_translate_markdown_explicit_fail_open_follows_split_recovery(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2512,7 +2534,7 @@ def test_translate_markdown_default_quality_retries_fail_open_after_two_attempts
             self.calls += 1
             return "This remains untranslated English prose. " * 30
 
-    monkeypatch.delenv("TRANSLATION_FAIL_OPEN", raising=False)
+    monkeypatch.setenv("TRANSLATION_FAIL_OPEN", "1")
     monkeypatch.delenv("TRANSLATION_FALLBACK", raising=False)
     monkeypatch.delenv("DEEPL_AUTH_KEY", raising=False)
     monkeypatch.delenv("DEEPL_API_KEY", raising=False)
@@ -2539,7 +2561,8 @@ def test_translate_markdown_default_quality_retries_fail_open_after_two_attempts
         cache_dir=tmp_path / "cache",
     )
 
-    assert translator.calls == 2
+    # Whole-chunk retries must be followed by bounded smaller-part recovery.
+    assert 2 < translator.calls <= 20
     assert "BOOKWEAVER_TRANSLATION_FAIL_OPEN" in result.translated_markdown
 
 
@@ -2608,7 +2631,7 @@ def test_translate_book_chapters_classifies_legacy_contents_and_index_as_skipped
 
     assert len(translator.sources) == 1
     assert result.translated_chapters[0].markdown.strip() == "# Contents\n\nChapter One .... 1"
-    assert result.translated_chapters[1].markdown.strip() == "这是正文译文。"
+    assert result.translated_chapters[1].markdown.strip() == "# Chapter One\n\n这是正文译文。"
     assert result.translated_chapters[2].markdown.strip() == "# Index\n\nApple, 3\nConservatism, 8"
 
 
@@ -2639,3 +2662,119 @@ def test_read_chunk_cache_rejects_index_fallback_when_source_fingerprint_differs
 
 def test_default_translation_concurrency_is_conservative() -> None:
     assert DEFAULT_TRANSLATION_CONCURRENCY == 3
+def test_structure_contract_rejects_merged_paragraphs():
+    from pdf_translator.translate import _assert_translation_quality
+    import pytest
+    with pytest.raises(ValueError, match="paragraph/block"):
+        _assert_translation_quality(
+            chunk=TranslationChunk(index=0, markdown="First paragraph.\n\nSecond paragraph.", preserve_block_structure=True),
+            translated="第一段和第二段被粘在一起。", target_language="zh-CN", translator_name="minimax")
+
+
+def test_structure_failure_recovers_by_source_block(monkeypatch, tmp_path):
+    from pdf_translator.translate import _translate_chunk_resumable
+    monkeypatch.setattr("pdf_translator.translate.time.sleep", lambda _: None)
+    calls = []
+
+    class MergingTranslator(BaseTranslator):
+        name = "minimax"
+
+        def translate_chunk(self, chunk, source_language, target_language):
+            calls.append(chunk)
+            if "\n\n" in chunk.markdown:
+                return "第一段和第二段被合并了。"
+            return "这是第一段的中文翻译。" if "First" in chunk.markdown else "这是第二段的中文翻译。"
+
+    result = _translate_chunk_resumable(
+        chunk=TranslationChunk(index=9, markdown="First paragraph.\n\nSecond paragraph.",
+                               preserve_block_structure=True, prompt_instruction="Keep the tone."),
+        source_language="en", target_language="zh-CN", translator=MergingTranslator(),
+        cache_dir=tmp_path, retry_count=1,
+    )
+    assert result == "这是第一段的中文翻译。\n\n这是第二段的中文翻译。"
+    assert len(calls) == 4  # whole chunk, tagged context, two isolated blocks
+    assert all(c.prompt_instruction.startswith("Keep the tone.") for c in calls)
+
+
+@pytest.mark.parametrize("corrupt", [False, True])
+def test_context_recovery_requires_exact_block_ownership(corrupt):
+    from pdf_translator.translate import _translate_tagged_blocks
+    class ContextTranslator(BaseTranslator):
+        name = "minimax"
+        def translate_chunk(self, chunk, source_language, target_language):
+            result = chunk.markdown.replace("First fragment", "第一段残句").replace("Second fragment", "第二段残句")
+            return result.replace("BW_BLOCK_0", "BW_BLOCK_9") if corrupt else result
+    chunk = TranslationChunk(index=1, markdown="First fragment\n\nSecond fragment", preserve_block_structure=True)
+    if corrupt:
+        with pytest.raises(ValueError, match="ownership markers"):
+            _translate_tagged_blocks(chunk=chunk, blocks=chunk.markdown.split("\n\n"), source_language="en",
+                                    target_language="zh-CN", translator=ContextTranslator(), cache_dir=None)
+    else:
+        assert _translate_tagged_blocks(chunk=chunk, blocks=chunk.markdown.split("\n\n"), source_language="en",
+                                       target_language="zh-CN", translator=ContextTranslator(), cache_dir=None) == "第一段残句\n\n第二段残句"
+
+
+def test_source_blocks_do_not_split_fenced_code():
+    from pdf_translator.chunking import markdown_source_blocks
+    assert markdown_source_blocks("A\n\n```python\nx = 1\n\ny = 2\n```\n\nB") == [
+        "A", "```python\nx = 1\n\ny = 2\n```", "B"]
+
+
+def test_copied_prose_enters_block_recovery_and_retries_invalid_part(monkeypatch, tmp_path):
+    from pdf_translator.translate import _translate_chunk_resumable, _is_untranslated_quality_error
+    monkeypatch.setattr("pdf_translator.translate.time.sleep", lambda _: None)
+    source = "This is a sufficiently long English paragraph about history and society that must be translated completely and never copied into the final output."
+    calls = []
+
+    class CopyingTranslator(BaseTranslator):
+        name = "minimax"
+
+        def translate_chunk(self, chunk, source_language, target_language):
+            calls.append(chunk.index)
+            if chunk.index == 25 or calls.count(chunk.index) == 1:
+                return chunk.markdown
+            return "这是一段关于历史和社会的完整中文翻译，必须准确表达原文的全部内容，不能直接复制英文作为最终结果。"
+
+    assert _is_untranslated_quality_error(ValueError("contains copied untranslated prose paragraphs."))
+    result = _translate_chunk_resumable(
+        chunk=TranslationChunk(index=25, markdown=source + "\n\n" + source + " More text.", preserve_block_structure=True),
+        source_language="en", target_language="zh-CN", translator=CopyingTranslator(),
+        cache_dir=tmp_path, retry_count=2,
+    )
+    assert len(result.split("\n\n")) == 2
+    assert "English" not in result
+    assert len(calls) == 7  # includes the bounded context-preserving recovery
+
+
+def test_single_prose_boundary_is_owned_by_source():
+    from pdf_translator.translate import _restore_single_prose_boundary, _translation_prompt
+    chunk = TranslationChunk(index=0, markdown="One long source paragraph.", preserve_block_structure=True)
+    assert _restore_single_prose_boundary(chunk, "第一句。\n\n第二句。") == "第一句。 第二句。"
+    for output in ("# 标题\n\n正文", "正文\n\n- 列表项", "正文\n\n> 引文"):
+        assert _restore_single_prose_boundary(chunk, output) == output
+    multi = TranslationChunk(index=0, markdown="First.\n\nSecond.", preserve_block_structure=True)
+    assert _restore_single_prose_boundary(multi, "第一段。\n\n第二段。") == "第一段。\n\n第二段。"
+    prompt = _translation_prompt(chunk, "en", "zh-CN", quality_retry="changed paragraph/block structure")
+    assert "Structure retry" in prompt
+    assert "not fully translated" not in prompt
+    assert "exact source block sequence" in prompt
+
+
+def test_structure_recovery_does_not_cache_invalid_partial_result(monkeypatch, tmp_path):
+    from pdf_translator.translate import _translate_chunk_resumable
+    monkeypatch.setattr("pdf_translator.translate.time.sleep", lambda _: None)
+
+    class BrokenTranslator(BaseTranslator):
+        name = "minimax"
+
+        def translate_chunk(self, chunk, source_language, target_language):
+            return "# 错误的标题"
+
+    with pytest.raises(ValueError, match="paragraph/block structure"):
+        _translate_chunk_resumable(
+            chunk=TranslationChunk(index=9, markdown="First paragraph.\n\nSecond paragraph.",
+                                   preserve_block_structure=True),
+            source_language="en", target_language="zh-CN", translator=BrokenTranslator(),
+            cache_dir=tmp_path, retry_count=1,
+        )
+    assert not list(tmp_path.glob("*.md"))

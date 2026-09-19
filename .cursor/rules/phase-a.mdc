@@ -1,0 +1,10 @@
+---
+description: BookWeaver Phase A scope, workflow, evidence, and verification rules
+alwaysApply: true
+---
+
+Read `AGENTS.md` and `docs/PHASE-A-CURRENT.md` before changing code.
+
+Work only on the current Phase A pipeline. PDF and EPUB have format specific reconstruction adapters and must converge on confirmed reading units. Keep internal stages out of the user workflow. Reject missing current artifacts instead of adding compatibility fallbacks.
+
+Use synthetic fixtures and new tasks for evidence. Do not read local `.env` files, real books, existing task directories, exports, or historical reports. Run the bounded tests and report exact commands, results, changed files, and remaining risks.

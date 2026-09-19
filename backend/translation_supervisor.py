@@ -50,6 +50,8 @@ def _scan_and_resume_stalled(service: Any) -> None:
         resume = enriched.get("translation_resume")
         if not isinstance(resume, dict) or not resume.get("available"):
             continue
+        if resume.get("reason") in {"user_paused", "human_intervention"}:
+            continue
         if service.translation_worker_lock_held(job_id):
             continue
         attempts = service.auto_resume_attempts(job_id) if hasattr(service, "auto_resume_attempts") else 0

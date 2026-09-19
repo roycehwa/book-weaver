@@ -190,17 +190,13 @@ function ReviewCenter() {
                     <span className={`rounded-full px-2 py-1 text-xs ${statusClass[project.review_status]}`}>
                       {statusLabel[project.review_status]}
                     </span>
-                    {project.workspace_job_id ? (
+                    {project.workspace_job_id && (
                       <button
                         onClick={() => navigate(`/jobs/${project.workspace_job_id}`)}
                         className="rounded-lg border border-purple-300 px-3 py-1.5 text-xs text-purple-700"
                       >
                         回到工作台
                       </button>
-                    ) : (
-                      <span className="rounded-full bg-slate-100 px-2 py-1 text-xs text-slate-600">
-                        历史译稿
-                      </span>
                     )}
                     <button
                       onClick={() => openReview(project.run_dir)}

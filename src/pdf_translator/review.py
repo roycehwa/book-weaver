@@ -15,7 +15,7 @@ from pdf_translator.glossary import (
     select_glossary_entries_for_text,
 )
 from pdf_translator.models import TranslationChunk
-from pdf_translator.chunking import split_markdown_into_chunks
+from pdf_translator.chunking import split_markdown_into_chunks, join_chunk_texts, untranslated_prose_blocks
 from pdf_translator.chapter_kind import classify_chapter, should_translate_chapter
 from pdf_translator.chapter_segments import chapter_segments_for_translation
 from pdf_translator.review_exemptions import (
@@ -25,6 +25,7 @@ from pdf_translator.review_exemptions import (
 from pdf_translator.translate import (
     _chapter_markdown_for_translation,
     _chunk_cache_path,
+    _chunk_input_hash,
     _is_preserved_apparatus_block,
     _read_chunk_cache,
     _split_markdown_media_segments,
@@ -230,6 +231,8 @@ def build_aligned_review_segments(
         }
     segment_plan = chapter_segments_for_translation(book, max_chars=max_chunk_chars)
     if segment_plan:
+        from pdf_translator.translation_failures import read_failures
+        interventions = read_failures(cache_dir.parent)['items']
         for segment in segment_plan:
             source_text = str(segment.get("markdown") or "").strip()
             if not source_text:
@@ -238,7 +241,9 @@ def build_aligned_review_segments(
             chunk_index = global_chunk_index
             chunk_terms = glossary_constraints.get(chunk_index) if translate else None
             translated_text = source_text
+            human_resolution = None
             if translate:
+                input_chunk = TranslationChunk(index=chunk_index, markdown=source_text, glossary_entries=chunk_terms)
                 translated_text = _read_chunk_cache(
                     cache_dir,
                     TranslationChunk(
@@ -247,6 +252,12 @@ def build_aligned_review_segments(
                         glossary_entries=chunk_terms,
                     ),
                 )
+                intervention = interventions.get(str(segment.get('segment_id') or ''), {})
+                if intervention.get('input_hash') == _chunk_input_hash(input_chunk) and intervention.get('resolution'):
+                    human_resolution = intervention['resolution']
+                    translated_text = human_resolution['text']
+                    if human_resolution['kind'] == 'preserve_source':
+                        translate = False
                 global_chunk_index += 1
             base = {
                 "segment_id": str(segment.get("segment_id") or f"segment-{len(source_segments) + 1:04d}"),
@@ -261,12 +272,15 @@ def build_aligned_review_segments(
                     "page_start": segment.get("page_start"),
                     "page_end": segment.get("page_end"),
                     "source_pages": segment.get("source_pages") or [],
-                    "source_internal_path": None,
+                    "source_internal_path": segment.get("source_internal_path"),
                 },
                 "translate": translate,
+                "separator_before": segment.get("separator_before", "\n\n"),
             }
             if chunk_terms:
                 base["glossary_entries"] = chunk_terms
+            if human_resolution:
+                base['human_resolution'] = human_resolution
             source_segments.append(
                 {
                     **base,
@@ -391,10 +405,11 @@ def _merge_reading_review_segments(
     source_parts: list[str] = []
     translated_parts: list[str] = []
     part_ids: list[str] = []
+    separators: list[str] = []
     active_chapter: dict[str, Any] | None = None
 
     def flush() -> None:
-        nonlocal source_parts, translated_parts, part_ids, active_chapter
+        nonlocal source_parts, translated_parts, part_ids, active_chapter, separators
         if not active_chapter or not source_parts:
             return
         chapter_id = str(active_chapter["chapter_id"])
@@ -409,6 +424,7 @@ def _merge_reading_review_segments(
             "block_index": block_index,
             "source_location": active_chapter["source_location"],
             "translation_part_ids": list(part_ids),
+            "separator_before": separators[0],
             "translate": active_chapter["translate"],
             "aligned_parts": [
                 {
@@ -423,10 +439,12 @@ def _merge_reading_review_segments(
                 )
             ],
         }
+        if active_chapter.get('human_resolution'):
+            base['human_resolution'] = active_chapter['human_resolution']
         merged_source.append(
             {
                 **base,
-                "source_text": "\n\n".join(source_parts),
+                "source_text": join_chunk_texts(source_parts, separators),
                 "source_path": active_chapter["source_path"],
                 "status": "pending",
             }
@@ -434,7 +452,7 @@ def _merge_reading_review_segments(
         merged_translated.append(
             {
                 **base,
-                "translated_text": "\n\n".join(part for part in translated_parts if part.strip()),
+                "translated_text": join_chunk_texts(translated_parts, separators),
                 "target_language": active_chapter["target_language"],
                 "status": "needs_review",
             }
@@ -442,10 +460,13 @@ def _merge_reading_review_segments(
         source_parts = []
         translated_parts = []
         part_ids = []
+        separators = []
         active_chapter = None
 
     for source in source_segments:
         chapter_id = str(source["chapter_id"])
+        if source.get('human_resolution'):
+            flush()
         if active_chapter and chapter_id != str(active_chapter["chapter_id"]):
             flush()
 
@@ -459,15 +480,18 @@ def _merge_reading_review_segments(
                 "source_path": source.get("source_path"),
                 "target_language": translated.get("target_language"),
                 "translate": bool(source.get("translate", True)),
+                "human_resolution": source.get('human_resolution'),
             }
 
         translated = translated_by_id.get(str(source["segment_id"]), {})
+        active_chapter["translate"] = active_chapter["translate"] or bool(source.get("translate", True))
         source_parts.append(str(source.get("source_text") or ""))
         translated_parts.append(str(translated.get("translated_text") or ""))
         part_ids.append(str(source["segment_id"]))
+        separators.append(str(source.get("separator_before", "\n\n")))
 
         combined_len = sum(len(part) for part in source_parts)
-        if combined_len >= min_chars:
+        if combined_len >= min_chars or source.get('human_resolution'):
             flush()
 
     flush()
@@ -604,8 +628,13 @@ def detect_review_items(
         if resource_chapter:
             continue
         has_fail_open_placeholder = FAIL_OPEN_MARKER in translated_text
-        if _is_non_prose_review_segment(source_text) or _is_non_prose_review_segment(translated_text):
-            if not has_fail_open_placeholder:
+        missing_prose_part = any(
+            not str(part.get("translation") or "").strip()
+            and not _is_non_prose_review_segment(str(part.get("source") or ""))
+            for part in source.get("aligned_parts", [])
+        )
+        if _is_non_prose_review_segment(source_text):
+            if not has_fail_open_placeholder and not missing_prose_part:
                 continue
         if not bool(source.get("translate", True)) and text_operation == "translate":
             continue
@@ -617,9 +646,13 @@ def detect_review_items(
                 "reason": "Model output failed translation quality checks; source was preserved for manual review.",
                 "translation_part_ids": source.get("translation_part_ids", []),
             }
-        elif not translated_text:
+        elif not translated_text or missing_prose_part:
             issue_type = "missing_content" if text_operation == "preserve" else "missing_translation"
             severity = "high"
+        elif text_operation == "translate" and target_language.lower().startswith("zh") and untranslated_prose_blocks(source_text, translated_text):
+            issue_type = "untranslated"
+            severity = "high"
+            evidence = {"copied_paragraph_indices": untranslated_prose_blocks(source_text, translated_text)}
         elif text_operation == "preserve":
             if len(source_text) >= 200 and len(translated_text) < len(source_text) * 0.5:
                 issue_type = "possibly_incomplete"
@@ -897,11 +930,30 @@ def build_review_artifacts(
                     },
                 }
             )
+    if run_dir is not None and (run_dir / 'polish-warning.json').exists() and segments:
+        warning = json.loads((run_dir / 'polish-warning.json').read_text(encoding='utf-8'))
+        first = segments[0]
+        review_items.append({
+            'item_id': 'review-polish-unavailable', 'segment_id': first['segment_id'],
+            'issue_type': 'polish_unavailable', 'severity': 'medium', 'status': 'open',
+            'chapter_id': first.get('chapter_id'), 'chapter_title': first.get('chapter_title'),
+            'source_location': first.get('source_location', {}), 'evidence': warning,
+        })
     pre_review = build_pre_review_report(
         segments,
         review_items,
         method="preserve_integrity_v1" if text_operation == "preserve" else "rules_v1",
     )
+    review_state = create_review_state(review_items)
+    for segment in translated_segments_list:
+        resolution = segment.get('human_resolution')
+        if resolution:
+            review_state.setdefault('decisions', {})[segment['segment_id']] = {
+                'status': 'approved', 'action': resolution['kind'],
+                'approved_text': resolution['text'], 'note': resolution.get('reason', ''),
+                'updated_by': 'user', 'updated_at': resolution.get('updated_at') or utc_now(),
+            }
+    review_state['summary'] = summarize_review_state(review_items, review_state)
     return {
         "segments": {
             "schema": SCHEMA_SEGMENTS,
@@ -921,7 +973,7 @@ def build_review_artifacts(
             "text_operation": text_operation,
             "items": review_items,
         },
-        "review_state": create_review_state(review_items),
+        "review_state": review_state,
         "pre_review": pre_review,
         "chapter_marks": {
             "schema": SCHEMA_CHAPTER_MARKS,
@@ -1091,6 +1143,16 @@ def _is_valid_rewrite_candidate(source_text: str, candidate: str, target_languag
 
 
 def rewrite_review_requests(
+    *, run_dir: Path, translator: Any, source_language: str | None,
+    target_language: str, segment_id: str | None = None,
+) -> dict[str, Any]:
+    from pdf_translator.source_workspace import source_lock
+    with source_lock(run_dir):
+        return _rewrite_review_requests(run_dir=run_dir, translator=translator,
+            source_language=source_language, target_language=target_language, segment_id=segment_id)
+
+
+def _rewrite_review_requests(
     *,
     run_dir: Path,
     translator: Any,
@@ -1098,6 +1160,8 @@ def rewrite_review_requests(
     target_language: str,
     segment_id: str | None = None,
 ) -> dict[str, Any]:
+    from pdf_translator.source_workspace import require_current_translation
+    require_current_translation(run_dir)
     project = review_project_from_run(run_dir)
     source_by_id = {segment["segment_id"]: segment for segment in project["segments"]}
     translated_by_id = {segment["segment_id"]: segment for segment in project["translated_segments"]}
@@ -1117,9 +1181,9 @@ def rewrite_review_requests(
         translated = translated_by_id.get(current_segment_id)
         if source is None or translated is None:
             continue
-        reviewer_comment = str(decision.get("reviewer_comment") or "").strip()
-        if not reviewer_comment:
-            continue
+        reviewer_comment = str(decision.get("reviewer_comment") or "").strip() or (
+            "请依据原文和已确认术语完整重译，保留段落结构，不遗漏内容。"
+        )
         source_text = str(source.get("source_text") or "").strip()
         current_translation = str(translated.get("translated_text") or "").strip()
         relevant_glossary = select_glossary_entries_for_text(
@@ -1217,10 +1281,9 @@ def rewrite_review_requests(
         rewritten_count += 1
 
     state["updated_at"] = utc_now()
-    (run_dir / "review_state.json").write_text(
-        json.dumps(state, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    from pdf_translator.source_workspace import atomic_json
+    state["revision"] = int(state.get("revision") or 0) + 1
+    atomic_json(run_dir / "review_state.json", state)
     return {"rewritten_count": rewritten_count, "review_state_path": str(run_dir / "review_state.json")}
 
 
@@ -1262,20 +1325,25 @@ def translated_segments_to_chapters(translated_segments_payload: Any) -> list[di
 
     chapters: list[dict[str, Any]] = []
     for (chapter_index, chapter_id, title), chapter_segments in sorted(grouped.items(), key=lambda item: item[0]):
-        markdown = "\n\n".join(
-            str(segment.get("translated_text") or "").strip()
-            for segment in sorted(chapter_segments, key=lambda item: int(item.get("block_index") or 0))
-            if str(segment.get("translated_text") or "").strip()
+        ordered = sorted(chapter_segments, key=lambda item: int(item.get("block_index") or 0))
+        markdown = join_chunk_texts(
+            [str(segment.get("translated_text") or "") for segment in ordered],
+            [str(segment.get("separator_before", "\n\n")) for segment in ordered],
         ).strip()
         first = chapter_segments[0] if chapter_segments else {}
+        pages = sorted({
+            int(page)
+            for segment in chapter_segments
+            for page in (segment.get("source_location") or {}).get("source_pages", [])
+        })
         chapters.append(
             {
                 "index": chapter_index,
                 "chapter_id": chapter_id or None,
                 "title": title,
-                "page_start": (first.get("source_location") or {}).get("page_start"),
-                "page_end": (first.get("source_location") or {}).get("page_end"),
-                "source_pages": (first.get("source_location") or {}).get("source_pages", []),
+                "page_start": min(pages) if pages else (first.get("source_location") or {}).get("page_start"),
+                "page_end": max(pages) if pages else (first.get("source_location") or {}).get("page_end"),
+                "source_pages": pages,
                 "source_internal_path": (first.get("source_location") or {}).get("source_internal_path"),
                 "markdown": markdown + "\n" if markdown else "",
                 "toc": True,
@@ -1284,10 +1352,32 @@ def translated_segments_to_chapters(translated_segments_payload: Any) -> list[di
     return chapters
 
 
+def assert_translation_policy_coverage(book: dict[str, Any], segments: list[dict[str, Any]]) -> None:
+    """Reject a whole prose chapter silently reclassified as untranslated."""
+    failures = []
+    for chapter in book.get("chapters", []):
+        if chapter.get("translate") is not True or chapter.get("preserve_original"):
+            continue
+        owned = [segment for segment in segments if segment.get("chapter_id") == chapter.get("chapter_id")]
+        explicitly_preserved = owned and all((segment.get("human_resolution") or {}).get("kind") == "preserve_source" and (segment.get("human_resolution") or {}).get("reason") for segment in owned)
+        if owned and not explicitly_preserved and not any(segment.get("translate", True) for segment in owned):
+            failures.append(str(chapter.get("title") or chapter.get("chapter_id")))
+    if failures:
+        raise ValueError("导出被阻止：以下正文章节被错误跳过翻译：" + "；".join(failures))
+
+
 def merge_reviewed_chapters_with_resources(
     reviewed_chapters: list[dict[str, Any]],
     book: dict[str, Any],
 ) -> list[dict[str, Any]]:
+    source_by_id = {chapter.get("chapter_id"): chapter for chapter in book.get("chapters", []) if chapter.get("chapter_id")}
+    reviewed_chapters = [dict(chapter) for chapter in reviewed_chapters]
+    for chapter in reviewed_chapters:
+        source = source_by_id.get(chapter.get("chapter_id"))
+        if source:
+            for key in ("preserve_original", "resource_only", "toc"):
+                if key in source:
+                    chapter[key] = source[key]
     covered_pages = {
         int(page)
         for chapter in reviewed_chapters
@@ -1326,10 +1416,10 @@ def restore_review_chapter_apparatus(
     )
     if not isinstance(base_items, list):
         return chapters
-    base_by_index = {
-        int(item.get("index") or 0): item
+    base_by_id = {
+        str(item["chapter_id"]): item
         for item in base_items
-        if isinstance(item, dict)
+        if isinstance(item, dict) and item.get("chapter_id")
     }
     note_heading = re.compile(r"^#{1,6}\s+(?:notes?|注释|註釋)\s*$", re.IGNORECASE | re.MULTILINE)
     note_item = re.compile(
@@ -1339,7 +1429,8 @@ def restore_review_chapter_apparatus(
     restored: list[dict[str, Any]] = []
     for chapter in chapters:
         merged = dict(chapter)
-        base = base_by_index.get(int(chapter.get("index") or 0))
+        chapter_id = str(chapter.get("chapter_id") or "")
+        base = base_by_id.get(chapter_id) if chapter_id else None
         if not isinstance(base, dict):
             restored.append(merged)
             continue
@@ -1504,6 +1595,10 @@ def update_review_workflow(run_dir: Path, *, human_review_mode: str) -> dict[str
 
 
 def write_review_artifacts(run_dir: Path, artifacts: dict[str, Any]) -> dict[str, str]:
+    from pdf_translator.source_workspace import atomic_json
+    import shutil
+    import uuid
+    artifacts = dict(artifacts)
     paths = {
         "segments": run_dir / "segments.json",
         "translated_segments": run_dir / "translated_segments.json",
@@ -1512,10 +1607,53 @@ def write_review_artifacts(run_dir: Path, artifacts: dict[str, Any]) -> dict[str
         "pre_review": run_dir / "pre_review.json",
         "chapter_marks": run_dir / "review_chapter_marks.json",
     }
+    if paths["review_state"].exists() and paths["segments"].exists():
+        previous_state = json.loads(paths["review_state"].read_text())
+        previous_segments = _payload_segments(json.loads(paths["segments"].read_text()))
+        new_segments = _payload_segments(artifacts.get("segments", {}))
+        def chapter_sources(segments):
+            grouped = {}
+            for segment in segments:
+                grouped.setdefault(segment.get("chapter_id"), []).append((segment.get("segment_id"), segment.get("source_text")))
+            return grouped
+        old_chapters, new_chapters = chapter_sources(previous_segments), chapter_sources(new_segments)
+        unchanged = {key for key, value in new_chapters.items() if old_chapters.get(key) == value}
+        binding_path = run_dir / 'translation-source-revision.json'
+        if binding_path.exists():
+            from pdf_translator.source_workspace import glossary_fingerprint
+            binding = json.loads(binding_path.read_text())
+            if 'glossary_fingerprint' in binding and binding['glossary_fingerprint'] != glossary_fingerprint(run_dir):
+                unchanged = set()
+        source_by_id = {segment['segment_id']: segment for segment in new_segments}
+        state = dict(artifacts.get("review_state") or {})
+        decisions = dict(state.get("decisions") or {})
+        stale = list(previous_state.get("stale_decisions") or [])
+        for segment_id, decision in previous_state.get("decisions", {}).items():
+            source = source_by_id.get(segment_id)
+            if source and source.get("chapter_id") in unchanged:
+                incoming = decisions.get(segment_id)
+                if not incoming or str(decision.get('updated_at', '')) >= str(incoming.get('updated_at', '')):
+                    decisions[segment_id] = decision
+                else:
+                    stale.append({'segment_id': segment_id, 'decision': decision, 'reason': 'newer_human_resolution', 'at': utc_now()})
+            else:
+                stale.append({'segment_id': segment_id, 'decision': decision, 'reason': 'source_chapter_changed', 'at': utc_now()})
+        state.update(decisions=decisions, stale_decisions=stale, revision=int(previous_state.get('revision') or 0) + 1)
+        state['summary'] = summarize_review_state(_payload_items(artifacts.get('review_items', {})), state)
+        artifacts["review_state"] = state
+        backup = run_dir / 'review-backups' / uuid.uuid4().hex
+        backup.mkdir(parents=True)
+        for path in paths.values():
+            if path.exists():
+                shutil.copy2(path, backup / path.name)
+        if paths['chapter_marks'].exists() and 'chapter_marks' in artifacts:
+            old_marks = json.loads(paths['chapter_marks'].read_text())
+            if old_chapters == new_chapters:
+                artifacts['chapter_marks'] = old_marks
     for key, path in paths.items():
         if key not in artifacts:
             continue
-        path.write_text(json.dumps(artifacts[key], ensure_ascii=False, indent=2), encoding="utf-8")
+        atomic_json(path, artifacts[key])
     return {key: str(path) for key, path in paths.items() if key in artifacts}
 
 
@@ -1551,11 +1689,12 @@ def write_versioned_outputs(
     translated_markdown_override: str | None = None,
     parent_version: str | None = None,
     approval_status: str = "draft",
+    output_dir: Path | None = None,
 ) -> dict[str, str]:
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", version_name):
         raise ValueError("Unsafe review version name. Use letters, numbers, dots, underscores, or dashes.")
-    version_dir = run_dir / "versions" / version_name
-    version_dir.mkdir(parents=True, exist_ok=True)
+    version_dir = output_dir or run_dir / "versions" / version_name
+    version_dir.mkdir(parents=True, exist_ok=False)
     translated_markdown = (
         translated_markdown_override
         if translated_markdown_override is not None

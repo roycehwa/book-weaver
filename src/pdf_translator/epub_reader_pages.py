@@ -97,12 +97,12 @@ def _fragment_bytes_to_markdown(
     return _epub_clean_malformed_html_wrapper_lines(markdown).strip()
 
 
-def build_epub_reader_page_markdown(
+def build_epub_reader_page_records(
     path: Path,
     *,
     asset_dir: Path | None = None,
-) -> dict[int, str]:
-    """Return markdown keyed by EPUB reader virtual page index (``/epub/pages``)."""
+) -> dict[int, dict[str, object]]:
+    """Return reader-page Markdown with its source XHTML resource and anchor range."""
 
     if not path.is_file():
         raise FileNotFoundError(f"EPUB not found: {path}")
@@ -110,7 +110,7 @@ def build_epub_reader_page_markdown(
     target_asset_dir = asset_dir or path.parent / ".epub-reader-assets"
     target_asset_dir.mkdir(parents=True, exist_ok=True)
     written_assets: dict[str, Path] = {}
-    page_markdown: dict[int, str] = {}
+    page_records: dict[int, dict[str, object]] = {}
 
     with ZipFile(path, "r") as zipf:
         if "META-INF/encryption.xml" in zipf.namelist():
@@ -141,7 +141,11 @@ def build_epub_reader_page_markdown(
                     written_assets=written_assets,
                     fallback_title=Path(internal).stem.replace("_", " "),
                 )
-                page_markdown[page_index] = body_md.strip()
+                page_records[page_index] = {
+                    "markdown": body_md.strip(),
+                    "source_internal_path": internal,
+                    "whole_resource": True,
+                }
                 continue
 
             for anchor_index, match in enumerate(anchors):
@@ -152,12 +156,31 @@ def build_epub_reader_page_markdown(
                     else _find_body_close(xhtml)
                 )
                 page_index += 1
-                page_markdown[page_index] = _fragment_bytes_to_markdown(
-                    xhtml[start:end],
-                    zipf=zipf,
-                    internal_xhtml_path=internal,
-                    asset_dir=target_asset_dir,
-                    written_assets=written_assets,
-                )
+                page_records[page_index] = {
+                    "markdown": _fragment_bytes_to_markdown(
+                        xhtml[start:end],
+                        zipf=zipf,
+                        internal_xhtml_path=internal,
+                        asset_dir=target_asset_dir,
+                        written_assets=written_assets,
+                    ),
+                    "source_internal_path": internal,
+                    "whole_resource": False,
+                    "anchor_id": match.group("anchor").decode("utf-8", errors="replace"),
+                    "source_byte_start": start,
+                    "source_byte_end": end,
+                }
 
-    return page_markdown
+    return page_records
+
+
+def build_epub_reader_page_markdown(
+    path: Path,
+    *,
+    asset_dir: Path | None = None,
+) -> dict[int, str]:
+    """Return markdown keyed by EPUB reader virtual page index (``/epub/pages``)."""
+    return {
+        page_no: str(record.get("markdown") or "")
+        for page_no, record in build_epub_reader_page_records(path, asset_dir=asset_dir).items()
+    }

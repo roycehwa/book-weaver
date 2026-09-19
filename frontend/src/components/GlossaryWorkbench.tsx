@@ -364,7 +364,8 @@ export default function GlossaryWorkbench({
     try {
       const result = await jobsApi.suggestGlossary(jobId, { target_lang: 'zh-CN', translator: 'minimax' })
       onGlossaryChange?.(result.glossary)
-      setMessage('正在后台生成中文建议…')
+      // Progress is rendered from backend status below, not a sticky success
+      // notice which can survive a later failure or completion.
       await onUpdated()
     } catch (suggestError) {
       setError(suggestError instanceof Error ? suggestError.message : '生成中文建议失败')
@@ -560,7 +561,7 @@ export default function GlossaryWorkbench({
     }
   }
 
-  const stageLabel = workflowStage ? (workflowStageLabels[workflowStage] || workflowStage) : '未知'
+  const stageLabel = glossary.workflow?.glossary_finalized_by_user ? '术语已定稿' : workflowStage ? (workflowStageLabels[workflowStage] || workflowStage) : '未知'
 
   const actionBar = canEditGlossary ? (
     <div className="flex flex-wrap items-center gap-2">
@@ -614,7 +615,7 @@ export default function GlossaryWorkbench({
       {error && <div className="mt-2 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{error}</div>}
       {suggestFailed && glossary.suggest_status?.detail && (
         <div className="mt-2 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
-          中文建议生成失败：{glossary.suggest_status.detail}
+          {glossary.suggest_status.detail}
         </div>
       )}
       {suggestRunning && (

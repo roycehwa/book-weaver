@@ -8,6 +8,102 @@ def _prov(page_no: int, left: float, top: float) -> list[dict]:
     return [{"page_no": page_no, "bbox": {"l": left, "t": top}}]
 
 
+def test_same_source_node_crossing_pdf_pages_is_one_logical_paragraph() -> None:
+    structured = {
+        "body": {"children": [{"$ref": "#/texts/0"}]},
+        "texts": [
+            {
+                "label": "text",
+                "text": "A revolution- ary movement emerged.",
+                "prov": [
+                    {
+                        "page_no": 1,
+                        "charspan": [0, 13],
+                        "bbox": {"l": 50, "t": 600, "b": 580, "r": 500},
+                    },
+                    {
+                        "page_no": 2,
+                        "charspan": [14, 35],
+                        "bbox": {"l": 50, "t": 700, "b": 680, "r": 500},
+                    },
+                ],
+            }
+        ],
+        "pictures": [],
+        "tables": [],
+    }
+
+    result = build_book_reconstruction(structured)
+
+    chapter = result["chapters"][0]
+    assert chapter["source_pages"] == [1, 2]
+    assert chapter["markdown"] == "A revolutionary movement emerged.\n"
+    assert "[[page: 1]]" in chapter["trace_markdown"]
+    assert "[[page: 2]]" in chapter["trace_markdown"]
+    assert len(result["logical_continuations"]) == 1
+    assert result["logical_continuations"][0]["repair"] == "page_break_hyphen_removed"
+    assert result["pages"][1]["content_items"][0]["source_node_id"] == "#/texts/0"
+
+    canonical = apply_canonical_chapter_plan(
+        result,
+        {
+            "source_artifact": "user_confirmation",
+            "chapters": [
+                {
+                    "title": "Confirmed",
+                    "source_pages": [1, 2],
+                    "page_start": 1,
+                    "page_end": 2,
+                    "content_policy": "translate",
+                }
+            ],
+        },
+    )
+    assert canonical["chapters"][0]["markdown"] == "A revolutionary movement emerged."
+    assert "[[page: 2]]" in canonical["chapters"][0]["trace_markdown"]
+
+
+def test_different_source_nodes_on_adjacent_pdf_pages_remain_separate() -> None:
+    structured = {
+        "body": {"children": [{"$ref": "#/texts/0"}, {"$ref": "#/texts/1"}]},
+        "texts": [
+            {
+                "label": "text",
+                "text": "A complete paragraph.",
+                "prov": [{"page_no": 1, "bbox": {"l": 50, "t": 600, "b": 580, "r": 500}}],
+            },
+            {
+                "label": "text",
+                "text": "another paragraph begins.",
+                "prov": [{"page_no": 2, "bbox": {"l": 50, "t": 700, "b": 680, "r": 500}}],
+            },
+        ],
+        "pictures": [],
+        "tables": [],
+    }
+
+    result = build_book_reconstruction(structured)
+
+    assert result["logical_continuations"] == []
+    assert "A complete paragraph.\n\nanother paragraph begins." in result["chapters"][0]["markdown"]
+
+
+def test_canonical_plan_preserves_unassigned_front_pages_without_shifting_ids():
+    from pdf_translator.page_integrity import build_page_ledger
+    book = {
+        "chapters": [{"title": "Original", "source_pages": [2, 8],
+                      "trace_markdown": "[[page: 2]]\n\nCopyright text.\n\n[[page: 8]]\n\nBody text."}],
+        "pages": [{"page_no": 2, "has_content": True}, {"page_no": 8, "has_content": True}],
+    }
+    result = apply_canonical_chapter_plan(book, {"source_artifact": "user_confirmation", "chapters": [
+        {"title": "Body", "page_start": 8, "page_end": 8, "source_pages": [8]},
+    ]})
+    assert result["chapters"][0]["markdown"] == "Copyright text."
+    assert result["chapters"][0]["translate"] is False
+    assert result["chapters"][1]["chapter_id"] == "ch-001-body"
+    assert build_page_ledger(result)["summary"]["required_coverage_ratio"] == 1
+
+
 def test_apply_canonical_chapter_plan_replaces_automatic_titles_and_preserves_pages() -> None:
     book = {
         "metadata": {"chapter_source": "pdf_outline"},
@@ -733,7 +829,7 @@ def test_book_rebuild_prefers_pdf_table_crop_over_markdown_table(monkeypatch, tm
     assert any(asset["kind"] == "table" and asset["path"] == str(table_crop) for asset in result["assets"])
 
 
-def test_book_rebuild_preserves_pdf_back_matter_as_original_page_images(monkeypatch, tmp_path) -> None:
+def test_book_rebuild_preserves_readable_pdf_back_matter_as_text(monkeypatch, tmp_path) -> None:
     page_image = tmp_path / "original-page-p0003.png"
     page_image.write_bytes(b"png")
     monkeypatch.setattr(book_rebuild, "_render_pdf_cover_page", lambda source_pdf, images_dir: None)
@@ -765,10 +861,9 @@ def test_book_rebuild_preserves_pdf_back_matter_as_original_page_images(monkeypa
     assert notes["title"] == "Notes"
     assert notes["translate"] is False
     assert notes["resource_only"] is True
-    assert notes["toc"] is False
-    assert f"![Original page 3]({page_image.name})" in notes["markdown"]
+    assert f"![Original page 3]({page_image.name})" not in notes["markdown"]
     assert str(tmp_path) not in notes["markdown"]
-    assert "densely formatted note" not in notes["markdown"]
+    assert "densely formatted note" in notes["markdown"]
 
 
 def test_book_rebuild_keeps_front_matter_when_it_has_text(monkeypatch) -> None:
@@ -1456,8 +1551,9 @@ def test_book_rebuild_preserves_contiguous_layout_apparatus_pages(monkeypatch, t
     assert [chapter["title"] for chapter in result["chapters"]] == ["1 BODY", "References", "Index"]
     assert result["chapters"][1]["source_pages"] == [2, 3]
     assert result["chapters"][2]["source_pages"] == [4]
-    assert "page-2.png" in result["chapters"][1]["markdown"]
-    assert "page-3.png" in result["chapters"][1]["markdown"]
+    assert "Reference page one." in result["chapters"][1]["markdown"]
+    assert "Reference page two." in result["chapters"][1]["markdown"]
+    assert "page-2.png" not in result["chapters"][1]["markdown"]
 
 
 def test_book_rebuild_does_not_start_apparatus_from_copyright_citations(monkeypatch, tmp_path) -> None:

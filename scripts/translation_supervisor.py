@@ -202,6 +202,9 @@ class Supervisor:
             if not job_id:
                 continue
             snap_full = self.client.get_job(job_id) or snap
+            resume = snap_full.get("translation_resume") if isinstance(snap_full, dict) else None
+            if isinstance(resume, dict) and (resume.get("reason") in {"user_paused", "human_intervention"} or resume.get("available") is False):
+                continue
             activity = snap_full.get("translation_activity") if isinstance(snap_full, dict) else None
             verdict = assess_stall(snap, activity, stuck_threshold=self.stuck_threshold)
             LOG.debug(

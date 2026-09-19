@@ -131,6 +131,17 @@ def test_scan_polish_candidates_finds_mixed_english_words() -> None:
     assert candidates[0].suspects == ["active"]
 
 
+def test_polish_preserves_human_failure_resolution(tmp_path):
+    from pdf_translator.translation_failures import put_failure, resolve_failure
+    manual = '这是用户明确批准的 active 表述。'
+    run_dir = _write_run_dir(tmp_path, '# Chapter 1\n\n' + manual)
+    put_failure(run_dir, 's1', {'source': 'Original', 'input_hash': 'hash'})
+    resolve_failure(run_dir, 's1', 1, manual)
+    result = run_polish(run_dir=run_dir, translator=FakePolishTranslator(), target_language='zh-CN')
+    assert result.candidate_count == 0
+    assert manual in result.polished_markdown_path.read_text()
+
+
 def test_run_polish_writes_safe_markdown_epub_and_report(tmp_path: Path) -> None:
     run_dir = _write_run_dir(
         tmp_path,
@@ -254,3 +265,8 @@ def test_run_polish_does_not_expand_network_failures_to_single_line_fallback(tmp
     assert translator.calls == 3
     assert "active" in polished
     assert report["unchanged_count"] == 2
+
+
+def test_polish_cannot_insert_paragraph_boundaries():
+    from pdf_translator.polish import _safe_accept_polish
+    assert _safe_accept_polish("这是完整的一段正文。", "这是完整的\n\n一段正文。") == (False, "paragraph_boundary_changed")

@@ -8,13 +8,18 @@ import {
   type JobEpubPage,
   type JobChapterDraft,
   type JobGlossaryResponse,
+  type JobReadingUnitsDocument,
   type WorkspaceBook,
   type WorkspaceStepStatus,
 } from '../api'
 import GlossaryWorkbench from './GlossaryWorkbench'
+import SourceWorkbench from './SourceWorkbench'
+import TranslationFailures from './TranslationFailures'
 import PdfViewer from './pdf-viewer/PdfViewer'
 import EpubViewer from './epub-viewer/EpubViewer'
 import { validateChapterQuality } from './chapterQuality'
+import { insertChapterRange } from './insertChapter'
+import { appendixChapterRecommendations, simplifiedChapterIds } from './simplifiedChapters'
 import { sectionStartsOpen } from './workspaceSections'
 import { useJobSourceInfo } from './useJobSourceInfo'
 import { chapterEpubPages, summarizeEpubPageRange } from './chapterPagePreview'
@@ -23,6 +28,7 @@ const stageLabels: Record<BookJob['state'], string> = {
   created: '任务已创建',
   ingesting: '正在解析文件',
   reconstructing: '正在重建书籍结构',
+  awaiting_chapter_confirmation: '等待确认重建文档与章节',
   awaiting_glossary: '等待术语定稿',
   translating: '正在翻译全文',
   polishing: '正在润色',
@@ -54,6 +60,7 @@ const lifecycleStageLabels: Record<string, string> = {
   created: '导入',
   ingesting: '导入',
   reconstructing: '结构重建',
+  awaiting_chapter_confirmation: '原文与章节确认',
   awaiting_glossary: '术语定稿',
   translating: '机器翻译',
   polishing: '润色',
@@ -221,6 +228,8 @@ function JobDetail() {
   const [job, setJob] = useState<BookJob | null>(null)
   const [workspaceBook, setWorkspaceBook] = useState<WorkspaceBook | null>(null)
   const [glossary, setGlossary] = useState<JobGlossaryResponse | null>(null)
+  const [readingUnits, setReadingUnits] = useState<JobReadingUnitsDocument | null>(null)
+  const [readingUnitsError, setReadingUnitsError] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
   const [resuming, setResuming] = useState(false)
@@ -229,6 +238,31 @@ function JobDetail() {
   const [reprocessingMode, setReprocessingMode] = useState<CreateJobOptions['processingMode'] | null>(null)
   const [confirmingChapters, setConfirmingChapters] = useState(false)
   const [chapterDraft, setChapterDraft] = useState<JobChapterDraft[]>([])
+  const [newChapter, setNewChapter] = useState<{ title: string; start: string; end: string } | null>(null)
+  const [newChapterError, setNewChapterError] = useState<string | null>(null)
+  const simplifiedPrevious = useRef<Record<string, JobChapterDraft['content_policy']>>({})
+  const [simplifiedRequested, setSimplifiedRequested] = useState(false)
+  const simplifiedIds = simplifiedChapterIds(chapterDraft)
+  const appendixRecommendations = appendixChapterRecommendations(chapterDraft)
+  const simplifiedEnabled = simplifiedRequested || (
+    simplifiedIds.size > 0
+    && chapterDraft.filter(c => simplifiedIds.has(c.chapter_id)).every(
+      c => c.content_policy === appendixRecommendations.get(c.chapter_id),
+    )
+  )
+  const toggleSimplified = (enabled: boolean) => {
+    setSimplifiedRequested(enabled)
+    setChapterDraft(chapters => chapters.map(chapter => {
+      if (!simplifiedIds.has(chapter.chapter_id)) return chapter
+      if (enabled) simplifiedPrevious.current[chapter.chapter_id] = chapter.content_policy
+      return {
+        ...chapter,
+        content_policy: enabled
+          ? (appendixRecommendations.get(chapter.chapter_id) || 'auto')
+          : (simplifiedPrevious.current[chapter.chapter_id] || 'auto'),
+      }
+    }))
+  }
   const [selectedChapterIndex, setSelectedChapterIndex] = useState(0)
   const [currentPdfPage, setCurrentPdfPage] = useState(1)
   const [totalPdfPages, setTotalPdfPages] = useState<number | null>(null)
@@ -369,6 +403,27 @@ function JobDetail() {
       active = false
     }
   }, [id, job, job?.artifacts.glossary_candidates, job?.state, job?.revision])
+
+  useEffect(() => {
+    if (!id || !job?.artifacts.reading_units) {
+      setReadingUnits(null)
+      setReadingUnitsError(null)
+      return
+    }
+    let active = true
+    jobsApi.readingUnits(id)
+      .then((payload) => {
+        if (!active) return
+        setReadingUnits(payload)
+        setReadingUnitsError(null)
+      })
+      .catch((loadError) => {
+        if (!active) return
+        setReadingUnits(null)
+        setReadingUnitsError(loadError instanceof Error ? loadError.message : '无法读取重建文档')
+      })
+    return () => { active = false }
+  }, [id, job?.artifacts.reading_units, job?.revision])
 
   useEffect(() => {
     if (glossary?.suggest_status?.status !== 'running') return
@@ -551,18 +606,21 @@ function JobDetail() {
             page_start: pageStart,
             page_end: pageEnd,
             source_pages: makeSourcePages(pageStart, pageEnd),
+            content_policy: chapter.content_policy === 'auto' || !chapter.content_policy
+              ? (appendixRecommendations.get(chapter.chapter_id) || 'translate')
+              : chapter.content_policy,
           }
         })
         .filter((chapter) => chapter.title.trim())
-      const result = await jobsApi.confirmChapterDraft(id, normalized)
+      const result = await jobsApi.confirmChapterDraft(id, normalized, job?.source_revision || 0)
       setJob(result.job)
       setWorkspaceBook(result.workspace_book)
       setChapterDraft(normalized)
       setSelectedChapterIndex((current) => Math.max(0, Math.min(current, normalized.length - 1)))
       setNotice(
         isTranslatePath
-          ? '源书章节目录已确认。现在可以进入翻译审阅控制台逐段检查译文。'
-          : '源书章节目录已确认。当前书籍已经具备进入知识解析的前置条件。'
+          ? '重建文档、章节和内容策略已确认。术语候选已按确认后的翻译范围生成，请继续定稿术语。'
+          : '重建文档、章节和内容策略已确认，可以继续完成 Phase A 导出。'
       )
     } catch (confirmError) {
       setError(confirmError instanceof Error ? confirmError.message : '确认章节结构失败')
@@ -609,40 +667,24 @@ function JobDetail() {
   }
 
   const addChapter = () => {
-    const boundedSelectedIndex = chapterDraft.length
-      ? Math.max(0, Math.min(selectedChapterIndex, chapterDraft.length - 1))
-      : 0
-    const insertAt = chapterDraft.length ? boundedSelectedIndex + 1 : 0
-    setChapterDraft((chapters) => {
-      const selected = chapters[boundedSelectedIndex]
-      const selectedStart = toPositivePage(selected?.page_start)
-      const selectedEnd = toPositivePage(selected?.page_end)
-      const shouldSplitSelected =
-        Boolean(selectedStart && selectedEnd) &&
-        currentPdfPage > Number(selectedStart) &&
-        currentPdfPage <= Number(selectedEnd)
-      const chapter = {
-        index: insertAt + 1,
-        chapter_id: `manual-${Date.now()}`,
-        title: `新章节 ${insertAt + 1}`,
-        page_start: currentPdfPage,
-        page_end: shouldSplitSelected ? selectedEnd : currentPdfPage,
-        source_pages: makeSourcePages(currentPdfPage, shouldSplitSelected ? selectedEnd : currentPdfPage),
-      }
-      const next = chapters.map((item, index) => {
-        if (!shouldSplitSelected || index !== boundedSelectedIndex) return item
-        const pageStart = toPositivePage(item.page_start)
-        const pageEnd = currentPdfPage - 1
-        return {
-          ...item,
-          page_end: pageEnd,
-          source_pages: makeSourcePages(pageStart, pageEnd),
-        }
-      })
-      next.splice(insertAt, 0, chapter)
-      return next.map((item, index) => ({ ...item, index: index + 1 }))
-    })
-    setSelectedChapterIndex(insertAt)
+    const containing = chapterDraft.find(c => Number(c.page_start) <= currentPdfPage && Number(c.page_end) >= currentPdfPage)
+    const following = [...chapterDraft].filter(c => Number(c.page_start) > currentPdfPage).sort((a, b) => Number(a.page_start) - Number(b.page_start))[0]
+    const end = containing ? (Number(containing.page_start) === currentPdfPage ? currentPdfPage : Number(containing.page_end)) : following ? Number(following.page_start) - 1 : currentPdfPage
+    setNewChapter({ title: '', start: String(currentPdfPage), end: String(end) })
+    setNewChapterError(null)
+  }
+
+  const insertNewChapter = () => {
+    if (!newChapter) return
+    try {
+      if (totalPdfPages && Number(newChapter.end) > totalPdfPages) throw new Error(`结束页不能超过全书 ${totalPdfPages} 页。`)
+      const result = insertChapterRange(chapterDraft, Number(newChapter.start), Number(newChapter.end), newChapter.title, `manual-${Date.now()}`)
+      setChapterDraft(result.chapters)
+      setSelectedChapterIndex(result.selectedIndex)
+      setNewChapter(null)
+      setNotice('新章节已加入草稿，尚未提交章节确认。')
+      window.setTimeout(() => document.getElementById(`chapter-row-${result.selectedIndex}`)?.scrollIntoView({ block: 'center', behavior: 'smooth' }), 0)
+    } catch (error) { setNewChapterError(error instanceof Error ? error.message : '无法新增章节') }
   }
 
   const removeChapter = (index: number) => {
@@ -667,6 +709,7 @@ function JobDetail() {
     book_markdown: 'Book Markdown',
     normalized_markdown: '规范化 Markdown',
     reconstructed_markdown: '重建 Markdown',
+    reading_units: '逻辑阅读单元',
     chapter_report: '章节报告',
     chapter_segments: '章内语义拆分',
     manifest: '处理清单 (manifest)',
@@ -703,12 +746,36 @@ function JobDetail() {
   const pipelineLockMessage =
     job.state === 'created'
       ? '文件已上传，正在启动后台解析；通常几秒内会进入「正在解析文件」。'
+      : job.state === 'failed'
+      ? '任务已停止：已完成结果保留。请处理失败片段或恢复任务；不会自动重复重试。'
       : job.state === 'translating'
-      ? '全文翻译进行中：术语表已锁定；章节目录可在下方确认。'
+      ? '全文翻译进行中：正在使用已定稿术语和已确认章节内的语义分块。'
       : job.state === 'pre_review'
         ? '机器预审进行中：请等待预审完成后再进入人工审阅。'
         : '书籍正在处理中：部分编辑操作已锁定，请等待当前阶段完成。'
   const selectedChapter = chapterDraft[selectedChapterIndex]
+  const selectedDraftStart = toPositivePage(selectedChapter?.page_start)
+  const selectedDraftEnd = toPositivePage(selectedChapter?.page_end)
+  const readingChapterByPage = readingUnits?.chapters
+    .map((chapter) => {
+      const ids = new Set(chapter.unit_ids)
+      const pages = new Set(
+        readingUnits.units
+          .filter(unit => ids.has(unit.unit_id))
+          .flatMap(unit => unit.provenance.map(span => span.page_no))
+          .filter((page): page is number => typeof page === 'number'),
+      )
+      const overlap = selectedDraftStart && selectedDraftEnd
+        ? [...pages].filter(page => page >= selectedDraftStart && page <= selectedDraftEnd).length
+        : 0
+      return { chapter, overlap }
+    })
+    .sort((a, b) => b.overlap - a.overlap)[0]
+  const selectedReadingChapter = readingUnits?.chapters.find(
+    chapter => chapter.chapter_id === selectedChapter?.chapter_id,
+  ) ?? (readingChapterByPage?.overlap ? readingChapterByPage.chapter : readingUnits?.chapters[selectedChapterIndex])
+  const selectedReadingUnitIds = new Set(selectedReadingChapter?.unit_ids || [])
+  const selectedReadingUnits = readingUnits?.units.filter(unit => selectedReadingUnitIds.has(unit.unit_id)) || []
   const selectedPageStart = toPositivePage(selectedChapter?.page_start)
   const selectedPageEnd = toPositivePage(selectedChapter?.page_end)
   const selectedPageRange =
@@ -733,15 +800,18 @@ function JobDetail() {
         ? '确认源书章节目录'
         : '更新章节目录'
   const workflowStepOrder =
-    workspaceBook?.workflow_step_order ??
+    (workspaceBook?.workflow_step_order ??
     (isTranslatePath
-      ? ['import', 'structure', 'glossary_finalization', 'text_processing', 'translation_review', 'chapter_confirmation', 'knowledge_handoff']
-      : ['import', 'structure', 'text_processing', 'chapter_confirmation', 'knowledge_handoff'])
+      ? ['import', 'structure', 'chapter_confirmation', 'glossary_finalization', 'text_processing', 'translation_review', 'delivery']
+      : ['import', 'structure', 'text_processing', 'chapter_confirmation', 'delivery']))
   const workflowPathLabel = isTranslatePath ? '译本路径' : isPreservePath ? '原文路径' : '处理路径'
   const translatorInfo = describeTranslator(job)
   const progressHint = progressStageHint(job.state)
   const translationActivity =
-    isTranslatePath
+    job.state === 'translating' && progress.automatic_recovery_attempt
+      ? { badgeClass: 'bg-blue-100 text-blue-800', title: '正在自动恢复',
+          detail: `正在自动恢复剩余片段（${progress.automatic_recovery_attempt}/${progress.automatic_recovery_limit ?? 2}），无需手动重启。` }
+      : isTranslatePath
     && (job.state === 'translating' || (job.state === 'failed' && job.failed_stage === 'translating'))
     && job.translation_activity
       ? translationActivityLabel(job.translation_activity, progress)
@@ -751,7 +821,9 @@ function JobDetail() {
     && job.failed_stage === 'translating'
     && job.translation_activity?.status === 'active'
   const stageTitle =
-    job.state === 'awaiting_glossary' && glossary?.workflow?.stage === 'glossary_ready'
+    job.state === 'failed' && (job.translation_resume?.reason === 'human_intervention' || job.error?.code === 'translation_intervention_required')
+      ? '翻译待人工处理'
+      : job.state === 'awaiting_glossary' && glossary?.workflow?.stage === 'glossary_ready'
       ? '术语已定稿，待启动翻译'
       : translationResuming
         ? '翻译恢复中'
@@ -927,13 +999,6 @@ function JobDetail() {
                 )
               })}
             </div>
-            {!workspaceBook.knowledge_ready && (
-              <p className="mt-4 text-xs text-amber-800">
-                {isTranslatePath
-                  ? '知识解析：需完成翻译审阅并确认章节目录。'
-                  : '知识解析：需先确认章节目录。'}
-              </p>
-            )}
           </details>
         )}
 
@@ -950,10 +1015,59 @@ function JobDetail() {
               )}
             </summary>
             <div className="mt-4">
+            {(readingUnits || readingUnitsError) && (
+              <details className="mb-4 rounded-xl border border-blue-200 bg-blue-50 p-4" open>
+                <summary className="cursor-pointer font-medium text-blue-950">
+                  算法重建后的待翻译文档
+                </summary>
+                <p className="mt-2 text-xs leading-5 text-blue-800">
+                  这里显示算法当前重建出的连续文档。确认章节后会按你的边界与处理策略更新；右侧原始文件用于核对来源。
+                </p>
+                {readingUnitsError ? (
+                  <p role="alert" className="mt-3 text-sm text-red-700">{readingUnitsError}</p>
+                ) : (
+                  <div className="mt-3 max-h-[32rem] overflow-auto rounded-lg border border-blue-100 bg-white p-4">
+                    <div className="mb-3 flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 pb-3">
+                      <h3 className="font-semibold text-slate-900">
+                        {selectedReadingChapter?.title || selectedChapter?.title || '当前章节'}
+                      </h3>
+                      <span className="text-xs text-slate-500">{selectedReadingUnits.length} 个逻辑单元</span>
+                    </div>
+                    <div className="space-y-4">
+                      {selectedReadingUnits.map((unit) => {
+                        const pages = [...new Set(unit.provenance.map(span => span.page_no).filter((page): page is number => typeof page === 'number'))]
+                        const resources = [...new Set(unit.provenance.map(span => span.resource_path).filter((path): path is string => Boolean(path)))]
+                        const sourceLabel = pages.length
+                          ? `来源页 ${pages.length > 1 ? `${Math.min(...pages)}–${Math.max(...pages)}` : pages[0]}`
+                          : resources.length
+                            ? `来源 ${resources[0].split('/').pop()}`
+                            : '来源已记录'
+                        const displayText = unit.kind === 'heading'
+                          ? unit.markdown.replace(/^#{1,6}\s+/, '')
+                          : unit.markdown
+                        return (
+                          <div key={unit.unit_id} className={unit.kind === 'quote' ? 'border-l-4 border-slate-300 pl-3' : ''}>
+                            {unit.kind === 'heading' ? (
+                              <h4 className="text-base font-semibold text-slate-900">{displayText}</h4>
+                            ) : (
+                              <p className="whitespace-pre-wrap text-sm leading-7 text-slate-800">{displayText}</p>
+                            )}
+                            <div className="mt-1 text-[11px] text-slate-400">{sourceLabel}</div>
+                          </div>
+                        )
+                      })}
+                      {!selectedReadingUnits.length && (
+                        <p className="text-sm text-slate-500">当前章节暂无可显示的逻辑正文。</p>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </details>
+            )}
             <div className="flex flex-wrap items-center justify-between gap-2">
               <div className="min-w-[16rem] flex-1">
                 <p className="mt-1 text-sm text-slate-600">
-                  对照{previewTargetLabel}确认每章标题与起止页。用于知识拆分与页面对照，不编辑译文；可与翻译审阅并行。
+                  对照{previewTargetLabel}确认每章标题与起止页。翻译前须完成确认；后续语义分块将在这些章节内部进行。
                 </p>
               </div>
               <button
@@ -963,6 +1077,31 @@ function JobDetail() {
               >
                 在当前页插入章节
               </button>
+            </div>
+            {newChapter && (
+              <div role="dialog" aria-label="新增章节" className="mt-3 rounded-lg border border-blue-300 bg-blue-50 p-4">
+                <p className="font-medium">新增章节（当前预览第 {currentPdfPage} 页）</p>
+                <p className="mt-1 text-sm">确认新增后，仅调整草稿：重叠的原章节保留范围外的页面。不会立即提交章节确认。</p>
+                <div className="mt-2 flex flex-wrap gap-2">
+                  <input autoFocus aria-label="新章节标题" placeholder="章节标题" value={newChapter.title} onChange={e => setNewChapter({ ...newChapter, title: e.target.value })} className="rounded border p-2" />
+                  <input aria-label="新章节开始页" type="number" min="1" value={newChapter.start} onChange={e => setNewChapter({ ...newChapter, start: e.target.value })} className="w-24 rounded border p-2" />
+                  <span>至</span>
+                  <input aria-label="新章节结束页" type="number" min="1" value={newChapter.end} onChange={e => setNewChapter({ ...newChapter, end: e.target.value })} className="w-24 rounded border p-2" />
+                  <button type="button" onClick={insertNewChapter} className="rounded bg-blue-600 px-3 py-2 text-white">确认新增到草稿</button>
+                  <button type="button" onClick={() => setNewChapter(null)} className="rounded border px-3 py-2">取消</button>
+                </div>
+                {newChapterError && <p role="alert" className="mt-2 text-red-700">{newChapterError}</p>}
+              </div>
+            )}
+            <div className="mt-3 rounded-lg border border-slate-200 p-3 text-sm">
+              <label className="flex items-center gap-2">
+                <input type="checkbox" checked={simplifiedEnabled}
+                  onChange={event => toggleSimplified(event.target.checked)} />
+                应用书尾附录建议
+              </label>
+              <p className="mt-1 text-xs text-slate-600">{simplifiedIds.size
+                ? `建议范围：${chapterDraft.filter(c => simplifiedIds.has(c.chapter_id)).map(c => `${c.title}（${appendixRecommendations.get(c.chapter_id) === 'exclude' ? '略过' : '保留原文'}）`).join('；')}。可逐章调整，确认后生效。`
+                : `${simplifiedEnabled ? '附录建议已应用。' : ''}暂无自动建议；可逐章选择翻译、保留原文或略过。`}</p>
             </div>
             {hasAutoFilledChapterDraft && (
               <p className="mt-3 text-xs text-sky-800">
@@ -1109,6 +1248,7 @@ function JobDetail() {
                     return (
                       <div
                         key={`${chapter.chapter_id}-${index}`}
+                        id={`chapter-row-${index}`}
                         className={`grid grid-cols-[3rem_minmax(12rem,1fr)_8rem_5rem] gap-2 border-b border-slate-100 px-3 py-3 text-sm ${
                           selectedChapterIndex === index ? 'bg-blue-50' : 'bg-white'
                         }`}
@@ -1131,6 +1271,14 @@ function JobDetail() {
                             {pageStart && pageEnd ? `${pageEnd - pageStart + 1} 页` : '页码不完整'}
                             {invalidRange && <span className="ml-2 text-red-600">结束页早于开始页</span>}
                           </div>
+                          <select aria-label={`第 ${index + 1} 章处理方式`} value={chapter.content_policy || 'auto'}
+                            onChange={event => setChapterDraft(chapters => chapters.map((item, i) => i === index ? { ...item, content_policy: event.target.value as JobChapterDraft['content_policy'] } : item))}
+                            className="w-full rounded border border-slate-300 px-2 py-1 text-sm">
+                            <option value="auto">采用自动建议（确认时默认翻译）</option>
+                            <option value="translate">翻译</option>
+                            <option value="preserve">保留原文（不翻译）</option>
+                            <option value="exclude">略过（不翻译、不导出）</option>
+                          </select>
                         </div>
                         <div className="grid grid-cols-2 gap-1">
                           <input
@@ -1161,6 +1309,7 @@ function JobDetail() {
                       </div>
                     )
                   })}
+                  <SourceWorkbench jobId={id} page={currentPdfPage} onSelectPage={setCurrentPdfPage} onSaved={() => { void loadJob() }} />
                 </div>
 
                 <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
@@ -1230,7 +1379,7 @@ function JobDetail() {
                         </p>
                         <p className="max-w-md text-sm text-slate-500">
                           请用本地 EPUB 阅读器打开原文件，或下载后在桌面工具中校对页码。
-                          章节范围与页码仍可在此页面继续编辑，确认后会用于知识解析。
+                          章节范围与页码仍可在此页面继续编辑，确认后将用于章节内拆分和翻译。
                         </p>
                         <a
                           href={jobsApi.sourceUrl(job.job_id)}
@@ -1249,8 +1398,8 @@ function JobDetail() {
                 <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-200 bg-amber-50 p-4">
                   <p className="text-sm text-amber-900">
                     {needsChapterConfirmation
-                      ? '核对标题与页码后点击确认。确认后用于知识解析与 PDF 对照，不会触发重译。'
-                      : '章节目录已确认；若修改了标题或页码，可再次保存更新。'}
+                      ? '核对原文、标题与页码后确认，再手动启动翻译。修改原文会使旧确认和受影响译文过期。'
+                      : '章节目录已确认；修改标题或页码后需重新确认，原有人工审阅记录会保留。'}
                   </p>
                   <button
                     type="button"
@@ -1285,7 +1434,12 @@ function JobDetail() {
           </div>
         )}
 
-        <div className="mt-6 flex flex-wrap gap-3">
+        {(job.failed_stage === 'translating' || job.state === 'translating') && <TranslationFailures jobId={job.job_id} stopped={job.state === 'failed'} />}
+        <div className="mt-6 flex flex-wrap items-start gap-3">
+          {job.state === 'translating' && <button className="rounded-lg border border-amber-500 px-4 py-2 text-sm" onClick={async () => {
+            try { const result = await jobsApi.pauseTranslation(id); setNotice(result.detail) }
+            catch (error) { setError(error instanceof Error ? error.message : '暂停失败') }
+          }}>暂停翻译（保留进度）</button>}
           {job.state === 'awaiting_glossary'
             && isConvertPath
             && chaptersConfirmed && (
@@ -1338,15 +1492,6 @@ function JobDetail() {
               onClick={confirmEditedChapters}
             >
               {chapterConfirmLabel}
-            </button>
-          )}
-          {workspaceBook?.knowledge_ready && (
-            <button
-              type="button"
-              className="rounded-lg bg-purple-600 px-4 py-2 text-sm font-medium text-white"
-              onClick={() => setNotice('知识解析入口已就绪；下一阶段会接入 BookWeaver 的知识拆分规划。')}
-            >
-              进入知识解析
             </button>
           )}
           {job.state === 'awaiting_human_review' && !isTranslatePath && !isPreservePath && (

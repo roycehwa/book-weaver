@@ -933,8 +933,8 @@ def _suggest_glossary_targets_impl(
         )
     if not suggestions and failed_sources:
         raise ValueError(
-            "术语中文建议生成失败：主模型与 DeepL 备用均未成功。"
-            "请确认已配置 DEEPL_AUTH_KEY，或手动填写译法。"
+            "术语中文建议生成失败：本次未获得有效建议。"
+            "可重试生成或手动填写译法；DeepL 是可选备用，不是继续处理的必需配置。"
         )
     by_source = {str(item["source"]): item for item in suggestions if item.get("source")}
 

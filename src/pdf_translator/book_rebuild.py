@@ -102,6 +102,11 @@ class BookItem:
     top: float
     path: str | None = None
     from_page_footer: bool = False
+    right: float = 0.0
+    source_node_id: str | None = None
+    source_char_start: int | None = None
+    source_char_end: int | None = None
+    source_separator_before: str = ""
 
 
 def stable_chapter_slug(title: str, index: int) -> str:
@@ -410,9 +415,40 @@ def _ordered_page_blocks(
                 ),
             )
         )
-        ordered_pages[page_no] = page_order
+        ordered_pages[page_no] = _join_geometric_continuations(page_order)
 
     return ordered_pages
+
+
+def _join_geometric_continuations(blocks: list[LayoutBlock]) -> list[LayoutBlock]:
+    """Join only tight, same-column body continuations with geometric evidence.
+
+    This deliberately leaves uncertain cross-page and sentence-boundary cases for
+    human review; punctuation alone is never enough to join paragraphs.
+    """
+    result: list[LayoutBlock] = []
+    for block in blocks:
+        previous = result[-1] if result else None
+        if previous and previous.label == block.label == 'text' and previous.page_no == block.page_no:
+            gap = previous.bottom - block.top
+            width = previous.right - previous.left
+            tight = 0 <= gap <= 6 and width >= 100 and block.right > block.left
+            same_column = abs(previous.right - block.right) <= 12 and block.left <= previous.left + 3
+            continuation = (re.search(r'[A-Za-z]-$', previous.text.rstrip()) and re.match(r'^[a-z]', block.text)) or (
+                re.search(r'[A-Za-z,;:(]$', previous.text.rstrip()) and re.match(r'^[a-z]', block.text))
+            if tight and same_column and continuation:
+                left = previous.text.rstrip()
+                text = left[:-1] + block.text.lstrip() if left.endswith('-') else left + ' ' + block.text.lstrip()
+                result[-1] = LayoutBlock(label='text', text=text, page_no=previous.page_no,
+                    left=min(previous.left, block.left), right=max(previous.right, block.right),
+                    top=previous.top, bottom=block.bottom,
+                    source_node_id=(previous.source_node_id if previous.source_node_id == block.source_node_id else None),
+                    source_char_start=previous.source_char_start,
+                    source_char_end=block.source_char_end,
+                    source_separator_before=previous.source_separator_before)
+                continue
+        result.append(block)
+    return result
 
 
 def _crop_pdf_regions(
@@ -536,6 +572,12 @@ def _replace_preserved_apparatus_with_page_images(
         if not bool(chapter.get("preserve_original")):
             continue
         if not OUTLINE_SKIP_TITLE_RE.match(title):
+            continue
+        # Preserving source language does not mean rasterizing readable text.
+        source_text = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", str(chapter.get("markdown") or ""))
+        source_text = re.sub(r"^#{1,6} .*?$", "", source_text, flags=re.MULTILINE)
+        if source_text.strip():
+            chapter["resource_only"] = True
             continue
         reading_pages: list[str] = []
         trace_pages: list[str] = []
@@ -691,11 +733,33 @@ def _extract_table_items(
         per_page_counts[page_no] = per_page_counts.get(page_no, 0) + 1
         table_no = per_page_counts[page_no]
         table_markdown = _table_to_markdown(table, page_no=page_no, table_no=table_no)
+        if table.get("label") == "document_index":
+            # Docling stores many TOCs as nested text references in an empty
+            # one-cell table. An empty grid is not evidence of an image-only TOC.
+            seen: set[str] = set()
+            def index_text(item: dict[str, Any]) -> str:
+                pieces = []
+                for child in item.get("children", []):
+                    ref = child.get("$ref")
+                    if not ref or ref in seen:
+                        continue
+                    seen.add(ref)
+                    resolved = _resolve_ref(structured, ref)
+                    if resolved:
+                        bucket, value = resolved
+                        text = str(value.get("text") or "") if bucket == "texts" else index_text(value)
+                        if text.strip():
+                            pieces.append(text.strip())
+                separator = "\n\n" if item.get("label") in {"document_index", "list"} else " "
+                return separator.join(pieces)
+            table_markdown = index_text(table) or table_markdown
         image_path = exported_paths.get(page_no, {}).get(table_no)
-        if image_path is not None:
+        if image_path is not None and table_markdown is None:
             table_markdown = f"![Table {page_no}.{table_no}]({image_path.as_posix()})"
         elif table_markdown is None:
             continue
+        else:
+            image_path = None
         items_by_page.setdefault(page_no, []).append(
             BookItem(
                 kind="table",
@@ -775,6 +839,11 @@ def _promote_trailing_footnote_like_items(items: list[BookItem]) -> list[BookIte
             top=it.top,
             path=it.path,
             from_page_footer=(i >= k) or it.from_page_footer,
+            right=it.right,
+            source_node_id=it.source_node_id,
+            source_char_start=it.source_char_start,
+            source_char_end=it.source_char_end,
+            source_separator_before=it.source_separator_before,
         )
         for i, it in enumerate(items)
     ]
@@ -795,6 +864,11 @@ def _page_content_items(
             left=block.left,
             top=block.top,
             from_page_footer=block.label in {"footnote", "page_footer"},
+            right=block.right,
+            source_node_id=block.source_node_id,
+            source_char_start=block.source_char_start,
+            source_char_end=block.source_char_end,
+            source_separator_before=block.source_separator_before,
         )
         for block in blocks
         if _format_book_block(block)
@@ -841,6 +915,11 @@ def _page_content_items(
                 top=item.top,
                 path=item.path,
                 from_page_footer=item.from_page_footer,
+                right=item.right,
+                source_node_id=item.source_node_id,
+                source_char_start=item.source_char_start,
+                source_char_end=item.source_char_end,
+                source_separator_before=item.source_separator_before,
             )
         )
     return out
@@ -1174,6 +1253,106 @@ def _detect_chapter_title(blocks: list[LayoutBlock]) -> str | None:
     return None
 
 
+def _book_item_payload(item: BookItem) -> dict[str, Any]:
+    return {
+        "kind": item.kind,
+        "text": item.text,
+        "page_no": item.page_no,
+        "from_page_footer": item.from_page_footer,
+        "source_node_id": item.source_node_id,
+        "source_char_start": item.source_char_start,
+        "source_char_end": item.source_char_end,
+        "source_separator_before": item.source_separator_before,
+    }
+
+
+def _page_body_text_items(page: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        item
+        for item in page.get("content_items") or []
+        if isinstance(item, dict)
+        and item.get("kind") == "text"
+        and not item.get("from_page_footer")
+        and item.get("source_node_id")
+        and isinstance(item.get("source_char_start"), int)
+        and isinstance(item.get("source_char_end"), int)
+    ]
+
+
+def _join_source_node_fragments(left: str, right: str, separator: str) -> tuple[str, str]:
+    left_text = left.rstrip()
+    right_text = right.lstrip()
+    if (
+        separator.isspace()
+        and left_text.endswith("-")
+        and re.match(r"^[a-z]", right_text)
+    ):
+        return left_text[:-1] + right_text, "page_break_hyphen_removed"
+    normalized_separator = " " if separator and separator.isspace() else separator
+    return left_text + normalized_separator + right_text, "source_separator_restored"
+
+
+def _build_logical_continuations(page_payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    continuations: list[dict[str, Any]] = []
+    ordered_pages = sorted(page_payloads, key=lambda page: int(page.get("page_no") or 0))
+    for left_page, right_page in zip(ordered_pages, ordered_pages[1:]):
+        left_page_no = int(left_page.get("page_no") or 0)
+        right_page_no = int(right_page.get("page_no") or 0)
+        if right_page_no != left_page_no + 1:
+            continue
+        left_items = _page_body_text_items(left_page)
+        right_items = _page_body_text_items(right_page)
+        if not left_items or not right_items:
+            continue
+        left = left_items[-1]
+        right = right_items[0]
+        if left["source_node_id"] != right["source_node_id"]:
+            continue
+        left_end = int(left["source_char_end"])
+        right_start = int(right["source_char_start"])
+        separator = str(right.get("source_separator_before") or "")
+        if right_start < left_end or right_start - left_end != len(separator):
+            continue
+        if separator and not separator.isspace():
+            continue
+        joined, repair = _join_source_node_fragments(
+            str(left.get("text") or ""),
+            str(right.get("text") or ""),
+            separator,
+        )
+        continuations.append(
+            {
+                "from_page": left_page_no,
+                "to_page": right_page_no,
+                "source_node_id": left["source_node_id"],
+                "source_char_end": left_end,
+                "next_source_char_start": right_start,
+                "source_separator": separator,
+                "left_text": str(left.get("text") or "").strip(),
+                "right_text": str(right.get("text") or "").strip(),
+                "joined_text": joined,
+                "repair": repair,
+                "confidence": "deterministic_same_source_node",
+            }
+        )
+    return continuations
+
+
+def _apply_logical_continuations(
+    markdown: str,
+    continuations: list[dict[str, Any]],
+) -> str:
+    result = markdown
+    for continuation in continuations:
+        left = str(continuation.get("left_text") or "").strip()
+        right = str(continuation.get("right_text") or "").strip()
+        joined = str(continuation.get("joined_text") or "")
+        if not left or not right or not joined:
+            continue
+        result = result.replace(f"{left}\n\n{right}", joined, 1)
+    return result
+
+
 def _build_chapter_markdown(page_payloads: list[dict[str, Any]], *, include_page_markers: bool) -> str:
     parts: list[str] = []
     for payload in page_payloads:
@@ -1187,6 +1366,11 @@ def _build_chapter_markdown(page_payloads: list[dict[str, Any]], *, include_page
         parts.extend(content_lines)
     markdown = "\n\n".join(line.strip() for line in parts if line.strip())
     markdown = re.sub(r"\n{3,}", "\n\n", markdown).strip()
+    if not include_page_markers:
+        markdown = _apply_logical_continuations(
+            markdown,
+            _build_logical_continuations(page_payloads),
+        )
     markdown = _dedupe_adjacent_duplicate_headings(markdown)
     return markdown + "\n" if markdown else ""
 
@@ -1443,6 +1627,7 @@ def apply_canonical_chapter_plan(
     source_path: Path | None = None,
     asset_dir: Path | None = None,
 ) -> dict[str, Any]:
+    from pdf_translator.source_workspace import chapter_fingerprint
     canonical_source = str(canonical.get("source_artifact") or "")
     user_confirmed = canonical_source == "user_confirmation"
     use_epub_reader_pages = bool(
@@ -1453,14 +1638,24 @@ def apply_canonical_chapter_plan(
 
     page_markdown: dict[int, str] = {}
     page_policy: dict[int, dict[str, bool]] = {}
+    epub_page_records: dict[int, dict[str, Any]] = {}
 
     if use_epub_reader_pages:
-        from pdf_translator.epub_reader_pages import build_epub_reader_page_markdown
+        if source_path is not None and source_path.is_file():
+            from pdf_translator.epub_reader_pages import build_epub_reader_page_records
 
-        page_markdown = build_epub_reader_page_markdown(
-            source_path,
-            asset_dir=asset_dir,
-        )
+            epub_page_records = build_epub_reader_page_records(source_path, asset_dir=asset_dir)
+            page_markdown = {
+                page_no: str(record.get("markdown") or "")
+                for page_no, record in epub_page_records.items()
+            }
+        else:
+            from pdf_translator.epub_reader_pages import build_epub_reader_page_markdown
+
+            page_markdown = build_epub_reader_page_markdown(
+                source_path,
+                asset_dir=asset_dir,
+            )
     else:
         for chapter in book.get("chapters", []):
             for page_no in chapter.get("source_pages", []):
@@ -1497,6 +1692,12 @@ def apply_canonical_chapter_plan(
                 page_markdown[asset["page_no"]] = "\n\n".join(
                     part for part in (page_markdown.get(asset["page_no"], ""), asset_markdown) if part
                 )
+
+    source_overrides = canonical.get("source_overrides") or {}
+    for page, blocks in source_overrides.items():
+        page_markdown[int(page)] = "\n\n".join(
+            str(block["text"]) for block in blocks if block.get("policy") != "exclude"
+        )
 
     canonical_chapters = [
         chapter
@@ -1535,9 +1736,18 @@ def apply_canonical_chapter_plan(
         )
     }
     chapters: list[dict[str, Any]] = []
+    excluded_sections: list[dict[str, Any]] = []
+
+    # Covers are resources, not inferred body pages. Image-only page 1 may not
+    # appear in the text-page inventory and must survive chapter confirmation.
+    cover_pages: set[int] = set()
+    for source_chapter in book.get("chapters", []):
+        if source_chapter.get("cover"):
+            chapters.append(dict(source_chapter))
+            cover_pages.update(source_chapter.get("source_pages", []))
 
     if not user_confirmed:
-        uncovered = [page_no for page_no in available_pages if page_no not in planned_pages]
+        uncovered = [page_no for page_no in available_pages if page_no not in planned_pages and page_no not in cover_pages]
         if uncovered:
             groups: list[list[int]] = []
             for page_no in uncovered:
@@ -1577,7 +1787,28 @@ def apply_canonical_chapter_plan(
                     }
                 )
 
-    for canonical_chapter in canonical_chapters:
+    slices = []
+    for chapter in canonical_chapters:
+        owned = chapter.get("source_pages") or range(int(chapter.get("page_start") or 0), int(chapter.get("page_end") or 0) + 1)
+        slices.append([{ "page_no": int(page), "start": 0, "end": len(page_markdown.get(int(page), "")), "page_length": len(page_markdown.get(int(page), "")) } for page in owned if int(page) not in cover_pages])
+    if user_confirmed:
+        normalize_heading = lambda text: re.sub(r"[\W_]+", "", text.casefold())
+        for index in range(1, len(canonical_chapters)):
+            if not slices[index] or not slices[index - 1]:
+                continue
+            first = slices[index][0]
+            if slices[index - 1][-1]["page_no"] != first["page_no"] - 1:
+                continue
+            page_text = page_markdown.get(first["page_no"], "")
+            title = normalize_heading(str(canonical_chapters[index].get("title") or ""))
+            matches = [m for m in re.finditer(r"(?m)^#{1,6}\s+(.+?)\s*$", page_text) if normalize_heading(m.group(1)) == title]
+            if len(matches) != 1 or not page_text[:matches[0].start()].strip():
+                continue
+            split = matches[0].start()
+            slices[index - 1].append({**first, "end": split})
+            first["start"] = split
+
+    for chapter_position, canonical_chapter in enumerate(canonical_chapters):
         pages = [
             int(page_no)
             for page_no in (
@@ -1589,12 +1820,29 @@ def apply_canonical_chapter_plan(
             )
         ]
         chapter_title = str(canonical_chapter.get("title") or f"Chapter {len(chapters) + 1}")
+        chapter_slices = slices[chapter_position]
+        pages = [part["page_no"] for part in chapter_slices]
+        policy = canonical_chapter.get("content_policy", "auto")
+        if policy not in {"auto", "translate", "preserve", "exclude"}:
+            raise ValueError("Unknown chapter content policy")
+        if policy == "exclude":
+            if not user_confirmed:
+                raise ValueError("Excluding chapters requires user confirmation")
+            excluded_sections.append({"chapter_id": canonical_chapter.get("chapter_id"),
+                "title": chapter_title, "source_pages": pages,
+                "page_slices": chapter_slices,
+                "reason": "user_confirmed_exclusion", "actor": "user"})
+            continue
         base_preserve_original = _canonical_chapter_preserve_original(
             title=chapter_title,
             pages=pages,
             page_policy=page_policy,
             user_confirmed=user_confirmed,
         )
+        if policy == "translate":
+            base_preserve_original = False
+        if policy == "preserve":
+            base_preserve_original = True
         if not pages:
             continue
         pages, preserve_original, page_exclusions = _resolve_canonical_chapter_pages(
@@ -1605,11 +1853,50 @@ def apply_canonical_chapter_plan(
         )
         if not pages:
             continue
-        markdown = "\n\n".join(page_markdown.get(page, "") for page in pages).strip()
+        chapter_slices = [part for part in chapter_slices if part["page_no"] in pages]
+        markdown = "\n\n".join(page_markdown.get(part["page_no"], "")[part["start"]:part["end"]] for part in chapter_slices).strip()
+        chapter_pages = set(pages)
+        markdown = _apply_logical_continuations(
+            markdown,
+            [
+                continuation
+                for continuation in book.get("logical_continuations") or []
+                if int(continuation.get("from_page") or 0) in chapter_pages
+                and int(continuation.get("to_page") or 0) in chapter_pages
+            ],
+        )
         trace_markdown = "\n\n".join(
-            f"[[page: {page}]]\n\n{page_markdown.get(page, '')}"
-            for page in pages
+            f"[[page: {part['page_no']}]]\n\n{page_markdown.get(part['page_no'], '')[part['start']:part['end']]}"
+            for part in chapter_slices
         ).strip()
+        source_internal_paths = list(dict.fromkeys(
+            str(epub_page_records[page].get("source_internal_path") or "")
+            for page in pages
+            if page in epub_page_records
+            and epub_page_records[page].get("source_internal_path")
+        ))
+        selected_whole_resources = {
+            path
+            for path in source_internal_paths
+            if all(
+                bool(record.get("whole_resource"))
+                for record in epub_page_records.values()
+                if record.get("source_internal_path") == path
+            )
+            and all(
+                page in pages
+                for page, record in epub_page_records.items()
+                if record.get("source_internal_path") == path
+            )
+        }
+        dom_units = [
+            dict(unit)
+            for source_chapter in book.get("chapters") or []
+            if isinstance(source_chapter, dict)
+            and source_chapter.get("source_internal_path") in selected_whole_resources
+            for unit in source_chapter.get("dom_units") or []
+            if isinstance(unit, dict)
+        ]
         chapters.append(
             {
                 "title": chapter_title,
@@ -1619,6 +1906,11 @@ def apply_canonical_chapter_plan(
                 "markdown": markdown,
                 "trace_markdown": trace_markdown,
                 "translate": not preserve_original,
+                "translation_policy_confirmed": user_confirmed,
+                "page_slices": chapter_slices,
+                "source_internal_path": source_internal_paths[0] if len(source_internal_paths) == 1 else None,
+                "source_internal_paths": source_internal_paths,
+                "dom_units": dom_units,
                 "preserve_original": preserve_original,
                 "resource_only": preserve_original,
                 "toc": True,
@@ -1636,6 +1928,28 @@ def apply_canonical_chapter_plan(
         for page_no in chapter.get("source_pages", [])
         if isinstance(page_no, int)
     }
+    # Keep book-front material outside the user's first chapter without
+    # moving their boundaries or renumbering existing chapter identifiers.
+    first_page = min(int(chapter.get("page_start") or 0) for chapter in canonical_chapters)
+    for page in book.get("pages", []):
+        page_no = page.get("page_no")
+        if not isinstance(page_no, int) or not (0 < page_no < first_page):
+            continue
+        text = page_markdown.get(page_no, "").strip()
+        if not text or page_no in chapter_by_page:
+            continue
+        resource_id = f"resource-front-page-{page_no:04d}"
+        chapters.append({
+            "index": 0, "chapter_id": resource_id,
+            "title": f"原书书前页 {page_no}",
+            "page_start": page_no, "page_end": page_no,
+            "source_pages": [page_no], "markdown": text,
+            "trace_markdown": f"[[page: {page_no}]]\n\n{text}",
+            "translate": False, "preserve_original": True,
+            "resource_only": True, "toc": False,
+        })
+        chapter_by_page[page_no] = resource_id
+    chapters.sort(key=lambda chapter: int(chapter["page_start"]))
     semantic_content = book.get("semantic_content")
     if isinstance(semantic_content, dict):
         for note in semantic_content.get("footnotes", []):
@@ -1649,6 +1963,12 @@ def apply_canonical_chapter_plan(
     full_parts: list[str] = []
     trace_parts: list[str] = []
     for chapter in chapters:
+        chapter["source_decisions"] = [
+            {**block, "page": int(page)}
+            for page, blocks in source_overrides.items()
+            if int(page) in chapter.get("source_pages", [])
+            for block in blocks if block.get("policy") != "translate" or block.get("reason")
+        ]
         if chapter.get("toc", True):
             full_parts.append(f"# {chapter['title']}")
         full_parts.append(str(chapter.get("markdown") or "").strip())
@@ -1661,8 +1981,11 @@ def apply_canonical_chapter_plan(
         "chapter_source": "user_confirmed_canonical",
         "canonical_chapter_count": len(canonical_chapters),
         "page_coordinate_system": "epub_reader" if use_epub_reader_pages else "book_ir",
+        "source_revision": canonical.get("source_revision", 0),
+        "chapter_fingerprint": chapter_fingerprint(canonical),
     }
     result["chapters"] = chapters
+    result["excluded_sections"] = excluded_sections
     result["chapter_count"] = len(chapters)
     raw_pages = [
         {
@@ -1677,6 +2000,17 @@ def apply_canonical_chapter_plan(
         if isinstance(page, dict)
     ]
     result["pages"] = _mark_excluded_canonical_pages(raw_pages, chapters)
+    retained_pages = {page for chapter in chapters for page in chapter.get("source_pages", [])}
+    excluded_pages = {page for section in excluded_sections for page in section["source_pages"]} - retained_pages
+    for page in result["pages"]:
+        if page.get("page_no") in excluded_pages:
+            page["disposition"] = "skipped"
+            page["skip_reason"] = "user_confirmed_exclusion"
+    if excluded_pages and isinstance(result.get("semantic_content"), dict):
+        result["semantic_content"] = dict(result["semantic_content"])
+        for key in ("footnotes", "ocr_quarantine"):
+            result["semantic_content"][key] = [record for record in result["semantic_content"].get(key, [])
+                if record.get("source_page", record.get("page_no")) not in excluded_pages]
     result["full_markdown"] = "\n\n".join(part for part in full_parts if part).strip()
     result["trace_markdown"] = "\n\n".join(part for part in trace_parts if part).strip()
     return result
@@ -1956,6 +2290,11 @@ def _build_book_from_epub_meta(meta: dict[str, Any], source_path: Path | None) -
                 "preserve_original": is_preserved_resource,
                 "resource_only": is_preserved_resource,
                 "source_internal_path": sip if isinstance(sip, str) else None,
+                "dom_units": [
+                    dict(unit)
+                    for unit in entry.get("dom_units") or []
+                    if isinstance(unit, dict)
+                ],
                 "toc": not is_preserved_resource,
             }
         )
@@ -2116,10 +2455,13 @@ def build_book_reconstruction(
                 "page_kind": page_kind,
                 "chapter_title": chapter_title,
                 "content_lines": content_lines,
+                "content_items": [_book_item_payload(item) for item in content_items],
                 "figure_count": len(picture_items.get(page_no, [])),
                 "table_count": len(table_items.get(page_no, [])),
             }
         )
+
+    logical_continuations = _build_logical_continuations(pages)
 
     outline_entries = _extract_pdf_outline_chapters(source_pdf, total_pages=total_pages)
     chapters: list[dict[str, Any]] = _chapter_pages_from_outline(pages, outline_entries)
@@ -2312,8 +2654,10 @@ def build_book_reconstruction(
             "ocr_quarantine": ocr_quarantine,
             "evidence_assets": [],
         },
+        "logical_continuations": logical_continuations,
         "pages": [
             {
+                **({"content_items": page["content_items"]} if page.get("content_items") else {}),
                 "page_no": page["page_no"],
                 "page_kind": page["page_kind"],
                 "chapter_title": page["chapter_title"],

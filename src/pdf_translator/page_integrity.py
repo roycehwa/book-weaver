@@ -17,6 +17,7 @@ def build_page_ledger(book: dict[str, Any]) -> dict[str, Any]:
             "chapter_id": str(raw_chapter.get("chapter_id") or f"chapter-{index:03d}"),
             "resource_only": bool(raw_chapter.get("resource_only")),
             "preserve_original": bool(raw_chapter.get("preserve_original")),
+            "page_slices": raw_chapter.get("page_slices", []),
         }
         for raw_page_no in raw_chapter.get("source_pages", []):
             if isinstance(raw_page_no, int):
@@ -51,7 +52,16 @@ def build_page_ledger(book: dict[str, Any]) -> dict[str, Any]:
         # Two body chapters claiming the same content page is a real
         # ownership conflict; we keep that as a hard failure.
         body_owners = [o for o in page_owners if not o["resource_only"]]
-        if len(body_owners) > 1:
+        excluded_spans = [part for section in book.get("excluded_sections", [])
+            for part in section.get("page_slices", []) if part.get("page_no") == page_no]
+        spans = [part for owner in page_owners for part in owner["page_slices"] if part.get("page_no") == page_no] + excluded_spans
+        valid_split = False
+        if spans and len(spans) == len(page_owners) + len(excluded_spans):
+            spans.sort(key=lambda part: part["start"])
+            valid_split = (spans[0]["start"] == 0 and spans[-1]["end"] == spans[0]["page_length"]
+                and all(part["page_length"] == spans[0]["page_length"] and part["start"] < part["end"] for part in spans)
+                and all(a["end"] == b["start"] for a, b in zip(spans, spans[1:])))
+        if (len(body_owners) > 1 or spans) and not valid_split:
             duplicates_by_content.append(page_no)
         elif len(page_owners) > 1:
             # Only front-matter (cover / preserved original) plus body — benign.
@@ -88,6 +98,7 @@ def build_page_ledger(book: dict[str, Any]) -> dict[str, Any]:
                 "disposition": disposition,
                 "chapter_id": chapter_id,
                 "reason": reason,
+                **({"chapter_ids": [owner["chapter_id"] for owner in page_owners], "page_slices": spans} if valid_split else {}),
             }
         )
 

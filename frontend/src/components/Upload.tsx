@@ -17,7 +17,7 @@ const duplicateStatusLabels: Record<string, string> = {
   processing: '处理中',
   needs_translation_review: '需要翻译审阅',
   needs_chapter_confirmation: '需要确认章节',
-  ready_for_knowledge: '可进入知识解析',
+  phase_a_complete: 'Phase A 已完成',
   failed: '处理失败',
   unreviewed: '未审阅',
   in_review: '审阅中',
@@ -238,10 +238,11 @@ const Upload = () => {
           {file ? file.name : '拖拽文件到此处，或点击选择'}
         </div>
         <div className="mt-2 text-sm text-slate-500">
-          {file ? `${(file.size / 1024 / 1024).toFixed(2)} MB` : '支持 PDF 和 EPUB，最大 50MB'}
+          {file ? `${(file.size / 1024 / 1024).toFixed(2)} MB` : '支持文字型 PDF 和 EPUB，最大 50MB'}
         </div>
       </div>
 
+      <p className="mt-2 text-xs text-slate-500">首发范围为 EPUB 和文字型 PDF。扫描件、复杂多栏版面暂不保证处理质量；请先核对解析预览，不要直接开始整书翻译。</p>
       {checkingDuplicate && (
         <div className="mt-4 rounded-lg border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-800">
           正在检查这本书是否已经处理过...

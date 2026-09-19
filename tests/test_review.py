@@ -75,6 +75,7 @@ def test_restore_review_chapter_apparatus_appends_base_notes() -> None:
     reviewed = [
         {
             "index": 1,
+            "chapter_id": "ch-001",
             "title": "Chapter",
             "markdown": (
                 "# 章节\n\n审阅后的正文。\n\n### 注释\n\n"
@@ -85,6 +86,7 @@ def test_restore_review_chapter_apparatus_appends_base_notes() -> None:
     base = [
         {
             "index": 1,
+            "chapter_id": "ch-001",
             "source_internal_path": "OPS/c01.xhtml",
             "markdown": (
                 "# Chapter\n\nBase body.[1](OPS/c01.xhtml#c01-note-0001)\n\n"
@@ -107,6 +109,7 @@ def test_restore_review_chapter_apparatus_handles_notes_without_heading() -> Non
     reviewed = [
         {
             "index": 1,
+            "chapter_id": "ch-001",
             "title": "Chapter",
             "markdown": (
                 "# 章节\n\n审阅后的正文。\n\n"
@@ -117,6 +120,7 @@ def test_restore_review_chapter_apparatus_handles_notes_without_heading() -> Non
     base = [
         {
             "index": 1,
+            "chapter_id": "ch-001",
             "source_internal_path": "OPS/c01.xhtml",
             "markdown": (
                 "# Chapter\n\nBase body.[1](OPS/c01.xhtml#c01-note-0001)\n\n"
@@ -132,6 +136,17 @@ def test_restore_review_chapter_apparatus_handles_notes_without_heading() -> Non
     assert "Partial note" not in restored[0]["markdown"]
     assert "First note" in restored[0]["markdown"]
     assert "Second note" in restored[0]["markdown"]
+
+
+def test_restore_apparatus_uses_identity_not_renumbered_position() -> None:
+    reviewed = [{"index": 9, "chapter_id": "front-13", "markdown": "Front matter"}]
+    base = [
+        {"index": 0, "chapter_id": "front-13", "toc": False, "markdown": "Front matter"},
+        {"index": 9, "chapter_id": "notes", "markdown": "# Notes\n\nEnd notes"},
+    ]
+    result = restore_review_chapter_apparatus(reviewed, base)
+    assert "End notes" not in result[0]["markdown"]
+    assert result[0]["toc"] is False
 
 
 def sample_book() -> dict:
@@ -873,7 +888,8 @@ def test_review_project_from_run_loads_json_contract(tmp_path: Path) -> None:
     assert project["review_state"]["schema"] == "translation_review_state_v1"
 
 
-def test_rewrite_review_requests_writes_candidate_for_model_decision(tmp_path: Path) -> None:
+@pytest.mark.parametrize("reviewer_comment", ["补译遗漏内容。", ""])
+def test_rewrite_review_requests_writes_candidate_for_model_decision(tmp_path: Path, reviewer_comment: str) -> None:
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     artifacts = build_review_artifacts(
@@ -889,7 +905,7 @@ def test_rewrite_review_requests_writes_candidate_for_model_decision(tmp_path: P
         "ch-001-intro:s002": {
             "status": "open",
             "action": "model_rewrite",
-            "reviewer_comment": "补译遗漏内容。",
+            "reviewer_comment": reviewer_comment,
         }
     }
     for name, payload in artifacts.items():
@@ -908,7 +924,7 @@ def test_rewrite_review_requests_writes_candidate_for_model_decision(tmp_path: P
     assert result["rewritten_count"] == 1
     assert decision["status"] == "candidate"
     assert decision["approved_text"] == "这是模型根据意见生成的候选译文。"
-    assert "补译遗漏内容" in translator.prompts[0]
+    assert ("补译遗漏内容" if reviewer_comment else "完整重译") in translator.prompts[0]
 
 
 def test_rewrite_prompt_for_missing_translation_uses_source_text() -> None:

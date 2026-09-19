@@ -192,6 +192,10 @@ class LiveProgressTranslationJobObserver:
         self.inner.attempt_success(chunk_index=chunk_index, input_hash=input_hash, cache_path=cache_path)
         self._emit()
 
+    def human_resolution(self, *, chunk_index: int, kind: str) -> None:
+        self.inner.human_resolution(chunk_index=chunk_index, kind=kind)
+        self._emit()
+
     def attempt_failure(
         self,
         *,
@@ -329,6 +333,22 @@ class TranslationJobObserver:
             input_hash=input_hash,
             cache_path=str(cache_path) if cache_path else None,
         )
+
+    def human_resolution(self, *, chunk_index: int, kind: str) -> None:
+        with self._progress_lock:
+            progress = self._load_progress()
+            self._record_chunk_done(progress, chunk_index)
+            resolved = dict(progress.get('human_resolutions') or {})
+            resolved[str(chunk_index)] = kind
+            progress['human_resolutions'] = resolved
+            progress['preserved_source_chunks'] = sum(value == 'preserve_source' for value in resolved.values())
+            for prefix in ('running', 'retrying', 'failed'):
+                indices = set(progress.get(f'{prefix}_chunk_indices') or [])
+                indices.discard(chunk_index)
+                progress[f'{prefix}_chunk_indices'] = sorted(indices)
+                progress[f'{prefix}_chunks'] = len(indices)
+            self._write_progress(progress)
+        self._event('human_resolution', chunk_index=chunk_index, kind=kind)
 
     def attempt_failure(
         self,

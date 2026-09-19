@@ -165,10 +165,7 @@ def test_approved_review_export_rejects_integrity_ledger_failure() -> None:
         _validate_approved_review_project(project, integrity_ledger=ledger)
 
 
-def test_review_export_migrates_legacy_book_before_delivery(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
+def test_review_export_rejects_book_without_current_contract(tmp_path: Path) -> None:
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     manifest = {"source_pdf": str(tmp_path / "source.pdf")}
@@ -184,38 +181,8 @@ def test_review_export_migrates_legacy_book_before_delivery(
         ),
         encoding="utf-8",
     )
-    migrated: list[Path] = []
-
-    def fake_migrate(path: Path):
-        migrated.append(path)
-        (path / "book.json").write_text(
-            json.dumps(
-                {
-                    "pages": [
-                        {"page_no": 1, "has_content": True},
-                        {"page_no": 2, "has_content": True},
-                    ],
-                    "chapters": [
-                        {"chapter_id": "body", "source_pages": [1]},
-                        {
-                            "chapter_id": "resource",
-                            "source_pages": [2],
-                            "resource_only": True,
-                            "preserve_original": True,
-                        },
-                    ],
-                }
-            ),
-            encoding="utf-8",
-        )
-        return {"migrated": True}
-
-    monkeypatch.setattr(cli_module, "migrate_legacy_review_run", fake_migrate)
-
-    book = _load_complete_review_book(run_dir, manifest)
-
-    assert migrated == [run_dir.resolve()]
-    assert _uncovered_book_pages(book) == []
+    with pytest.raises(ValueError, match="current semantic content is required"):
+        _load_complete_review_book(run_dir, manifest)
 
 
 def test_review_export_restores_chapter_notes_before_delivery(tmp_path: Path, monkeypatch) -> None:
@@ -236,6 +203,7 @@ def test_review_export_restores_chapter_notes_before_delivery(tmp_path: Path, mo
         json.dumps(
             {
                 "pages": [{"page_no": 1, "has_content": True}],
+                "semantic_content": {"schema": "semantic_content_v1", "footnotes": []},
                 "chapters": [{"chapter_id": "ch-001", "source_pages": [1]}],
             }
         ),

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -33,7 +34,6 @@ from pdf_translator.review import (
     translated_segments_to_chapters,
     write_versioned_outputs,
 )
-from pdf_translator.review_migration import migrate_legacy_review_run
 from pdf_translator.epub import render_epub_from_book, validate_epub_internal_hrefs
 from pdf_translator.glossary import (
     apply_glossary_decision,
@@ -668,29 +668,21 @@ def _load_complete_review_book(
     run_dir: Path,
     manifest: dict[str, object],
 ) -> dict[str, object]:
-    book: dict[str, object] = {
-        "metadata": {"schema": "review_export_fallback"},
-        "chapters": [],
-    }
     book_path = run_dir / "book.json"
-    if book_path.exists():
-        book = json.loads(book_path.read_text(encoding="utf-8"))
+    if not book_path.exists():
+        raise ValueError(
+            "Review export blocked: current book.json is required. Create a new task."
+        )
+    book: dict[str, object] = json.loads(book_path.read_text(encoding="utf-8"))
     semantic_content = book.get("semantic_content")
-    needs_contract_migration = (
-        not isinstance(semantic_content, dict)
-        or semantic_content.get("schema") != "semantic_content_v1"
-        or not (run_dir / "integrity-ledger.json").exists()
-    )
-    normalized_value = (manifest.get("files") or {}).get("normalized_json")
-    normalized_path = (
-        Path(str(normalized_value)).expanduser().resolve()
-        if normalized_value
-        else run_dir / "normalized.json"
-    )
-    can_rebuild = normalized_path.exists() and (run_dir / "review_state.json").exists()
-    if _uncovered_book_pages(book) or (needs_contract_migration and can_rebuild):
-        migrate_legacy_review_run(run_dir)
-        book = json.loads(book_path.read_text(encoding="utf-8"))
+    if not isinstance(semantic_content, dict) or semantic_content.get("schema") != "semantic_content_v1":
+        raise ValueError(
+            "Review export blocked: current semantic content is required. Create a new task."
+        )
+    if not (run_dir / "integrity-ledger.json").exists():
+        raise ValueError(
+            "Review export blocked: current integrity-ledger.json is required. Create a new task."
+        )
     uncovered_pages = _uncovered_book_pages(book)
     if uncovered_pages:
         preview = ", ".join(str(page) for page in uncovered_pages[:12])
@@ -747,7 +739,52 @@ def _run_review_export(
     output_format: str,
     approve: bool,
 ) -> dict[str, object]:
+    import shutil
+    import tempfile
+    from pdf_translator.source_workspace import source_lock, atomic_json
     run_dir = run_dir.expanduser().resolve()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", version_name):
+        raise ValueError("Unsafe review version name")
+    with source_lock(run_dir):
+        final = run_dir / "versions" / version_name
+        if final.exists():
+            raise ValueError("此导出版本已存在，请使用新版本名；不会覆盖已有成品。")
+        staging_root = Path(tempfile.mkdtemp(prefix=".export-", dir=run_dir))
+        staged = staging_root / "version"
+        try:
+            result = _render_review_export(run_dir=run_dir, version_name=version_name,
+                parent_version=parent_version, target_language=target_language,
+                output_format=output_format, approve=approve, output_dir=staged)
+            def relocate(value):
+                if isinstance(value, str):
+                    return value.replace(str(staged), str(final)).replace(str(staged.relative_to(run_dir)), str(final.relative_to(run_dir)))
+                if isinstance(value, dict):
+                    return {key: relocate(item) for key, item in value.items()}
+                if isinstance(value, list):
+                    return [relocate(item) for item in value]
+                return value
+            manifest_path = staged / "version-manifest.json"
+            atomic_json(manifest_path, relocate(json.loads(manifest_path.read_text())))
+            final.parent.mkdir(exist_ok=True)
+            staged.rename(final)
+            return relocate(result)
+        finally:
+            shutil.rmtree(staging_root)
+
+
+def _render_review_export(
+    *,
+    run_dir: Path,
+    version_name: str,
+    parent_version: str | None,
+    target_language: str,
+    output_format: str,
+    approve: bool,
+    output_dir: Path,
+) -> dict[str, object]:
+    run_dir = run_dir.expanduser().resolve()
+    from pdf_translator.source_workspace import require_current_translation
+    require_current_translation(run_dir)
     project = review_project_from_run(run_dir)
     if approve:
         integrity_path = run_dir / "integrity-ledger.json"
@@ -769,6 +806,17 @@ def _run_review_export(
             integrity_ledger=integrity_ledger,
         )
     applied_segments = apply_review_state(project["translated_segments"], project["review_state"])
+    applied_by_id = {item.get("segment_id"): item for item in applied_segments}
+    missing = [item.get("segment_id") for item in project["segments"]
+               if str(item.get("source_text") or "").strip()
+               and not str((applied_by_id.get(item.get("segment_id")) or {}).get("translated_text") or "").strip()]
+    if missing:
+        raise ValueError(f"导出被阻止：{len(missing)} 个片段尚无输出，请补译或明确保留原文。")
+    from pdf_translator.review import FAIL_OPEN_MARKER
+    failed = [item.get('segment_id') for item in applied_segments
+              if FAIL_OPEN_MARKER in str(item.get('translated_text') or '')]
+    if failed:
+        raise ValueError(f"导出被阻止：{len(failed)} 个片段仍是翻译失败占位内容，请重译或明确保留原文。")
     manifest = {}
     manifest_path = run_dir / "manifest.json"
     if manifest_path.exists():
@@ -782,11 +830,10 @@ def _run_review_export(
             base_translated = json.loads(translated_chapters_file.read_text(encoding="utf-8"))
             reviewed_chapters = restore_review_chapter_apparatus(reviewed_chapters, base_translated)
     book = _load_complete_review_book(run_dir, manifest)
+    from pdf_translator.review import assert_translation_policy_coverage
+    assert_translation_policy_coverage(book, applied_segments)
     if not book.get("chapters"):
-        book = {
-            "metadata": {"schema": "review_export_fallback"},
-            "chapters": reviewed_chapters,
-        }
+        raise ValueError("导出被阻止：当前书籍结构缺少章节。请创建新任务。")
     delivery_chapters = merge_reviewed_chapters_with_resources(
         reviewed_chapters,
         book,
@@ -795,12 +842,19 @@ def _run_review_export(
     for chapter in delivery_chapters:
         body = strip_fail_open_notices(str(chapter.get("markdown") or "")).strip()
         title = str(chapter.get("title") or "").strip()
-        if title and body and not body.startswith("#"):
+        if title and body and chapter.get("toc", True) and not body.startswith("#"):
             body = f"# {title}\n\n{body}"
         if body:
             delivery_markdown_parts.append(body)
     delivery_markdown = "\n\n".join(delivery_markdown_parts).strip() + "\n"
     image_roots = _review_image_roots(run_dir, manifest)
+    from pdf_translator.epub import _markdown_to_body_html, _resolve_image_source_path
+    from bs4 import BeautifulSoup
+    missing_images = [str(img.get('src') or '')
+                      for img in BeautifulSoup(_markdown_to_body_html(delivery_markdown), 'html.parser').find_all('img')
+                      if _resolve_image_source_path(str(img.get('src') or ''), image_roots) is None]
+    if missing_images:
+        raise ValueError(f"导出被阻止：{len(missing_images)} 个必需图片无法读取，请回原文修正台处理。")
 
     version = write_versioned_outputs(
         run_dir=run_dir,
@@ -810,6 +864,7 @@ def _run_review_export(
         translated_markdown_override=delivery_markdown,
         parent_version=parent_version,
         approval_status="approved" if approve else "draft",
+        output_dir=output_dir,
     )
     version_dir = Path(version["version_dir"])
     translated_markdown_path = Path(version["translated_markdown_path"])
@@ -838,10 +893,24 @@ def _run_review_export(
         )
         rendered_files["translated_epub"] = str(epub_path)
         rendered_files["epub_href_validation"] = validate_epub_internal_hrefs(epub_path)
+        if rendered_files["epub_href_validation"].get("missing_assets"):
+            raise ValueError("导出缺少资源文件，请修正图片或资源路径后重试。")
+        if rendered_files["epub_href_validation"].get("unresolved_internal_hrefs"):
+            raise ValueError("导出包含无效内部链接，请修正脚注或章节链接后重试。")
+        if rendered_files["epub_href_validation"].get("absolute_paths"):
+            raise ValueError("导出包含本机文件路径，请修正资源引用后重试。")
 
     version_manifest_path = version_dir / "version-manifest.json"
     version_manifest = json.loads(version_manifest_path.read_text(encoding="utf-8"))
     version_manifest["render"] = {"format": output_format}
+    version_manifest["excluded_sections"] = book.get("excluded_sections", [])
+    version_manifest["source_decisions"] = [decision for chapter in book.get("chapters", [])
+                                             for decision in chapter.get("source_decisions", [])]
+    from pdf_translator.translation_failures import read_failures
+    version_manifest["translation_interventions"] = [
+        {"segment_id": key, "input_hash": item.get("input_hash"), "resolution": item["resolution"]}
+        for key, item in read_failures(run_dir)["items"].items() if item.get("resolution")
+    ]
     version_manifest["files"].update(
         {
             key: str(Path(value).relative_to(run_dir)) if isinstance(value, str) else value

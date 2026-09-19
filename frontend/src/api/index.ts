@@ -228,6 +228,7 @@ export interface ReviewProject {
   chapter_groups?: ReviewChapterGroup[]
   workflow?: ReviewWorkflow
   review_state: {
+    revision?: number
     schema: string
     summary: Record<string, number>
     workflow?: ReviewWorkflow
@@ -317,6 +318,7 @@ export interface ReviewSyncResponse {
 }
 
 export interface ReviewDecisionRequest {
+  expected_revision?: number
   status: string
   action?: 'manual_edit' | 'model_rewrite'
   reviewer_comment?: string
@@ -358,6 +360,7 @@ export type JobState =
   | 'created'
   | 'ingesting'
   | 'reconstructing'
+  | 'awaiting_chapter_confirmation'
   | 'awaiting_glossary'
   | 'translating'
   | 'polishing'
@@ -370,6 +373,7 @@ export type JobState =
   | 'failed'
 
 export interface BookJob {
+  source_revision?: number
   schema: 'book_job_v1'
   job_id: string
   revision: number
@@ -402,6 +406,8 @@ export interface BookJob {
     translation_cache_hits: number
     translation_attempts: number
     translation_retries: number
+    automatic_recovery_attempt?: number
+    automatic_recovery_limit?: number
   }
   translation_activity?: {
     status: 'active' | 'waiting' | 'stalled' | 'unknown' | 'failed'
@@ -470,6 +476,7 @@ export interface JobGlossaryResponse {
   excluded_sources?: string[]
   excluded_candidates?: JobGlossaryCandidate[]
   workflow?: {
+    glossary_finalized_by_user?: boolean
     stage?: string
     updated_at?: string
   } | null
@@ -515,6 +522,41 @@ export interface JobGlossaryResponse {
   } | null
 }
 
+export interface JobReadingUnit {
+  unit_id: string
+  chapter_id: string
+  chapter_index: number
+  order: number
+  kind: 'paragraph' | 'heading' | 'list' | 'quote' | 'figure' | 'table' | 'code' | 'note'
+  markdown: string
+  boundary_before: 'chapter' | 'paragraph' | 'continuation' | 'uncertain'
+  policy: 'translate' | 'preserve' | 'exclude'
+  policy_confirmed: boolean
+  provenance: Array<{
+    source_format: 'pdf' | 'epub'
+    precision: 'chapter' | 'resource' | 'dom' | 'span'
+    page_no?: number
+    resource_path?: string
+    dom_path?: string
+    anchor?: string
+  }>
+}
+
+export interface JobReadingUnitsDocument {
+  schema: 'bookweaver_reading_units_v1'
+  source_format: 'pdf' | 'epub'
+  chapter_count: number
+  unit_count: number
+  chapters: Array<{
+    chapter_id: string
+    index: number
+    title: string
+    policy: 'translate' | 'preserve' | 'exclude'
+    unit_ids: string[]
+  }>
+  units: JobReadingUnit[]
+}
+
 export interface JobGlossarySuggestResponse {
   status: 'started'
   suggest_status: NonNullable<JobGlossaryResponse['suggest_status']>
@@ -543,7 +585,7 @@ export interface WorkspaceBook {
     | 'processing'
     | 'needs_translation_review'
     | 'needs_chapter_confirmation'
-    | 'ready_for_knowledge'
+    | 'phase_a_complete'
     | 'failed'
   steps: {
     import: WorkspaceStep
@@ -553,21 +595,21 @@ export interface WorkspaceBook {
     polish?: WorkspaceStep
     translation_review: WorkspaceStep
     chapter_confirmation: WorkspaceStep
-    knowledge_handoff: WorkspaceStep
+    delivery: WorkspaceStep
   }
   next_action: {
     kind:
       | 'view_progress'
       | 'review_translation'
       | 'confirm_chapters'
-      | 'start_knowledge'
+      | 'view_delivery'
       | 'resume_job'
       | 'finalize_glossary'
       | 'start_translation'
     label: string
     href: string
   }
-  knowledge_ready: boolean
+  phase_a_complete: boolean
   updated_at?: string
   progress_percent: number
   pipeline_locked?: boolean
@@ -586,7 +628,7 @@ export interface WorkspaceTextVersion {
   status_label?: string
   text_operation?: BookJob['resolved']['text_operation']
   processing_mode?: BookJob['request']['processing_mode']
-  knowledge_ready: boolean
+  phase_a_complete: boolean
   progress_percent: number
   updated_at?: string
   next_action: WorkspaceBook['next_action']
@@ -630,6 +672,7 @@ export interface WorkspaceBooksResponse {
 }
 
 export interface JobChapterDraft {
+  content_policy?: 'auto' | 'translate' | 'preserve' | 'exclude'
   index: number
   chapter_id: string
   title: string
@@ -801,7 +844,14 @@ export const uploadApi = {
   },
 }
 
+export interface SourceBlock { id: string; text: string; policy: 'translate' | 'preserve' | 'exclude'; reason: string }
+export interface SourceWorkspace { revision: number; page: number; blocks: SourceBlock[]; available_pages: number[]; can_undo: boolean; issue_groups?: {code: string; count: number; pages: number[]}[]; issues: { block_id: string; code: string; severity: string; status: string }[] }
+
 export const jobsApi = {
+  pauseTranslation: (jobId: string) => request<{status: string; detail: string}>(`/jobs/${encodeURIComponent(jobId)}/translation-pause`, { method: 'POST' }),
+  sourceWorkspace: (jobId: string, page: number) => request<SourceWorkspace>(`/jobs/${encodeURIComponent(jobId)}/source-workspace?page=${page}`),
+  saveSourceWorkspace: (jobId: string, data: { page: number; blocks: SourceBlock[]; expected_revision: number; request_id: string; undo?: boolean }) =>
+    request<SourceWorkspace>(`/jobs/${encodeURIComponent(jobId)}/source-workspace`, { method: 'POST', body: JSON.stringify(data) }),
   create: (
     file: File,
     options: CreateJobOptions,
@@ -850,6 +900,10 @@ export const jobsApi = {
   },
   list: () => request<JobListResponse>('/jobs'),
   get: (jobId: string) => request<BookJob>(`/jobs/${encodeURIComponent(jobId)}`),
+  readingUnits: (jobId: string) =>
+    request<JobReadingUnitsDocument>(
+      `/jobs/${encodeURIComponent(jobId)}/artifacts/reading_units`,
+    ),
   delete: (jobId: string) =>
     request<{ status: 'deleted'; job_id: string }>(`/jobs/${encodeURIComponent(jobId)}`, {
       method: 'DELETE',
@@ -898,12 +952,12 @@ export const jobsApi = {
       `/jobs/${encodeURIComponent(jobId)}/chapters/confirm`,
       { method: 'POST' }
     ),
-  confirmChapterDraft: (jobId: string, chapters: JobChapterDraft[]) =>
+  confirmChapterDraft: (jobId: string, chapters: JobChapterDraft[], expectedSourceRevision = 0) =>
     request<{ job: BookJob; workspace_book: WorkspaceBook }>(
       `/jobs/${encodeURIComponent(jobId)}/chapters/confirm`,
       {
         method: 'POST',
-        body: JSON.stringify({ chapters }),
+        body: JSON.stringify({ chapters, expected_source_revision: expectedSourceRevision }),
       }
     ),
   getReviewLink: (jobId: string) =>

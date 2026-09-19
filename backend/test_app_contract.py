@@ -7,6 +7,27 @@ import pytest
 from fastapi.testclient import TestClient
 
 
+def test_failure_resolution_api_revision_lock_and_missing_reason(tmp_path, monkeypatch):
+    module = importlib.import_module('main')
+    from pdf_translator.translation_failures import put_failure
+    put_failure(tmp_path, 's1', {'source': 'Original', 'input_hash': 'hash', 'status': 'failed'})
+    locks = []
+    service = SimpleNamespace(
+        get=lambda _: {'state': 'failed'},
+        artifact_path=lambda *_: tmp_path / 'book.json',
+        _acquire_worker_lock=lambda _: locks.append('acquire'),
+        _release_worker_lock=lambda _: locks.append('release'),
+    )
+    monkeypatch.setattr(module, 'get_job_service', lambda: service)
+    client = TestClient(module.app)
+    url = '/api/jobs/test/translation-failures'
+    assert client.get(url).json()['revision'] == 1
+    assert client.post(url, json={'key': 's1', 'revision': 1, 'text': '', 'kind': 'preserve_source'}).status_code == 400
+    assert client.post(url, json={'key': 's1', 'revision': 1, 'text': '人工译文'}).status_code == 200
+    assert client.post(url, json={'key': 's1', 'revision': 1, 'text': '过期页面'}).status_code == 409
+    assert locks == ['acquire', 'release'] * 3
+
+
 def test_application_imports_without_tencent_sdk():
     module = importlib.import_module("main")
     assert module.app.title
@@ -79,6 +100,29 @@ def _write_review_project(run_dir: Path, *, open_items: int = 0):
     )
 
 
+def _write_current_review_contract(run_dir: Path) -> None:
+    (run_dir / "manifest.json").write_text(json.dumps({"mode": "translate"}), encoding="utf-8")
+    (run_dir / "reading-units.json").write_text(
+        json.dumps(
+            {
+                "schema": "bookweaver_reading_units_v1",
+                "generation": {"translation_authority": True},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "chapter-segments.json").write_text(
+        json.dumps(
+            {
+                "schema": "bookweaver_chapter_segments_v1",
+                "source": "confirmed_reading_units",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "integrity-ledger.json").write_text("{}", encoding="utf-8")
+
+
 def test_review_project_export_does_not_imply_review_completed(tmp_path: Path):
     module = importlib.import_module("main")
     run_dir = tmp_path / "review"
@@ -145,40 +189,13 @@ def test_review_project_item_preserves_zero_open_items_and_pending_rewrites(tmp_
     assert item.rewrites_needing_instruction == 1
 
 
-def test_review_project_list_prefers_desktop_job_copy(tmp_path: Path, monkeypatch):
-    module = importlib.import_module("main")
-    legacy_root = tmp_path / "legacy"
-    jobs_root = tmp_path / "jobs"
-    legacy_run = legacy_root / "same-book-review"
-    job_run = jobs_root / "same-book-review"
-    for run_dir in (legacy_run, job_run):
-        _write_review_project(run_dir)
-        (run_dir / "manifest.json").write_text(
-            json.dumps({"source_pdf": "/books/Same Book.epub"}),
-            encoding="utf-8",
-        )
-
-    monkeypatch.setattr(module, "_review_roots", lambda: [legacy_root, jobs_root])
-    monkeypatch.setattr(
-        module,
-        "get_job_service",
-        lambda: SimpleNamespace(jobs_dir=jobs_root),
-    )
-
-    response = TestClient(module.app).get("/api/review/projects")
-
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["total_projects"] == 1
-    assert payload["projects"][0]["run_dir"] == str(job_run)
-
-
 def test_review_project_list_marks_workspace_job_origin(tmp_path: Path, monkeypatch):
     module = importlib.import_module("main")
     jobs_root = tmp_path / "jobs"
     job_dir = jobs_root / "job-1"
     run_dir = job_dir / "review"
     _write_review_project(run_dir)
+    _write_current_review_contract(run_dir)
     (job_dir / "job.json").write_text(json.dumps({"schema": "book_job_v1"}), encoding="utf-8")
     monkeypatch.setattr(module, "_review_roots", lambda: [jobs_root])
     monkeypatch.setattr(
@@ -193,11 +210,30 @@ def test_review_project_list_marks_workspace_job_origin(tmp_path: Path, monkeypa
     assert response.json()["projects"][0]["workspace_job_id"] == "job-1"
 
 
+def test_review_project_list_excludes_run_without_current_contract(tmp_path: Path, monkeypatch):
+    module = importlib.import_module("main")
+    jobs_root = tmp_path / "jobs"
+    job_dir = jobs_root / "job-1"
+    run_dir = job_dir / "review"
+    _write_review_project(run_dir)
+    (job_dir / "job.json").write_text(json.dumps({"schema": "book_job_v1"}), encoding="utf-8")
+    monkeypatch.setattr(module, "_review_roots", lambda: [jobs_root])
+    monkeypatch.setattr(module, "get_job_service", lambda: SimpleNamespace(jobs_dir=jobs_root))
+
+    response = TestClient(module.app).get("/api/review/projects")
+
+    assert response.status_code == 200
+    assert response.json()["total_projects"] == 0
+
+
 def test_review_project_can_be_hidden_without_deleting_files(tmp_path: Path, monkeypatch):
     module = importlib.import_module("main")
     jobs_root = tmp_path / "jobs"
-    run_dir = jobs_root / "book-review"
+    job_dir = jobs_root / "job-1"
+    run_dir = job_dir / "review"
     _write_review_project(run_dir)
+    _write_current_review_contract(run_dir)
+    (job_dir / "job.json").write_text(json.dumps({"schema": "book_job_v1"}), encoding="utf-8")
     monkeypatch.setattr(module, "_review_roots", lambda: [jobs_root])
     monkeypatch.setattr(
         module,
@@ -218,9 +254,9 @@ def test_review_project_can_be_hidden_without_deleting_files(tmp_path: Path, mon
 def test_review_project_delete_is_limited_to_jobs_root(tmp_path: Path, monkeypatch):
     module = importlib.import_module("main")
     jobs_root = tmp_path / "jobs"
-    legacy_run = tmp_path / "legacy" / "book-review"
-    _write_review_project(legacy_run)
-    monkeypatch.setattr(module, "_review_roots", lambda: [legacy_run.parent, jobs_root])
+    external_run = tmp_path / "external" / "book-review"
+    _write_review_project(external_run)
+    monkeypatch.setattr(module, "_review_roots", lambda: [external_run.parent, jobs_root])
     monkeypatch.setattr(
         module,
         "get_job_service",
@@ -229,18 +265,19 @@ def test_review_project_delete_is_limited_to_jobs_root(tmp_path: Path, monkeypat
 
     response = TestClient(module.app).delete(
         "/api/review/projects",
-        params={"run_dir": str(legacy_run), "mode": "delete"},
+        params={"run_dir": str(external_run), "mode": "delete"},
     )
 
     assert response.status_code == 400
-    assert legacy_run.exists()
+    assert external_run.exists()
 
 
-def test_review_rewrite_rejects_missing_instruction(tmp_path: Path, monkeypatch):
+def test_review_rewrite_accepts_missing_instruction(tmp_path: Path, monkeypatch):
     module = importlib.import_module("main")
     run_dir = tmp_path / "review"
     _write_review_project(run_dir, open_items=0)
     monkeypatch.setattr(module, "_resolve_review_run_dir", lambda _: run_dir)
+    monkeypatch.setattr(module, "_run_pdf_translator_cli", lambda *args, **kwargs: SimpleNamespace(stdout="Rewritten candidates: 1", stderr="", returncode=0))
 
     response = TestClient(module.app).post(
         "/api/review/rewrite",
@@ -248,8 +285,25 @@ def test_review_rewrite_rejects_missing_instruction(tmp_path: Path, monkeypatch)
         json={},
     )
 
-    assert response.status_code == 400
-    assert "尚未填写给模型的重译要求" in response.json()["detail"]
+    assert response.status_code == 200
+
+
+def test_old_review_page_cannot_overwrite_new_decision(tmp_path: Path, monkeypatch):
+    module = importlib.import_module("main")
+    run_dir = tmp_path / "review"
+    _write_review_project(run_dir, open_items=0)
+    (run_dir / "segments.json").write_text(json.dumps({"segments": [{"segment_id": "s1", "source_text": "Text"}]}))
+    monkeypatch.setattr(module, "_resolve_review_run_dir", lambda _: run_dir)
+    client = TestClient(module.app)
+    url = '/api/review/segments/s1/decision'
+    first = client.post(url, params={'run_dir': str(run_dir)}, json={
+        'expected_revision': 0, 'status': 'approved', 'action': 'manual_edit', 'approved_text': '最新人工译文'})
+    assert first.status_code == 200
+    stale = client.post(url, params={'run_dir': str(run_dir)}, json={
+        'expected_revision': 0, 'status': 'approved', 'action': 'manual_edit', 'approved_text': '旧窗口译文'})
+    assert stale.status_code == 409
+    state = json.loads((run_dir/'review_state.json').read_text())
+    assert state['decisions']['s1']['approved_text'] == '最新人工译文'
 
 
 def test_review_rewrite_uses_nested_cli_command(tmp_path: Path, monkeypatch):
@@ -326,6 +380,19 @@ def test_review_export_uses_nested_cli_command(tmp_path: Path, monkeypatch):
         "translated_pdf",
         "translated_epub",
     }
+    assert Path(response.json()["delivered_files"]["translated_pdf"]).name == "book (final).pdf"
+    assert Path(response.json()["delivered_files"]["translated_epub"]).name == "book (final).epub"
+
+
+def test_latest_export_is_chronological_not_alphabetical(tmp_path):
+    import os
+    module = importlib.import_module("main")
+    for name, timestamp in [("z-old", 100), ("a-new", 200)]:
+        path = tmp_path / "versions" / name / "version-manifest.json"
+        path.parent.mkdir(parents=True)
+        path.write_text("{}")
+        os.utime(path, (timestamp, timestamp))
+    assert module._collect_exported_versions(tmp_path) == ["z-old", "a-new"]
 
 
 def test_pdf_translator_cli_hides_traceback_and_clears_foreign_virtualenv(
@@ -389,11 +456,12 @@ def test_review_decision_summary_does_not_double_count_approved_items(
     ]
 
     client = TestClient(module.app)
-    for segment_id in item_ids:
+    for revision, segment_id in enumerate(item_ids):
         response = client.post(
             f"/api/review/segments/{segment_id}/decision",
             params={"run_dir": str(run_dir)},
             json={
+                "expected_revision": revision,
                 "status": "approved",
                 "action": "manual_edit",
                 "approved_text": "译文",
@@ -834,7 +902,7 @@ def test_workspace_books_marks_translation_review_as_required_for_translated_job
     assert book["steps"]["chapter_confirmation"]["status"] == "action_required"
     assert book["workflow_path"] == "translation_edition"
     assert "translation_review" in book["workflow_step_order"]
-    assert book["knowledge_ready"] is False
+    assert book["phase_a_complete"] is False
     assert response.json()["total_source_books"] == 1
     assert response.json()["source_books"][0]["text_versions"][0]["kind"] == "translated"
 
@@ -849,7 +917,7 @@ def test_workspace_books_marks_translation_review_after_chapters_confirmed(tmp_p
         artifacts={
             "book": {"href": "artifacts/book.json"},
             "review_items": {"href": "artifacts/review_items.json"},
-            "canonical_chapters": {"href": "artifacts/canonical-chapters.json"},
+            "canonical_chapters": {"href": "artifacts/canonical-chapters.json", "source_artifact": "user_confirmation"},
         },
     )
 
@@ -926,7 +994,7 @@ def test_workspace_books_next_action_rejects_auto_confirmed_chapters_after_gloss
     assert book["steps"]["chapter_confirmation"]["status"] == "action_required"
 
 
-def test_workspace_books_accepts_legacy_user_confirmed_canonical_file(
+def test_workspace_books_rejects_canonical_file_without_current_artifact_metadata(
     tmp_path: Path,
     monkeypatch,
 ):
@@ -943,7 +1011,7 @@ def test_workspace_books_accepts_legacy_user_confirmed_canonical_file(
         encoding="utf-8",
     )
     snapshot = _job_snapshot(
-        "job-legacy-user-chapters",
+        "job-stale-user-chapters",
         filename="Policy Book.epub",
         state="awaiting_glossary",
         text_operation="translate",
@@ -966,8 +1034,8 @@ def test_workspace_books_accepts_legacy_user_confirmed_canonical_file(
 
     book = module._workspace_book_from_job(snapshot)
 
-    assert book["next_action"]["kind"] == "start_translation"
-    assert book["steps"]["chapter_confirmation"]["status"] == "done"
+    assert book["next_action"]["kind"] == "confirm_chapters"
+    assert book["steps"]["chapter_confirmation"]["status"] == "action_required"
 
 
 def test_workspace_books_next_action_start_translation_after_glossary_and_chapters_ready(monkeypatch):
@@ -1120,7 +1188,7 @@ def test_workspace_books_skips_translation_review_for_preserved_jobs(tmp_path, m
     assert book["steps"]["chapter_confirmation"]["status"] == "action_required"
     assert book["workflow_path"] == "source_edition"
     assert "translation_review" not in book["workflow_step_order"]
-    assert book["knowledge_ready"] is False
+    assert book["phase_a_complete"] is False
     source_book = response.json()["source_books"][0]
     assert source_book["chapter_structure"]["status"] == "needs_confirmation"
     assert source_book["text_versions"][0]["kind"] == "source"
@@ -1179,7 +1247,7 @@ def test_workspace_books_groups_source_book_text_versions_and_history(tmp_path, 
         text_operation="preserve",
         artifacts={
             "book": {"href": "artifacts/book.json"},
-            "canonical_chapters": {"href": "artifacts/canonical-chapters.json"},
+            "canonical_chapters": {"href": "artifacts/canonical-chapters.json", "source_artifact": "user_confirmation"},
         },
     )
     translated_old = _job_snapshot(
@@ -1279,7 +1347,7 @@ def test_workspace_books_prefers_in_flight_translation_over_stale_review_ready(m
     assert source_book["chapter_structure"]["label"] == "翻译进行中"
 
 
-def test_confirm_job_chapters_marks_preserved_job_ready_for_knowledge(tmp_path, monkeypatch):
+def test_confirm_job_chapters_marks_preserved_job_phase_a_complete(tmp_path, monkeypatch):
     module = importlib.import_module("main")
     snapshot = _job_snapshot(
         "job-preserve",
@@ -1288,7 +1356,7 @@ def test_confirm_job_chapters_marks_preserved_job_ready_for_knowledge(tmp_path, 
         text_operation="preserve",
         artifacts={
             "book": {"href": "artifacts/book.json"},
-            "canonical_chapters": {"href": "artifacts/canonical-chapters.json"},
+            "canonical_chapters": {"href": "artifacts/canonical-chapters.json", "source_artifact": "user_confirmation"},
         },
     )
     calls = []
@@ -1307,9 +1375,10 @@ def test_confirm_job_chapters_marks_preserved_job_ready_for_knowledge(tmp_path, 
     assert calls == ["job-preserve"]
     body = response.json()
     assert body["job"]["artifacts"]["canonical_chapters"]["href"] == "artifacts/canonical-chapters.json"
-    assert body["workspace_book"]["pipeline_status"] == "ready_for_knowledge"
+    assert body["workspace_book"]["pipeline_status"] == "phase_a_complete"
     assert body["workspace_book"]["steps"]["chapter_confirmation"]["status"] == "done"
-    assert body["workspace_book"]["knowledge_ready"] is True
+    assert body["workspace_book"]["steps"]["delivery"]["status"] == "ready"
+    assert body["workspace_book"]["phase_a_complete"] is True
 
 
 def test_get_job_chapter_draft_returns_editable_chapters(tmp_path, monkeypatch):

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import fcntl
 import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 from datetime import datetime, timezone
 from typing import Any
 
@@ -61,7 +63,7 @@ def _merge_shell_exports(path: Path, environment: dict[str, str], *, keys: tuple
         if value:
             environment[key] = value
 
-_CHAPTER_CONFIRM_BLOCKED_STATES = frozenset({"created", "ingesting", "reconstructing"})
+_CHAPTER_CONFIRM_BLOCKED_STATES = frozenset({"created", "ingesting", "reconstructing", "translating", "polishing", "pre_review", "preserving", "validating", "exporting"})
 _PIPELINE_LOCKED_STATES = frozenset(
     {
         "created",
@@ -86,6 +88,45 @@ class JobNotFound(JobServiceError):
 
 
 class BookJobService:
+    def source_workspace(self, job_id: str, page: int) -> dict[str, Any]:
+        from pdf_translator.source_workspace import inspect_page, source_pages
+        book_path = self.artifact_path(job_id, "book")
+        baseline = book_path.parent / "source-baseline-book.json"
+        pages = source_pages(self._read_json_any(baseline if baseline.exists() else book_path), source_path=self.source_path(job_id),
+                             asset_dir=book_path.parent / "book-images")
+        return inspect_page(book_path.parent, pages, page)
+
+    def save_source_workspace(self, job_id: str, *, page: int, blocks: list[dict],
+                              expected_revision: int, request_id: str, undo: bool = False) -> dict:
+        from pdf_translator.source_workspace import save_page, source_pages, read_source_state
+        snapshot = self.get(job_id)
+        if snapshot.get("state") in _CHAPTER_CONFIRM_BLOCKED_STATES or self.translation_worker_lock_held(job_id):
+            raise JobServiceError("任务运行中，原文已冻结。请等待任务停止后修改。")
+        book_path = self.artifact_path(job_id, "book")
+        baseline = book_path.parent / "source-baseline-book.json"
+        if not baseline.exists():
+            self._write_json_atomic(baseline, self._read_json_any(book_path))
+        pages = source_pages(self._read_json_any(baseline), source_path=self.source_path(job_id),
+                             asset_dir=book_path.parent / "book-images")
+        if request_id in read_source_state(book_path.parent)["requests"]:
+            return self.source_workspace(job_id, page)
+        state = save_page(book_path.parent, pages=pages, page=page, blocks=blocks,
+                          expected_revision=expected_revision, request_id=request_id, undo=undo)
+        canonical_info = snapshot.get("artifacts", {}).get("canonical_chapters")
+        if isinstance(canonical_info, dict):
+            canonical_info["source_artifact"] = "source_modified"
+        snapshot["source_revision"] = state["revision"]
+        snapshot["state"] = "awaiting_chapter_confirmation"
+        snapshot["failed_stage"] = None
+        snapshot["error"] = None
+        from pdf_translator.workflow import write_workflow
+        write_workflow(book_path.parent, stage="awaiting_chapter_confirmation")
+        for name in ("glossary_candidates", "glossary_active", "glossary_decisions"):
+            snapshot.get("artifacts", {}).pop(name, None)
+        snapshot["revision"] = int(snapshot.get("revision") or 0) + 1
+        self._write_json_atomic(self._job_dir(job_id) / "job.json", snapshot)
+        return self.source_workspace(job_id, page)
+
     def __init__(
         self,
         *,
@@ -102,6 +143,7 @@ class BookJobService:
             jobs_dir or settings.BOOKMATE_JOBS_DIR
         ).expanduser().resolve()
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
+        self._worker_handles: dict[str, Any] = {}
 
     def create(
         self,
@@ -175,9 +217,22 @@ class BookJobService:
             self._require_user_confirmed_canonical_chapters(job_id)
         self._acquire_worker_lock(job_id)
         try:
+            try:
+                (self._run_dir(job_id) / "translation-pause.json").unlink(missing_ok=True)
+            except JobNotFound:
+                pass
             self._run(["job", "resume", job_id, "--jobs-dir", str(self.jobs_dir), "--json"])
         finally:
             self._release_worker_lock(job_id)
+
+    def pause_translation(self, job_id: str) -> dict:
+        snapshot = self.get(job_id)
+        if snapshot.get("state") != "translating":
+            raise JobServiceError("只有正在翻译的任务可以暂停。")
+        self._write_json_atomic(self._run_dir(job_id) / "translation-pause.json", {
+            "requested_by": "user", "requested_at": datetime.now(timezone.utc).isoformat(),
+        })
+        return {"status": "pause_requested", "detail": "已请求暂停；当前模型请求结束或超时后停止，已完成内容保留。"}
 
     def mark_translation_resume_blocked(self, job_id: str, message: str) -> None:
         self._validate_job_id(job_id)
@@ -265,6 +320,15 @@ class BookJobService:
         return self._job_dir(job_id) / "translation-worker.lock"
 
     def translation_worker_lock_held(self, job_id: str) -> bool:
+        guard = self._job_dir(job_id) / ".worker-guard"
+        if guard.exists():
+            with guard.open("a") as handle:
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return True
+                fcntl.flock(handle, fcntl.LOCK_UN)
+            return False
         path = self._worker_lock_path(job_id)
         if not path.is_file():
             return False
@@ -279,10 +343,24 @@ class BookJobService:
     def _acquire_worker_lock(self, job_id: str) -> None:
         if self.translation_worker_lock_held(job_id):
             raise JobServiceError(f"Translation worker already running for job {job_id}.")
-        self._worker_lock_path(job_id).write_text(str(os.getpid()), encoding="utf-8")
+        handle = (self._job_dir(job_id) / ".worker-guard").open("a")
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._worker_lock_path(job_id).write_text(str(os.getpid()), encoding="utf-8")
+        except BlockingIOError as exc:
+            handle.close()
+            raise JobServiceError(f"Translation worker already running for job {job_id}.") from exc
+        except Exception:
+            handle.close()
+            raise
+        self._worker_handles[job_id] = handle
 
     def _release_worker_lock(self, job_id: str) -> None:
         self._worker_lock_path(job_id).unlink(missing_ok=True)
+        handle = self._worker_handles.pop(job_id, None)
+        if handle is not None:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+            handle.close()
 
     def delete(self, job_id: str) -> None:
         self._validate_job_id(job_id)
@@ -290,6 +368,8 @@ class BookJobService:
         jobs_root = self.jobs_dir.resolve()
         if not job_dir.is_dir() or job_dir == jobs_root or jobs_root not in job_dir.parents:
             raise JobNotFound(f"Job not found: {job_id}")
+        if self.translation_worker_lock_held(job_id):
+            raise JobServiceError("任务仍在运行，请暂停并等待停止后再删除。")
         shutil.rmtree(job_dir)
 
     @staticmethod
@@ -442,6 +522,14 @@ class BookJobService:
         if activity is not None:
             enriched["translation_activity"] = activity
         if resume is not None:
+            if snapshot.get("state") == "failed" and "book" in snapshot.get("artifacts", {}):
+                from pdf_translator.translation_failures import read_failures
+                failures = read_failures(self._artifact_path_from_snapshot(job_id, snapshot, "book").parent)
+                if failures["items"]:
+                    enriched["error"] = dict(enriched.get("error") or {}, code="translation_intervention_required",
+                        message="部分片段待处理，已完成结果保留。")
+                    if resume.get("reason") in {"translation_failed", "not_retryable"}:
+                        resume = dict(resume, reason="human_intervention", label="重试待处理片段", detail="成功结果已保存，请处理失败清单后恢复。")
             enriched["translation_resume"] = resume
         return enriched
 
@@ -507,6 +595,10 @@ class BookJobService:
             elif state in {"exporting", "awaiting_human_review", "completed", "pre_review", "validating"}:
                 progress["translation_chunks_completed"] = total
                 progress["stage_percent"] = 100
+                if state == "awaiting_human_review":
+                    progress["overall_percent"] = 90
+                elif state == "completed":
+                    progress["overall_percent"] = 100
         elif cache_completed > 0:
             progress["translation_chunks_completed"] = cache_completed
         merged["progress"] = progress
@@ -618,12 +710,12 @@ class BookJobService:
 
         if self.translation_worker_lock_held(job_id):
             activity_status = "waiting" if running_chunks > 0 else "active"
-        elif cache_recent or cache_ahead:
-            activity_status = "active"
         elif state == "failed":
             activity_status = "failed"
         elif progress_status == "failed" or last_job_status == "failed":
             activity_status = "failed"
+        elif cache_recent or cache_ahead:
+            activity_status = "active"
         elif seconds_since_update is None:
             activity_status = "unknown"
         elif seconds_since_update <= 120:
@@ -680,6 +772,15 @@ class BookJobService:
                 "reason": "already_running",
                 "detail": "翻译引擎正在后台运行，请等待当前批次完成后再试。",
             }
+
+        try:
+            paused = (self._artifact_path_from_snapshot(job_id, snapshot, "book").parent / "translation-pause.json").exists()
+        except JobNotFound:
+            paused = False
+        if paused and state == "failed":
+            blocker = self._translation_resume_human_gate_blocker(job_id)
+            return {"available": not bool(blocker), "reason": "user_paused",
+                    "label": "继续已暂停的翻译", "detail": blocker or "用户已暂停，只有手动操作才会继续。"}
 
         cooldown = self._resume_cooldown_remaining(job_id)
         if cooldown > 0:
@@ -773,6 +874,13 @@ class BookJobService:
             return str(exc) or "请先人工确认章节目录，再开始全文翻译。"
         if not isinstance(canonical, dict) or canonical.get("source_artifact") != "user_confirmation":
             return "请先人工确认章节目录，再开始全文翻译。"
+        try:
+            from pdf_translator.source_workspace import require_current_source
+            require_current_source(self._artifact_path_from_snapshot(job_id, snapshot, "book").parent, canonical)
+        except JobNotFound:
+            pass  # Legacy snapshots without a run cannot have source corrections.
+        except ValueError as exc:
+            return str(exc)
 
         try:
             from pdf_translator.workflow import (
@@ -1043,7 +1151,8 @@ class BookJobService:
             return text_toc, "pdf_text_toc", detail, meta
 
         book_path = self.artifact_path(job_id, "book")
-        book = self._read_json_any(book_path)
+        baseline = book_path.parent / "source-baseline-book.json"
+        book = self._read_json_any(baseline if baseline.exists() else book_path)
         chapters = book.get("chapters") if isinstance(book, dict) else None
         if not isinstance(chapters, list) or not chapters:
             raise JobServiceError("Book structure does not contain chapters.")
@@ -1169,10 +1278,11 @@ class BookJobService:
         job_id: str,
         *,
         chapters: list[dict[str, Any]] | None = None,
+        expected_source_revision: int = 0,
     ) -> dict[str, Any]:
         snapshot = self.get(job_id)
         state = str(snapshot.get("state") or "")
-        if state in _CHAPTER_CONFIRM_BLOCKED_STATES:
+        if state in _CHAPTER_CONFIRM_BLOCKED_STATES or self.translation_worker_lock_held(job_id):
             raise JobServiceError("章节确认需等待结构解析完成后再进行。")
         source_artifact = "user_confirmation" if chapters is not None else "book"
         source_chapters = chapters if chapters is not None else self.draft_chapters(job_id)
@@ -1192,22 +1302,106 @@ class BookJobService:
         }
         if not canonical["chapters"]:
             raise JobServiceError("Book structure does not contain valid chapters.")
+        if source_artifact == "user_confirmation":
+            for chapter in canonical["chapters"]:
+                if chapter.get("content_policy") == "auto":
+                    chapter["content_policy"] = "translate"
+
+        from pdf_translator.source_workspace import bind_source_revision
+        try:
+            canonical = bind_source_revision(canonical, self.artifact_path(job_id, "book").parent)
+            if canonical["source_revision"] != expected_source_revision:
+                raise JobServiceError("原文版本已变化，请刷新并核对后重新确认章节。")
+        except JobNotFound:
+            pass
 
         job_dir = self._job_dir(job_id)
         canonical_path = job_dir / "artifacts" / "canonical-chapters.json"
         canonical_path.parent.mkdir(parents=True, exist_ok=True)
-        self._write_json_atomic(canonical_path, canonical)
 
         snapshot.setdefault("artifacts", {})["canonical_chapters"] = {
             "href": canonical_path.relative_to(job_dir).as_posix(),
             "source_artifact": source_artifact,
         }
-        segment_path = self._write_chapter_segment_preview(job_id, canonical, source_artifact)
+        canonical_book = self._build_confirmed_book(job_id, canonical) if source_artifact == "user_confirmation" else None
+        segment_path = self._write_chapter_segment_preview(
+            job_id,
+            canonical,
+            source_artifact,
+            canonical_book=canonical_book,
+        )
+        # Do not publish a confirmation if preview construction failed.
+        self._write_json_atomic(canonical_path, canonical)
+        from pdf_translator.source_workspace import chapter_fingerprint
+        chapter_scope_changed = True
+        try:
+            run_dir = self.artifact_path(job_id, "book").parent
+            binding_path = run_dir / "confirmed-input.json"
+            fingerprint = chapter_fingerprint(canonical)
+            previous = self._read_json_any(binding_path) if binding_path.exists() else {}
+            chapter_scope_changed = previous.get("chapter_fingerprint") != fingerprint
+            self._write_json_atomic(binding_path, {"chapter_fingerprint": fingerprint})
+            if chapter_scope_changed and state in {"awaiting_human_review", "completed"}:
+                snapshot["state"] = "awaiting_chapter_confirmation"
+                from pdf_translator.workflow import write_workflow
+                write_workflow(run_dir, stage="awaiting_chapter_confirmation")
+        except JobNotFound:
+            pass
         if segment_path is not None:
             snapshot.setdefault("artifacts", {})["chapter_segments"] = {
                 "href": segment_path.relative_to(job_dir).as_posix(),
                 "source_artifact": source_artifact,
             }
+        if source_artifact == "user_confirmation":
+            request = snapshot.get("request") if isinstance(snapshot.get("request"), dict) else {}
+            resolved = snapshot.get("resolved") if isinstance(snapshot.get("resolved"), dict) else {}
+            if canonical_book is not None:
+                from pdf_translator.reading_units import write_reading_units
+                run_dir = self.artifact_path(job_id, "book").parent
+                try:
+                    confirmed_source_path = self.source_path(job_id)
+                except JobNotFound:
+                    source = snapshot.get("source") if isinstance(snapshot.get("source"), dict) else {}
+                    confirmed_source_path = Path(str(source.get("filename") or "source.pdf"))
+                write_reading_units(
+                    run_dir / "reading-units.json",
+                    canonical_book,
+                    source_path=confirmed_source_path,
+                    translation_authority=True,
+                )
+            mode = str(request.get("processing_mode") or "auto")
+            text_operation = str(resolved.get("text_operation") or "")
+            if not text_operation:
+                from pdf_translator.jobs import resolve_text_operation
+                text_operation = resolve_text_operation(
+                    mode,
+                    resolved.get("source_language") or request.get("source_language"),
+                    str(request.get("target_language") or "zh-CN"),
+                )
+            if text_operation == "translate" and canonical_book is not None:
+                from pdf_translator.glossary import (
+                    extract_glossary_candidates,
+                    reconcile_active_glossary_to_book,
+                )
+                from pdf_translator.workflow import write_workflow
+                run_dir = self.artifact_path(job_id, "book").parent
+                if chapter_scope_changed and (run_dir / "glossary").is_dir():
+                    reconcile_active_glossary_to_book(run_dir, canonical_book)
+                extract_glossary_candidates(run_dir, book=canonical_book)
+                write_workflow(run_dir, stage="awaiting_glossary")
+                for name, relative in {
+                    "glossary_candidates": "glossary/candidates.json",
+                    "glossary_active": "glossary/active.json",
+                    "glossary_decisions": "glossary/decisions.jsonl",
+                }.items():
+                    path = run_dir / relative
+                    if path.is_file():
+                        snapshot.setdefault("artifacts", {})[name] = {
+                            "href": path.relative_to(job_dir).as_posix()
+                        }
+                snapshot["state"] = "awaiting_glossary"
+            elif mode == "convert":
+                snapshot["state"] = "awaiting_glossary"
         snapshot["updated_at"] = canonical["created_at"]
         snapshot["revision"] = int(snapshot.get("revision") or 0) + 1
         self._write_json_atomic(job_dir / "job.json", snapshot)
@@ -1218,6 +1412,8 @@ class BookJobService:
         job_id: str,
         canonical: dict[str, Any],
         source_artifact: str,
+        *,
+        canonical_book: dict[str, Any] | None = None,
     ) -> Path | None:
         if source_artifact != "user_confirmation":
             return None
@@ -1226,21 +1422,33 @@ class BookJobService:
         except JobNotFound:
             return None
         try:
-            from pdf_translator.book_rebuild import apply_canonical_chapter_plan
-            from pdf_translator.chapter_segments import build_chapter_segments
+            from pdf_translator.chapter_segments import build_chapter_segments_from_reading_units
             from pdf_translator.config import DEFAULT_MAX_CHUNK_CHARS
+            from pdf_translator.reading_units import build_reading_units
         except Exception as exc:
             raise JobServiceError("无法加载章节拆分预览模块。") from exc
         try:
             max_chars = int(os.getenv("BOOKWEAVER_MAX_CHUNK_CHARS") or DEFAULT_MAX_CHUNK_CHARS)
         except ValueError:
             max_chars = int(DEFAULT_MAX_CHUNK_CHARS)
-        book = self._read_json_any(book_path)
-        if not isinstance(book, dict):
-            raise JobServiceError("书籍结构不可用于生成章节拆分预览。")
         try:
-            canonical_book = apply_canonical_chapter_plan(book, canonical)
-            segment_plan = build_chapter_segments(canonical_book, max_chars=max_chars)
+            if canonical_book is None:
+                canonical_book = self._build_confirmed_book(job_id, canonical)
+            try:
+                confirmed_source_path = self.source_path(job_id)
+            except JobNotFound:
+                metadata = canonical_book.get("metadata") if isinstance(canonical_book.get("metadata"), dict) else {}
+                suffix = ".epub" if metadata.get("chapter_source") == "epub_spine" else ".pdf"
+                confirmed_source_path = Path(f"source{suffix}")
+            reading_payload = build_reading_units(
+                canonical_book,
+                source_path=confirmed_source_path,
+                translation_authority=True,
+            )
+            segment_plan = build_chapter_segments_from_reading_units(
+                reading_payload,
+                max_chars=max_chars,
+            )
         except Exception as exc:
             detail = str(exc).strip()
             message = "生成章节拆分预览失败。"
@@ -1252,6 +1460,34 @@ class BookJobService:
         segment_path.parent.mkdir(parents=True, exist_ok=True)
         self._write_json_atomic(segment_path, segment_plan)
         return segment_path
+
+    def _build_confirmed_book(self, job_id: str, canonical: dict[str, Any]) -> dict[str, Any]:
+        try:
+            book_path = self.artifact_path(job_id, "book")
+        except JobNotFound as exc:
+            raise JobServiceError("书籍结构不可用于确认章节。") from exc
+        baseline = book_path.parent / "source-baseline-book.json"
+        book = self._read_json_any(baseline if baseline.exists() else book_path)
+        if not isinstance(book, dict):
+            raise JobServiceError("书籍结构不可用于确认章节。")
+        try:
+            source_path = self.source_path(job_id)
+        except JobNotFound:
+            source_path = None
+        try:
+            from pdf_translator.book_rebuild import apply_canonical_chapter_plan
+            return apply_canonical_chapter_plan(
+                book,
+                canonical,
+                source_path=source_path,
+                asset_dir=book_path.parent / "book-images",
+            )
+        except Exception as exc:
+            detail = str(exc).strip()
+            message = "生成章节拆分预览失败。"
+            if detail:
+                message = f"生成章节拆分预览失败：{detail}"
+            raise JobServiceError(message) from exc
 
     def review_run_dir(self, job_id: str) -> Path:
         snapshot = self.get(job_id)
@@ -1722,6 +1958,11 @@ class BookJobService:
             raise JobServiceError("请先人工确认章节目录，再开始全文翻译。") from exc
         if not isinstance(canonical, dict) or canonical.get("source_artifact") != "user_confirmation":
             raise JobServiceError("请先人工确认章节目录，再开始全文翻译。")
+        from pdf_translator.source_workspace import require_current_source
+        try:
+            require_current_source(self._run_dir(job_id), canonical)
+        except ValueError as exc:
+            raise JobServiceError(str(exc)) from exc
 
     def _require_glossary_ready_for_translation(self, job_id: str) -> None:
         from pdf_translator.workflow import (
@@ -1750,6 +1991,7 @@ class BookJobService:
         self._validate_job_id(job_id)
         self._acquire_worker_lock(job_id)
         try:
+            (self._run_dir(job_id) / "translation-pause.json").unlink(missing_ok=True)
             self._run(
                 ["job", "translate", job_id, "--jobs-dir", str(self.jobs_dir), "--json"],
                 timeout_seconds=-1,
@@ -1795,14 +2037,23 @@ class BookJobService:
         self._normalize_provider_env(environment)
         # 启动 launchd 环境下 PATH 不含 ~/.local/bin，找不到 uv 时回退到 pdf-translator 自带 venv
         cmd = self._resolve_runner_cmd(environment)
+        worker = self._worker_handles.get(args[2]) if len(args) > 2 and args[:2] in (["job", "execute"], ["job", "resume"]) else None
+        command = [*cmd, "pdf-translator", *args]
+        inherited = ()
+        if worker is not None:
+            # The actual worker, not an intermediate launcher, must retain the
+            # flock if the API process is restarted. Its caches remain reusable.
+            command = [sys.executable, "-c", "from pdf_translator.cli import main; main()", *args]
+            inherited = (worker.fileno(),)
         result = subprocess.run(
-            [*cmd, "pdf-translator", *args],
+            command,
             cwd=self.project_home,
             capture_output=True,
             text=True,
             timeout=effective_timeout,
             check=False,
             env=environment,
+            pass_fds=inherited,
         )
         if result.returncode != 0:
             detail = "\n".join(
@@ -1905,6 +2156,9 @@ class BookJobService:
     @staticmethod
     def _canonical_chapter(chapter: dict[str, Any], fallback_index: int) -> dict[str, Any]:
         title = str(chapter.get("title") or f"Chapter {fallback_index}").strip()
+        policy = chapter.get("content_policy", "auto")
+        if policy not in {"auto", "translate", "preserve", "exclude"}:
+            raise JobServiceError("未知章节处理方式。")
         return {
             "index": int(chapter.get("index") or fallback_index),
             "chapter_id": str(chapter.get("chapter_id") or f"chapter-{fallback_index:03d}"),
@@ -1912,6 +2166,7 @@ class BookJobService:
             "page_start": chapter.get("page_start"),
             "page_end": chapter.get("page_end"),
             "source_pages": chapter.get("source_pages") if isinstance(chapter.get("source_pages"), list) else [],
+            "content_policy": policy,
         }
 
 

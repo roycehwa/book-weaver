@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { reviewApi, type ReviewProject } from '../api'
@@ -73,6 +73,13 @@ const project: ReviewProject = {
 describe('Review draft navigation', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    const values = new Map<string, string>()
+    vi.stubGlobal('localStorage', {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => values.set(key, String(value)),
+      removeItem: (key: string) => values.delete(key),
+      clear: () => values.clear(),
+    })
     localStorage.clear()
     window.history.replaceState({}, '', '/review?runDir=%2Ftmp%2Freview-run')
     getProject.mockResolvedValue(project)
@@ -80,6 +87,7 @@ describe('Review draft navigation', () => {
 
   afterEach(() => {
     cleanup()
+    vi.unstubAllGlobals()
   })
 
   test('flushes a dirty draft before moving to another page', async () => {
@@ -105,9 +113,10 @@ describe('Review draft navigation', () => {
     const translationEditor = container.querySelector('textarea')
     expect(translationEditor).toBeInstanceOf(HTMLTextAreaElement)
     fireEvent.change(translationEditor as HTMLTextAreaElement, { target: { value: draftText } })
-    await user.click(screen.getByRole('button', { name: '下一页' }))
+    await user.click(screen.getByRole('button', { name: '下一段' }))
 
     expect(saveDecision).toHaveBeenCalledWith('/tmp/review-run', 's1', {
+      expected_revision: 0,
       status: 'open',
       action: 'manual_edit',
       approved_text: draftText,
@@ -119,6 +128,48 @@ describe('Review draft navigation', () => {
       finishSave?.()
     })
     expect(await screen.findByText('Source two')).toBeTruthy()
+  })
+
+  test('saves a default rewrite request when additional instructions are empty', async () => {
+    saveDecision.mockResolvedValue({ status: 'saved', segment_id: 's1', review_state: project.review_state })
+    const user = userEvent.setup()
+    render(<Review />)
+    await screen.findByText('Source one')
+    await user.click(screen.getByRole('button', { name: '手动修改' }))
+    await user.click(screen.getByRole('button', { name: '请求模型重译' }))
+    await user.click(screen.getByRole('button', { name: '保存重译要求' }))
+    expect(saveDecision).toHaveBeenCalledWith('/tmp/review-run', 's1', expect.objectContaining({
+      status: 'open', action: 'model_rewrite',
+      reviewer_comment: expect.stringContaining('根据原文完整重新翻译'),
+    }))
+    expect(await screen.findByText('重译要求已保存。可以立即重译本段，或稍后批量执行。')).toBeTruthy()
+  })
+
+  test('autosave responses never close or reset an active editor', async () => {
+    saveDecision.mockImplementation(async (_run, segmentId, data) => ({
+      status: 'open', segment_id: segmentId,
+      review_state: { ...project.review_state, revision: 1, decisions: {
+        [segmentId]: { ...data, updated_at: new Date().toISOString() },
+      } },
+    }))
+    const user = userEvent.setup()
+    const { container } = render(<Review />)
+    await screen.findByText('Source one')
+    await user.click(screen.getByRole('button', { name: '手动修改' }))
+    const editor = container.querySelector('textarea') as HTMLTextAreaElement
+    editor.focus()
+    fireEvent.change(editor, { target: { value: '第一轮持续输入' } })
+    await waitFor(() => expect(saveDecision).toHaveBeenCalledTimes(1), { timeout: 2000 })
+    expect(container.querySelector('textarea')).toBe(editor)
+    expect(editor.value).toBe('第一轮持续输入')
+    expect(document.activeElement).toBe(editor)
+    fireEvent.compositionStart(editor)
+    fireEvent.change(editor, { target: { value: '第一轮持续输入，第二轮中文输入法' } })
+    fireEvent.compositionEnd(editor)
+    await waitFor(() => expect(saveDecision).toHaveBeenCalledTimes(2), { timeout: 2000 })
+    expect(container.querySelector('textarea')).toBe(editor)
+    expect(editor.value).toBe('第一轮持续输入，第二轮中文输入法')
+    expect(document.activeElement).toBe(editor)
   })
 
   test('renders structured OCR evidence without raw markdown paths', async () => {

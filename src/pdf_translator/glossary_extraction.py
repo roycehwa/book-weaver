@@ -402,6 +402,10 @@ def candidate_integrity_rejection(phrase: str) -> str | None:
     normalized = _normalize_phrase(phrase)
     if not normalized:
         return "empty phrase"
+    if re.match(r"^(?:this|these|those|our)\s", normalized, re.IGNORECASE):
+        return "demonstrative_phrase"
+    if re.match(r"^(?:during|since|among|within|across|under)\s", normalized, re.IGNORECASE) and not re.match(r"^under secretary\b", normalized, re.IGNORECASE):
+        return "clause_fragment"
     if any(marker in normalized for marker in ("*", "[", "]", "(", ")")):
         return "markup_contamination"
     if normalized.startswith(("Journal of ", "International Journal of ", "Glossary of ")):

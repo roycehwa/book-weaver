@@ -71,7 +71,11 @@ def _font_media_type(path: Path) -> str:
 
 
 def resolve_embedded_font(language: str | None) -> EpubEmbeddedFont | None:
-    """Embed one reading font when available so readers do not pick randomly."""
+    """Only embed explicitly configured fonts, never copy host system collections.
+
+    Reader font stacks are the portable default. PDF font configuration does not
+    authorize embedding that (potentially huge) font in a reflowable EPUB.
+    """
 
     configured = os.environ.get("BOOKWEAVER_EPUB_FONT")
     if is_cjk_language(language):
@@ -79,11 +83,6 @@ def resolve_embedded_font(language: str | None) -> EpubEmbeddedFont | None:
             [
                 configured,
                 os.environ.get("BOOKWEAVER_EPUB_FONT_CJK"),
-                os.environ.get("PDF_TRANSLATOR_CJK_FONT"),
-                "/System/Library/Fonts/Supplemental/Songti.ttc",
-                "/System/Library/Fonts/STHeiti Light.ttc",
-                "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
-                "/usr/share/fonts/truetype/noto/NotoSerifCJK-Regular.ttc",
             ]
         )
         epub_name = "bookweaver-text.ttc" if font_path and font_path.suffix.lower() == ".ttc" else "bookweaver-text.ttf"
@@ -92,16 +91,17 @@ def resolve_embedded_font(language: str | None) -> EpubEmbeddedFont | None:
             [
                 configured,
                 os.environ.get("BOOKWEAVER_EPUB_FONT_LATIN"),
-                "/System/Library/Fonts/Supplemental/Georgia.ttf",
-                "/System/Library/Fonts/Supplemental/Times New Roman.ttf",
-                "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf",
-                "C:/Windows/Fonts/georgia.ttf",
             ]
         )
         epub_name = "bookweaver-text.ttf"
 
     if font_path is None:
         return None
+    if font_path.suffix.lower() == ".ttc":
+        raise ValueError("EPUB font must be a single licensed font, not a TTC collection")
+    if font_path.stat().st_size > 8 * 1024 * 1024:
+        raise ValueError("EPUB font exceeds 8 MiB; configure a subset font or use reader fonts")
+    epub_name = f"bookweaver-text{font_path.suffix.lower()}"
     return EpubEmbeddedFont(
         family=BOOKWEAVER_FONT_FAMILY,
         source_path=font_path,
@@ -139,7 +139,8 @@ html {{
 body {{
   font-family: inherit;
   line-height: 1.82;
-  margin: 0;
+  margin: 0 auto;
+  max-width: 46rem;
   padding: 1.8rem 1.45rem 2.4rem;
   color: #222831;
   background: #fffdf8;
@@ -180,11 +181,15 @@ h3 {{
 p {{
   margin: 0 0 1.05em;
   text-align: start;
+  overflow-wrap: anywhere;
 }}
 img {{
   display: block;
   max-width: 100%;
+  max-height: 80vh;
+  width: auto;
   height: auto;
+  object-fit: contain;
   margin: 1.8rem auto 1.1rem;
   page-break-inside: avoid;
   break-inside: avoid;

@@ -1,4 +1,13 @@
 from pathlib import Path
+import pytest
+
+
+def test_font_collection_is_rejected(tmp_path, monkeypatch):
+    font = tmp_path / "collection.ttc"
+    font.write_bytes(b"collection")
+    monkeypatch.setenv("BOOKWEAVER_EPUB_FONT", str(font))
+    with pytest.raises(ValueError, match="TTC"):
+        resolve_embedded_font("zh")
 
 from pdf_translator.epub_typography import (
     build_epub_css,
@@ -49,13 +58,11 @@ def test_build_epub_css_embeds_single_font_face(tmp_path: Path) -> None:
     assert "Songti SC" not in css
 
 
-def test_resolve_embedded_font_prefers_georgia_on_mac() -> None:
-    georgia = Path("/System/Library/Fonts/Supplemental/Georgia.ttf")
-    if not georgia.is_file():
-        return
-    font = resolve_embedded_font("en")
-    assert font is not None
-    assert font.source_path == georgia.resolve()
+def test_resolve_embedded_font_does_not_copy_system_fonts(monkeypatch) -> None:
+    for key in ("BOOKWEAVER_EPUB_FONT", "BOOKWEAVER_EPUB_FONT_CJK", "BOOKWEAVER_EPUB_FONT_LATIN"):
+        monkeypatch.delenv(key, raising=False)
+    assert resolve_embedded_font("en") is None
+    assert resolve_embedded_font("zh-CN") is None
 
 
 def test_is_cjk_language() -> None:

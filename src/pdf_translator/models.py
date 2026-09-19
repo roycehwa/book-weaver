@@ -21,6 +21,9 @@ class TranslationChunk:
     markdown: str
     glossary_entries: list[dict] | None = None
     prompt_instruction: str | None = None
+    # Transport boundaries are not necessarily paragraph boundaries.
+    separator_before: str = "\n\n"
+    preserve_block_structure: bool = False
 
 
 @dataclass(slots=True)
@@ -74,3 +77,4 @@ class PipelineArtifacts:
     book_json_path: Path | None = None
     book_markdown_path: Path | None = None
     book_trace_markdown_path: Path | None = None
+    reading_units_path: Path | None = None

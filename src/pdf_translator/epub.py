@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import asdict, is_dataclass
 from html import escape
 import hashlib
+import json
+from io import BytesIO
 import mimetypes
 import posixpath
 from pathlib import Path, PurePosixPath
@@ -13,6 +15,30 @@ from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile
 
 from bs4 import BeautifulSoup
 from markdown import markdown
+from PIL import Image, ImageChops, UnidentifiedImageError
+
+
+def _export_image_bytes(path: Path) -> bytes:
+    """Lossless export-only compression; never downsample text-bearing pages."""
+    original = path.read_bytes()
+    if path.suffix.lower() != ".png":
+        return original
+    try:
+        with Image.open(BytesIO(original)) as source:
+            if getattr(source, "n_frames", 1) != 1:
+                return original
+            if source.mode == "RGB":
+                red, green, blue = source.split()
+                if ImageChops.difference(red, green).getbbox() is None and ImageChops.difference(red, blue).getbbox() is None:
+                    # Exact grayscale encoding, not desaturation: every decoded
+                    # RGB pixel stays identical; resolution is unchanged.
+                    source = red
+            output = BytesIO()
+            source.save(output, format="PNG", optimize=True)
+            optimized = output.getvalue()
+            return optimized if len(optimized) < len(original) else original
+    except (UnidentifiedImageError, OSError):
+        return original
 
 from pdf_translator.book_views import (
     dedupe_markdown_image_blocks,
@@ -85,6 +111,9 @@ def _normalize_typography(soup: BeautifulSoup) -> None:
         for attr in ("style", "face", "size", "color"):
             if tag.has_attr(attr):
                 del tag[attr]
+        if tag.name == "img":
+            for attr in ("width", "height"):
+                tag.attrs.pop(attr, None)
 
 
 def _annotate_worksheet_tables(soup: BeautifulSoup) -> None:
@@ -590,7 +619,21 @@ def render_epub_from_book(
             )
         )
 
-    cover_manifest_id = "image-1" if image_items else None
+    # Never promote an arbitrary illustration or publisher logo to cover.
+    cover_paths = set()
+    cover_path = (book.get("metadata") or {}).get("cover_image_path")
+    if cover_path:
+        resolved = _resolve_image_source_path(str(cover_path), resolved_image_roots)
+        if resolved:
+            cover_paths.add(resolved)
+    for chapter in chapters:
+        if chapter.get("cover") or str(chapter.get("title") or "").casefold() == "cover":
+            for image in BeautifulSoup(_markdown_to_body_html(str(chapter.get("markdown") or "")), "html.parser").find_all("img"):
+                resolved = _resolve_image_source_path(str(image.get("src") or ""), resolved_image_roots)
+                if resolved:
+                    cover_paths.add(resolved)
+    cover_hrefs = {image_map[path] for path in cover_paths if path in image_map}
+    cover_manifest_id = next((f"image-{i}" for i, (href, _) in enumerate(image_items, 1) if href in cover_hrefs), None)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     identifier = f"urn:uuid:{uuid.uuid4()}"
@@ -619,9 +662,20 @@ def render_epub_from_book(
         for chapter_file, chapter_document in chapter_documents:
             archive.writestr(f"OEBPS/{chapter_file}", chapter_document, compress_type=ZIP_DEFLATED)
         for epub_path, source_path in image_items:
-            archive.write(source_path, f"OEBPS/{epub_path}", compress_type=ZIP_DEFLATED)
+            archive.writestr(f"OEBPS/{epub_path}", _export_image_bytes(source_path), compress_type=ZIP_DEFLATED)
         for epub_path, source_path, _media_type in font_items:
             archive.write(source_path, f"OEBPS/{epub_path}", compress_type=ZIP_DEFLATED)
+
+    with ZipFile(output_path) as archive:
+        entries = [{"path": item.filename, "bytes": item.file_size,
+                    "compressed_bytes": item.compress_size} for item in archive.infolist()]
+    report = {"schema": "epub_resource_budget_v1", "total_bytes": output_path.stat().st_size,
+              "image_count": len(image_items), "font_count": len(font_items),
+              "large_resources": [entry for entry in entries if entry["compressed_bytes"] > 1024 * 1024],
+              "resources": entries,
+              "warnings": ["EPUB exceeds 30 MiB: inspect retained page images and configured fonts"]
+              if output_path.stat().st_size > 30 * 1024 * 1024 else []}
+    output_path.with_suffix(".resources.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def validate_epub_internal_hrefs(epub_path: Path) -> dict[str, object]:

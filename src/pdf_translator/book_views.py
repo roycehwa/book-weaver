@@ -89,7 +89,6 @@ def render_translation_input_markdown(book: dict) -> str:
     chapters = book.get("chapters") or []
     pages = book.get("pages") or []
     if not chapters:
-        # nothing structured; fall back to legacy full_markdown
         return str(book.get("full_markdown") or "")
 
     out: list[str] = []

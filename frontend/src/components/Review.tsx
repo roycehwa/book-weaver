@@ -15,6 +15,7 @@ const issueLabels: Record<string, string> = {
   possibly_incomplete: '算法提示：疑似漏译',
   mixed_english: '算法提示：混用英文',
   glossary_drift: '算法提示：术语不一致',
+  polish_unavailable: '自动润色未完成，机器译文已保留',
   suspect_ocr: 'OCR 隔离：疑似解析噪声',
 }
 
@@ -25,6 +26,7 @@ const issueGuidance: Record<string, string> = {
   possibly_incomplete: '这一段可能漏译或过短。请对照原文补齐。',
   mixed_english: '这一段译文里混入了不该保留的英文。请改成自然、完整的目标语言版本。',
   glossary_drift: '这一段原文含有已定稿术语，但译文未使用约定译法。请按术语表改成统一中文。',
+  polish_unavailable: '自动润色服务失败，未覆盖已有译文。请检查机器译文中的疑点；可接受现有译文或手工修改。',
   suspect_ocr: '该块未进入正文或翻译。请根据原始页证据确认它是噪声，或恢复为阅读内容。',
 }
 
@@ -262,6 +264,8 @@ function Review() {
   const translationScrollRef = useRef<HTMLDivElement>(null)
   const syncingScrollRef = useRef(false)
   const draftSavePromiseRef = useRef<Promise<boolean> | null>(null)
+  const initializedEditorKeyRef = useRef<string | null>(null)
+  const initializedTranslationRef = useRef<unknown>(null)
 
   const orderedSegments = useMemo(() => {
     if (!project) return []
@@ -520,6 +524,12 @@ function Review() {
 
   useEffect(() => {
     if (!selectedSegmentId) return
+    const editorKey = `${runDir}\u0000${selectedSegmentId}`
+    // Autosave changes review_state, not the selected source/candidate. Never
+    // reinitialize a live editor or close it when that save response arrives.
+    if (initializedEditorKeyRef.current === editorKey && initializedTranslationRef.current === selectedTranslation) return
+    initializedEditorKeyRef.current = editorKey
+    initializedTranslationRef.current = selectedTranslation
     const decision = project?.review_state.decisions[selectedSegmentId]
     const localDraft = loadDraft(localStorage, runDir, selectedSegmentId)
     const useLocalDraft =
@@ -556,16 +566,20 @@ function Review() {
       }
 
       const savePendingDrafts = async (): Promise<boolean> => {
+        let revision = project?.review_state.revision || 0
         let draft = loadDraft(localStorage, runDir, segmentId)
         while (draft) {
           setDraftSaveState('saving')
           try {
-            await reviewApi.saveDecision(runDir, segmentId, {
+            const saved = await reviewApi.saveDecision(runDir, segmentId, {
+              expected_revision: revision,
               status: 'open',
               action: draft.resolutionMode,
               approved_text: draft.approvedText,
               reviewer_comment: draft.comment,
             })
+            revision = saved.review_state.revision || 0
+            setProject(current => current ? { ...current, review_state: saved.review_state } : current)
           } catch {
             setDraftSaveState('error')
             return false
@@ -599,7 +613,7 @@ function Review() {
         }
       }
     },
-    [runDir]
+    [runDir, project?.review_state.revision]
   )
 
   useEffect(() => {
@@ -702,7 +716,7 @@ function Review() {
   const openModelRewritePanel = () => {
     setResolutionMode('model_rewrite')
     setShowEditPanel(true)
-    setActionMessage('请填写希望模型如何修改本段，然后选择立即重译或保存后批量处理。')
+    setActionMessage('可直接送回重译；额外要求选填。留空将按原文完整重译并遵循已确认术语。')
   }
 
   const saveBookmark = () => {
@@ -735,10 +749,13 @@ function Review() {
     const text = options?.approvedTextOverride ?? approvedText
     try {
       await reviewApi.saveDecision(runDir, selectedSegmentId, {
+        expected_revision: project?.review_state.revision || 0,
         status,
         action,
         approved_text: action === 'manual_edit' ? text : undefined,
-        reviewer_comment: comment,
+        reviewer_comment: action === 'model_rewrite'
+          ? comment.trim() || '请根据原文完整重新翻译本段，遵循已确认术语，保留段落、引文和链接，不遗漏、不概括；不要输出翻译失败占位提示或处理说明。'
+          : comment,
       })
       removeDraft(localStorage, runDir, selectedSegmentId)
       setDraftSaveState('saved')
@@ -814,21 +831,12 @@ function Review() {
 
   const handleRewriteCurrentSegment = async () => {
     if (!selectedSegmentId) return
-    if (!comment.trim()) {
-      setError('请先填写给模型的重译要求，再运行本段重译。')
-      setShowEditPanel(true)
-      return
-    }
     const saved = await saveDecision('open', false, { actionOverride: 'model_rewrite' })
     if (!saved) return
     await handleRewrite(selectedSegmentId)
   }
 
   const handleSaveRewriteRequest = async () => {
-    if (!comment.trim()) {
-      setError('请先填写具体的重译要求，例如需要补译、纠正术语或改写哪一部分。')
-      return
-    }
     const saved = await saveDecision('open', false, { actionOverride: 'model_rewrite' })
     if (saved) setActionMessage('重译要求已保存。可以立即重译本段，或稍后批量执行。')
   }
@@ -968,7 +976,7 @@ function Review() {
                   {showIssueQueue
                     ? '收起问题列表'
                     : openIssues.length > 0
-                      ? `算法问题（${openIssues.length}）`
+                      ? `质量提示（${openIssues.length}）`
                       : `审阅记录（${allIssues.length}）`}
                 </button>
               )}
@@ -1005,7 +1013,7 @@ function Review() {
                 <div className="font-medium">本轮审阅范围</div>
                 <p className="mt-1 text-xs text-slate-600">
                   {humanReviewMode === 'issues_only'
-                    ? `当前工作范围是机器标记的 ${issueScopeSegments.length} 个审阅项；页面导航仍按全书顺序，审阅项导航只在标记项之间移动。`
+                    ? `当前工作范围是机器标记的 ${issueScopeSegments.length} 个审阅项；段落导航仍按全书顺序，审阅项导航只在标记项之间移动。`
                     : `当前工作范围是全书 ${orderedSegments.length} 页；审阅项导航仍可回访机器标记的内容。`}
                 </p>
               </div>
@@ -1032,7 +1040,7 @@ function Review() {
                     : 'border-slate-300 bg-white text-slate-700'
                 }`}
               >
-                全书阅读（{orderedSegments.length} 页）
+                全书阅读（{orderedSegments.length} 段）
               </button>
               <span className="text-xs text-slate-500">
                 机器检测通过 {project.pre_review.clean_segments} 段
@@ -1472,7 +1480,7 @@ function Review() {
             }}
           />
           <label className="mb-1 mt-3 block text-xs text-slate-500">
-            {resolutionMode === 'model_rewrite' ? '给模型的重译要求' : '审阅意见（可选）'}
+            {resolutionMode === 'model_rewrite' ? '给模型的重译要求（可选，留空按原文完整重译）' : '审阅意见（可选）'}
           </label>
           <textarea
             className="min-h-24 w-full rounded-lg border border-slate-300 p-3 text-sm leading-7"
@@ -1511,14 +1519,14 @@ function Review() {
             ) : (
               <>
                 <button
-                  disabled={!selectedSegmentId || saving || !comment.trim()}
+                  disabled={!selectedSegmentId || saving}
                   onClick={() => void handleSaveRewriteRequest()}
                   className="rounded-lg bg-amber-600 px-4 py-2 text-sm font-medium text-white disabled:opacity-50"
                 >
                   保存重译要求
                 </button>
                 <button
-                  disabled={!selectedSegmentId || rewriting || !comment.trim()}
+                  disabled={!selectedSegmentId || rewriting || saving}
                   onClick={() => void handleRewriteCurrentSegment()}
                   className="rounded-lg border border-amber-400 bg-amber-50 px-4 py-2 text-sm font-medium text-amber-900 disabled:opacity-50"
                 >
@@ -1549,14 +1557,14 @@ function Review() {
               onClick={() => goToIndex(currentIndex - 1)}
               className="rounded-lg border border-slate-300 px-4 py-2 text-sm text-slate-700 disabled:opacity-40"
             >
-              上一页
+              上一段
             </button>
             <button
               disabled={!orderedSegments.length || currentIndex >= orderedSegments.length - 1}
               onClick={() => goToIndex(currentIndex + 1)}
               className="rounded-lg border border-slate-300 px-4 py-2 text-sm text-slate-700 disabled:opacity-40"
             >
-              下一页
+              下一段
             </button>
             <button
               disabled={!chapterOutline.length || currentChapterPosition >= chapterOutline.length}
@@ -1609,8 +1617,8 @@ function Review() {
           </div>
           <p className="mt-2 w-full text-center text-xs text-slate-500">
             {humanReviewMode === 'issues_only'
-              ? `页面导航按全书顺序；审阅项导航在 ${issueScopeSegments.length} 个标记项之间循环。手动修改会先保存草稿，确认后成为定稿。`
-              : '页面导航按全书顺序；审阅项导航只回访机器标记内容。手动修改会先保存草稿，确认后成为定稿。'}
+              ? `段落导航按全书顺序；审阅项导航在 ${issueScopeSegments.length} 个标记项之间循环。手动修改会先保存草稿，确认后成为定稿。`
+              : '段落导航按全书顺序；审阅项导航只回访机器标记内容。手动修改会先保存草稿，确认后成为定稿。'}
           </p>
         </div>
       </footer>

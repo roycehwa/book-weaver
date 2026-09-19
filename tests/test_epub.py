@@ -5,6 +5,51 @@ from pdf_translator.epub import render_epub_from_book
 from pdf_translator.models import TranslatedChapter
 
 
+def test_export_has_resource_budget_and_no_automatic_fonts(tmp_path, monkeypatch):
+    import json
+    for key in ("BOOKWEAVER_EPUB_FONT", "BOOKWEAVER_EPUB_FONT_CJK", "BOOKWEAVER_EPUB_FONT_LATIN"):
+        monkeypatch.delenv(key, raising=False)
+    output = tmp_path / "small.epub"
+    render_epub_from_book(book={}, translated_chapters=[{"index": 1, "title": "正文", "markdown": "# 正文\n\n" + "中文正文。" * 10000}], output_path=output, title="测试", language="zh-CN")
+    report = json.loads(output.with_suffix(".resources.json").read_text())
+    assert report["font_count"] == 0
+    assert report["total_bytes"] < 100000
+    with ZipFile(output) as archive:
+        assert not any("/fonts/" in name for name in archive.namelist())
+
+
+def test_image_optimization_is_lossless_and_keeps_source(tmp_path):
+    from PIL import Image
+    from io import BytesIO
+    from pdf_translator.epub import _export_image_bytes
+    image = Image.new("RGB", (800, 1000), "white")
+    image.putpixel((200, 300), (20, 40, 60))
+    path = tmp_path / "page.png"
+    image.save(path, compress_level=0)
+    original = path.read_bytes()
+    optimized = _export_image_bytes(path)
+    assert len(optimized) < len(original)
+    assert path.read_bytes() == original
+    with Image.open(BytesIO(optimized)) as decoded:
+        assert decoded.size == image.size
+        assert decoded.tobytes() == image.tobytes()
+
+
+def test_gray_rgb_export_preserves_every_pixel(tmp_path):
+    from PIL import Image
+    from io import BytesIO
+    from pdf_translator.epub import _export_image_bytes
+    image = Image.new("RGB", (128, 128))
+    image.putdata([(x % 256,) * 3 for x in range(128 * 128)])
+    path = tmp_path / "gray.png"
+    image.save(path)
+    original = path.read_bytes()
+    decoded = Image.open(BytesIO(_export_image_bytes(path)))
+    assert decoded.size == image.size
+    assert decoded.convert("RGB").tobytes() == image.tobytes()
+    assert path.read_bytes() == original
+
+
 def test_render_epub_from_book_writes_epub_structure_and_chapters(tmp_path: Path) -> None:
     image_path = tmp_path / "figure.png"
     image_path.write_bytes(b"fake-png")
@@ -52,8 +97,8 @@ def test_render_epub_from_book_writes_epub_structure_and_chapters(tmp_path: Path
         assert "OEBPS/images/figure.png" in names
 
         opf = archive.read("OEBPS/content.opf").decode("utf-8")
-        assert 'name="cover" content="image-1"' in opf
-        assert 'id="image-1"' in opf and "cover-image" in opf
+        assert 'name="cover"' not in opf
+        assert 'id="image-1"' in opf and "cover-image" not in opf
 
         nav = archive.read("OEBPS/nav.xhtml").decode("utf-8")
         assert nav.index("First Chapter") < nav.index("Second Chapter")

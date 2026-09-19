@@ -82,5 +82,6 @@ def write_segment_conservation_report(run_dir: Path, *, failures: list[str]) -> 
         "failures": failures,
     }
     path = run_dir / "segment-conservation.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return path
