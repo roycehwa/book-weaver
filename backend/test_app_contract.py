@@ -1559,3 +1559,42 @@ def test_job_glossary_suggest_defaults_to_minimax(monkeypatch) -> None:
     body = response.json()
     assert body["status"] == "started"
     assert body["glossary"]["candidates"][0]["target_suggestion"] == "股东至上"
+
+
+def test_workspace_book_reads_translation_quality_from_job_run_dir(monkeypatch, tmp_path: Path) -> None:
+    module = importlib.import_module("main")
+    run_dir = tmp_path / "artifacts" / "run"
+    run_dir.mkdir(parents=True)
+    (run_dir / "book.json").write_text("{}", encoding="utf-8")
+    (run_dir / "translation-quality-index.json").write_text(
+        json.dumps(
+            {
+                "schema": "bookweaver_translation_quality_index_v1",
+                "acceptable": True,
+                "aggregate_status": "review",
+                "blocking_count": 0,
+                "review_count": 3,
+            }
+        ),
+        encoding="utf-8",
+    )
+    snapshot = _job_snapshot(
+        "job-quality",
+        filename="Book.epub",
+        state="awaiting_human_review",
+        text_operation="translate",
+        artifacts={
+            "book": {"href": "../../outside/book.json"},
+            "review_items": {"href": "artifacts/review_items.json"},
+        },
+    )
+    monkeypatch.setattr(
+        module,
+        "get_job_service",
+        lambda: SimpleNamespace(artifact_path=lambda _job_id, _name: run_dir / "book.json"),
+    )
+
+    book = module._workspace_book_from_job(snapshot)
+
+    assert book["translation_quality_review_count"] == 3
+    assert book["translation_quality_blocking"] is False

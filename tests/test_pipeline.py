@@ -382,6 +382,19 @@ def test_translate_pipeline_writes_review_artifacts_for_real_translation(tmp_pat
         assert Path(manifest["files"][key]).exists()
     review_state = json.loads(Path(manifest["files"]["review_state"]).read_text(encoding="utf-8"))
     assert review_state["schema"] == "translation_review_state_v1"
+    for quality_key in (
+        "source_quality_report",
+        "raw_translation_quality_report",
+        "polished_output_quality_report",
+        "translation_quality_index",
+    ):
+        assert quality_key in manifest["files"]
+        assert Path(manifest["files"][quality_key]).exists()
+    pre_review = json.loads(Path(manifest["files"]["pre_review"]).read_text(encoding="utf-8"))
+    assert "translation_quality" in pre_review
+    run_dir = artifacts.output_dir
+    assert (run_dir / "translated.raw.md").exists()
+    assert (run_dir / "translated.cleaned.md").exists()
 
 
 def test_translate_pipeline_records_no_candidates_polish_outcome(tmp_path: Path, monkeypatch) -> None:

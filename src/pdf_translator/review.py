@@ -797,10 +797,46 @@ def build_pre_review_report(
     return payload
 
 
+def _first_translatable_segment(segments: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for segment in segments:
+        if segment.get("translate", True):
+            return segment
+    return segments[0] if segments else None
+
+
+def _map_polish_entry_to_segment(
+    entry: dict[str, Any],
+    *,
+    segments: list[dict[str, Any]],
+    translated_segments: list[dict[str, Any]],
+    segment_by_line: dict[int, dict[str, Any]],
+) -> tuple[dict[str, Any] | None, str]:
+    before = str(entry.get("before") or entry.get("text") or "")
+    translated_by_id = {
+        str(item.get("segment_id") or ""): item for item in translated_segments if item.get("segment_id")
+    }
+    unique_matches: list[dict[str, Any]] = []
+    if before:
+        for segment in segments:
+            segment_id = str(segment.get("segment_id") or "")
+            translated = translated_by_id.get(segment_id) or {}
+            translated_text = str(translated.get("translated_text") or "")
+            if translated_text.count(before) == 1:
+                unique_matches.append(segment)
+    if len(unique_matches) == 1:
+        return unique_matches[0], "before_text"
+    line = entry.get("line")
+    if isinstance(line, int) and line in segment_by_line:
+        return segment_by_line[line], "line"
+    fallback = _first_translatable_segment(segments)
+    return fallback, "fallback"
+
+
 def append_polish_quality_review_items(
     run_dir: Path | None,
     review_items: list[dict[str, Any]],
     segments: list[dict[str, Any]],
+    translated_segments: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     if run_dir is None or not segments:
         return review_items
@@ -808,6 +844,7 @@ def append_polish_quality_review_items(
     if not polish_report_path.exists():
         return review_items
     polish_report = json.loads(polish_report_path.read_text(encoding="utf-8"))
+    translated_segments = translated_segments or []
     existing = {
         (str(item.get("segment_id") or ""), str(item.get("issue_type") or ""))
         for item in review_items
@@ -830,15 +867,22 @@ def append_polish_quality_review_items(
         for entry in entries:
             if not isinstance(entry, dict):
                 continue
-            line = entry.get("line")
-            segment = segment_by_line.get(line) if isinstance(line, int) else segments[0]
+            segment, mapping = _map_polish_entry_to_segment(
+                entry,
+                segments=segments,
+                translated_segments=translated_segments,
+                segment_by_line=segment_by_line,
+            )
+            if segment is None:
+                continue
             segment_id = str(segment.get("segment_id") or "")
             if not segment_id:
                 continue
             key = (segment_id, issue_type)
             if key in existing:
                 continue
-            item_id = f"quality:{issue_type}:{segment_id}:{line}"
+            line = entry.get("line")
+            item_id = f"quality:{issue_type}:{segment_id}:{line or mapping}"
             updated.append(
                 {
                     "item_id": item_id,
@@ -849,7 +893,12 @@ def append_polish_quality_review_items(
                     "chapter_id": segment.get("chapter_id"),
                     "chapter_title": segment.get("chapter_title"),
                     "source_location": segment.get("source_location", {}),
-                    "evidence": {"polish_decision": entry.get("decision"), "line": line, "before": entry.get("before")},
+                    "evidence": {
+                        "polish_decision": entry.get("decision"),
+                        "line": line,
+                        "before": entry.get("before"),
+                        "mapping": mapping,
+                    },
                 }
             )
             existing.add(key)
@@ -1014,7 +1063,12 @@ def build_review_artifacts(
             'chapter_id': first.get('chapter_id'), 'chapter_title': first.get('chapter_title'),
             'source_location': first.get('source_location', {}), 'evidence': warning,
         })
-    review_items = append_polish_quality_review_items(run_dir, review_items, segments)
+    review_items = append_polish_quality_review_items(
+        run_dir,
+        review_items,
+        segments,
+        translated_segments_list,
+    )
     pre_review = build_pre_review_report(
         segments,
         review_items,

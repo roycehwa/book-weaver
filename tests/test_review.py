@@ -212,6 +212,44 @@ def test_build_review_artifacts_creates_segments_and_initial_queue() -> None:
     assert artifacts["review_state"]["workflow"]["human_review_mode"] == "issues_only"
 
 
+def test_build_review_artifacts_maps_polish_report_entries_to_review_items(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "polish-report.json").write_text(
+        json.dumps(
+            {
+                "outcome": "needs_review",
+                "rejected": [{"before": "mixed english", "decision": "rejected"}],
+                "unchanged": [{"before": "still english", "decision": "unchanged"}],
+                "unresolved": [{"before": "maybe english", "decision": "unresolved"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    book = sample_book()
+    artifacts = build_review_artifacts(
+        source_path=Path("book.epub"),
+        target_language="zh-CN",
+        book=book,
+        translated_chapters=[
+            {
+                "index": 1,
+                "chapter_id": "ch-001-intro",
+                "title": "Introduction",
+                "page_start": 1,
+                "page_end": 2,
+                "source_pages": [1, 2],
+                "markdown": "这是第一段译文。\n\n这一段 mixed english phrase remains 仍然没有翻译。",
+            }
+        ],
+        run_dir=run_dir,
+    )
+    issue_types = {item["issue_type"] for item in artifacts["review_items"]["items"]}
+    assert {"polish_rejected", "polish_unchanged", "polish_unresolved"}.issubset(issue_types)
+    assert artifacts["pre_review"]["flagged_segments"] == len(artifacts["review_items"]["items"])
+    assert artifacts["review_state"]["summary"]["open_items"] == len(artifacts["review_items"]["items"])
+
+
 def test_preserve_review_uses_content_integrity_checks_not_translation_checks() -> None:
     book = sample_book()
     artifacts = build_review_artifacts(

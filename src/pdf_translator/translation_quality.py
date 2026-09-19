@@ -10,13 +10,25 @@ from typing import Any, Literal
 import markdown as markdown_renderer
 from bs4 import BeautifulSoup
 
+from collections import Counter
+
 from pdf_translator.chunking import markdown_block_structure
 from pdf_translator.pdf_text_repair import scan_ingest_quality
-from pdf_translator.polish import POLISH_PROMPT_VERSION
+from pdf_translator.polish import POLISH_PROMPT_VERSION, _markdown_link_specs, _protected_literals
+from pdf_translator.polish import protected_spans as polish_protected_spans
 from pdf_translator.reading_units import validate_reading_units
 from pdf_translator.source_workspace import atomic_json, glossary_fingerprint
 from pdf_translator.translate import TRANSLATION_PROMPT_VERSION
-from pdf_translator.zh_markdown_cleanup import RULES_VERSION, TRANSLATION_CLEANUP_REPORT_FILENAME
+from pdf_translator.zh_markdown_cleanup import (
+    AUTO_LINK_RE,
+    EMAIL_RE,
+    FOOTNOTE_REF_RE,
+    INLINE_CODE_RE,
+    PRESERVE_MARKER_RE,
+    RULES_VERSION,
+    TRANSLATION_CLEANUP_REPORT_FILENAME,
+    URL_RE,
+)
 
 REPORT_SCHEMA = "bookweaver_translation_quality_report_v1"
 INDEX_SCHEMA = "bookweaver_translation_quality_index_v1"
@@ -71,9 +83,26 @@ def _read_json(path: Path) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
-def stable_finding_id(*, stage: str, code: str, evidence: dict[str, Any]) -> str:
+def stable_finding_id(
+    *,
+    stage: str,
+    code: str,
+    evidence: dict[str, Any],
+    chapter_id: str | None = None,
+    unit_ids: list[str] | None = None,
+    segment_ids: list[str] | None = None,
+    source_location: dict[str, Any] | None = None,
+) -> str:
     digest = json.dumps(
-        {"stage": stage, "code": code, "evidence": evidence},
+        {
+            "stage": stage,
+            "code": code,
+            "evidence": evidence,
+            "chapter_id": chapter_id,
+            "unit_ids": unit_ids or [],
+            "segment_ids": segment_ids or [],
+            "source_location": source_location or {},
+        },
         sort_keys=True,
         ensure_ascii=False,
     )
@@ -94,7 +123,15 @@ def _finding(
 ) -> dict[str, Any]:
     evidence = dict(evidence or {})
     return {
-        "finding_id": stable_finding_id(stage=stage, code=code, evidence=evidence),
+        "finding_id": stable_finding_id(
+            stage=stage,
+            code=code,
+            evidence=evidence,
+            chapter_id=chapter_id,
+            unit_ids=unit_ids,
+            segment_ids=segment_ids,
+            source_location=source_location,
+        ),
         "code": code,
         "severity": severity,
         "stage": stage,
@@ -199,7 +236,6 @@ def build_quality_context(run_dir: Path) -> dict[str, Any]:
     raw_path = run_dir / "translated.raw.md"
     cleaned_path = run_dir / "translated.cleaned.md"
     final_path = run_dir / "translated.md"
-    review_state_path = run_dir / "review-state.json"
     return {
         "run_dir": str(run_dir),
         "reading_units_document_fingerprint": reading_units.get("document_fingerprint"),
@@ -221,9 +257,6 @@ def build_quality_context(run_dir: Path) -> dict[str, Any]:
         "translation_prompt_version": TRANSLATION_PROMPT_VERSION,
         "zh_cleanup_rules_version": RULES_VERSION,
         "polish_prompt_version": POLISH_PROMPT_VERSION,
-        "manual_decision_state_sha256": sha256_file(review_state_path)
-        if review_state_path.exists()
-        else None,
     }
 
 
@@ -241,44 +274,67 @@ def build_quality_signature(run_dir: Path, *, text_operation: str) -> dict[str, 
         "translation_prompt_version": context.get("translation_prompt_version"),
         "zh_cleanup_rules_version": context.get("zh_cleanup_rules_version"),
         "polish_prompt_version": context.get("polish_prompt_version"),
-        "manual_decision_state_sha256": context.get("manual_decision_state_sha256"),
         "text_operation": text_operation,
     }
 
 
-def _markdown_link_targets(text: str) -> set[str]:
+def _html_anchor_targets(text: str) -> list[str]:
     soup = BeautifulSoup(markdown_renderer.markdown(text), "html.parser")
-    targets = {str(item["href"]) for item in soup.find_all("a", href=True)}
+    return sorted(str(item["href"]) for item in soup.find_all("a", href=True))
+
+
+def _markdown_link_targets(text: str) -> set[str]:
+    targets = set(_html_anchor_targets(text))
     targets.update(url.rstrip(".,;:!?)]") for url in re.findall(r"https?://[^\s<>]+", text))
+    for _is_image, destination in _markdown_link_specs(text):
+        targets.add(destination)
     return targets
 
 
-def _markdown_link_specs(text: str) -> list[tuple[bool, str]]:
-    specs: list[tuple[bool, str]] = []
-    index = 0
-    while index < len(text):
-        is_image = text.startswith("![", index)
-        if is_image or text[index] == "[":
-            start = index + 2 if is_image else index + 1
-            close = text.find("]", start)
-            if close != -1 and close + 1 < len(text) and text[close + 1] == "(":
-                depth = 0
-                end = -1
-                for pos in range(close + 1, len(text)):
-                    char = text[pos]
-                    if char == "(":
-                        depth += 1
-                    elif char == ")":
-                        depth -= 1
-                        if depth == 0:
-                            end = pos
-                            break
-                if end != -1:
-                    specs.append((is_image, text[close + 2 : end]))
-                    index = end + 1
-                    continue
-        index += 1
-    return specs
+def _protected_literal_multiset(text: str) -> list[str]:
+    literals: list[str] = []
+    for line in text.splitlines():
+        literals.extend(_protected_literals(line))
+    spans = polish_protected_spans(text)
+    if spans and not literals:
+        literals.extend(text[start:end] for start, end in spans)
+    return sorted(literals)
+
+
+def _raw_protected_multisets(text: str) -> dict[str, list[str]]:
+    return {
+        "footnotes": sorted(FOOTNOTE_REF_RE.findall(text)),
+        "preserve_markers": sorted(PRESERVE_MARKER_RE.findall(text)),
+        "inline_code": sorted(INLINE_CODE_RE.findall(text)),
+        "auto_links": sorted(AUTO_LINK_RE.findall(text)),
+        "urls": sorted(URL_RE.findall(text)),
+        "emails": sorted(EMAIL_RE.findall(text)),
+        "html_anchors": _html_anchor_targets(text),
+        "link_destinations": sorted(destination for _is_image, destination in _markdown_link_specs(text)),
+        "protected_literals": _protected_literal_multiset(text),
+    }
+
+
+def _relative_report_path(run_dir: Path, path: Path) -> str:
+    resolved = path.expanduser().resolve()
+    run_resolved = run_dir.expanduser().resolve()
+    if resolved.is_relative_to(run_resolved):
+        return str(resolved.relative_to(run_resolved))
+    return path.name
+
+
+def _write_translation_source_revision(run_dir: Path, *, context: dict[str, Any]) -> None:
+    book = _read_json(run_dir / "book.json")
+    metadata = book.get("metadata") if isinstance(book.get("metadata"), dict) else {}
+    atomic_json(
+        run_dir / "translation-source-revision.json",
+        {
+            "source_revision": metadata.get("source_revision", 0),
+            "chapter_fingerprint": metadata.get("chapter_fingerprint"),
+            "glossary_fingerprint": context.get("glossary_fingerprint"),
+            "reading_units_fingerprint": context.get("reading_units_fingerprint"),
+        },
+    )
 
 
 def _numeric_literals(text: str) -> list[str]:
@@ -358,7 +414,17 @@ def build_source_quality_report(
         chapter_segments = _load_chapter_segments(run_dir)
         expected = reading_units.get("document_fingerprint")
         actual = chapter_segments.get("reading_units_fingerprint")
-        if expected and actual and expected != actual:
+        if not actual:
+            findings.append(
+                _finding(
+                    stage="source",
+                    code="missing_reading_units_fingerprint",
+                    severity="blocking",
+                    message="chapter-segments.json must include reading_units_fingerprint.",
+                    evidence={"expected": expected},
+                )
+            )
+        elif expected != actual:
             findings.append(
                 _finding(
                     stage="source",
@@ -408,6 +474,8 @@ def run_source_quality_gate_before_translation(
 ) -> dict[str, str]:
     run_dir = run_dir.expanduser().resolve()
     context = build_quality_context(run_dir)
+    if text_operation == "translate":
+        _write_translation_source_revision(run_dir, context=context)
     report = build_source_quality_report(run_dir, text_operation=text_operation, context=context)
     source_path = run_dir / SOURCE_QUALITY_REPORT
     write_quality_report(source_path, report)
@@ -442,6 +510,8 @@ def _review_items_to_findings(
     findings: list[dict[str, Any]] = []
     for item in review_items:
         issue_type = str(item.get("issue_type") or "unknown")
+        if issue_type.startswith("polish_"):
+            continue
         code = _REVIEW_ISSUE_TO_CODE.get(issue_type, issue_type)
         severity: QualitySeverity = "review"
         if issue_type in {
@@ -537,7 +607,10 @@ def build_raw_translation_quality_report(
                     },
                 )
             )
-        invented = _markdown_link_targets(raw_text) - _markdown_link_targets(source_markdown)
+        source_targets = _markdown_link_targets(source_markdown)
+        raw_targets = _markdown_link_targets(raw_text)
+        invented = raw_targets - source_targets
+        lost = source_targets - raw_targets
         if invented:
             findings.append(
                 _finding(
@@ -545,26 +618,68 @@ def build_raw_translation_quality_report(
                     code="invented_link_targets",
                     severity="blocking",
                     message="Raw translation introduced link targets absent from source.",
-                    evidence={"targets": sorted(invented)[:20]},
+                    evidence={"targets": sorted(invented)[:20], "count": len(invented)},
                 )
             )
+        if lost:
+            findings.append(
+                _finding(
+                    stage="raw_translation",
+                    code="lost_link_targets",
+                    severity="blocking",
+                    message="Raw translation lost link targets present in source.",
+                    evidence={"targets": sorted(lost)[:20], "count": len(lost)},
+                )
+            )
+        source_specs = _markdown_link_specs(source_markdown)
+        raw_specs = _markdown_link_specs(raw_text)
+        if Counter(source_specs) != Counter(raw_specs):
+            findings.append(
+                _finding(
+                    stage="raw_translation",
+                    code="markdown_link_structure_loss",
+                    severity="blocking",
+                    message="Raw translation changed Markdown link/image destination structure.",
+                    evidence={
+                        "source_count": len(source_specs),
+                        "raw_count": len(raw_specs),
+                    },
+                )
+            )
+        source_protected = _raw_protected_multisets(source_markdown)
+        raw_protected = _raw_protected_multisets(raw_text)
+        for key, source_values in source_protected.items():
+            if Counter(source_values) != Counter(raw_protected.get(key, [])):
+                findings.append(
+                    _finding(
+                        stage="raw_translation",
+                        code=f"{key}_regression",
+                        severity="blocking",
+                        message=f"Raw translation changed protected {key} relative to source.",
+                        evidence={
+                            "source_count": len(source_values),
+                            "raw_count": len(raw_protected.get(key, [])),
+                        },
+                    )
+                )
 
     binding_path = run_dir / "translation-source-revision.json"
     if binding_path.exists():
         binding = _read_json(binding_path)
-        if binding.get("glossary_fingerprint") and binding["glossary_fingerprint"] != context.get("glossary_fingerprint"):
-            findings.append(
-                _finding(
-                    stage="raw_translation",
-                    code="stale_glossary_fingerprint",
-                    severity="blocking",
-                    message="Raw translation provenance does not match current glossary fingerprint.",
-                    evidence={
-                        "expected": context.get("glossary_fingerprint"),
-                        "actual": binding.get("glossary_fingerprint"),
-                    },
+        for field, expected in (
+            ("glossary_fingerprint", context.get("glossary_fingerprint")),
+            ("reading_units_fingerprint", context.get("reading_units_fingerprint")),
+        ):
+            if expected and binding.get(field) and binding.get(field) != expected:
+                findings.append(
+                    _finding(
+                        stage="raw_translation",
+                        code=f"stale_{field}",
+                        severity="blocking",
+                        message=f"Raw translation provenance does not match current {field}.",
+                        evidence={"expected": expected, "actual": binding.get(field)},
+                    )
                 )
-            )
 
     if review_items:
         findings.extend(_review_items_to_findings(review_items, stage="raw_translation"))
@@ -643,6 +758,16 @@ def build_polished_output_quality_report(
                     },
                 )
             )
+        if cleaned_text.endswith("\n") != final_text.endswith("\n"):
+            findings.append(
+                _finding(
+                    stage="polished_output",
+                    code="final_newline_regression",
+                    severity="blocking",
+                    message="Final translation changed trailing newline relative to cleaned translation.",
+                    evidence={},
+                )
+            )
         if markdown_block_structure(cleaned_text) != markdown_block_structure(final_text):
             findings.append(
                 _finding(
@@ -656,7 +781,7 @@ def build_polished_output_quality_report(
                     },
                 )
             )
-        if _markdown_link_specs(cleaned_text) != _markdown_link_specs(final_text):
+        if Counter(_markdown_link_specs(cleaned_text)) != Counter(_markdown_link_specs(final_text)):
             findings.append(
                 _finding(
                     stage="polished_output",
@@ -686,7 +811,19 @@ def build_polished_output_quality_report(
                     evidence={},
                 )
             )
-        if _numeric_literals(cleaned_text) != _numeric_literals(final_text):
+        if _protected_literal_multiset(cleaned_text) != _protected_literal_multiset(final_text):
+            findings.append(
+                _finding(
+                    stage="polished_output",
+                    code="protected_literal_regression",
+                    severity="blocking",
+                    message="Final translation changed protected literals relative to cleaned translation.",
+                    evidence={},
+                )
+            )
+        cleaned_numeric = _numeric_literals(cleaned_text)
+        final_numeric = _numeric_literals(final_text)
+        if cleaned_numeric != final_numeric:
             findings.append(
                 _finding(
                     stage="polished_output",
@@ -696,8 +833,22 @@ def build_polished_output_quality_report(
                     evidence={},
                 )
             )
+        for key in ("urls", "emails", "html_anchors", "auto_links", "inline_code", "preserve_markers"):
+            if Counter(_raw_protected_multisets(cleaned_text)[key]) != Counter(
+                _raw_protected_multisets(final_text)[key]
+            ):
+                findings.append(
+                    _finding(
+                        stage="polished_output",
+                        code=f"polished_{key}_regression",
+                        severity="blocking",
+                        message=f"Final translation changed {key} relative to cleaned translation.",
+                        evidence={},
+                    )
+                )
 
     polish_report = _read_json(run_dir / "polish-report.json")
+    polish_outcome = str(polish_report.get("outcome") or "")
     warning = _read_json(run_dir / "polish-warning.json")
     if warning:
         findings.append(
@@ -709,26 +860,28 @@ def build_polished_output_quality_report(
                 evidence=warning,
             )
         )
-    for bucket, code in (
-        ("rejected", "polish_rejected"),
-        ("unchanged", "polish_unchanged"),
-        ("unresolved", "polish_unresolved"),
-    ):
-        for entry in polish_report.get(bucket, []) if isinstance(polish_report.get(bucket), list) else []:
-            if not isinstance(entry, dict):
-                continue
-            findings.append(
-                _finding(
-                    stage="polished_output",
-                    code=code,
-                    severity="review",
-                    message=f"Polish decision requires review ({code}).",
-                    evidence={"decision": entry.get("decision"), "line": entry.get("line"), "before": entry.get("before")},
+    if polish_outcome != "applied":
+        for bucket, code in (
+            ("rejected", "polish_rejected"),
+            ("unchanged", "polish_unchanged"),
+            ("unresolved", "polish_unresolved"),
+        ):
+            for entry in polish_report.get(bucket, []) if isinstance(polish_report.get(bucket), list) else []:
+                if not isinstance(entry, dict):
+                    continue
+                findings.append(
+                    _finding(
+                        stage="polished_output",
+                        code=code,
+                        severity="review",
+                        message=f"Polish decision requires review ({code}).",
+                        evidence={
+                            "decision": entry.get("decision"),
+                            "line": entry.get("line"),
+                            "before": entry.get("before"),
+                        },
+                    )
                 )
-            )
-    outcome = str(polish_report.get("outcome") or "")
-    if outcome in {"no_candidates", "accepted"} and not findings:
-        pass
 
     if polished_path.exists() and not final_text and polished_path.read_text(encoding="utf-8").strip():
         findings.append(
@@ -761,15 +914,25 @@ def build_translation_quality_index(
     invalidated_artifacts: list[str] | None = None,
 ) -> dict[str, Any]:
     run_dir = run_dir.expanduser().resolve()
-    report_paths: dict[str, str | None] = {
-        "source": str(run_dir / SOURCE_QUALITY_REPORT),
-        "raw_translation": str(run_dir / RAW_TRANSLATION_QUALITY_REPORT),
-        "polished_output": str(run_dir / POLISHED_OUTPUT_QUALITY_REPORT),
+    report_filenames = {
+        "source": SOURCE_QUALITY_REPORT,
+        "raw_translation": RAW_TRANSLATION_QUALITY_REPORT,
+        "polished_output": POLISHED_OUTPUT_QUALITY_REPORT,
+    }
+    report_paths: dict[str, str] = {
+        key: _relative_report_path(run_dir, run_dir / filename)
+        for key, filename in report_filenames.items()
     }
     report_hashes: dict[str, str | None] = {}
-    for key, path_value in report_paths.items():
-        path = Path(path_value)
-        report_hashes[key] = sha256_file(path) if path.exists() else None
+    for key, rel_path in report_paths.items():
+        payload = reports.get(key)
+        path = run_dir / rel_path
+        if payload is None:
+            report_hashes[key] = None
+        elif path.exists():
+            report_hashes[key] = sha256_file(path)
+        else:
+            report_hashes[key] = None
 
     findings: list[dict[str, Any]] = []
     for payload in reports.values():
@@ -817,12 +980,6 @@ def invalidate_stale_translation_postprocess(run_dir: Path, *, text_operation: s
         run_dir / RAW_TRANSLATION_QUALITY_REPORT,
         index_path,
     ]
-    old_epub = (
-        prior.get("reports", {})
-        .get("polished_output", {})
-        if isinstance(prior.get("reports"), dict)
-        else {}
-    )
     polish_report = _read_json(run_dir / "polish-report.json")
     epub_value = (
         (polish_report.get("outputs") or {}).get("translated_polished_epub")
@@ -830,12 +987,21 @@ def invalidate_stale_translation_postprocess(run_dir: Path, *, text_operation: s
         else None
     )
     if isinstance(epub_value, str) and epub_value.strip():
-        candidates.append(Path(epub_value))
+        epub_path = Path(epub_value).expanduser()
+        if not epub_path.is_absolute():
+            epub_path = run_dir / epub_path
+        epub_path = epub_path.resolve()
+        if epub_path.is_relative_to(run_dir.resolve()) and epub_path.exists():
+            candidates.append(epub_path)
 
+    run_resolved = run_dir.resolve()
     for path in candidates:
-        if path.exists():
-            path.unlink()
-            removed.append(str(path.relative_to(run_dir)) if path.is_relative_to(run_dir) else str(path))
+        resolved = path.expanduser().resolve()
+        if not resolved.is_relative_to(run_resolved):
+            continue
+        if resolved.exists():
+            resolved.unlink()
+            removed.append(str(resolved.relative_to(run_resolved)))
     return removed
 
 
@@ -849,6 +1015,7 @@ def write_translation_quality_bundle(
 ) -> dict[str, str]:
     run_dir = run_dir.expanduser().resolve()
     context = build_quality_context(run_dir)
+    _write_translation_source_revision(run_dir, context=context)
     source_report = build_source_quality_report(run_dir, text_operation=text_operation, context=context)
     raw_report = build_raw_translation_quality_report(
         run_dir,
@@ -941,16 +1108,32 @@ def assert_translation_quality_current(run_dir: Path) -> None:
             "Re-run translation or create a new task."
         )
     reports = index.get("reports") if isinstance(index.get("reports"), dict) else {}
-    for key, meta in reports.items():
+    run_resolved = run_dir.resolve()
+    for key in ("source", "raw_translation", "polished_output"):
+        meta = reports.get(key)
         if not isinstance(meta, dict):
-            continue
+            raise ValueError(
+                f"Export blocked: translation quality report metadata for {key} is missing or malformed."
+            )
         path_value = meta.get("path")
         expected_hash = meta.get("sha256")
-        if not isinstance(path_value, str) or not isinstance(expected_hash, str):
-            continue
+        if not isinstance(path_value, str) or not path_value.strip():
+            raise ValueError(
+                f"Export blocked: translation quality report {key} path is missing or malformed."
+            )
+        if not isinstance(expected_hash, str) or not expected_hash.strip():
+            raise ValueError(
+                f"Export blocked: translation quality report {key} hash is missing or malformed."
+            )
         path = Path(path_value)
         if not path.is_absolute():
-            path = run_dir / path.name
+            path = (run_dir / path).resolve()
+        else:
+            path = path.expanduser().resolve()
+        if not path.is_relative_to(run_resolved):
+            raise ValueError(
+                f"Export blocked: translation quality report {key} path is outside the run directory."
+            )
         if not path.exists() or sha256_file(path) != expected_hash:
             raise ValueError(
                 f"Export blocked: translation quality report {key} is missing or stale. Create a new task."

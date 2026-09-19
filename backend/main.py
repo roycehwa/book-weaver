@@ -798,13 +798,20 @@ def _workspace_book_from_job(job: dict[str, Any]) -> dict[str, Any]:
     chapters_confirmed = _chapters_confirmed_by_user(job, artifacts)
     polish_outcome = _polish_outcome(job)
     quality_summary = {"translation_quality_blocking": False, "translation_quality_review_count": 0}
-    book_href = artifacts.get("book")
-    if isinstance(book_href, dict) and isinstance(book_href.get("href"), str):
+    job_id = job.get("job_id")
+    run_dir: Path | None = None
+    if isinstance(job_id, str) and job_id and "book" in artifacts:
+        service = get_job_service()
+        if hasattr(service, "artifact_path"):
+            run_dir = service.artifact_path(job_id, "book").parent
+    if run_dir is None:
+        book_href = artifacts.get("book")
+        if isinstance(book_href, dict) and isinstance(book_href.get("href"), str):
+            run_dir = Path(str(book_href["href"])).expanduser().resolve().parent
+    if run_dir is not None and run_dir.exists():
         from pdf_translator.translation_quality import translation_quality_summary
 
-        run_dir = Path(str(book_href["href"])).expanduser().resolve().parent
-        if run_dir.exists():
-            quality_summary = translation_quality_summary(run_dir)
+        quality_summary = translation_quality_summary(run_dir)
     polish_finished = polish_outcome in {"applied", "no_candidates", "needs_review", "waived"}
     polish_failed = state == "failed" and failed_stage == "polishing" or polish_outcome == "failed"
     lifecycle_stage = _canonical_lifecycle_stage(job)

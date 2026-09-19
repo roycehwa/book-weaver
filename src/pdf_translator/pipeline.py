@@ -927,7 +927,7 @@ def run_translation_pipeline(
         run_dir=artifacts.output_dir,
     )
     extra_files.update(write_review_artifacts(artifacts.output_dir, review_artifacts))
-    from pdf_translator.source_workspace import atomic_json, glossary_fingerprint
+    from pdf_translator.source_workspace import atomic_json
     from pdf_translator.translation_quality import write_translation_quality_bundle
     from pdf_translator.review import extend_pre_review_with_translation_quality
 
@@ -940,19 +940,16 @@ def run_translation_pipeline(
         invalidated_artifacts=invalidated_postprocess or None,
     )
     extra_files.update(quality_files)
-    pre_review_path = artifacts.output_dir / "pre-review.json"
+    pre_review_path = artifacts.output_dir / "pre_review.json"
+    pre_review_payload = review_artifacts.get("pre_review") or {}
     if pre_review_path.exists():
         pre_review_payload = json.loads(pre_review_path.read_text(encoding="utf-8"))
-        atomic_json(
-            pre_review_path,
-            extend_pre_review_with_translation_quality(pre_review_payload, artifacts.output_dir),
-        )
-        review_artifacts["pre_review"] = json.loads(pre_review_path.read_text(encoding="utf-8"))
-    atomic_json(artifacts.output_dir / "translation-source-revision.json", {
-        "source_revision": (book or {}).get("metadata", {}).get("source_revision", 0),
-        "chapter_fingerprint": (book or {}).get("metadata", {}).get("chapter_fingerprint"),
-        "glossary_fingerprint": glossary_fingerprint(artifacts.output_dir),
-    })
+    pre_review_with_quality = extend_pre_review_with_translation_quality(
+        pre_review_payload,
+        artifacts.output_dir,
+    )
+    atomic_json(pre_review_path, pre_review_with_quality)
+    review_artifacts["pre_review"] = pre_review_with_quality
     rendered_files: dict[str, str] = {}
     epub_validation: dict[str, Any] | None = None
     if settings.output_format in {"pdf", "both"}:

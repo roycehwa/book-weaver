@@ -10,6 +10,38 @@ from pdf_translator.reading_units import build_reading_units
 from pdf_translator.translation_quality import write_translation_quality_bundle
 
 
+def write_synthetic_reading_units(run_dir: Path) -> None:
+    book = {
+        "chapters": [
+            {
+                "index": 1,
+                "chapter_id": "ch-1",
+                "title": "Chapter",
+                "markdown": "# Chapter\n\nHello world.\n",
+                "source_pages": [1],
+                "translate": True,
+            }
+        ]
+    }
+    payload = build_reading_units(book, source_path=Path("synthetic.pdf"), translation_authority=True)
+    (run_dir / "reading-units.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    markdown = "# Chapter\n\nHello world.\n"
+    segments = {
+        "schema": "bookweaver_chapter_segments_v1",
+        "reading_units_fingerprint": payload["document_fingerprint"],
+        "segments": [
+            {
+                "segment_id": "seg-1",
+                "chapter_id": "ch-1",
+                "block_index": 0,
+                "markdown": markdown,
+            }
+        ],
+    }
+    (run_dir / "chapter-segments.json").write_text(json.dumps(segments, indent=2), encoding="utf-8")
+    (run_dir / "translation-input.md").write_text(markdown, encoding="utf-8")
+
+
 def ensure_confirmed_reading_units_for_translation(run_dir: Path, *, max_chars: int = 9000) -> None:
     run_dir = run_dir.expanduser().resolve()
     reading_units_path = run_dir / "reading-units.json"
@@ -38,6 +70,16 @@ def ensure_confirmed_reading_units_for_translation(run_dir: Path, *, max_chars: 
     )
 
 
+def _source_markdown_for_quality(run_dir: Path) -> str:
+    translation_input = run_dir / "translation-input.md"
+    if translation_input.exists():
+        return translation_input.read_text(encoding="utf-8")
+    book_md = run_dir / "book.md"
+    if book_md.exists():
+        return book_md.read_text(encoding="utf-8")
+    return "Synthetic source.\n"
+
+
 def write_minimal_translation_quality_artifacts(run_dir: Path) -> None:
     """Write passing quality reports for a translate-mode manifest if outputs exist."""
     run_dir = run_dir.expanduser().resolve()
@@ -49,41 +91,25 @@ def write_minimal_translation_quality_artifacts(run_dir: Path) -> None:
     manifest_path = run_dir / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
     text_operation = manifest.get("text_operation") or "translate"
+    source_markdown = _source_markdown_for_quality(run_dir)
     if text_operation != "translate":
         write_translation_quality_bundle(
             run_dir,
             text_operation=str(text_operation),
-            source_markdown=(run_dir / "translation-input.md").read_text(encoding="utf-8")
-            if (run_dir / "translation-input.md").exists()
-            else (run_dir / "book.md").read_text(encoding="utf-8")
-            if (run_dir / "book.md").exists()
-            else "",
+            source_markdown=source_markdown,
             review_items=[],
         )
         return
-    source_path = run_dir / "translation-input.md"
-    if not source_path.exists():
-        source_path = run_dir / "book.md"
     raw_path = run_dir / "translated.raw.md"
     if not raw_path.exists() and (run_dir / "translated.md").exists():
-        raw_path.write_text((run_dir / "translated.md").read_text(encoding="utf-8"), encoding="utf-8")
+        raw_path.write_text(source_markdown, encoding="utf-8")
     if not (run_dir / "translated.cleaned.md").exists() and raw_path.exists():
         (run_dir / "translated.cleaned.md").write_text(raw_path.read_text(encoding="utf-8"), encoding="utf-8")
-    if raw_path.exists():
-        source = raw_path.read_text(encoding="utf-8")
-    elif source_path.exists():
-        source = source_path.read_text(encoding="utf-8")
-    else:
-        source = "Synthetic source.\n"
+    if not (run_dir / "translated.md").exists() and raw_path.exists():
+        (run_dir / "translated.md").write_text(raw_path.read_text(encoding="utf-8"), encoding="utf-8")
     write_translation_quality_bundle(
         run_dir,
         text_operation="translate",
-        source_markdown=source,
+        source_markdown=source_markdown,
         review_items=[],
     )
-
-
-def write_synthetic_reading_units(run_dir: Path) -> None:
-    from tests.test_translation_quality import _write_reading_units
-
-    _write_reading_units(run_dir)
