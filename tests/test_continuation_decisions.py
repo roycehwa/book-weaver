@@ -12,8 +12,16 @@ def _prov(page_no: int, left: float, top: float, *, bottom: float | None = None,
     }]
 
 
+def _docling_pages(height: float = 792.0, width: float = 612.0, count: int = 2) -> dict[str, dict]:
+    return {
+        str(page_no): {"size": {"width": width, "height": height}}
+        for page_no in range(1, count + 1)
+    }
+
+
 def test_cross_node_true_continuation_merges_and_records_acceptance() -> None:
     structured = {
+        "pages": _docling_pages(),
         "body": {"children": [{"$ref": "#/texts/0"}, {"$ref": "#/texts/1"}]},
         "texts": [
             {
@@ -46,6 +54,7 @@ def test_cross_node_true_continuation_merges_and_records_acceptance() -> None:
 
 def test_cross_node_paragraph_break_is_rejected() -> None:
     structured = {
+        "pages": _docling_pages(),
         "body": {"children": [{"$ref": "#/texts/0"}, {"$ref": "#/texts/1"}]},
         "texts": [
             {
@@ -72,6 +81,7 @@ def test_cross_node_paragraph_break_is_rejected() -> None:
 
 def test_cross_node_multi_column_mismatch_is_rejected() -> None:
     structured = {
+        "pages": _docling_pages(),
         "body": {"children": [{"$ref": "#/texts/0"}, {"$ref": "#/texts/1"}]},
         "texts": [
             {
@@ -97,6 +107,7 @@ def test_cross_node_multi_column_mismatch_is_rejected() -> None:
 
 def test_page_header_noise_does_not_merge_with_body() -> None:
     structured = {
+        "pages": _docling_pages(),
         "body": {"children": [{"$ref": f"#/texts/{index}"} for index in range(3)]},
         "texts": [
             {
@@ -129,6 +140,7 @@ def test_page_header_noise_does_not_merge_with_body() -> None:
 
 def test_cross_node_hyphenation_merge() -> None:
     structured = {
+        "pages": _docling_pages(),
         "body": {"children": [{"$ref": "#/texts/0"}, {"$ref": "#/texts/1"}]},
         "texts": [
             {
@@ -155,6 +167,7 @@ def test_cross_node_hyphenation_merge() -> None:
 
 def test_reading_units_keep_combined_cross_node_provenance() -> None:
     structured = {
+        "pages": _docling_pages(),
         "body": {"children": [{"$ref": "#/texts/0"}, {"$ref": "#/texts/1"}]},
         "texts": [
             {
@@ -176,7 +189,8 @@ def test_reading_units_keep_combined_cross_node_provenance() -> None:
     paragraph = next(unit for unit in payload["units"] if unit["kind"] == "paragraph")
     joined = "The movement began to gather momentum across the region during the following decade."
     assert paragraph["markdown"] == joined
-    assert paragraph["boundary_before"] == "continuation"
+    assert paragraph["boundary_before"] in {"chapter", "paragraph"}
+    assert paragraph["continuation_decision"]["kind"] == "cross_source_node"
     assert len(paragraph["provenance"]) == 2
     assert paragraph["provenance"][0]["source_node_id"] == "#/texts/0"
     assert paragraph["provenance"][1]["source_node_id"] == "#/texts/1"
@@ -184,6 +198,7 @@ def test_reading_units_keep_combined_cross_node_provenance() -> None:
 
 def test_ledger_and_fingerprints_are_stable_for_unchanged_input() -> None:
     structured = {
+        "pages": _docling_pages(),
         "body": {"children": [{"$ref": "#/texts/0"}, {"$ref": "#/texts/1"}]},
         "texts": [
             {
@@ -213,6 +228,7 @@ def test_ledger_and_fingerprints_are_stable_for_unchanged_input() -> None:
 
 def test_same_source_node_output_remains_stable() -> None:
     structured = {
+        "pages": _docling_pages(),
         "body": {"children": [{"$ref": "#/texts/0"}]},
         "texts": [
             {
@@ -235,3 +251,90 @@ def test_same_source_node_output_remains_stable() -> None:
     assert result["logical_continuations"][0]["repair"] == "page_break_hyphen_removed"
     assert result["continuation_decisions"]["decisions"][0]["status"] == "accepted"
     assert result["continuation_decisions"]["decisions"][0]["kind"] == "same_source_node"
+
+
+def test_page_relative_geometry_accepts_equivalent_layout_on_scaled_pages() -> None:
+    def scaled_structured(scale: float) -> dict:
+        return {
+            "pages": _docling_pages(height=792.0 * scale, width=612.0 * scale),
+            "body": {"children": [{"$ref": "#/texts/0"}, {"$ref": "#/texts/1"}]},
+            "texts": [
+                {
+                    "label": "text",
+                    "text": "The movement began to gather momentum across the",
+                    "prov": _prov(1, 50 * scale, 320 * scale, bottom=280 * scale, right=500 * scale),
+                },
+                {
+                    "label": "text",
+                    "text": "region during the following decade.",
+                    "prov": _prov(2, 50 * scale, 680 * scale, bottom=640 * scale, right=500 * scale),
+                },
+            ],
+            "pictures": [],
+            "tables": [],
+        }
+
+    baseline = build_book_reconstruction(scaled_structured(1.0))
+    scaled = build_book_reconstruction(scaled_structured(2.0))
+
+    assert baseline["chapters"][0]["markdown"] == scaled["chapters"][0]["markdown"]
+    assert baseline["continuation_decisions"]["decisions"][0]["status"] == "accepted"
+    assert scaled["continuation_decisions"]["decisions"][0]["status"] == "accepted"
+
+
+def test_missing_page_dimensions_fail_closed_for_cross_node_merge() -> None:
+    structured = {
+        "body": {"children": [{"$ref": "#/texts/0"}, {"$ref": "#/texts/1"}]},
+        "texts": [
+            {
+                "label": "text",
+                "text": "The movement began to gather momentum across the",
+                "prov": _prov(1, 50, 320, bottom=280),
+            },
+            {
+                "label": "text",
+                "text": "region during the following decade.",
+                "prov": _prov(2, 50, 680, bottom=640),
+            },
+        ],
+        "pictures": [],
+        "tables": [],
+    }
+
+    result = build_book_reconstruction(structured)
+
+    decision = result["continuation_decisions"]["decisions"][0]
+    assert decision["status"] == "rejected"
+    assert "missing_page_dimensions" in decision["reasons"]
+    assert "The movement began" in result["chapters"][0]["markdown"]
+    assert "region during" in result["chapters"][0]["markdown"]
+
+
+def test_ledger_fingerprint_changes_when_joined_text_changes() -> None:
+    def structured_for(joined_suffix: str) -> dict:
+        return {
+            "pages": _docling_pages(),
+            "body": {"children": [{"$ref": "#/texts/0"}, {"$ref": "#/texts/1"}]},
+            "texts": [
+                {
+                    "label": "text",
+                    "text": "The movement began to gather momentum across the",
+                    "prov": _prov(1, 50, 320, bottom=280),
+                },
+                {
+                    "label": "text",
+                    "text": f"region during the following decade{joined_suffix}",
+                    "prov": _prov(2, 50, 680, bottom=640),
+                },
+            ],
+            "pictures": [],
+            "tables": [],
+        }
+
+    first = build_book_reconstruction(structured_for(""))
+    second = build_book_reconstruction(structured_for("."))
+
+    assert (
+        first["continuation_decisions"]["document_fingerprint"]
+        != second["continuation_decisions"]["document_fingerprint"]
+    )

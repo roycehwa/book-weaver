@@ -151,6 +151,78 @@ def _pdf_item_span(item: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def _continuation_decision_metadata(continuation: dict[str, Any]) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "decision_id": continuation.get("decision_id"),
+        "kind": continuation.get("kind"),
+        "from_page": continuation.get("from_page"),
+        "to_page": continuation.get("to_page"),
+        "joined_text": continuation.get("joined_text"),
+        "repair": continuation.get("repair"),
+        "confidence": continuation.get("confidence"),
+        "left_source_node_id": continuation.get("left_source_node_id") or continuation.get("source_node_id"),
+        "right_source_node_id": continuation.get("right_source_node_id") or continuation.get("source_node_id"),
+        "left_char_end": continuation.get("source_char_end"),
+        "right_char_start": continuation.get("next_source_char_start"),
+    }
+    style_evidence = continuation.get("style_evidence")
+    if isinstance(style_evidence, dict):
+        metadata["style_evidence"] = style_evidence
+    return {key: value for key, value in metadata.items() if value is not None}
+
+
+def _continuation_matches_provenance(
+    continuation: dict[str, Any],
+    provenance: list[dict[str, Any]],
+) -> bool:
+    if len(provenance) != 2:
+        return False
+    left_span, right_span = provenance[0], provenance[1]
+    if left_span.get("precision") != "span" or right_span.get("precision") != "span":
+        return False
+    left_node = str(continuation.get("left_source_node_id") or continuation.get("source_node_id") or "")
+    right_node = str(continuation.get("right_source_node_id") or continuation.get("source_node_id") or "")
+    left_end = continuation.get("source_char_end")
+    right_start = continuation.get("next_source_char_start")
+    left_span_end = left_span.get("char_end")
+    right_span_start = right_span.get("char_start")
+    if (
+        not left_node
+        or not right_node
+        or not isinstance(left_end, int)
+        or not isinstance(right_start, int)
+        or not isinstance(left_span_end, int)
+        or not isinstance(right_span_start, int)
+    ):
+        return False
+    from_page = continuation.get("from_page")
+    to_page = continuation.get("to_page")
+    left_page = left_span.get("page_no")
+    right_page = right_span.get("page_no")
+    if not isinstance(from_page, int) or not isinstance(to_page, int):
+        return False
+    if not isinstance(left_page, int) or not isinstance(right_page, int):
+        return False
+    return (
+        from_page == left_page
+        and to_page == right_page
+        and left_node == str(left_span.get("source_node_id") or "")
+        and right_node == str(right_span.get("source_node_id") or "")
+        and left_end == left_span_end
+        and right_start == right_span_start
+    )
+
+
+def _continuation_for_provenance(
+    continuations: list[dict[str, Any]],
+    provenance: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    for continuation in continuations:
+        if isinstance(continuation, dict) and _continuation_matches_provenance(continuation, provenance):
+            return continuation
+    return None
+
+
 def _pdf_block_span_candidates(
     book: dict[str, Any],
     chapter: dict[str, Any],
@@ -307,11 +379,11 @@ def build_reading_units(
             if source_format == "epub"
             else {}
         )
-        continuation_boundaries = {
-            str(continuation.get("joined_text") or "").strip(): continuation
+        chapter_continuations = [
+            continuation
             for continuation in book.get("logical_continuations") or []
-            if isinstance(continuation, dict) and str(continuation.get("joined_text") or "").strip()
-        }
+            if isinstance(continuation, dict)
+        ]
         unit_ids: list[str] = []
         for block_index, block in enumerate(blocks, 1):
             unit_id = f"{chapter_id}:unit{block_index:05d}"
@@ -323,9 +395,8 @@ def build_reading_units(
             )
             provenance = exact_candidates.pop(0) if exact_candidates else _source_spans(chapter, source_format)
             boundary_before = "chapter" if block_index == 1 else "paragraph"
-            if block_index > 1 and block.strip() in continuation_boundaries:
-                boundary_before = "continuation"
-            units.append({
+            continuation_match = _continuation_for_provenance(chapter_continuations, provenance)
+            unit_payload: dict[str, Any] = {
                 "unit_id": unit_id,
                 "chapter_id": chapter_id,
                 "chapter_index": chapter_index,
@@ -337,7 +408,10 @@ def build_reading_units(
                 "policy_confirmed": bool(chapter.get("translation_policy_confirmed")),
                 "provenance": provenance,
                 "source_fingerprint": _sha256_text(block),
-            })
+            }
+            if continuation_match is not None:
+                unit_payload["continuation_decision"] = _continuation_decision_metadata(continuation_match)
+            units.append(unit_payload)
         chapters.append({
             "chapter_id": chapter_id,
             "index": chapter_index,
@@ -355,6 +429,11 @@ def build_reading_units(
             "markdown": unit["markdown"],
             "policy": unit["policy"],
             "provenance": unit["provenance"],
+            **(
+                {"continuation_decision": unit["continuation_decision"]}
+                if isinstance(unit.get("continuation_decision"), dict)
+                else {}
+            ),
         }
         for unit in units
     ]

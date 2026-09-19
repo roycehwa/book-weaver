@@ -17,8 +17,9 @@ SCHEMA = "bookweaver_continuation_decisions_v1"
 STATUSES = frozenset({"accepted", "rejected", "uncertain"})
 PROVENANCE = "pdf_docling_page_boundary_v1"
 
-PAGE_BOTTOM_MAX = 320.0
-PAGE_TOP_MIN = 520.0
+# Reference geometry on a ~792pt page; decisions use page-relative ratios instead.
+PAGE_BOTTOM_MAX_RATIO = 320.0 / 792.0
+PAGE_TOP_MIN_RATIO = 520.0 / 792.0
 COLUMN_ALIGN_TOLERANCE = 14.0
 INDENT_TOLERANCE = 22.0
 
@@ -44,6 +45,70 @@ def _decision_id(
 ) -> str:
     payload = f"{from_page}:{to_page}:{left_node}:{right_node}:{left_end}:{right_start}"
     return _sha256_text(payload)[:24]
+
+
+def page_dimensions_from_structured(structured: dict[str, Any] | None) -> dict[int, tuple[float, float]]:
+    pages = (structured or {}).get("pages")
+    dimensions: dict[int, tuple[float, float]] = {}
+    if isinstance(pages, dict):
+        for key, page in pages.items():
+            if not isinstance(page, dict):
+                continue
+            try:
+                page_no = int(key)
+            except (TypeError, ValueError):
+                continue
+            size = page.get("size") if isinstance(page.get("size"), dict) else {}
+            width = float(size.get("width") or 0.0)
+            height = float(size.get("height") or 0.0)
+            if width > 0 and height > 0:
+                dimensions[page_no] = (width, height)
+    elif isinstance(pages, list):
+        for page in pages:
+            if not isinstance(page, dict):
+                continue
+            page_no = page.get("page_no")
+            if not isinstance(page_no, int):
+                continue
+            size = page.get("size") if isinstance(page.get("size"), dict) else {}
+            width = float(size.get("width") or page.get("page_width") or 0.0)
+            height = float(size.get("height") or page.get("page_height") or 0.0)
+            if width > 0 and height > 0:
+                dimensions[page_no] = (width, height)
+    return dimensions
+
+
+def attach_page_dimensions(
+    page_payloads: list[dict[str, Any]],
+    dimensions_by_page: dict[int, tuple[float, float]],
+) -> None:
+    for page in page_payloads:
+        if not isinstance(page, dict):
+            continue
+        page_no = int(page.get("page_no") or 0)
+        size = dimensions_by_page.get(page_no)
+        if not size:
+            continue
+        width, height = size
+        page["page_width"] = width
+        page["page_height"] = height
+        page["page_size"] = {"width": width, "height": height}
+
+
+def _page_size_from_payload(page: dict[str, Any] | None) -> tuple[float, float] | None:
+    if not isinstance(page, dict):
+        return None
+    size = page.get("page_size")
+    if isinstance(size, dict):
+        width = float(size.get("width") or 0.0)
+        height = float(size.get("height") or 0.0)
+        if width > 0 and height > 0:
+            return width, height
+    width = float(page.get("page_width") or 0.0)
+    height = float(page.get("page_height") or 0.0)
+    if width > 0 and height > 0:
+        return width, height
+    return None
 
 
 def _item_geometry(item: dict[str, Any]) -> dict[str, float]:
@@ -267,6 +332,7 @@ def evaluate_cross_source_node_boundary(
     from_page: int,
     to_page: int,
     structured: dict[str, Any] | None = None,
+    left_page: dict[str, Any] | None = None,
     right_page: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     left_node = str(left["source_node_id"])
@@ -301,12 +367,36 @@ def evaluate_cross_source_node_boundary(
     right_geo = _item_geometry(right)
     if right_page and _right_page_leading_boundary_noise(right_page, right, structured=structured):
         decision["reasons"].append("page_boundary_noise")
-    if left_geo["bottom"] > PAGE_BOTTOM_MAX:
-        decision["reasons"].append("left_not_near_page_bottom")
-    if right_geo["top"] < PAGE_TOP_MIN:
-        decision["reasons"].append("right_not_near_page_top")
+    left_page_size = _page_size_from_payload(left_page)
+    right_page_size = _page_size_from_payload(right_page)
+    page_geometry_ok = False
+    page_geometry_evidence: dict[str, Any] = {
+        "left_page_size": (
+            {"width": left_page_size[0], "height": left_page_size[1]} if left_page_size else None
+        ),
+        "right_page_size": (
+            {"width": right_page_size[0], "height": right_page_size[1]} if right_page_size else None
+        ),
+    }
+    if not left_page_size or not right_page_size:
+        decision["reasons"].append("missing_page_dimensions")
+    else:
+        left_height = left_page_size[1]
+        right_height = right_page_size[1]
+        left_bottom_ratio = left_geo["bottom"] / left_height
+        right_top_ratio = right_geo["top"] / right_height
+        page_geometry_evidence["left_bottom_ratio"] = round(left_bottom_ratio, 6)
+        page_geometry_evidence["right_top_ratio"] = round(right_top_ratio, 6)
+        page_geometry_ok = (
+            left_bottom_ratio <= PAGE_BOTTOM_MAX_RATIO
+            and right_top_ratio >= PAGE_TOP_MIN_RATIO
+        )
+        if left_bottom_ratio > PAGE_BOTTOM_MAX_RATIO:
+            decision["reasons"].append("left_not_near_page_bottom")
+        if right_top_ratio < PAGE_TOP_MIN_RATIO:
+            decision["reasons"].append("right_not_near_page_top")
     columns_ok, column_evidence = _columns_compatible(left, right)
-    decision["evidence"]["geometry"] = column_evidence
+    decision["evidence"]["geometry"] = {**column_evidence, **page_geometry_evidence}
     if not columns_ok:
         decision["reasons"].append("column_or_alignment_mismatch")
     if right_geo["left"] > left_geo["left"] + INDENT_TOLERANCE:
@@ -324,11 +414,17 @@ def evaluate_cross_source_node_boundary(
     if decision["reasons"]:
         decision["status"] = "rejected"
         if (
-            syntax_ok
+            page_geometry_ok is False
+            and left_page_size
+            and right_page_size
+            and syntax_ok
             and columns_ok
             and style_ok
-            and len(decision["reasons"]) == 1
-            and decision["reasons"][0] in {"left_not_near_page_bottom", "right_not_near_page_top"}
+            and "missing_page_dimensions" not in decision["reasons"]
+            and "page_boundary_noise" not in decision["reasons"]
+            and set(decision["reasons"]).issubset(
+                {"left_not_near_page_bottom", "right_not_near_page_top"}
+            )
         ):
             decision["status"] = "uncertain"
         return decision
@@ -380,20 +476,11 @@ def build_continuation_decisions_ledger(
                     from_page=left_page_no,
                     to_page=right_page_no,
                     structured=structured,
+                    left_page=left_page,
                     right_page=right_page,
                 )
             )
-    fingerprint_payload = [
-        {
-            "decision_id": item["decision_id"],
-            "status": item["status"],
-            "from_page": item["from_page"],
-            "to_page": item["to_page"],
-            "left_source_node_id": item["left_source_node_id"],
-            "right_source_node_id": item["right_source_node_id"],
-        }
-        for item in decisions
-    ]
+    fingerprint_payload = [_decision_fingerprint_entry(item) for item in decisions]
     return {
         "schema": SCHEMA,
         "provenance": PROVENANCE,
@@ -402,6 +489,30 @@ def build_continuation_decisions_ledger(
             json.dumps(fingerprint_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         ),
         "decisions": decisions,
+    }
+
+
+def _decision_fingerprint_entry(decision: dict[str, Any]) -> dict[str, Any]:
+    evidence = decision.get("evidence") if isinstance(decision.get("evidence"), dict) else {}
+    return {
+        "decision_id": decision["decision_id"],
+        "status": decision["status"],
+        "kind": decision.get("kind"),
+        "from_page": decision["from_page"],
+        "to_page": decision["to_page"],
+        "left_source_node_id": decision["left_source_node_id"],
+        "right_source_node_id": decision["right_source_node_id"],
+        "left_char_end": decision.get("left_char_end"),
+        "right_char_start": decision.get("right_char_start"),
+        "reasons": list(decision.get("reasons") or []),
+        "evidence": {
+            "joined_text": evidence.get("joined_text"),
+            "repair": evidence.get("repair"),
+            "source_separator": evidence.get("source_separator"),
+            "syntax_reason": evidence.get("syntax_reason"),
+            "style": evidence.get("style"),
+            "geometry": evidence.get("geometry"),
+        },
     }
 
 
@@ -488,6 +599,9 @@ def logical_continuations_from_ledger(ledger: dict[str, Any]) -> list[dict[str, 
             "confidence": decision.get("confidence"),
             "kind": decision.get("kind"),
         }
+        style_evidence = evidence.get("style")
+        if isinstance(style_evidence, dict):
+            entry["style_evidence"] = style_evidence
         if decision.get("kind") == "same_source_node":
             entry["source_separator"] = evidence.get("source_separator", "")
         continuations.append(entry)

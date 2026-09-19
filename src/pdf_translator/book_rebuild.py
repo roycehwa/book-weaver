@@ -25,9 +25,12 @@ from pdf_translator.semantic_content import (
 )
 from pdf_translator.ocr_quality import assess_ocr_block
 from pdf_translator.continuation_decisions import (
+    attach_page_dimensions,
     build_continuation_decisions_ledger,
     enrich_logical_continuations,
     logical_continuations_from_ledger,
+    page_dimensions_from_structured,
+    validate_continuation_decisions,
 )
 from pdf_translator.guardrails import (
     ORIGINAL_PAGE_FALLBACK_RE,
@@ -1314,6 +1317,7 @@ def _logical_continuations_for_pages(
     structured: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     ledger = build_continuation_decisions_ledger(page_payloads, structured=structured)
+    validate_continuation_decisions(ledger)
     continuations = enrich_logical_continuations(
         page_payloads,
         logical_continuations_from_ledger(ledger),
@@ -1321,13 +1325,18 @@ def _logical_continuations_for_pages(
     return continuations, ledger
 
 
-def _build_logical_continuations(
+def _continuations_for_page_group(
+    logical_continuations: list[dict[str, Any]],
     page_payloads: list[dict[str, Any]],
-    *,
-    structured: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    continuations, _ledger = _logical_continuations_for_pages(page_payloads, structured=structured)
-    return continuations
+    page_numbers = {int(page.get("page_no") or 0) for page in page_payloads}
+    return [
+        continuation
+        for continuation in logical_continuations
+        if isinstance(continuation, dict)
+        and int(continuation.get("from_page") or 0) in page_numbers
+        and int(continuation.get("to_page") or 0) in page_numbers
+    ]
 
 
 def _apply_logical_continuations(
@@ -1345,7 +1354,12 @@ def _apply_logical_continuations(
     return result
 
 
-def _build_chapter_markdown(page_payloads: list[dict[str, Any]], *, include_page_markers: bool) -> str:
+def _build_chapter_markdown(
+    page_payloads: list[dict[str, Any]],
+    *,
+    include_page_markers: bool,
+    logical_continuations: list[dict[str, Any]] | None = None,
+) -> str:
     parts: list[str] = []
     for payload in page_payloads:
         content_lines = payload["content_lines"]
@@ -1358,10 +1372,10 @@ def _build_chapter_markdown(page_payloads: list[dict[str, Any]], *, include_page
         parts.extend(content_lines)
     markdown = "\n\n".join(line.strip() for line in parts if line.strip())
     markdown = re.sub(r"\n{3,}", "\n\n", markdown).strip()
-    if not include_page_markers:
+    if not include_page_markers and logical_continuations is not None:
         markdown = _apply_logical_continuations(
             markdown,
-            _build_logical_continuations(page_payloads),
+            _continuations_for_page_group(logical_continuations, page_payloads),
         )
     markdown = _dedupe_adjacent_duplicate_headings(markdown)
     return markdown + "\n" if markdown else ""
@@ -2011,6 +2025,8 @@ def apply_canonical_chapter_plan(
 def _build_preserved_resource_chapters(
     pages: list[dict[str, Any]],
     chapters: list[dict[str, Any]],
+    *,
+    logical_continuations: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     used_pages = {
         int(page_no)
@@ -2037,7 +2053,11 @@ def _build_preserved_resource_chapters(
     for group in groups:
         page = group[0]
         page_no = int(page["page_no"])
-        markdown = _build_chapter_markdown(group, include_page_markers=False)
+        markdown = _build_chapter_markdown(
+            group,
+            include_page_markers=False,
+            logical_continuations=logical_continuations,
+        )
         if not markdown.strip():
             continue
         title = _preserved_resource_title(page)
@@ -2050,7 +2070,11 @@ def _build_preserved_resource_chapters(
                 "page_end": int(group[-1]["page_no"]),
                 "source_pages": [int(item["page_no"]) for item in group],
                 "markdown": markdown,
-                "trace_markdown": _build_chapter_markdown(group, include_page_markers=True),
+                "trace_markdown": _build_chapter_markdown(
+                    group,
+                    include_page_markers=True,
+                    logical_continuations=logical_continuations,
+                ),
                 "translate": not apparatus,
                 "preserve_original": apparatus,
                 "resource_only": True,
@@ -2077,7 +2101,11 @@ def _layout_apparatus_title(page: dict[str, Any]) -> str | None:
     return None
 
 
-def _build_layout_apparatus_chapters(pages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _build_layout_apparatus_chapters(
+    pages: list[dict[str, Any]],
+    *,
+    logical_continuations: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     chapters: list[dict[str, Any]] = []
     current_pages: list[dict[str, Any]] = []
     current_title: str | None = None
@@ -2086,7 +2114,11 @@ def _build_layout_apparatus_chapters(pages: list[dict[str, Any]]) -> list[dict[s
         nonlocal current_pages, current_title
         if not current_pages or current_title is None:
             return
-        markdown = _build_chapter_markdown(current_pages, include_page_markers=False)
+        markdown = _build_chapter_markdown(
+            current_pages,
+            include_page_markers=False,
+            logical_continuations=logical_continuations,
+        )
         page_start = int(current_pages[0]["page_no"])
         page_end = max(page_start, int(end_page or current_pages[-1]["page_no"]))
         chapters.append(
@@ -2097,7 +2129,11 @@ def _build_layout_apparatus_chapters(pages: list[dict[str, Any]]) -> list[dict[s
                 "page_end": page_end,
                 "source_pages": list(range(page_start, page_end + 1)),
                 "markdown": markdown,
-                "trace_markdown": _build_chapter_markdown(current_pages, include_page_markers=True),
+                "trace_markdown": _build_chapter_markdown(
+                    current_pages,
+                    include_page_markers=True,
+                    logical_continuations=logical_continuations,
+                ),
                 "translate": False,
                 "preserve_original": True,
                 "resource_only": True,
@@ -2163,6 +2199,8 @@ def _build_cover_chapter(cover_path: Path | None) -> dict[str, Any] | None:
 def _chapter_pages_from_outline(
     pages: list[dict[str, Any]],
     outline_entries: list[dict[str, Any]],
+    *,
+    logical_continuations: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     if not outline_entries:
         return []
@@ -2204,9 +2242,17 @@ def _chapter_pages_from_outline(
             continue
 
         title = str(entry["title"])
-        chapter_markdown = _build_chapter_markdown(selected_pages, include_page_markers=False)
+        chapter_markdown = _build_chapter_markdown(
+            selected_pages,
+            include_page_markers=False,
+            logical_continuations=logical_continuations,
+        )
         chapter_markdown = _strip_duplicate_leading_heading(chapter_markdown, title)
-        trace_markdown = _build_chapter_markdown(selected_pages, include_page_markers=True)
+        trace_markdown = _build_chapter_markdown(
+            selected_pages,
+            include_page_markers=True,
+            logical_continuations=logical_continuations,
+        )
         if not chapter_markdown.strip():
             continue
 
@@ -2453,13 +2499,19 @@ def build_book_reconstruction(
             }
         )
 
+    attach_page_dimensions(pages, page_dimensions_from_structured(structured))
+
     logical_continuations, continuation_decisions = _logical_continuations_for_pages(
         pages,
         structured=structured,
     )
 
     outline_entries = _extract_pdf_outline_chapters(source_pdf, total_pages=total_pages)
-    chapters: list[dict[str, Any]] = _chapter_pages_from_outline(pages, outline_entries)
+    chapters: list[dict[str, Any]] = _chapter_pages_from_outline(
+        pages,
+        outline_entries,
+        logical_continuations=logical_continuations,
+    )
     cover_chapter = _build_cover_chapter(cover_path)
     if cover_chapter is not None:
         chapters.insert(0, cover_chapter)
@@ -2472,9 +2524,17 @@ def build_book_reconstruction(
             return
         fallback_title = f"Untitled Section {len(chapters) + 1}"
         chapter_title = current_title or _infer_section_title(current_pages, fallback_title)
-        chapter_markdown = _build_chapter_markdown(current_pages, include_page_markers=False)
+        chapter_markdown = _build_chapter_markdown(
+            current_pages,
+            include_page_markers=False,
+            logical_continuations=logical_continuations,
+        )
         chapter_markdown = _strip_duplicate_leading_heading(chapter_markdown, chapter_title)
-        trace_markdown = _build_chapter_markdown(current_pages, include_page_markers=True)
+        trace_markdown = _build_chapter_markdown(
+            current_pages,
+            include_page_markers=True,
+            logical_continuations=logical_continuations,
+        )
         is_part_divider = bool(current_title and PART_WITH_TITLE_RE.match(current_title))
         if not chapter_markdown.strip() and not is_part_divider:
             current_pages = []
@@ -2499,7 +2559,7 @@ def build_book_reconstruction(
     has_content_chapters = any(not bool(chapter.get("resource_only")) for chapter in chapters)
     if not has_content_chapters:
         layout_apparatus = (
-            _build_layout_apparatus_chapters(pages)
+            _build_layout_apparatus_chapters(pages, logical_continuations=logical_continuations)
             if source_pdf is not None and images_dir is not None
             else []
         )
@@ -2532,7 +2592,13 @@ def build_book_reconstruction(
         flush()
         chapters.extend(layout_apparatus)
 
-    chapters.extend(_build_preserved_resource_chapters(pages, chapters))
+    chapters.extend(
+        _build_preserved_resource_chapters(
+            pages,
+            chapters,
+            logical_continuations=logical_continuations,
+        )
+    )
     chapters.sort(key=lambda chapter: (int(chapter.get("page_start") or 0), int(chapter.get("index") or 0)))
     _replace_preserved_apparatus_with_page_images(chapters, source_pdf=source_pdf, images_dir=images_dir)
     for index, chapter in enumerate(chapters, 1):
@@ -2659,6 +2725,11 @@ def build_book_reconstruction(
                 "chapter_title": page["chapter_title"],
                 "figure_count": page["figure_count"],
                 "table_count": page["table_count"],
+                **(
+                    {"page_size": page["page_size"]}
+                    if isinstance(page.get("page_size"), dict)
+                    else {}
+                ),
                 "has_content": bool(
                     page.get("content_lines")
                     or int(page.get("figure_count") or 0) > 0

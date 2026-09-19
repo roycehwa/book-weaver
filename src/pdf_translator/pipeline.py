@@ -10,6 +10,7 @@ import re
 from typing import Any
 
 from pdf_translator.book_rebuild import apply_canonical_chapter_plan, build_book_reconstruction
+from pdf_translator.continuation_decisions import validate_continuation_decisions
 from pdf_translator.book_views import (
     ensure_chapter_top_heading,
     join_chapter_delivery_markdown,
@@ -440,6 +441,7 @@ def _prepare_intake_artifacts(settings: RunSettings) -> tuple[
         write_reading_units(artifacts.reading_units_path, book, source_path=settings.source_pdf)
         continuation_payload = book.get("continuation_decisions")
         if isinstance(continuation_payload, dict) and artifacts.continuation_decisions_path is not None:
+            validate_continuation_decisions(continuation_payload)
             artifacts.continuation_decisions_path.write_text(
                 json.dumps(continuation_payload, ensure_ascii=False, indent=2) + "\n",
                 encoding="utf-8",
