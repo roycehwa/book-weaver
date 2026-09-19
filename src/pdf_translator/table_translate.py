@@ -9,6 +9,7 @@ from typing import Any
 
 import requests
 
+from pdf_translator.book_views import join_chapter_delivery_markdown
 from pdf_translator.epub import render_epub_from_book
 from pdf_translator.pipeline import safe_delivery_file_stem
 from pdf_translator.translate import (
@@ -184,7 +185,7 @@ def translate_tables_in_markdown(
     return "\n\n".join(output_blocks) + ("\n" if markdown.endswith("\n") else ""), translated_count, skipped_count
 
 
-from pdf_translator.book_views import join_chapter_delivery_markdown
+def run_translate_tables(
     *,
     run_dir: Path,
     target_language: str = "zh-CN",
