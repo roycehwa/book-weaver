@@ -7,6 +7,7 @@ from zipfile import ZipFile
 from pdf_translator.models import TranslationChunk
 from pdf_translator.polish import (
     POLISH_PROMPT_VERSION,
+    _APOSTROPHE,
     _parse_polish_response,
     _safe_accept_polish,
     _split_polished_markdown_into_chapters,
@@ -646,3 +647,135 @@ def test_run_polish_preserves_crlf_and_missing_final_newline(tmp_path: Path) -> 
         polished2 = handle.read()
     assert not polished2.endswith("\n")
     assert not polished2.endswith("\r\n")
+
+
+class LeadingWhitespacePolishTranslator(BaseTranslator):
+    name = "leading-whitespace-polish"
+
+    def translate_chunk(
+        self,
+        chunk: TranslationChunk,
+        source_language: str | None,
+        target_language: str,
+    ) -> str:
+        payload = json.loads(chunk.markdown.split("\n\n", 1)[1])
+        results = []
+        for item in payload:
+            text = item["text"]
+            polished = " " + text.replace(" active ", " 活跃的 ")
+            results.append({"line": item["line"], "polished_text": polished})
+        return json.dumps(results, ensure_ascii=False)
+
+
+def test_apostrophe_class_contains_ascii_and_curly_once() -> None:
+    assert _APOSTROPHE == "'\u2019"
+    assert len(_APOSTROPHE) == 2
+    assert len(set(_APOSTROPHE)) == 2
+
+
+def test_scan_polish_candidates_skips_inline_code_only_suspects() -> None:
+    source = "中文 `active` 结束。\n中文 active 可见。\n"
+    result = scan_polish_candidates_internal(source)
+    assert len(result.candidates) == 1
+    assert result.protected_skip_count == 1
+    assert result.detected_candidate_count == 2
+
+
+def test_scan_polish_candidates_skips_url_destination_suspects() -> None:
+    source = "中文 https://example.com/active/path 结束。\n"
+    result = scan_polish_candidates_internal(source)
+    assert len(result.candidates) == 0
+    assert result.protected_skip_count == 1
+    assert result.detected_candidate_count == 1
+
+
+def test_scan_polish_candidates_keeps_link_label_suspects() -> None:
+    source = "中文 [标签 active 文本](https://example.com/x) 结束。\n"
+    candidates = scan_polish_candidates(source)
+    assert len(candidates) == 1
+    assert candidates[0].suspects == ["active"]
+
+
+def test_safe_accept_polish_rejects_leading_whitespace_change() -> None:
+    before = "  这是一个 active 的核心假设。"
+    after = "   这是一个 活跃 的核心假设。"
+    context = PolishAcceptContext(
+        suspects=["active"],
+        protected_literals=[],
+        glossary_terms=[],
+        book_title=None,
+        book_author=None,
+    )
+    ok, reason = _safe_accept_polish(before, after, context=context, whole_before=before, whole_after=after)
+    assert ok is False
+    assert reason == "leading_whitespace_changed"
+
+
+def test_safe_accept_polish_rejects_trailing_whitespace_change() -> None:
+    before = "这是一个 active 的核心假设。  "
+    after = "这是一个 活跃 的核心假设。   "
+    context = PolishAcceptContext(
+        suspects=["active"],
+        protected_literals=[],
+        glossary_terms=[],
+        book_title=None,
+        book_author=None,
+    )
+    ok, reason = _safe_accept_polish(before, after, context=context, whole_before=before, whole_after=after)
+    assert ok is False
+    assert reason == "trailing_whitespace_changed"
+
+
+def test_safe_accept_polish_protects_curly_apostrophe_non_suspect_token() -> None:
+    before = "保留 Rock\u2019s 品牌与 active 词语。"
+    after = "保留 Rocks 品牌与 活跃 词语。"
+    context = PolishAcceptContext(
+        suspects=["active"],
+        protected_literals=[],
+        glossary_terms=[],
+        book_title=None,
+        book_author=None,
+    )
+    ok, reason = _safe_accept_polish(before, after, context=context, whole_before=before, whole_after=after)
+    assert ok is False
+    assert reason == "non_suspect_latin_changed"
+
+
+def test_run_polish_rejects_leading_whitespace_change(tmp_path: Path) -> None:
+    run_dir = _write_run_dir(tmp_path, "  这是一个 active 的核心假设。\n")
+    result = run_polish(
+        run_dir=run_dir,
+        translator=LeadingWhitespacePolishTranslator(),
+        target_language="zh-CN",
+    )
+    report = json.loads(result.report_path.read_text(encoding="utf-8"))
+    assert report["rejected_count"] == 1
+    assert report["rejected"][0]["decision"] == "leading_whitespace_changed"
+    assert result.outcome == "needs_review"
+
+
+def test_run_polish_manual_skip_count_matches_excluded_candidates_only(tmp_path: Path) -> None:
+    approved_match = "这是用户批准的 active 表述。"
+    other_candidate = "这是另一个 active 的核心假设。"
+    run_dir = _write_run_dir(
+        tmp_path,
+        f"# Chapter 1\n\n{approved_match}\n\n{other_candidate}\n",
+    )
+    (run_dir / "review_state.json").write_text(
+        json.dumps(
+            {
+                "decisions": {
+                    "unrelated": {"approved_text": "无关人工保留行。\n另一条无关行。\n"},
+                    "matched": {"approved_text": approved_match},
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    result = run_polish(run_dir=run_dir, translator=FakePolishTranslator(), target_language="zh-CN")
+    report = json.loads(result.report_path.read_text(encoding="utf-8"))
+    assert report["manual_skip_count"] == 1
+    assert report["detected_candidate_count"] == 2
+    assert result.candidate_count == 1
+    assert approved_match in result.polished_markdown_path.read_text(encoding="utf-8")

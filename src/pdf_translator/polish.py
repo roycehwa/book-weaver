@@ -130,7 +130,7 @@ HIGH_CONFIDENCE_ENGLISH_WORDS = {
     "cross-fertilization",
 }
 
-_APOSTROPHE = "''\u2019"
+_APOSTROPHE = "'\u2019"
 ENGLISH_WORD_RE = re.compile(
     rf"(?<![A-Za-z])([A-Za-z][A-Za-z{_APOSTROPHE}-]{{1,30}})(?![A-Za-z])"
 )
@@ -247,21 +247,23 @@ def _inside_parenthetical(text: str, start: int, end: int) -> bool:
     return "(" in before or "（" in before or ")" in after or "）" in after
 
 
-def _scan_line_candidates(line: str) -> list[str]:
+def _collect_line_suspects(line: str, *, respect_protected_spans: bool) -> list[str]:
     stripped = line.strip()
     if _is_structural_line(stripped) or not CJK_RE.search(stripped):
         return []
-    spans = protected_spans(stripped)
+    spans = protected_spans(stripped) if respect_protected_spans else []
     suspects: list[str] = []
+    apostrophe_strip = f"{_APOSTROPHE}-"
     for match in ENGLISH_THEN_CHINESE_RE.finditer(stripped):
-        if not _span_overlaps(match.start(), match.end(), spans):
-            english = match.group("english").strip()
-            if english and english not in suspects:
-                suspects.append(english)
-    for match in ENGLISH_WORD_RE.finditer(stripped):
-        if _in_spans(match.start(), spans):
+        if respect_protected_spans and _span_overlaps(match.start(), match.end(), spans):
             continue
-        word = match.group(1).strip("''-")
+        english = match.group("english").strip()
+        if english and english not in suspects:
+            suspects.append(english)
+    for match in ENGLISH_WORD_RE.finditer(stripped):
+        if respect_protected_spans and _in_spans(match.start(), spans):
+            continue
+        word = match.group(1).strip(apostrophe_strip)
         if not word or word not in HIGH_CONFIDENCE_ENGLISH_WORDS:
             continue
         if _inside_parenthetical(stripped, match.start(), match.end()):
@@ -269,6 +271,10 @@ def _scan_line_candidates(line: str) -> list[str]:
         if word not in suspects:
             suspects.append(word)
     return suspects
+
+
+def _scan_line_candidates(line: str) -> list[str]:
+    return _collect_line_suspects(line, respect_protected_spans=True)
 
 
 def _line_is_structurally_protected(
@@ -310,8 +316,9 @@ def scan_polish_candidates_internal(markdown_text: str) -> PolishScanResult:
                 protected = True
         elif in_fence:
             protected = True
-        suspects = _scan_line_candidates(content)
-        if not suspects:
+        actionable_suspects = _scan_line_candidates(content)
+        masked_suspects = _collect_line_suspects(content, respect_protected_spans=False)
+        if not actionable_suspects and not masked_suspects:
             continue
         if _line_is_structurally_protected(
             content,
@@ -321,7 +328,12 @@ def scan_polish_candidates_internal(markdown_text: str) -> PolishScanResult:
         ):
             protected_skip_count += 1
             continue
-        candidates.append(PolishCandidate(line=line_no, text=content, suspects=suspects))
+        if not actionable_suspects:
+            protected_skip_count += 1
+            continue
+        candidates.append(
+            PolishCandidate(line=line_no, text=content, suspects=actionable_suspects)
+        )
     return PolishScanResult(
         candidates=candidates,
         detected_candidate_count=len(candidates) + protected_skip_count,
@@ -572,6 +584,10 @@ def _safe_accept_polish(
 ) -> tuple[bool, str]:
     if not after.strip():
         return False, "empty"
+    if before[: len(before) - len(before.lstrip())] != after[: len(after) - len(after.lstrip())]:
+        return False, "leading_whitespace_changed"
+    if before[len(before.rstrip()) :] != after[len(after.rstrip()) :]:
+        return False, "trailing_whitespace_changed"
     if before.count("\n") != after.count("\n"):
         return False, "newline_changed"
     if len(before.splitlines()) != len(after.splitlines()):
@@ -1047,7 +1063,7 @@ def _apply_polish_replacements_to_chapters(
     return patched
 
 
-def _collect_protected_manual_lines(run_dir: Path) -> tuple[set[str], int]:
+def _collect_protected_manual_lines(run_dir: Path) -> set[str]:
     from pdf_translator.translation_failures import read_failures
 
     protected_lines: set[str] = set()
@@ -1078,7 +1094,7 @@ def _collect_protected_manual_lines(run_dir: Path) -> tuple[set[str], int]:
                     stripped = line.strip()
                     if stripped:
                         protected_lines.add(stripped)
-    return protected_lines, len(protected_lines)
+    return protected_lines
 
 
 def _compute_outcome(
@@ -1130,8 +1146,13 @@ def run_polish(
     all_candidates = scan_result.candidates
     protected_skip_count = scan_result.protected_skip_count
     detected_candidate_count = scan_result.detected_candidate_count
-    protected_lines, manual_skip_count = _collect_protected_manual_lines(run_dir)
-    candidates = [candidate for candidate in all_candidates if candidate.text.strip() not in protected_lines]
+    protected_lines = _collect_protected_manual_lines(run_dir)
+    manual_skip_count = sum(
+        1 for candidate in all_candidates if candidate.text.strip() in protected_lines
+    )
+    candidates = [
+        candidate for candidate in all_candidates if candidate.text.strip() not in protected_lines
+    ]
     protected_terms_by_line = {
         candidate.line: _protected_terms_for_candidate(
             candidate,
