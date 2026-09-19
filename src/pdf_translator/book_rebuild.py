@@ -32,6 +32,7 @@ from pdf_translator.continuation_decisions import (
     page_dimensions_from_structured,
     validate_continuation_decisions,
 )
+from pdf_translator.epub_continuation import apply_epub_spine_continuations
 from pdf_translator.guardrails import (
     ORIGINAL_PAGE_FALLBACK_RE,
     _translatable_page_text_chars,
@@ -2277,11 +2278,10 @@ def _chapter_pages_from_outline(
 def _build_book_from_epub_meta(meta: dict[str, Any], source_path: Path | None) -> dict[str, Any]:
     raw_chapters = meta.get("chapters") or []
     raw_assets = meta.get("assets") or []
-    chapters: list[dict[str, Any]] = []
-    pages: list[dict[str, Any]] = []
+    spine_entries: list[dict[str, Any]] = []
     in_outline_index = False
     for entry in raw_chapters:
-        title = str(entry.get("title") or f"Section {len(chapters) + 1}")
+        title = str(entry.get("title") or f"Section {len(spine_entries) + 1}")
         md = str(entry.get("markdown") or "").strip()
         title_clean = _clean_book_text(title).lower()
         md_no_links = re.sub(r"\[[^\]]+\]\([^)]+\)", "", md)
@@ -2296,7 +2296,7 @@ def _build_book_from_epub_meta(meta: dict[str, Any], source_path: Path | None) -
         if "## page list" in md.lower() and md.count("\n- [") > 25:
             continue
 
-        i = len(chapters) + 1
+        page_no = int(entry.get("page_no") or len(spine_entries) + 1)
         if md and not md.endswith("\n"):
             md += "\n"
         tr = str(entry.get("trace_markdown") or md).strip()
@@ -2315,36 +2315,55 @@ def _build_book_from_epub_meta(meta: dict[str, Any], source_path: Path | None) -
         )
         if INDEX_TITLE_RE.match(title):
             in_outline_index = True
-        chapters.append(
-            {
-                "index": i,
-                "title": title,
-                "page_start": i,
-                "page_end": i,
-                "source_pages": [i],
-                "markdown": md,
-                "trace_markdown": tr,
-                "translate": not is_preserved_resource,
-                "preserve_original": is_preserved_resource,
-                "resource_only": is_preserved_resource,
-                "source_internal_path": sip if isinstance(sip, str) else None,
-                "dom_units": [
-                    dict(unit)
-                    for unit in entry.get("dom_units") or []
-                    if isinstance(unit, dict)
-                ],
-                "toc": not is_preserved_resource,
-            }
-        )
-        pages.append(
-            {
-                "page_no": i,
-                "page_kind": "body",
-                "chapter_title": None,
-                "figure_count": 0,
-                "table_count": 0,
-            }
-        )
+        spine_entry: dict[str, Any] = {
+            "title": title,
+            "page_no": page_no,
+            "page_start": page_no,
+            "page_end": page_no,
+            "source_pages": [page_no],
+            "markdown": md,
+            "trace_markdown": tr,
+            "translate": not is_preserved_resource,
+            "preserve_original": is_preserved_resource,
+            "resource_only": is_preserved_resource,
+            "source_internal_path": sip if isinstance(sip, str) else None,
+            "dom_units": [
+                dict(unit)
+                for unit in entry.get("dom_units") or []
+                if isinstance(unit, dict)
+            ],
+            "toc": not is_preserved_resource,
+        }
+        if isinstance(entry.get("spine_id"), str):
+            spine_entry["spine_id"] = entry["spine_id"]
+        if isinstance(entry.get("nav_label"), str):
+            spine_entry["nav_label"] = entry["nav_label"]
+        spine_entries.append(spine_entry)
+
+    chapters, logical_continuations, continuation_decisions = apply_epub_spine_continuations(spine_entries)
+    for index, chapter in enumerate(chapters, 1):
+        chapter["index"] = index
+    pages: list[dict[str, Any]] = []
+    seen_pages: set[int] = set()
+    for chapter in chapters:
+        for page_no in chapter.get("source_pages") or []:
+            try:
+                page_number = int(page_no)
+            except (TypeError, ValueError):
+                continue
+            if page_number in seen_pages:
+                continue
+            seen_pages.add(page_number)
+            pages.append(
+                {
+                    "page_no": page_number,
+                    "page_kind": "body",
+                    "chapter_title": None,
+                    "figure_count": 0,
+                    "table_count": 0,
+                }
+            )
+    pages.sort(key=lambda page: int(page.get("page_no") or 0))
 
     full_markdown_parts: list[str] = []
     trace_markdown_parts: list[str] = []
@@ -2403,7 +2422,7 @@ def _build_book_from_epub_meta(meta: dict[str, Any], source_path: Path | None) -
                 break
     cover_image_path = next((asset["path"] for asset in assets if asset["kind"] == "cover"), None)
 
-    return {
+    book = {
         "metadata": {
             "schema": "book_ir",
             "schema_version": 1,
@@ -2437,6 +2456,8 @@ def _build_book_from_epub_meta(meta: dict[str, Any], source_path: Path | None) -
         ],
         "full_markdown": full_markdown,
         "trace_markdown": trace_markdown,
+        "logical_continuations": logical_continuations,
+        "continuation_decisions": continuation_decisions,
     }
     _annotate_chapter_kinds(book)
     return book

@@ -797,6 +797,17 @@ def logical_continuations_from_ledger(ledger: dict[str, Any]) -> list[dict[str, 
             "confidence": decision.get("confidence"),
             "kind": decision.get("kind"),
         }
+        if decision.get("kind") == "epub_paragraph_join":
+            entry.update({
+                "left_resource_path": decision.get("left_resource_path"),
+                "right_resource_path": decision.get("right_resource_path"),
+                "left_dom_path": decision.get("left_dom_path"),
+                "right_dom_path": decision.get("right_dom_path"),
+                "left_char_end": decision.get("left_char_end"),
+                "right_char_start": decision.get("right_char_start"),
+                "left_text": evidence.get("left_text"),
+                "right_text": evidence.get("right_text"),
+            })
         style_evidence = evidence.get("style")
         if isinstance(style_evidence, dict):
             entry["style_evidence"] = style_evidence

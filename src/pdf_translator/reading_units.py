@@ -178,6 +178,22 @@ def _continuation_matches_provenance(
     if len(provenance) != 2:
         return False
     left_span, right_span = provenance[0], provenance[1]
+    if left_span.get("source_format") == "epub" and left_span.get("precision") == "dom":
+        left_end = continuation.get("source_char_end")
+        right_start = continuation.get("next_source_char_start")
+        if not isinstance(left_end, int) or not isinstance(right_start, int):
+            left_end = continuation.get("left_char_end")
+            right_start = continuation.get("right_char_start")
+        return (
+            str(continuation.get("left_resource_path") or "") == str(left_span.get("resource_path") or "")
+            and str(continuation.get("right_resource_path") or "") == str(right_span.get("resource_path") or "")
+            and str(continuation.get("left_dom_path") or "") == str(left_span.get("dom_path") or "")
+            and str(continuation.get("right_dom_path") or "") == str(right_span.get("dom_path") or "")
+            and isinstance(left_end, int)
+            and isinstance(right_start, int)
+            and left_end == left_span.get("char_end")
+            and right_start == right_span.get("char_start")
+        )
     if left_span.get("precision") != "span" or right_span.get("precision") != "span":
         return False
     left_node = str(continuation.get("left_source_node_id") or continuation.get("source_node_id") or "")
@@ -287,7 +303,43 @@ def _pdf_block_span_candidates(
     return by_text
 
 
-def _epub_block_span_candidates(chapter: dict[str, Any]) -> dict[str, list[list[dict[str, Any]]]]:
+def _epub_dom_span(unit: dict[str, Any], fallback_resource: str) -> dict[str, Any] | None:
+    markdown = str(unit.get("markdown") or "").strip()
+    resource_path = str(unit.get("resource_path") or fallback_resource).replace("\\", "/")
+    dom_path = str(unit.get("dom_path") or "")
+    char_start = unit.get("char_start")
+    char_end = unit.get("char_end")
+    if (
+        not markdown
+        or not resource_path
+        or not dom_path
+        or not isinstance(char_start, int)
+        or not isinstance(char_end, int)
+        or char_start < 0
+        or char_end < char_start
+    ):
+        return None
+    span: dict[str, Any] = {
+        "source_format": "epub",
+        "resource_path": resource_path,
+        "dom_path": dom_path,
+        "char_start": char_start,
+        "char_end": char_end,
+        "precision": "dom",
+    }
+    if unit.get("element_id"):
+        span["element_id"] = str(unit["element_id"])
+    link_targets = [str(target) for target in unit.get("link_targets") or [] if str(target)]
+    if link_targets:
+        span["link_targets"] = link_targets
+    return span
+
+
+def _epub_block_span_candidates(
+    chapter: dict[str, Any],
+    *,
+    continuations: list[dict[str, Any]] | None = None,
+) -> dict[str, list[list[dict[str, Any]]]]:
     by_text: dict[str, list[list[dict[str, Any]]]] = {}
     fallback_resource = str(chapter.get("source_internal_path") or "").replace("\\", "/")
     for unit in chapter.get("dom_units") or []:
@@ -298,30 +350,36 @@ def _epub_block_span_candidates(chapter: dict[str, Any]) -> dict[str, list[list[
         dom_path = str(unit.get("dom_path") or "")
         char_start = unit.get("char_start")
         char_end = unit.get("char_end")
-        if (
-            not markdown
-            or not resource_path
-            or not dom_path
-            or not isinstance(char_start, int)
-            or not isinstance(char_end, int)
-            or char_start < 0
-            or char_end < char_start
-        ):
+        span = _epub_dom_span(unit, fallback_resource)
+        if span is None:
             continue
-        span: dict[str, Any] = {
-            "source_format": "epub",
-            "resource_path": resource_path,
-            "dom_path": dom_path,
-            "char_start": char_start,
-            "char_end": char_end,
-            "precision": "dom",
-        }
-        if unit.get("element_id"):
-            span["element_id"] = str(unit["element_id"])
-        link_targets = [str(target) for target in unit.get("link_targets") or [] if str(target)]
-        if link_targets:
-            span["link_targets"] = link_targets
         by_text.setdefault(markdown, []).append([span])
+    for continuation in continuations or []:
+        if not isinstance(continuation, dict) or continuation.get("kind") != "epub_paragraph_join":
+            continue
+        joined = str(continuation.get("joined_text") or "").strip()
+        left_span = _epub_dom_span(
+            {
+                "markdown": str(continuation.get("left_text") or ""),
+                "resource_path": continuation.get("left_resource_path"),
+                "dom_path": continuation.get("left_dom_path"),
+                "char_start": 0,
+                "char_end": continuation.get("left_char_end"),
+            },
+            fallback_resource,
+        )
+        right_span = _epub_dom_span(
+            {
+                "markdown": str(continuation.get("right_text") or ""),
+                "resource_path": continuation.get("right_resource_path"),
+                "dom_path": continuation.get("right_dom_path"),
+                "char_start": continuation.get("right_char_start"),
+                "char_end": continuation.get("right_char_end"),
+            },
+            fallback_resource,
+        )
+        if joined and left_span and right_span:
+            by_text.setdefault(joined, []).insert(0, [left_span, right_span])
     return by_text
 
 
@@ -374,16 +432,23 @@ def build_reading_units(
             if source_format == "pdf"
             else {}
         )
-        epub_span_candidates = (
-            _epub_block_span_candidates(chapter)
-            if source_format == "epub"
-            else {}
-        )
+        chapter_pages = {
+            int(page)
+            for page in chapter.get("source_pages") or []
+            if isinstance(page, int) or (isinstance(page, str) and str(page).isdigit())
+        }
         chapter_continuations = [
             continuation
             for continuation in book.get("logical_continuations") or []
             if isinstance(continuation, dict)
+            and int(continuation.get("from_page") or 0) in chapter_pages
+            and int(continuation.get("to_page") or 0) in chapter_pages
         ]
+        epub_span_candidates = (
+            _epub_block_span_candidates(chapter, continuations=chapter_continuations)
+            if source_format == "epub"
+            else {}
+        )
         unit_ids: list[str] = []
         for block_index, block in enumerate(blocks, 1):
             unit_id = f"{chapter_id}:unit{block_index:05d}"

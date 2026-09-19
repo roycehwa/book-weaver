@@ -1168,6 +1168,8 @@ def ingest_epub(path: Path) -> NormalizedDocument:
             *,
             source_internal_path: str | None = None,
             dom_units: list[dict[str, Any]] | None = None,
+            spine_id: str | None = None,
+            nav_label: str | None = None,
         ) -> None:
             nonlocal page_no, text_index
             page_no += 1
@@ -1179,9 +1181,14 @@ def ingest_epub(path: Path) -> NormalizedDocument:
                 "title": title,
                 "markdown": combined,
                 "trace_markdown": trace,
+                "page_no": pn,
             }
             if source_internal_path:
                 entry["source_internal_path"] = source_internal_path.replace("\\", "/")
+            if spine_id:
+                entry["spine_id"] = spine_id
+            if nav_label and nav_label.strip():
+                entry["nav_label"] = nav_label.strip()[:240]
             if dom_units:
                 entry["dom_units"] = dom_units
             spine_chapters.append(entry)
@@ -1238,7 +1245,14 @@ def ingest_epub(path: Path) -> NormalizedDocument:
                 book_title=book_title,
                 provenance_out=dom_units,
             )
-            emit_spine_chapter(title, body_md, source_internal_path=internal, dom_units=dom_units)
+            emit_spine_chapter(
+                title,
+                body_md,
+                source_internal_path=internal,
+                dom_units=dom_units,
+                spine_id=sid,
+                nav_label=nav_title,
+            )
 
     if page_no == 0:
         raise ValueError("EPUB spine contains no readable XHTML documents.")
