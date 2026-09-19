@@ -186,15 +186,17 @@ def _pdf_block_span_candidates(
         if from_page not in chapter_pages or to_page not in chapter_pages:
             continue
         node_id = continuation.get("source_node_id")
+        left_node = str(continuation.get("left_source_node_id") or node_id or "")
+        right_node = str(continuation.get("right_source_node_id") or node_id or "")
         left_end = continuation.get("source_char_end")
         right_start = continuation.get("next_source_char_start")
-        if not isinstance(node_id, str) or not isinstance(left_end, int) or not isinstance(right_start, int):
+        if not left_node or not right_node or not isinstance(left_end, int) or not isinstance(right_start, int):
             continue
         left = next(
             (
                 item
                 for (page_no, item_node, _start, end), item in item_by_location.items()
-                if page_no == from_page and item_node == node_id and end == left_end
+                if page_no == from_page and item_node == left_node and end == left_end
             ),
             None,
         )
@@ -202,7 +204,7 @@ def _pdf_block_span_candidates(
             (
                 item
                 for (page_no, item_node, start, _end), item in item_by_location.items()
-                if page_no == to_page and item_node == node_id and start == right_start
+                if page_no == to_page and item_node == right_node and start == right_start
             ),
             None,
         )
@@ -305,6 +307,11 @@ def build_reading_units(
             if source_format == "epub"
             else {}
         )
+        continuation_boundaries = {
+            str(continuation.get("joined_text") or "").strip(): continuation
+            for continuation in book.get("logical_continuations") or []
+            if isinstance(continuation, dict) and str(continuation.get("joined_text") or "").strip()
+        }
         unit_ids: list[str] = []
         for block_index, block in enumerate(blocks, 1):
             unit_id = f"{chapter_id}:unit{block_index:05d}"
@@ -315,6 +322,9 @@ def build_reading_units(
                 or []
             )
             provenance = exact_candidates.pop(0) if exact_candidates else _source_spans(chapter, source_format)
+            boundary_before = "chapter" if block_index == 1 else "paragraph"
+            if block_index > 1 and block.strip() in continuation_boundaries:
+                boundary_before = "continuation"
             units.append({
                 "unit_id": unit_id,
                 "chapter_id": chapter_id,
@@ -322,7 +332,7 @@ def build_reading_units(
                 "order": len(units),
                 "kind": _unit_kind(block),
                 "markdown": block,
-                "boundary_before": "chapter" if block_index == 1 else "paragraph",
+                "boundary_before": boundary_before,
                 "policy": _unit_policy(chapter, block, policy),
                 "policy_confirmed": bool(chapter.get("translation_policy_confirmed")),
                 "provenance": provenance,

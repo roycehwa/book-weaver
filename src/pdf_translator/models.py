@@ -78,3 +78,4 @@ class PipelineArtifacts:
     book_markdown_path: Path | None = None
     book_trace_markdown_path: Path | None = None
     reading_units_path: Path | None = None
+    continuation_decisions_path: Path | None = None

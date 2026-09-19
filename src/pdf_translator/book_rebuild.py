@@ -24,6 +24,11 @@ from pdf_translator.semantic_content import (
     stable_semantic_id,
 )
 from pdf_translator.ocr_quality import assess_ocr_block
+from pdf_translator.continuation_decisions import (
+    build_continuation_decisions_ledger,
+    enrich_logical_continuations,
+    logical_continuations_from_ledger,
+)
 from pdf_translator.guardrails import (
     ORIGINAL_PAGE_FALLBACK_RE,
     _translatable_page_text_chars,
@@ -103,6 +108,8 @@ class BookItem:
     path: str | None = None
     from_page_footer: bool = False
     right: float = 0.0
+    bottom: float = 0.0
+    source_label: str = "text"
     source_node_id: str | None = None
     source_char_start: int | None = None
     source_char_end: int | None = None
@@ -863,8 +870,10 @@ def _page_content_items(
             page_no=block.page_no,
             left=block.left,
             top=block.top,
+            bottom=block.bottom,
             from_page_footer=block.label in {"footnote", "page_footer"},
             right=block.right,
+            source_label=str(block.label or "text"),
             source_node_id=block.source_node_id,
             source_char_start=block.source_char_start,
             source_char_end=block.source_char_end,
@@ -916,6 +925,8 @@ def _page_content_items(
                 path=item.path,
                 from_page_footer=item.from_page_footer,
                 right=item.right,
+                bottom=item.bottom,
+                source_label=item.source_label,
                 source_node_id=item.source_node_id,
                 source_char_start=item.source_char_start,
                 source_char_end=item.source_char_end,
@@ -1263,6 +1274,11 @@ def _book_item_payload(item: BookItem) -> dict[str, Any]:
         "source_char_start": item.source_char_start,
         "source_char_end": item.source_char_end,
         "source_separator_before": item.source_separator_before,
+        "left": item.left,
+        "top": item.top,
+        "right": item.right,
+        "bottom": item.bottom,
+        "source_label": item.source_label,
     }
 
 
@@ -1292,49 +1308,25 @@ def _join_source_node_fragments(left: str, right: str, separator: str) -> tuple[
     return left_text + normalized_separator + right_text, "source_separator_restored"
 
 
-def _build_logical_continuations(page_payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    continuations: list[dict[str, Any]] = []
-    ordered_pages = sorted(page_payloads, key=lambda page: int(page.get("page_no") or 0))
-    for left_page, right_page in zip(ordered_pages, ordered_pages[1:]):
-        left_page_no = int(left_page.get("page_no") or 0)
-        right_page_no = int(right_page.get("page_no") or 0)
-        if right_page_no != left_page_no + 1:
-            continue
-        left_items = _page_body_text_items(left_page)
-        right_items = _page_body_text_items(right_page)
-        if not left_items or not right_items:
-            continue
-        left = left_items[-1]
-        right = right_items[0]
-        if left["source_node_id"] != right["source_node_id"]:
-            continue
-        left_end = int(left["source_char_end"])
-        right_start = int(right["source_char_start"])
-        separator = str(right.get("source_separator_before") or "")
-        if right_start < left_end or right_start - left_end != len(separator):
-            continue
-        if separator and not separator.isspace():
-            continue
-        joined, repair = _join_source_node_fragments(
-            str(left.get("text") or ""),
-            str(right.get("text") or ""),
-            separator,
-        )
-        continuations.append(
-            {
-                "from_page": left_page_no,
-                "to_page": right_page_no,
-                "source_node_id": left["source_node_id"],
-                "source_char_end": left_end,
-                "next_source_char_start": right_start,
-                "source_separator": separator,
-                "left_text": str(left.get("text") or "").strip(),
-                "right_text": str(right.get("text") or "").strip(),
-                "joined_text": joined,
-                "repair": repair,
-                "confidence": "deterministic_same_source_node",
-            }
-        )
+def _logical_continuations_for_pages(
+    page_payloads: list[dict[str, Any]],
+    *,
+    structured: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    ledger = build_continuation_decisions_ledger(page_payloads, structured=structured)
+    continuations = enrich_logical_continuations(
+        page_payloads,
+        logical_continuations_from_ledger(ledger),
+    )
+    return continuations, ledger
+
+
+def _build_logical_continuations(
+    page_payloads: list[dict[str, Any]],
+    *,
+    structured: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    continuations, _ledger = _logical_continuations_for_pages(page_payloads, structured=structured)
     return continuations
 
 
@@ -2461,7 +2453,10 @@ def build_book_reconstruction(
             }
         )
 
-    logical_continuations = _build_logical_continuations(pages)
+    logical_continuations, continuation_decisions = _logical_continuations_for_pages(
+        pages,
+        structured=structured,
+    )
 
     outline_entries = _extract_pdf_outline_chapters(source_pdf, total_pages=total_pages)
     chapters: list[dict[str, Any]] = _chapter_pages_from_outline(pages, outline_entries)
@@ -2655,6 +2650,7 @@ def build_book_reconstruction(
             "evidence_assets": [],
         },
         "logical_continuations": logical_continuations,
+        "continuation_decisions": continuation_decisions,
         "pages": [
             {
                 **({"content_items": page["content_items"]} if page.get("content_items") else {}),

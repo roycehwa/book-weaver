@@ -101,6 +101,7 @@ def build_artifacts(output_dir: Path, source_pdf: Path, target_language: str) ->
         book_markdown_path=output_dir / "book.md",
         book_trace_markdown_path=output_dir / "book-trace.md",
         reading_units_path=output_dir / "reading-units.json",
+        continuation_decisions_path=output_dir / "continuation-decisions.json",
     )
 
 
@@ -437,6 +438,13 @@ def _prepare_intake_artifacts(settings: RunSettings) -> tuple[
         artifacts.book_markdown_path.write_text(render_book_markdown(book), encoding="utf-8")
         artifacts.book_trace_markdown_path.write_text(render_book_markdown(book, include_trace=True), encoding="utf-8")
         write_reading_units(artifacts.reading_units_path, book, source_path=settings.source_pdf)
+        continuation_payload = book.get("continuation_decisions")
+        if isinstance(continuation_payload, dict) and artifacts.continuation_decisions_path is not None:
+            artifacts.continuation_decisions_path.write_text(
+                json.dumps(continuation_payload, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            extra_files["continuation_decisions"] = str(artifacts.continuation_decisions_path)
         chapter_report_path = output_dir / "chapter-report.json"
         chapter_report_path.write_text(
             json.dumps(_build_chapter_report(book, max_chunk_chars=settings.max_chunk_chars), ensure_ascii=False, indent=2),
