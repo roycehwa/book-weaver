@@ -20,7 +20,9 @@ from pdf_translator.translation_quality import (
     build_translation_quality_index,
     invalidate_stale_translation_postprocess,
     run_source_quality_gate_before_translation,
+    sha256_file,
     sha256_text,
+    stable_finding_id,
     write_translation_quality_bundle,
 )
 from pdf_translator.zh_markdown_cleanup import publish_translation_zh_cleanup
@@ -303,3 +305,254 @@ def test_translation_source_revision_written_before_raw_report(tmp_path: Path) -
     report = json.loads((run_dir / RAW_TRANSLATION_QUALITY_REPORT).read_text(encoding="utf-8"))
     assert binding.get("reading_units_fingerprint")
     assert not any(code.startswith("stale_") for code in (item["code"] for item in report["findings"]))
+
+
+def test_polished_report_inspects_review_buckets_when_outcome_applied(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    text = "Same line.\n"
+    (run_dir / "translated.cleaned.md").write_text(text, encoding="utf-8")
+    (run_dir / "translated.md").write_text(text, encoding="utf-8")
+    (run_dir / "polish-report.json").write_text(
+        json.dumps(
+            {
+                "outcome": "applied",
+                "rejected": [{"decision": "reject", "line": 1, "before": "Same line."}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    report = build_polished_output_quality_report(run_dir, text_operation="translate")
+    assert any(item["code"] == "polish_rejected" for item in report["findings"])
+
+
+def test_raw_report_input_sha_matches_translation_input_file(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    write_synthetic_reading_units(run_dir)
+    source = (run_dir / "translation-input.md").read_text(encoding="utf-8")
+    (run_dir / "translated.raw.md").write_text(source, encoding="utf-8")
+    report = build_raw_translation_quality_report(
+        run_dir,
+        text_operation="translate",
+        source_markdown=source,
+        review_items=[],
+    )
+    assert report["input_sha256"] == sha256_file(run_dir / "translation-input.md")
+    wrong = build_raw_translation_quality_report(
+        run_dir,
+        text_operation="translate",
+        source_markdown=source + "\n",
+        review_items=[],
+    )
+    assert any(item["code"] == "translation_input_sha_mismatch" for item in wrong["findings"])
+
+
+def test_review_findings_include_unit_ids_and_source_location(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    write_synthetic_reading_units(run_dir)
+    source = (run_dir / "translation-input.md").read_text(encoding="utf-8")
+    (run_dir / "translated.raw.md").write_text(source, encoding="utf-8")
+    segments = json.loads((run_dir / "chapter-segments.json").read_text(encoding="utf-8"))
+    unit_ids = segments["segments"][0]["unit_ids"]
+    report = build_raw_translation_quality_report(
+        run_dir,
+        text_operation="translate",
+        source_markdown=source,
+        review_items=[{"issue_type": "mixed_english", "segment_id": "seg-1", "evidence": {"token": "API"}}],
+    )
+    finding = next(item for item in report["findings"] if item["code"] == "mixed_english")
+    assert finding["unit_ids"] == unit_ids
+    assert finding["source_location"]["resource_path"] == "synthetic.pdf"
+    assert "evidence" not in finding["evidence"]
+
+
+def test_stable_finding_id_differs_for_same_evidence_in_different_segments() -> None:
+    evidence = {"token": "API"}
+    first = stable_finding_id(
+        stage="raw_translation",
+        code="mixed_english",
+        evidence=evidence,
+        segment_ids=["seg-1"],
+    )
+    second = stable_finding_id(
+        stage="raw_translation",
+        code="mixed_english",
+        evidence=evidence,
+        segment_ids=["seg-2"],
+    )
+    assert first != second
+
+
+def test_assert_translation_quality_current_unchanged_after_review_state(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    write_synthetic_reading_units(run_dir)
+    source = (run_dir / "translation-input.md").read_text(encoding="utf-8")
+    _write_passing_translation_outputs(run_dir, source=source)
+    (run_dir / "review_state.json").write_text(
+        json.dumps({"decisions": {"seg-1": {"status": "approved", "approved_text": "人工"}}}),
+        encoding="utf-8",
+    )
+    assert_translation_quality_current(run_dir)
+
+
+def test_assert_translation_quality_current_fails_on_stale_signature(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    write_synthetic_reading_units(run_dir)
+    source = (run_dir / "translation-input.md").read_text(encoding="utf-8")
+    _write_passing_translation_outputs(run_dir, source=source)
+    (run_dir / "translated.raw.md").write_text("# changed\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="stale"):
+        assert_translation_quality_current(run_dir)
+
+
+def test_assert_translation_quality_current_fails_on_stale_raw_report(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    write_synthetic_reading_units(run_dir)
+    source = (run_dir / "translation-input.md").read_text(encoding="utf-8")
+    _write_passing_translation_outputs(run_dir, source=source)
+    (run_dir / RAW_TRANSLATION_QUALITY_REPORT).write_text('{"stale": true}', encoding="utf-8")
+    with pytest.raises(ValueError, match="stale"):
+        assert_translation_quality_current(run_dir)
+
+
+def test_assert_translation_quality_current_fails_on_outside_report_path(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    write_synthetic_reading_units(run_dir)
+    source = (run_dir / "translation-input.md").read_text(encoding="utf-8")
+    _write_passing_translation_outputs(run_dir, source=source)
+    outside = tmp_path / "outside-report.json"
+    outside.write_text((run_dir / RAW_TRANSLATION_QUALITY_REPORT).read_text(encoding="utf-8"), encoding="utf-8")
+    index = json.loads((run_dir / TRANSLATION_QUALITY_INDEX).read_text(encoding="utf-8"))
+    index["reports"]["raw_translation"] = {
+        "path": str(outside),
+        "sha256": sha256_file(outside),
+    }
+    (run_dir / TRANSLATION_QUALITY_INDEX).write_text(json.dumps(index), encoding="utf-8")
+    with pytest.raises(ValueError, match="outside"):
+        assert_translation_quality_current(run_dir)
+
+
+def test_assert_translation_quality_current_fails_on_blocking_index(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    write_synthetic_reading_units(run_dir)
+    source = (run_dir / "translation-input.md").read_text(encoding="utf-8")
+    _write_passing_translation_outputs(run_dir, source=source)
+    index = json.loads((run_dir / TRANSLATION_QUALITY_INDEX).read_text(encoding="utf-8"))
+    index["blocking_count"] = 2
+    index["aggregate_status"] = "blocked"
+    index["acceptable"] = False
+    (run_dir / TRANSLATION_QUALITY_INDEX).write_text(json.dumps(index), encoding="utf-8")
+    with pytest.raises(ValueError, match="blocking"):
+        assert_translation_quality_current(run_dir)
+
+
+def test_assert_translation_quality_current_allows_review_only_index(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    write_synthetic_reading_units(run_dir)
+    source = (run_dir / "translation-input.md").read_text(encoding="utf-8")
+    _write_passing_translation_outputs(run_dir, source=source)
+    index = json.loads((run_dir / TRANSLATION_QUALITY_INDEX).read_text(encoding="utf-8"))
+    index["blocking_count"] = 0
+    index["review_count"] = 3
+    index["aggregate_status"] = "review"
+    index["acceptable"] = True
+    (run_dir / TRANSLATION_QUALITY_INDEX).write_text(json.dumps(index), encoding="utf-8")
+    assert_translation_quality_current(run_dir)
+
+
+def test_assert_translation_quality_current_skips_preserve_mode(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "manifest.json").write_text(
+        json.dumps({"text_operation": "preserve", "translation": {"mode": "preserved"}}),
+        encoding="utf-8",
+    )
+    assert_translation_quality_current(run_dir)
+
+
+def test_stale_invalidation_keeps_translation_and_polish_cache(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    write_synthetic_reading_units(run_dir)
+    translation_cache = run_dir / "translation-cache"
+    polish_cache = run_dir / "polish-cache"
+    translation_cache.mkdir()
+    polish_cache.mkdir()
+    (translation_cache / "chunk-0.json").write_text("{}", encoding="utf-8")
+    (polish_cache / "line-1.json").write_text("{}", encoding="utf-8")
+    (run_dir / "polish-report.json").write_text("{}", encoding="utf-8")
+    (run_dir / TRANSLATION_QUALITY_INDEX).write_text(
+        json.dumps({"signature": {"translation_input_sha256": "old"}}),
+        encoding="utf-8",
+    )
+    invalidate_stale_translation_postprocess(run_dir, text_operation="translate")
+    assert (translation_cache / "chunk-0.json").exists()
+    assert (polish_cache / "line-1.json").exists()
+    assert not (run_dir / "polish-report.json").exists()
+
+
+def test_assert_translation_quality_current_fails_on_stale_final_report(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    write_synthetic_reading_units(run_dir)
+    source = (run_dir / "translation-input.md").read_text(encoding="utf-8")
+    _write_passing_translation_outputs(run_dir, source=source)
+    (run_dir / POLISHED_OUTPUT_QUALITY_REPORT).write_text('{"stale": true}', encoding="utf-8")
+    with pytest.raises(ValueError, match="stale"):
+        assert_translation_quality_current(run_dir)
+
+
+def test_assert_translation_quality_current_fails_when_reading_units_change(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    write_synthetic_reading_units(run_dir)
+    source = (run_dir / "translation-input.md").read_text(encoding="utf-8")
+    _write_passing_translation_outputs(run_dir, source=source)
+    reading_units = json.loads((run_dir / "reading-units.json").read_text(encoding="utf-8"))
+    reading_units["document_fingerprint"] = "changed-fingerprint"
+    (run_dir / "reading-units.json").write_text(json.dumps(reading_units), encoding="utf-8")
+    with pytest.raises(ValueError, match="stale"):
+        assert_translation_quality_current(run_dir)
+
+
+def test_assert_translation_quality_current_fails_when_glossary_changes(
+    tmp_path: Path, monkeypatch
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    write_synthetic_reading_units(run_dir)
+    source = (run_dir / "translation-input.md").read_text(encoding="utf-8")
+    _write_passing_translation_outputs(run_dir, source=source)
+    monkeypatch.setattr(
+        "pdf_translator.translation_quality.glossary_fingerprint",
+        lambda _run: "glossary-changed",
+    )
+    with pytest.raises(ValueError, match="stale"):
+        assert_translation_quality_current(run_dir)
+
+
+def test_unchanged_signature_does_not_drop_polish_cache(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    write_synthetic_reading_units(run_dir)
+    signature = build_quality_signature(run_dir, text_operation="translate")
+    polish_cache = run_dir / "polish-cache"
+    polish_cache.mkdir()
+    cache_file = polish_cache / "candidate.json"
+    cache_file.write_text('{"suggestion": "活跃"}', encoding="utf-8")
+    (run_dir / TRANSLATION_QUALITY_INDEX).write_text(
+        json.dumps({"signature": signature}),
+        encoding="utf-8",
+    )
+    removed = invalidate_stale_translation_postprocess(run_dir, text_operation="translate")
+    assert removed == []
+    assert cache_file.exists()
+    assert json.loads(cache_file.read_text(encoding="utf-8"))["suggestion"] == "活跃"

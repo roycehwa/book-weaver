@@ -292,6 +292,120 @@ def test_review_export_restores_chapter_notes_before_delivery(tmp_path: Path, mo
     assert "Preserved note" in translated
 
 
+def test_render_review_export_invokes_quality_gate_before_publish(tmp_path: Path, monkeypatch) -> None:
+    from pdf_translator.cli import _render_review_export
+    from tests.synthetic_quality_fixtures import write_minimal_translation_quality_artifacts, write_synthetic_reading_units
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    source_pdf = tmp_path / "source.pdf"
+    source_pdf.write_bytes(b"%PDF")
+    write_synthetic_reading_units(run_dir)
+    (run_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "source_pdf": str(source_pdf),
+                "text_operation": "translate",
+                "translation": {"mode": "translated"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    write_minimal_translation_quality_artifacts(run_dir)
+    order: list[str] = []
+
+    monkeypatch.setattr(
+        "pdf_translator.translation_quality.assert_translation_quality_current",
+        lambda _run_dir: order.append("quality"),
+    )
+    monkeypatch.setattr("pdf_translator.source_workspace.require_current_translation", lambda _run_dir: None)
+    monkeypatch.setattr(
+        cli_module,
+        "review_project_from_run",
+        lambda _run_dir: (_ for _ in ()).throw(AssertionError("stop-after-quality-gate")),
+    )
+
+    with pytest.raises(AssertionError, match="stop-after-quality-gate"):
+        _render_review_export(
+            run_dir=run_dir,
+            version_name="draft",
+            parent_version=None,
+            target_language="zh-CN",
+            output_format="epub",
+            approve=False,
+            output_dir=run_dir / "versions" / "draft",
+        )
+    assert order == ["quality"]
+
+
+def test_render_review_export_draft_skips_approved_review_validation(tmp_path: Path, monkeypatch) -> None:
+    from pdf_translator.cli import _render_review_export
+    from tests.synthetic_quality_fixtures import write_minimal_translation_quality_artifacts, write_synthetic_reading_units
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    write_synthetic_reading_units(run_dir)
+    (run_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "source_pdf": str(tmp_path / "source.pdf"),
+                "text_operation": "translate",
+                "translation": {"mode": "translated"},
+                "files": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    write_minimal_translation_quality_artifacts(run_dir)
+    index = json.loads((run_dir / "translation-quality-index.json").read_text(encoding="utf-8"))
+    index["blocking_count"] = 0
+    index["review_count"] = 2
+    index["aggregate_status"] = "review"
+    index["acceptable"] = True
+    (run_dir / "translation-quality-index.json").write_text(json.dumps(index), encoding="utf-8")
+
+    monkeypatch.setattr("pdf_translator.source_workspace.require_current_translation", lambda _run_dir: None)
+    monkeypatch.setattr(
+        cli_module,
+        "review_project_from_run",
+        lambda _run_dir: {
+            "segments": [{"segment_id": "ch-001:r001", "source_text": "Body.", "translate": True}],
+            "translated_segments": [{"segment_id": "ch-001:r001", "translated_text": "正文。", "translate": True}],
+            "review_items": [{"segment_id": "ch-001:r001", "status": "open"}],
+            "review_state": {"decisions": {"ch-001:r001": {"status": "resolved"}}},
+        },
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_validate_approved_review_project",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("approved-only")),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_load_complete_review_book",
+        lambda _run_dir, _manifest: {
+            "chapters": [{"chapter_id": "ch-001", "title": "Chapter", "markdown": "正文。", "toc": True}]
+        },
+    )
+    monkeypatch.setattr(cli_module, "_review_image_roots", lambda _run_dir, _manifest: [])
+    monkeypatch.setattr(
+        cli_module,
+        "write_versioned_outputs",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("stop-before-render")),
+    )
+
+    with pytest.raises(AssertionError, match="stop-before-render"):
+        _render_review_export(
+            run_dir=run_dir,
+            version_name="draft",
+            parent_version=None,
+            target_language="zh-CN",
+            output_format="none",
+            approve=False,
+            output_dir=run_dir / "versions" / "draft",
+        )
+
+
 def test_public_cli_accepts_polish_command() -> None:
     parser = build_parser()
     args = parser.parse_args(

@@ -26,6 +26,7 @@ def write_synthetic_reading_units(run_dir: Path) -> None:
     payload = build_reading_units(book, source_path=Path("synthetic.pdf"), translation_authority=True)
     (run_dir / "reading-units.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     markdown = "# Chapter\n\nHello world.\n"
+    unit_id = payload["units"][0]["unit_id"] if payload.get("units") else "unit-1"
     segments = {
         "schema": "bookweaver_chapter_segments_v1",
         "reading_units_fingerprint": payload["document_fingerprint"],
@@ -35,6 +36,8 @@ def write_synthetic_reading_units(run_dir: Path) -> None:
                 "chapter_id": "ch-1",
                 "block_index": 0,
                 "markdown": markdown,
+                "unit_ids": [unit_id],
+                "source_location": {"line": 3, "resource_path": "synthetic.pdf"},
             }
         ],
     }

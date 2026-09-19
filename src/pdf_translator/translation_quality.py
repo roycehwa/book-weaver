@@ -26,7 +26,6 @@ from pdf_translator.zh_markdown_cleanup import (
     INLINE_CODE_RE,
     PRESERVE_MARKER_RE,
     RULES_VERSION,
-    TRANSLATION_CLEANUP_REPORT_FILENAME,
     URL_RE,
 )
 
@@ -502,11 +501,23 @@ def run_source_quality_gate_before_translation(
     }
 
 
+def _segment_lookup(run_dir: Path) -> dict[str, dict[str, Any]]:
+    chapter_segments = _read_json(run_dir / "chapter-segments.json")
+    segments = chapter_segments.get("segments") if isinstance(chapter_segments.get("segments"), list) else []
+    lookup: dict[str, dict[str, Any]] = {}
+    for segment in segments:
+        if isinstance(segment, dict) and segment.get("segment_id"):
+            lookup[str(segment["segment_id"])] = segment
+    return lookup
+
+
 def _review_items_to_findings(
     review_items: list[dict[str, Any]],
     *,
     stage: QualityStage,
+    segment_by_id: dict[str, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
+    segment_by_id = segment_by_id or {}
     findings: list[dict[str, Any]] = []
     for item in review_items:
         issue_type = str(item.get("issue_type") or "unknown")
@@ -522,16 +533,25 @@ def _review_items_to_findings(
             "possibly_incomplete",
         }:
             severity = "review"
+        segment_id = str(item.get("segment_id") or "")
+        segment = segment_by_id.get(segment_id) or {}
+        unit_ids = segment.get("unit_ids") if isinstance(segment.get("unit_ids"), list) else []
+        unit_ids = [str(unit_id) for unit_id in unit_ids]
+        source_location = item.get("source_location") if isinstance(item.get("source_location"), dict) else {}
+        if not source_location and isinstance(segment.get("source_location"), dict):
+            source_location = dict(segment["source_location"])
+        item_evidence = item.get("evidence") if isinstance(item.get("evidence"), dict) else {}
         findings.append(
             _finding(
                 stage=stage,
                 code=code,
                 severity=severity,
                 message=f"Review item {issue_type} detected in raw translation output.",
-                evidence={"issue_type": issue_type, "item_id": item.get("item_id"), "evidence": item.get("evidence", {})},
-                chapter_id=str(item.get("chapter_id") or "") or None,
-                segment_ids=[str(item.get("segment_id") or "")] if item.get("segment_id") else [],
-                source_location=item.get("source_location") if isinstance(item.get("source_location"), dict) else {},
+                evidence={"issue_type": issue_type, "item_id": item.get("item_id"), **item_evidence},
+                chapter_id=str(item.get("chapter_id") or segment.get("chapter_id") or "") or None,
+                unit_ids=unit_ids,
+                segment_ids=[segment_id] if segment_id else [],
+                source_location=source_location,
             )
         )
     return findings
@@ -561,6 +581,21 @@ def build_raw_translation_quality_report(
 
     raw_path = run_dir / "translated.raw.md"
     findings: list[dict[str, Any]] = []
+    file_input_sha = context.get("translation_input_sha256")
+    source_input_sha = sha256_text(source_markdown) if source_markdown else None
+    if file_input_sha and source_input_sha and file_input_sha != source_input_sha:
+        findings.append(
+            _finding(
+                stage="raw_translation",
+                code="translation_input_sha_mismatch",
+                severity="blocking",
+                message="Raw translation quality audit must use frozen translation-input.md content.",
+                evidence={
+                    "translation_input_sha256": file_input_sha,
+                    "source_markdown_sha256": source_input_sha,
+                },
+            )
+        )
     if not raw_path.exists():
         findings.append(
             _finding(
@@ -682,13 +717,20 @@ def build_raw_translation_quality_report(
                 )
 
     if review_items:
-        findings.extend(_review_items_to_findings(review_items, stage="raw_translation"))
+        findings.extend(
+            _review_items_to_findings(
+                review_items,
+                stage="raw_translation",
+                segment_by_id=_segment_lookup(run_dir),
+            )
+        )
 
     output_sha = sha256_text(raw_text) if raw_text else None
+    report_input_sha = file_input_sha if file_input_sha and source_input_sha == file_input_sha else source_input_sha
     return _report_payload(
         stage="raw_translation",
         findings=findings,
-        input_sha256=context.get("translation_input_sha256"),
+        input_sha256=report_input_sha,
         output_sha256=output_sha,
         rules_version=RULES_VERSION,
         prompt_version=TRANSLATION_PROMPT_VERSION,
@@ -848,7 +890,6 @@ def build_polished_output_quality_report(
                 )
 
     polish_report = _read_json(run_dir / "polish-report.json")
-    polish_outcome = str(polish_report.get("outcome") or "")
     warning = _read_json(run_dir / "polish-warning.json")
     if warning:
         findings.append(
@@ -860,28 +901,27 @@ def build_polished_output_quality_report(
                 evidence=warning,
             )
         )
-    if polish_outcome != "applied":
-        for bucket, code in (
-            ("rejected", "polish_rejected"),
-            ("unchanged", "polish_unchanged"),
-            ("unresolved", "polish_unresolved"),
-        ):
-            for entry in polish_report.get(bucket, []) if isinstance(polish_report.get(bucket), list) else []:
-                if not isinstance(entry, dict):
-                    continue
-                findings.append(
-                    _finding(
-                        stage="polished_output",
-                        code=code,
-                        severity="review",
-                        message=f"Polish decision requires review ({code}).",
-                        evidence={
-                            "decision": entry.get("decision"),
-                            "line": entry.get("line"),
-                            "before": entry.get("before"),
-                        },
-                    )
+    for bucket, code in (
+        ("rejected", "polish_rejected"),
+        ("unchanged", "polish_unchanged"),
+        ("unresolved", "polish_unresolved"),
+    ):
+        for entry in polish_report.get(bucket, []) if isinstance(polish_report.get(bucket), list) else []:
+            if not isinstance(entry, dict):
+                continue
+            findings.append(
+                _finding(
+                    stage="polished_output",
+                    code=code,
+                    severity="review",
+                    message=f"Polish decision requires review ({code}).",
+                    evidence={
+                        "decision": entry.get("decision"),
+                        "line": entry.get("line"),
+                        "before": entry.get("before"),
+                    },
                 )
+            )
 
     if polished_path.exists() and not final_text and polished_path.read_text(encoding="utf-8").strip():
         findings.append(

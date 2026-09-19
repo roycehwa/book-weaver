@@ -421,6 +421,91 @@ def test_translate_pipeline_records_no_candidates_polish_outcome(tmp_path: Path,
     assert ("polishing", {"stage_percent": 100, "polish_outcome": "no_candidates"}) in stages
 
 
+def test_translate_pipeline_e2e_source_gate_blocks_model_construction(tmp_path: Path, monkeypatch) -> None:
+    from pdf_translator.translation_quality import (
+        TranslationQualityBlockedError,
+        run_source_quality_gate_before_translation as real_source_gate,
+    )
+
+    _patch_intake_dependencies(monkeypatch)
+
+    def blocking_source_gate(run_dir, *, text_operation):
+        from tests.synthetic_quality_fixtures import ensure_confirmed_reading_units_for_translation
+
+        ensure_confirmed_reading_units_for_translation(run_dir)
+        (run_dir / "translation-input.md").write_text("bro\u00adken\n", encoding="utf-8")
+        return real_source_gate(run_dir, text_operation=text_operation)
+
+    monkeypatch.setattr(
+        "pdf_translator.translation_quality.run_source_quality_gate_before_translation",
+        blocking_source_gate,
+    )
+
+    def fail_build_translator(*_args, **_kwargs):
+        raise AssertionError("build_translator must not run when source gate blocks")
+
+    monkeypatch.setattr(pipeline_module, "build_translator", fail_build_translator)
+    settings = RunSettings(
+        source_pdf=tmp_path / "english-book.epub",
+        output_dir=tmp_path / "runs",
+        target_language="zh-CN",
+        source_language="en",
+        translator="mock",
+        max_chunk_chars=9000,
+        profile_name="book",
+        output_format="none",
+    )
+
+    with pytest.raises(TranslationQualityBlockedError):
+        pipeline_module.run_translation_pipeline(settings)
+
+
+def test_translate_pipeline_no_candidates_clears_stale_polish_manifest(tmp_path: Path, monkeypatch) -> None:
+    _patch_intake_dependencies(monkeypatch)
+    monkeypatch.setattr(polish_module, "scan_polish_candidates", lambda _text: [])
+    settings = RunSettings(
+        source_pdf=tmp_path / "english-book.epub",
+        output_dir=tmp_path / "runs",
+        target_language="zh-CN",
+        source_language="en",
+        translator="mock",
+        max_chunk_chars=9000,
+        profile_name="book",
+        output_format="none",
+    )
+    artifacts = pipeline_module.run_translation_pipeline(settings)
+    run_dir = artifacts.output_dir
+    (run_dir / "polish-report.json").write_text("{}", encoding="utf-8")
+    (run_dir / "translated.polished.md").write_text("stale polished", encoding="utf-8")
+    manifest_path = run_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["files"]["polish_report"] = str(run_dir / "polish-report.json")
+    manifest["files"]["translated_polished_markdown"] = str(run_dir / "translated.polished.md")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    book = json.loads((run_dir / "book.json").read_text(encoding="utf-8"))
+    book.setdefault("metadata", {})["chapter_source"] = "user_confirmed_canonical"
+    (run_dir / "book.json").write_text(json.dumps(book, ensure_ascii=False), encoding="utf-8")
+
+    rerun = pipeline_module.run_translation_pipeline(
+        RunSettings(
+            source_pdf=settings.source_pdf,
+            output_dir=tmp_path / "runs-rerun",
+            target_language=settings.target_language,
+            source_language=settings.source_language,
+            translator=settings.translator,
+            max_chunk_chars=settings.max_chunk_chars,
+            profile_name=settings.profile_name,
+            output_format=settings.output_format,
+            existing_run_dir=run_dir,
+        )
+    )
+    updated = json.loads(rerun.manifest_path.read_text(encoding="utf-8"))
+    assert "polish_report" not in updated["files"]
+    assert "translated_polished_markdown" not in updated["files"]
+    assert not (run_dir / "polish-report.json").exists()
+    assert not (run_dir / "translated.polished.md").exists()
+
+
 def test_translate_pipeline_does_not_hide_polish_failure(tmp_path: Path, monkeypatch) -> None:
     _patch_intake_dependencies(monkeypatch)
     monkeypatch.setattr(polish_module, "scan_polish_candidates", lambda _text: [object()])

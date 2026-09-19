@@ -851,6 +851,14 @@ def run_translation_pipeline(
         enter_stage("polishing")
         (artifacts.output_dir / 'polish-warning.json').unlink(missing_ok=True)
         polish_outcome = "no_candidates"
+
+        def _clear_stale_polish_artifacts() -> None:
+            for name in ("polish-report.json", "translated.polished.md", "polish-warning.json"):
+                (artifacts.output_dir / name).unlink(missing_ok=True)
+            extra_files.pop("polish_report", None)
+            extra_files.pop("translated_polished_markdown", None)
+            extra_files.pop("polish_warning", None)
+
         if settings.target_language.lower().startswith("zh") and book is not None:
             from pdf_translator.polish import run_polish, scan_polish_candidates
 
@@ -877,8 +885,13 @@ def run_translation_pipeline(
                     extra_files["polish_report"] = str(artifacts.output_dir / "polish-report.json")
                 if polish_result is None:
                     polish_outcome = "needs_review"
+                elif polish_result.outcome == "no_candidates":
+                    _clear_stale_polish_artifacts()
+                    polish_outcome = "no_candidates"
                 else:
                     polish_outcome = polish_result.outcome
+            else:
+                _clear_stale_polish_artifacts()
         if on_stage is not None:
             on_stage(
                 "polishing",
@@ -931,7 +944,7 @@ def run_translation_pipeline(
     from pdf_translator.translation_quality import write_translation_quality_bundle
     from pdf_translator.review import extend_pre_review_with_translation_quality
 
-    source_markdown_for_quality = render_translation_input_markdown(book) if book else translation_input_markdown
+    source_markdown_for_quality = translation_input_markdown
     quality_files = write_translation_quality_bundle(
         artifacts.output_dir,
         text_operation=text_operation,
