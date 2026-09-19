@@ -175,6 +175,7 @@ def test_job_service_blocks_before_canonical_write(tmp_path: Path, monkeypatch: 
     with pytest.raises(JobServiceError) as exc_info:
         service.confirm_chapters(
             "job-1",
+            expected_job_revision=1,
             chapters=[
                 {
                     "index": 1,
@@ -201,6 +202,7 @@ def test_job_service_blocks_before_canonical_write(tmp_path: Path, monkeypatch: 
     dep_id = exc_info.value.payload["findings"][0]["dependency_id"]
     service.confirm_chapters(
         "job-1",
+        expected_job_revision=1,
         chapters=[
             {
                 "index": 1,
@@ -265,6 +267,7 @@ def test_job_service_preview_failure_leaves_no_dependency_or_canonical_artifact(
     with pytest.raises(ValueError, match="preview failed"):
         service.confirm_chapters(
             "job-1",
+            expected_job_revision=1,
             chapters=chapters,
             acknowledged_dependency_ids=[finding["dependency_id"]],
         )

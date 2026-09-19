@@ -1284,6 +1284,7 @@ class BookJobService:
         *,
         chapters: list[dict[str, Any]] | None = None,
         expected_source_revision: int = 0,
+        expected_job_revision: int | None = None,
         acknowledged_dependency_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         snapshot = self.get(job_id)
@@ -1291,6 +1292,17 @@ class BookJobService:
         if state in _CHAPTER_CONFIRM_BLOCKED_STATES or self.translation_worker_lock_held(job_id):
             raise JobServiceError("章节确认需等待结构解析完成后再进行。")
         source_artifact = "user_confirmation" if chapters is not None else "book"
+        if source_artifact == "user_confirmation":
+            current_revision = int(snapshot.get("revision") or 0)
+            if expected_job_revision is None or current_revision != expected_job_revision:
+                raise JobServiceError(
+                    "任务状态已变化，请刷新后重新确认章节；当前编辑内容不会覆盖新版本。",
+                    payload={
+                        "code": "chapter_confirmation_stale",
+                        "expected_job_revision": expected_job_revision,
+                        "current_job_revision": current_revision,
+                    },
+                )
         source_chapters = chapters if chapters is not None else self.draft_chapters(job_id)
         if not isinstance(source_chapters, list) or not source_chapters:
             raise JobServiceError("Chapter confirmation requires at least one chapter.")
@@ -2049,11 +2061,30 @@ class BookJobService:
         state = str(snapshot.get("state") or "")
         if state not in {"awaiting_glossary", "failed", "exporting"}:
             raise JobServiceError(f"当前状态无法导出 EPUB：{state}")
+        if state == "exporting" and self.translation_worker_lock_held(job_id):
+            raise JobServiceError(
+                "EPUB 正在导出，请等待当前任务完成。",
+                payload={"code": "export_already_running"},
+            )
+        self._acquire_worker_lock(job_id)
+        try:
+            snapshot["state"] = "exporting"
+            snapshot["failed_stage"] = None
+            snapshot["error"] = None
+            snapshot["updated_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            snapshot["revision"] = int(snapshot.get("revision") or 0) + 1
+            self._write_json_atomic(self._job_dir(job_id) / "job.json", snapshot)
+        except Exception:
+            self._release_worker_lock(job_id)
+            raise
         return snapshot
 
-    def run_export(self, job_id: str) -> None:
+    def run_export(self, job_id: str, *, worker_claimed: bool = False) -> None:
         self._validate_job_id(job_id)
-        self._acquire_worker_lock(job_id)
+        if not worker_claimed:
+            self._acquire_worker_lock(job_id)
+        elif job_id not in self._worker_handles:
+            raise JobServiceError(f"Export worker claim missing for job {job_id}.")
         try:
             self._run(
                 ["job", "export", job_id, "--jobs-dir", str(self.jobs_dir), "--json"],
@@ -2148,7 +2179,11 @@ class BookJobService:
         self._normalize_provider_env(environment)
         # 启动 launchd 环境下 PATH 不含 ~/.local/bin，找不到 uv 时回退到 pdf-translator 自带 venv
         cmd = self._resolve_runner_cmd(environment)
-        worker = self._worker_handles.get(args[2]) if len(args) > 2 and args[:2] in (["job", "execute"], ["job", "resume"]) else None
+        worker = self._worker_handles.get(args[2]) if len(args) > 2 and args[:2] in (
+            ["job", "execute"],
+            ["job", "resume"],
+            ["job", "export"],
+        ) else None
         command = [*cmd, "pdf-translator", *args]
         inherited = ()
         if worker is not None:

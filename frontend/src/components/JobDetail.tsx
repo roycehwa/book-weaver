@@ -631,6 +631,7 @@ function JobDetail() {
       id,
       normalized,
       job?.source_revision || 0,
+      job?.revision || 0,
       acknowledgedDependencyIds,
     )
     setJob(result.job)

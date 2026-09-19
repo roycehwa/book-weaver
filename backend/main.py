@@ -369,6 +369,7 @@ class JobChapterDraftPrefsRequest(BaseModel):
 
 class JobChapterConfirmationRequest(BaseModel):
     expected_source_revision: int = Field(default=0, ge=0)
+    expected_job_revision: Optional[int] = Field(default=None, ge=0)
     chapters: Optional[List[dict[str, Any]]] = None
     acknowledged_dependency_ids: Optional[List[str]] = None
 
@@ -601,7 +602,7 @@ def _run_translate_in_background(service: BookJobService, job_id: str) -> None:
 
 def _run_export_in_background(service: BookJobService, job_id: str) -> None:
     try:
-        service.run_export(job_id)
+        service.run_export(job_id, worker_claimed=True)
     except Exception:
         logger.exception("Background EPUB export failed: %s", job_id)
 
@@ -1655,6 +1656,7 @@ async def confirm_job_chapters(
             job_id,
             chapters=request.chapters,
             expected_source_revision=request.expected_source_revision,
+            expected_job_revision=request.expected_job_revision,
             acknowledged_dependency_ids=request.acknowledged_dependency_ids,
         )
         return {
@@ -1664,7 +1666,9 @@ async def confirm_job_chapters(
     except JobNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except JobServiceError as exc:
-        raise HTTPException(status_code=400, detail=_job_service_http_detail(exc)) from exc
+        code = str((exc.payload or {}).get("code") or "")
+        status_code = 409 if code == "chapter_confirmation_stale" else 400
+        raise HTTPException(status_code=status_code, detail=_job_service_http_detail(exc)) from exc
 
 
 class SourceCorrectionRequest(BaseModel):
@@ -2259,6 +2263,9 @@ async def start_job_export(job_id: str, background_tasks: BackgroundTasks):
     except JobNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except JobServiceError as exc:
+        if str((exc.payload or {}).get("code") or "") == "export_already_running":
+            snapshot = service.get(job_id)
+            return {"job": snapshot, "workspace_book": _workspace_book_from_job(snapshot)}
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 

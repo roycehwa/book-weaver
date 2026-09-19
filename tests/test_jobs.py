@@ -553,6 +553,66 @@ def test_run_export_phase_completes_after_validating(
     assert "export_completed" in [event["type"] for event in repository.list_events(job_id)]
 
 
+def test_run_export_phase_retries_after_a_failed_attempt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.pdf"
+    source.write_bytes(b"%PDF")
+    repository = JobRepository(tmp_path / "jobs")
+    created = repository.create(
+        source_path=source,
+        processing_mode="convert",
+        output_format="epub",
+    )
+    job_id = created["job_id"]
+    repository.update(job_id, state="awaiting_glossary")
+    job_dir = repository.job_dir(job_id)
+    run_dir = job_dir / "artifacts" / "source"
+    run_dir.mkdir(parents=True)
+    book_json = run_dir / "book.json"
+    book_json.write_text(
+        json.dumps({"metadata": {}, "pages": [], "chapters": []}),
+        encoding="utf-8",
+    )
+    manifest = run_dir / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "source_pdf": str(job_dir / "source" / source.name),
+                "files": {"book_json": str(book_json)},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (job_dir / "artifacts" / "canonical-chapters.json").write_text("{}", encoding="utf-8")
+    runner = BookJobRunner(repository)
+    monkeypatch.setattr(runner, "_run_output_dir", lambda _job_id: run_dir)
+    attempts = {"count": 0}
+
+    def flaky_export_pipeline(settings, on_stage):
+        attempts["count"] += 1
+        on_stage("exporting", {"stage_percent": 50})
+        if attempts["count"] == 1:
+            raise OSError("injected export failure")
+        on_stage("validating", {"stage_percent": 100})
+        return _pipeline_artifacts(run_dir, manifest, run_dir / "translated.md")
+
+    monkeypatch.setattr("pdf_translator.pipeline.run_export_pipeline", flaky_export_pipeline)
+
+    with pytest.raises(OSError, match="injected export failure"):
+        runner.run_export_phase(job_id)
+    failed = repository.load(job_id)
+    assert failed["state"] == "failed"
+    assert failed["failed_stage"] == "exporting"
+
+    completed = runner.run_export_phase(job_id)
+
+    assert attempts["count"] == 2
+    assert completed["state"] == "completed"
+    assert completed["error"] is None
+
+
     source = tmp_path / "source.pdf"
     source.write_bytes(b"%PDF")
     repository = JobRepository(tmp_path / "jobs")

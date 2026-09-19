@@ -54,6 +54,41 @@ def test_start_translation_requires_confirmed_canonical_chapters(
         service.start_translation("job-1")
 
 
+def test_export_start_claims_worker_and_duplicate_submit_does_not_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = BookJobService(project_home=tmp_path, jobs_dir=tmp_path / "jobs")
+    job_dir = service.jobs_dir / "job-export"
+    job_dir.mkdir(parents=True)
+    snapshot = _snapshot("job-export")
+    snapshot.update(
+        {
+            "revision": 4,
+            "state": "awaiting_glossary",
+            "request": {"processing_mode": "convert"},
+        }
+    )
+    (job_dir / "job.json").write_text(json.dumps(snapshot), encoding="utf-8")
+    monkeypatch.setattr(service, "_require_user_confirmed_canonical_chapters", lambda _job_id: None)
+
+    started = service.start_export("job-export")
+
+    assert started["state"] == "exporting"
+    assert started["revision"] == 5
+    assert service.translation_worker_lock_held("job-export") is True
+    with pytest.raises(JobServiceError) as exc_info:
+        service.start_export("job-export")
+    assert exc_info.value.payload == {"code": "export_already_running"}
+
+    calls: list[list[str]] = []
+    monkeypatch.setattr(service, "_run", lambda args, **_kwargs: calls.append(args))
+    service.run_export("job-export", worker_claimed=True)
+
+    assert calls == [["job", "export", "job-export", "--jobs-dir", str(service.jobs_dir), "--json"]]
+    assert service.translation_worker_lock_held("job-export") is False
+
+
 def test_start_translation_rejects_auto_confirmed_canonical_chapters(tmp_path: Path) -> None:
     service = BookJobService(project_home=tmp_path, jobs_dir=tmp_path / "jobs")
     job_dir = service.jobs_dir / "job-1"
@@ -511,6 +546,7 @@ def test_confirm_chapters_accepts_user_edited_chapters(tmp_path: Path) -> None:
 
     service.confirm_chapters(
         "job-1",
+        expected_job_revision=int(snapshot.get("revision") or 0),
         chapters=[
             {
                 "index": 1,
@@ -527,6 +563,36 @@ def test_confirm_chapters_accepts_user_edited_chapters(tmp_path: Path) -> None:
     assert canonical["source_artifact"] == "user_confirmation"
     assert canonical["chapters"][0]["chapter_id"] == "manual-1"
     assert canonical["chapters"][0]["title"] == "用户修正章节"
+
+
+def test_confirm_chapters_rejects_stale_job_revision_before_writing(tmp_path: Path) -> None:
+    service = BookJobService(project_home=tmp_path, jobs_dir=tmp_path / "jobs")
+    job_dir = service.jobs_dir / "job-1"
+    artifacts_dir = job_dir / "artifacts"
+    artifacts_dir.mkdir(parents=True)
+    canonical_path = artifacts_dir / "canonical-chapters.json"
+    canonical_path.write_text('{"marker":"newer"}', encoding="utf-8")
+    snapshot = _snapshot("job-1")
+    snapshot["revision"] = 7
+    snapshot["state"] = "awaiting_chapter_confirmation"
+    snapshot["artifacts"] = {
+        "canonical_chapters": {"href": "artifacts/canonical-chapters.json"}
+    }
+    (job_dir / "job.json").write_text(json.dumps(snapshot), encoding="utf-8")
+
+    with pytest.raises(JobServiceError) as exc_info:
+        service.confirm_chapters(
+            "job-1",
+            expected_job_revision=6,
+            chapters=[{"chapter_id": "old-window", "title": "Old window"}],
+        )
+
+    assert exc_info.value.payload == {
+        "code": "chapter_confirmation_stale",
+        "expected_job_revision": 6,
+        "current_job_revision": 7,
+    }
+    assert canonical_path.read_text(encoding="utf-8") == '{"marker":"newer"}'
 
 
 def test_confirm_chapters_writes_user_chapter_segment_preview(tmp_path: Path) -> None:
@@ -560,6 +626,7 @@ def test_confirm_chapters_writes_user_chapter_segment_preview(tmp_path: Path) ->
 
     result = service.confirm_chapters(
         "job-1",
+        expected_job_revision=int(snapshot.get("revision") or 0),
         chapters=[
             {
                 "index": 1,
@@ -612,6 +679,7 @@ def test_confirming_translation_chapters_extracts_glossary_from_confirmed_book(t
 
     result = service.confirm_chapters(
         "job-1",
+        expected_job_revision=int(snapshot.get("revision") or 0),
         chapters=[{
             "index": 1,
             "chapter_id": "body",
@@ -665,6 +733,7 @@ def test_confirm_chapters_preview_error_includes_underlying_reason(tmp_path: Pat
     with pytest.raises(JobServiceError, match="no extractable embedded text"):
         service.confirm_chapters(
             "job-1",
+            expected_job_revision=int(snapshot.get("revision") or 0),
             chapters=[
                 {
                     "index": 1,
@@ -738,7 +807,8 @@ def test_worker_claim_is_exclusive_across_service_instances(tmp_path):
     second._release_worker_lock('job-lock')
 
 
-def test_worker_subprocess_inherits_guard(tmp_path, monkeypatch):
+@pytest.mark.parametrize("operation", ["resume", "export"])
+def test_worker_subprocess_inherits_guard(tmp_path, monkeypatch, operation):
     import sys
     (tmp_path/'pyproject.toml').touch()
     service = BookJobService(project_home=tmp_path, jobs_dir=tmp_path/'jobs')
@@ -750,7 +820,7 @@ def test_worker_subprocess_inherits_guard(tmp_path, monkeypatch):
         return SimpleNamespace(returncode=0, stdout='', stderr='')
     monkeypatch.setattr('job_service.subprocess.run', run)
     try:
-        service._run(['job', 'resume', 'job-lock'])
+        service._run(['job', operation, 'job-lock'])
         assert observed['command'][0] == sys.executable
         assert observed['pass_fds'] == (service._worker_handles['job-lock'].fileno(),)
     finally:

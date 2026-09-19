@@ -1391,10 +1391,12 @@ def test_confirm_job_chapters_marks_preserved_job_phase_a_complete(tmp_path, mon
             *,
             chapters=None,
             expected_source_revision=0,
+            expected_job_revision=None,
             acknowledged_dependency_ids=None,
         ):
             assert chapters is None
             assert expected_source_revision == 0
+            assert expected_job_revision is None
             assert acknowledged_dependency_ids is None
             calls.append(job_id)
             return snapshot
@@ -1498,22 +1500,89 @@ def test_confirm_job_chapters_passes_user_edited_chapters(tmp_path, monkeypatch)
             *,
             chapters=None,
             expected_source_revision=0,
+            expected_job_revision=None,
             acknowledged_dependency_ids=None,
         ):
             observed["job_id"] = job_id
             observed["chapters"] = chapters
+            observed["expected_job_revision"] = expected_job_revision
             return snapshot
 
     monkeypatch.setattr(module, "get_job_service", lambda: Service())
 
     response = TestClient(module.app).post(
         "/api/jobs/job-1/chapters/confirm",
-        json={"chapters": [{"index": 1, "chapter_id": "manual-1", "title": "手动章节"}]},
+        json={
+            "expected_job_revision": 1,
+            "chapters": [{"index": 1, "chapter_id": "manual-1", "title": "手动章节"}],
+        },
     )
 
     assert response.status_code == 200
     assert observed["job_id"] == "job-1"
     assert observed["chapters"][0]["title"] == "手动章节"
+    assert observed["expected_job_revision"] == 1
+
+
+def test_confirm_job_chapters_returns_conflict_for_stale_window(monkeypatch):
+    module = importlib.import_module("main")
+    from job_service import JobServiceError
+
+    class Service:
+        def confirm_chapters(self, *_args, **_kwargs):
+            raise JobServiceError(
+                "任务状态已变化",
+                payload={
+                    "code": "chapter_confirmation_stale",
+                    "expected_job_revision": 1,
+                    "current_job_revision": 2,
+                },
+            )
+
+    monkeypatch.setattr(module, "get_job_service", lambda: Service())
+    response = TestClient(module.app).post(
+        "/api/jobs/job-1/chapters/confirm",
+        json={
+            "expected_job_revision": 1,
+            "chapters": [{"index": 1, "chapter_id": "manual-1", "title": "旧窗口"}],
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "chapter_confirmation_stale"
+
+
+def test_duplicate_export_submit_returns_current_job_without_second_dispatch(monkeypatch):
+    module = importlib.import_module("main")
+    from job_service import JobServiceError
+
+    snapshot = _job_snapshot(
+        "job-export",
+        filename="Synthetic.pdf",
+        state="exporting",
+        text_operation="preserve",
+    )
+
+    class Service:
+        def start_export(self, job_id):
+            assert job_id == "job-export"
+            raise JobServiceError(
+                "EPUB 正在导出",
+                payload={"code": "export_already_running"},
+            )
+
+        def get(self, job_id):
+            assert job_id == "job-export"
+            return snapshot
+
+        def run_export(self, *_args, **_kwargs):
+            raise AssertionError("duplicate submit must not dispatch another worker")
+
+    monkeypatch.setattr(module, "get_job_service", lambda: Service())
+    response = TestClient(module.app).post("/api/jobs/job-export/export")
+
+    assert response.status_code == 202
+    assert response.json()["job"]["state"] == "exporting"
 
 
 def test_job_glossary_endpoint_returns_active_entries(monkeypatch) -> None:

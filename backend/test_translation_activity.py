@@ -261,3 +261,24 @@ def test_supervisor_marks_auto_resume_exhausted_at_limit(monkeypatch) -> None:
     _scan_and_resume_stalled(Service())
 
     assert marked == [("job-failed", 3)]
+
+
+def test_supervisor_recovers_stalled_export_without_duplicate_worker() -> None:
+    calls: list[str] = []
+
+    class Service:
+        def list(self):
+            return [
+                {"job_id": "job-stalled", "state": "exporting"},
+                {"job_id": "job-active", "state": "exporting"},
+            ]
+
+        def translation_worker_lock_held(self, job_id: str) -> bool:
+            return job_id == "job-active"
+
+        def run_export(self, job_id: str) -> None:
+            calls.append(job_id)
+
+    _scan_and_resume_stalled(Service())
+
+    assert calls == ["job-stalled"]

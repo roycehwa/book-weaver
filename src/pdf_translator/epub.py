@@ -636,46 +636,62 @@ def render_epub_from_book(
     cover_manifest_id = next((f"image-{i}" for i, (href, _) in enumerate(image_items, 1) if href in cover_hrefs), None)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_output = output_path.with_name(
+        f".{output_path.stem}.{uuid.uuid4().hex}.tmp{output_path.suffix or '.epub'}"
+    )
+    resource_report_path = output_path.with_suffix(".resources.json")
+    temporary_report = resource_report_path.with_name(
+        f".{resource_report_path.name}.{uuid.uuid4().hex}.tmp"
+    )
     identifier = f"urn:uuid:{uuid.uuid4()}"
-    with ZipFile(output_path, "w") as archive:
-        archive.writestr("mimetype", "application/epub+zip", compress_type=ZIP_STORED)
-        archive.writestr("META-INF/container.xml", _container_xml(), compress_type=ZIP_DEFLATED)
-        archive.writestr("OEBPS/styles/book.css", epub_css, compress_type=ZIP_DEFLATED)
-        archive.writestr(
-            "OEBPS/nav.xhtml",
-            _nav_xhtml(title, chapters, chapter_files, language=dc_language),
-            compress_type=ZIP_DEFLATED,
-        )
-        archive.writestr(
-            "OEBPS/content.opf",
-            _content_opf(
-                title=title,
-                identifier=identifier,
-                language=dc_language,
-                chapter_files=chapter_files,
-                image_items=image_items,
-                font_items=font_items,
-                cover_image_manifest_id=cover_manifest_id,
-            ),
-            compress_type=ZIP_DEFLATED,
-        )
-        for chapter_file, chapter_document in chapter_documents:
-            archive.writestr(f"OEBPS/{chapter_file}", chapter_document, compress_type=ZIP_DEFLATED)
-        for epub_path, source_path in image_items:
-            archive.writestr(f"OEBPS/{epub_path}", _export_image_bytes(source_path), compress_type=ZIP_DEFLATED)
-        for epub_path, source_path, _media_type in font_items:
-            archive.write(source_path, f"OEBPS/{epub_path}", compress_type=ZIP_DEFLATED)
+    try:
+        with ZipFile(temporary_output, "w") as archive:
+            archive.writestr("mimetype", "application/epub+zip", compress_type=ZIP_STORED)
+            archive.writestr("META-INF/container.xml", _container_xml(), compress_type=ZIP_DEFLATED)
+            archive.writestr("OEBPS/styles/book.css", epub_css, compress_type=ZIP_DEFLATED)
+            archive.writestr(
+                "OEBPS/nav.xhtml",
+                _nav_xhtml(title, chapters, chapter_files, language=dc_language),
+                compress_type=ZIP_DEFLATED,
+            )
+            archive.writestr(
+                "OEBPS/content.opf",
+                _content_opf(
+                    title=title,
+                    identifier=identifier,
+                    language=dc_language,
+                    chapter_files=chapter_files,
+                    image_items=image_items,
+                    font_items=font_items,
+                    cover_image_manifest_id=cover_manifest_id,
+                ),
+                compress_type=ZIP_DEFLATED,
+            )
+            for chapter_file, chapter_document in chapter_documents:
+                archive.writestr(f"OEBPS/{chapter_file}", chapter_document, compress_type=ZIP_DEFLATED)
+            for epub_path, source_path in image_items:
+                archive.writestr(f"OEBPS/{epub_path}", _export_image_bytes(source_path), compress_type=ZIP_DEFLATED)
+            for epub_path, source_path, _media_type in font_items:
+                archive.write(source_path, f"OEBPS/{epub_path}", compress_type=ZIP_DEFLATED)
 
-    with ZipFile(output_path) as archive:
-        entries = [{"path": item.filename, "bytes": item.file_size,
-                    "compressed_bytes": item.compress_size} for item in archive.infolist()]
-    report = {"schema": "epub_resource_budget_v1", "total_bytes": output_path.stat().st_size,
-              "image_count": len(image_items), "font_count": len(font_items),
-              "large_resources": [entry for entry in entries if entry["compressed_bytes"] > 1024 * 1024],
-              "resources": entries,
-              "warnings": ["EPUB exceeds 30 MiB: inspect retained page images and configured fonts"]
-              if output_path.stat().st_size > 30 * 1024 * 1024 else []}
-    output_path.with_suffix(".resources.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        with ZipFile(temporary_output) as archive:
+            entries = [{"path": item.filename, "bytes": item.file_size,
+                        "compressed_bytes": item.compress_size} for item in archive.infolist()]
+        output_size = temporary_output.stat().st_size
+        report = {"schema": "epub_resource_budget_v1", "total_bytes": output_size,
+                  "image_count": len(image_items), "font_count": len(font_items),
+                  "large_resources": [entry for entry in entries if entry["compressed_bytes"] > 1024 * 1024],
+                  "resources": entries,
+                  "warnings": ["EPUB exceeds 30 MiB: inspect retained page images and configured fonts"]
+                  if output_size > 30 * 1024 * 1024 else []}
+        temporary_report.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        temporary_report.replace(resource_report_path)
+        temporary_output.replace(output_path)
+    finally:
+        temporary_output.unlink(missing_ok=True)
+        temporary_report.unlink(missing_ok=True)
 
 
 def validate_epub_internal_hrefs(epub_path: Path) -> dict[str, object]:

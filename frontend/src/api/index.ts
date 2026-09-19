@@ -988,7 +988,8 @@ export const jobsApi = {
   confirmChapterDraft: (
     jobId: string,
     chapters: JobChapterDraft[],
-    expectedSourceRevision = 0,
+    expectedSourceRevision: number,
+    expectedJobRevision: number,
     acknowledgedDependencyIds: string[] = [],
   ) =>
     request<{ job: BookJob; workspace_book: WorkspaceBook }>(
@@ -998,6 +999,7 @@ export const jobsApi = {
         body: JSON.stringify({
           chapters,
           expected_source_revision: expectedSourceRevision,
+          expected_job_revision: expectedJobRevision,
           acknowledged_dependency_ids: acknowledgedDependencyIds,
         }),
       }

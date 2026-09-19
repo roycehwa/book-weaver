@@ -3,6 +3,7 @@ from __future__ import annotations
 import html as html_lib
 import os
 import re
+import uuid
 from io import BytesIO
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -567,33 +568,40 @@ def render_pdf_from_markdown(
         base_dir=output_path.parent,
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    doc = BaseDocTemplate(
-        str(output_path),
-        pagesize=A4,
-        leftMargin=PAGE_MARGIN,
-        rightMargin=PAGE_MARGIN,
-        topMargin=PAGE_MARGIN,
-        bottomMargin=PAGE_MARGIN,
-        title=title,
+    temporary_output = output_path.with_name(
+        f".{output_path.stem}.{uuid.uuid4().hex}.tmp{output_path.suffix or '.pdf'}"
     )
-    frame = Frame(
-        PAGE_MARGIN,
-        PAGE_MARGIN + FOOTNOTE_AREA_HEIGHT,
-        CONTENT_WIDTH,
-        CONTENT_HEIGHT,
-        id="body",
-        leftPadding=0,
-        rightPadding=0,
-        topPadding=0,
-        bottomPadding=0,
-    )
-    doc.addPageTemplates(
-        [
-            PageTemplate(
-                id="book",
-                frames=[frame],
-                onPageEnd=_draw_page_footnotes,
-            )
-        ]
-    )
-    doc.build(story)
+    try:
+        doc = BaseDocTemplate(
+            str(temporary_output),
+            pagesize=A4,
+            leftMargin=PAGE_MARGIN,
+            rightMargin=PAGE_MARGIN,
+            topMargin=PAGE_MARGIN,
+            bottomMargin=PAGE_MARGIN,
+            title=title,
+        )
+        frame = Frame(
+            PAGE_MARGIN,
+            PAGE_MARGIN + FOOTNOTE_AREA_HEIGHT,
+            CONTENT_WIDTH,
+            CONTENT_HEIGHT,
+            id="body",
+            leftPadding=0,
+            rightPadding=0,
+            topPadding=0,
+            bottomPadding=0,
+        )
+        doc.addPageTemplates(
+            [
+                PageTemplate(
+                    id="book",
+                    frames=[frame],
+                    onPageEnd=_draw_page_footnotes,
+                )
+            ]
+        )
+        doc.build(story)
+        temporary_output.replace(output_path)
+    finally:
+        temporary_output.unlink(missing_ok=True)

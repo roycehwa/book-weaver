@@ -9,6 +9,7 @@ logger = logging.getLogger(__name__)
 
 SUPERVISOR_INTERVAL_SECONDS = 30
 _active_resumes: set[str] = set()
+_active_exports: set[str] = set()
 _HUMAN_GATE_MARKERS = ("人工确认章节", "完成术语确认")
 
 
@@ -42,6 +43,18 @@ def _scan_and_resume_stalled(service: Any) -> None:
     for snapshot in service.list():
         job_id = str(snapshot.get("job_id") or "")
         state = str(snapshot.get("state") or "")
+        if job_id and state == "exporting":
+            if job_id in _active_exports or service.translation_worker_lock_held(job_id):
+                continue
+            logger.info("Recovering stalled export job %s", job_id)
+            _active_exports.add(job_id)
+            try:
+                service.run_export(job_id)
+            except Exception:
+                logger.exception("Export recovery failed for job %s", job_id)
+            finally:
+                _active_exports.discard(job_id)
+            continue
         if not job_id or state not in {"translating", "failed"}:
             continue
         if job_id in _active_resumes:

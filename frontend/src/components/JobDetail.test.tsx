@@ -104,6 +104,7 @@ describe('JobDetail Notes dependency acknowledgement', () => {
     await userEvent.click(screen.getByRole('checkbox', { name: /我已了解风险/ }))
     await userEvent.click(submit)
     await waitFor(() => expect(confirm).toHaveBeenCalledTimes(1))
-    expect(confirm.mock.calls[0][3]).toEqual(['cpd-server-id'])
+    expect(confirm.mock.calls[0][3]).toBe(1)
+    expect(confirm.mock.calls[0][4]).toEqual(['cpd-server-id'])
   })
 })
