@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from pdf_translator.lifecycle import cleanup_run, finalize_run
+from tests.synthetic_quality_fixtures import write_minimal_translation_quality_artifacts
 
 
 def test_finalize_run_writes_phase_a_status(tmp_path: Path) -> None:
@@ -56,11 +57,24 @@ def test_finalize_run_allows_english_source_to_enter_phase_b_directly(tmp_path: 
         encoding="utf-8",
     )
     (run_dir / "book.json").write_text(
-        json.dumps({"chapters": [{"chapter_id": "chapter-001"}]}),
+        json.dumps(
+            {
+                "chapters": [
+                    {
+                        "chapter_id": "chapter-001",
+                        "index": 1,
+                        "title": "Chapter One",
+                        "markdown": "# Chapter One\n\nEnglish source text.\n",
+                        "source_pages": [1],
+                    }
+                ]
+            }
+        ),
         encoding="utf-8",
     )
     (run_dir / "book.md").write_text("# Chapter One\n\nEnglish source text.\n", encoding="utf-8")
     (run_dir / "chapter-report.json").write_text("{}", encoding="utf-8")
+    write_minimal_translation_quality_artifacts(run_dir)
 
     status = finalize_run(run_dir)["status"]
 
@@ -88,7 +102,19 @@ def test_finalize_run_prefers_approved_review_version(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     (run_dir / "book.json").write_text(
-        json.dumps({"chapters": [{"chapter_id": "chapter-001"}]}),
+        json.dumps(
+            {
+                "chapters": [
+                    {
+                        "chapter_id": "chapter-001",
+                        "index": 1,
+                        "title": "Chapter One",
+                        "markdown": "# Chapter One\n\nEnglish source text.\n",
+                        "source_pages": [1],
+                    }
+                ]
+            }
+        ),
         encoding="utf-8",
     )
     (run_dir / "book.md").write_text("# Chapter One\n\nEnglish source text.\n", encoding="utf-8")
@@ -109,6 +135,7 @@ def test_finalize_run_prefers_approved_review_version(tmp_path: Path) -> None:
         ),
         encoding="utf-8",
     )
+    write_minimal_translation_quality_artifacts(run_dir)
 
     status = finalize_run(run_dir)["status"]
 
@@ -134,13 +161,26 @@ def test_finalize_run_uses_source_while_translation_review_is_pending(tmp_path: 
         encoding="utf-8",
     )
     (run_dir / "book.json").write_text(
-        json.dumps({"chapters": [{"chapter_id": "chapter-001"}]}),
+        json.dumps(
+            {
+                "chapters": [
+                    {
+                        "chapter_id": "chapter-001",
+                        "index": 1,
+                        "title": "Chapter One",
+                        "markdown": "# Chapter One\n\nEnglish source text.\n",
+                        "source_pages": [1],
+                    }
+                ]
+            }
+        ),
         encoding="utf-8",
     )
     (run_dir / "book.md").write_text("# Chapter One\n\nEnglish source text.\n", encoding="utf-8")
     (run_dir / "translated.md").write_text("# 第一章\n\n机器初译。\n", encoding="utf-8")
     (run_dir / "review_state.json").write_text(json.dumps({"decisions": {}}), encoding="utf-8")
     (run_dir / "chapter-report.json").write_text("{}", encoding="utf-8")
+    write_minimal_translation_quality_artifacts(run_dir)
 
     status = finalize_run(run_dir)["status"]
 

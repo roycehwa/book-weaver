@@ -167,6 +167,9 @@ def _chapter_id_coverage(book: dict[str, Any]) -> float:
 
 def finalize_run(run_dir: Path) -> dict[str, Any]:
     run_dir = run_dir.expanduser().resolve()
+    from pdf_translator.translation_quality import assert_translation_quality_current
+
+    assert_translation_quality_current(run_dir)
     manifest = _read_json(run_dir / "manifest.json")
     book = _read_json(run_dir / "book.json")
     polish_report = _read_json(run_dir / "polish-report.json")

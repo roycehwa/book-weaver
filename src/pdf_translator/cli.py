@@ -785,6 +785,9 @@ def _render_review_export(
     run_dir = run_dir.expanduser().resolve()
     from pdf_translator.source_workspace import require_current_translation
     require_current_translation(run_dir)
+    from pdf_translator.translation_quality import assert_translation_quality_current
+
+    assert_translation_quality_current(run_dir)
     project = review_project_from_run(run_dir)
     if approve:
         integrity_path = run_dir / "integrity-ledger.json"

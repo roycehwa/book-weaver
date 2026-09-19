@@ -617,6 +617,8 @@ export interface WorkspaceBook {
   lifecycle_stage?: string
   lifecycle_state?: 'active' | 'failed'
   polish_outcome?: 'applied' | 'no_candidates' | 'needs_review' | 'waived' | 'failed' | null
+  translation_quality_blocking?: boolean
+  translation_quality_review_count?: number
 }
 
 export interface WorkspaceTextVersion {

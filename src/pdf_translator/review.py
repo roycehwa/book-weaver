@@ -769,6 +769,7 @@ def build_pre_review_report(
     review_items: list[dict[str, Any]],
     *,
     method: str = "rules_v1",
+    quality_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Machine pre-review: audit source/translation pairs and flag questionable segments."""
     issue_counts: dict[str, int] = defaultdict(int)
@@ -780,7 +781,7 @@ def build_pre_review_report(
             flagged_segment_ids.append(segment_id)
     total_segments = len(segments)
     flagged_segments = len(flagged_segment_ids)
-    return {
+    payload = {
         "schema": SCHEMA_PRE_REVIEW,
         "status": "completed",
         "completed_at": utc_now(),
@@ -791,6 +792,80 @@ def build_pre_review_report(
         "issue_counts": dict(sorted(issue_counts.items())),
         "flagged_segment_ids": flagged_segment_ids,
     }
+    if quality_summary:
+        payload["translation_quality"] = quality_summary
+    return payload
+
+
+def append_polish_quality_review_items(
+    run_dir: Path | None,
+    review_items: list[dict[str, Any]],
+    segments: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if run_dir is None or not segments:
+        return review_items
+    polish_report_path = run_dir / "polish-report.json"
+    if not polish_report_path.exists():
+        return review_items
+    polish_report = json.loads(polish_report_path.read_text(encoding="utf-8"))
+    existing = {
+        (str(item.get("segment_id") or ""), str(item.get("issue_type") or ""))
+        for item in review_items
+    }
+    segment_by_line: dict[int, dict[str, Any]] = {}
+    for segment in segments:
+        location = segment.get("source_location") if isinstance(segment.get("source_location"), dict) else {}
+        line = location.get("line")
+        if isinstance(line, int):
+            segment_by_line[line] = segment
+    updated = list(review_items)
+    for bucket, issue_type in (
+        ("rejected", "polish_rejected"),
+        ("unchanged", "polish_unchanged"),
+        ("unresolved", "polish_unresolved"),
+    ):
+        entries = polish_report.get(bucket)
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            line = entry.get("line")
+            segment = segment_by_line.get(line) if isinstance(line, int) else segments[0]
+            segment_id = str(segment.get("segment_id") or "")
+            if not segment_id:
+                continue
+            key = (segment_id, issue_type)
+            if key in existing:
+                continue
+            item_id = f"quality:{issue_type}:{segment_id}:{line}"
+            updated.append(
+                {
+                    "item_id": item_id,
+                    "segment_id": segment_id,
+                    "issue_type": issue_type,
+                    "severity": "medium",
+                    "status": "open",
+                    "chapter_id": segment.get("chapter_id"),
+                    "chapter_title": segment.get("chapter_title"),
+                    "source_location": segment.get("source_location", {}),
+                    "evidence": {"polish_decision": entry.get("decision"), "line": line, "before": entry.get("before")},
+                }
+            )
+            existing.add(key)
+    return updated
+
+
+def extend_pre_review_with_translation_quality(
+    pre_review: dict[str, Any],
+    run_dir: Path,
+) -> dict[str, Any]:
+    from pdf_translator.translation_quality import translation_quality_summary
+
+    summary = translation_quality_summary(run_dir)
+    pre_review = dict(pre_review)
+    pre_review["translation_quality"] = summary
+    return pre_review
 
 
 def summarize_review_state(review_items: list[dict[str, Any]], review_state: dict[str, Any]) -> dict[str, int]:
@@ -939,6 +1014,7 @@ def build_review_artifacts(
             'chapter_id': first.get('chapter_id'), 'chapter_title': first.get('chapter_title'),
             'source_location': first.get('source_location', {}), 'evidence': warning,
         })
+    review_items = append_polish_quality_review_items(run_dir, review_items, segments)
     pre_review = build_pre_review_report(
         segments,
         review_items,

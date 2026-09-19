@@ -523,7 +523,7 @@ def publish_translation_zh_cleanup(
     target_language: str,
     text_operation: str,
 ) -> tuple[str, dict[str, str] | None]:
-    if not should_run_zh_markdown_cleanup(target_language, text_operation):
+    if text_operation != "translate":
         return raw_markdown, None
 
     run_dir = run_dir.expanduser().resolve()
@@ -532,6 +532,29 @@ def publish_translation_zh_cleanup(
     report_path = run_dir / TRANSLATION_CLEANUP_REPORT_FILENAME
 
     raw_path.write_text(raw_markdown, encoding="utf-8")
+    if not should_run_zh_markdown_cleanup(target_language, text_operation):
+        cleaned_path.write_text(raw_markdown, encoding="utf-8")
+        atomic_json(
+            report_path,
+            {
+                "schema": REPORT_SCHEMA,
+                "status": "skipped",
+                "reason": "target_not_zh",
+                "version": RULES_VERSION,
+                "target_language": target_language,
+                "changed_count": 0,
+                "changes": [],
+                "fingerprints": {
+                    "input_sha256": hashlib.sha256(raw_markdown.encode("utf-8")).hexdigest(),
+                    "output_sha256": hashlib.sha256(raw_markdown.encode("utf-8")).hexdigest(),
+                },
+            },
+        )
+        return raw_markdown, {
+            "translated_raw_markdown": str(raw_path),
+            "translated_cleaned_markdown": str(cleaned_path),
+            "translation_cleanup_report": str(report_path),
+        }
     cleaned, report = cleanup_zh_markdown(raw_markdown)
     idempotent_cleaned, idempotent_report = cleanup_zh_markdown(cleaned)
     if idempotent_cleaned != cleaned or idempotent_report["changed_count"] != 0:

@@ -42,6 +42,17 @@ def test_build_artifacts_names_user_visible_outputs_from_source_title(tmp_path: 
 
 
 def _patch_intake_dependencies(monkeypatch) -> None:
+    from pdf_translator.translation_quality import run_source_quality_gate_before_translation
+    from tests.synthetic_quality_fixtures import ensure_confirmed_reading_units_for_translation
+
+    def gated_source_quality(run_dir, *, text_operation):
+        ensure_confirmed_reading_units_for_translation(run_dir)
+        return run_source_quality_gate_before_translation(run_dir, text_operation=text_operation)
+
+    monkeypatch.setattr(
+        "pdf_translator.translation_quality.run_source_quality_gate_before_translation",
+        gated_source_quality,
+    )
     def fake_ingest(*args, **kwargs):
         source_pdf = args[0]
         return (

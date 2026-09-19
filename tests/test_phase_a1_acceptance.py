@@ -51,6 +51,17 @@ def _patch_book_intake(monkeypatch, *, markdown: str, chapter_id: str = "ch-001"
     monkeypatch.setattr(pipeline_module, "ingest_pdf_guarded", fake_ingest)
     monkeypatch.setattr(pipeline_module, "build_document_profile", lambda *a, **k: {"profile": "book"})
     monkeypatch.setattr(pipeline_module, "build_book_reconstruction", fake_book)
+    from pdf_translator.translation_quality import run_source_quality_gate_before_translation
+    from tests.synthetic_quality_fixtures import ensure_confirmed_reading_units_for_translation
+
+    def gated_source_quality(run_dir, *, text_operation):
+        ensure_confirmed_reading_units_for_translation(run_dir)
+        return run_source_quality_gate_before_translation(run_dir, text_operation=text_operation)
+
+    monkeypatch.setattr(
+        "pdf_translator.translation_quality.run_source_quality_gate_before_translation",
+        gated_source_quality,
+    )
 
 
 def _english_settings(tmp_path: Path, **overrides) -> RunSettings:

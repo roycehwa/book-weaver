@@ -197,7 +197,10 @@ def test_publish_writes_raw_cleaned_report_and_bypass_non_zh(tmp_path: Path) -> 
         text_operation="translate",
     )
     assert bypassed == raw
-    assert bypass_files is None
+    assert bypass_files is not None
+    report = json.loads((tmp_path / TRANSLATION_CLEANUP_REPORT_FILENAME).read_text(encoding="utf-8"))
+    assert report["status"] == "skipped"
+    assert report["reason"] == "target_not_zh"
 
 
 def test_pipeline_zh_cleanup_artifacts(tmp_path: Path, monkeypatch) -> None:

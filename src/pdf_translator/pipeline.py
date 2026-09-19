@@ -762,6 +762,13 @@ def run_translation_pipeline(
             if glossary_entries
             else settings
         )
+        from pdf_translator.translation_quality import run_source_quality_gate_before_translation
+
+        quality_stub_files = run_source_quality_gate_before_translation(
+            artifacts.output_dir,
+            text_operation=text_operation,
+        )
+        extra_files.update(quality_stub_files)
         translator = build_translator(settings.translator)
         total_chunks = _estimated_translation_total(
             book,
@@ -828,7 +835,19 @@ def run_translation_pipeline(
         encoding="utf-8",
     )
     polished_markdown = downstream_markdown
+    invalidated_postprocess: list[str] = []
     if not skip_translation and text_operation == "translate":
+        from pdf_translator.translation_quality import invalidate_stale_translation_postprocess
+
+        invalidated = invalidate_stale_translation_postprocess(
+            artifacts.output_dir,
+            text_operation=text_operation,
+        )
+        invalidated_postprocess = invalidated
+        if invalidated:
+            extra_files.pop("polish_report", None)
+            extra_files.pop("translated_polished_markdown", None)
+            extra_files.pop("polish_warning", None)
         enter_stage("polishing")
         (artifacts.output_dir / 'polish-warning.json').unlink(missing_ok=True)
         polish_outcome = "no_candidates"
@@ -909,6 +928,26 @@ def run_translation_pipeline(
     )
     extra_files.update(write_review_artifacts(artifacts.output_dir, review_artifacts))
     from pdf_translator.source_workspace import atomic_json, glossary_fingerprint
+    from pdf_translator.translation_quality import write_translation_quality_bundle
+    from pdf_translator.review import extend_pre_review_with_translation_quality
+
+    source_markdown_for_quality = render_translation_input_markdown(book) if book else translation_input_markdown
+    quality_files = write_translation_quality_bundle(
+        artifacts.output_dir,
+        text_operation=text_operation,
+        source_markdown=source_markdown_for_quality,
+        review_items=review_artifacts["review_items"]["items"],
+        invalidated_artifacts=invalidated_postprocess or None,
+    )
+    extra_files.update(quality_files)
+    pre_review_path = artifacts.output_dir / "pre-review.json"
+    if pre_review_path.exists():
+        pre_review_payload = json.loads(pre_review_path.read_text(encoding="utf-8"))
+        atomic_json(
+            pre_review_path,
+            extend_pre_review_with_translation_quality(pre_review_payload, artifacts.output_dir),
+        )
+        review_artifacts["pre_review"] = json.loads(pre_review_path.read_text(encoding="utf-8"))
     atomic_json(artifacts.output_dir / "translation-source-revision.json", {
         "source_revision": (book or {}).get("metadata", {}).get("source_revision", 0),
         "chapter_fingerprint": (book or {}).get("metadata", {}).get("chapter_fingerprint"),

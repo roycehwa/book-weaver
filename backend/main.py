@@ -797,6 +797,14 @@ def _workspace_book_from_job(job: dict[str, Any]) -> dict[str, Any]:
     review_done = bool(review_completion.get("review_completed"))
     chapters_confirmed = _chapters_confirmed_by_user(job, artifacts)
     polish_outcome = _polish_outcome(job)
+    quality_summary = {"translation_quality_blocking": False, "translation_quality_review_count": 0}
+    book_href = artifacts.get("book")
+    if isinstance(book_href, dict) and isinstance(book_href.get("href"), str):
+        from pdf_translator.translation_quality import translation_quality_summary
+
+        run_dir = Path(str(book_href["href"])).expanduser().resolve().parent
+        if run_dir.exists():
+            quality_summary = translation_quality_summary(run_dir)
     polish_finished = polish_outcome in {"applied", "no_candidates", "needs_review", "waived"}
     polish_failed = state == "failed" and failed_stage == "polishing" or polish_outcome == "failed"
     lifecycle_stage = _canonical_lifecycle_stage(job)
@@ -1054,6 +1062,8 @@ def _workspace_book_from_job(job: dict[str, Any]) -> dict[str, Any]:
         "lifecycle_stage": lifecycle_stage,
         "lifecycle_state": lifecycle_state,
         "polish_outcome": polish_outcome,
+        "translation_quality_blocking": quality_summary.get("translation_quality_blocking", False),
+        "translation_quality_review_count": quality_summary.get("translation_quality_review_count", 0),
         "steps": steps,
         "next_action": next_action,
         "phase_a_complete": phase_a_complete,
