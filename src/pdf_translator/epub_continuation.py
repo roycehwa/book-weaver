@@ -149,6 +149,8 @@ def _explicit_chapter_title_boundary(right: dict[str, Any]) -> bool:
 def _hard_spine_boundary(left: dict[str, Any], right: dict[str, Any]) -> str | None:
     if _explicit_chapter_title_boundary(right):
         return "heading_boundary"
+    if str(right.get("title_source") or "") in {"p_ct", "html_title"}:
+        return "strong_title_boundary"
     if _nav_chapter_boundary(left, right):
         return "nav_chapter_boundary"
     if _resource_policy_class(left) != _resource_policy_class(right):

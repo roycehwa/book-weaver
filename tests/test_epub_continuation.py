@@ -633,7 +633,41 @@ def test_epub_left_nav_rejects_strong_p_ct_right_title(tmp_path: Path) -> None:
     assert len(book["chapters"]) == 2
     group = _decision_pair(book, "epub_chapter_group")
     assert group["status"] == "rejected"
-    assert "insufficient_positive_evidence" in group["reasons"]
+    assert "strong_title_boundary" in group["reasons"]
+
+
+def test_epub_strong_p_ct_title_blocks_lowercase_paragraph_join(tmp_path: Path) -> None:
+    epub = tmp_path / "strong-ct-lowercase.epub"
+    _write_spine_epub(
+        epub,
+        opf_manifest="""    <item id="lead" href="lead.xhtml" media-type="application/xhtml+xml" />
+    <item id="tail" href="tail.xhtml" media-type="application/xhtml+xml" />""",
+        opf_spine_items="""    <itemref idref="lead" />
+    <itemref idref="tail" />""",
+        ncx_xml="""<?xml version="1.0" encoding="UTF-8"?>
+<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
+  <navMap>
+    <navPoint id="np1"><navLabel><text>Lead Chapter</text></navLabel><content src="lead.xhtml"/></navPoint>
+  </navMap>
+</ncx>""",
+        xhtml_files={
+            "OEBPS/lead.xhtml": """<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><body><p>Lead prose continues without ending</p></body></html>""",
+            "OEBPS/tail.xhtml": """<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><body>
+<p class="ct">Distinct Continuation Title</p>
+<p>lowercase prose begins the distinct section.</p>
+</body></html>""",
+        },
+    )
+    book = _rebuild(epub)
+    assert len(book["chapters"]) == 2
+    group = _decision_pair(book, "epub_chapter_group")
+    join = _decision_pair(book, "epub_paragraph_join")
+    assert group["status"] == "rejected"
+    assert join["status"] == "rejected"
+    assert group["reasons"] == ["strong_title_boundary"]
+    assert join["reasons"] == ["strong_title_boundary"]
 
 
 def test_epub_image_barrier_blocks_paragraph_endpoint(tmp_path: Path) -> None:

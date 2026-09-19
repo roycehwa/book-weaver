@@ -332,16 +332,10 @@ def evaluate_same_source_node_boundary(
 def _page_items_in_order(page: dict[str, Any] | None) -> list[dict[str, Any]]:
     if not isinstance(page, dict):
         return []
-    items = [item for item in page.get("content_items") or [] if isinstance(item, dict)]
-    return sorted(
-        items,
-        key=lambda item: (
-            bool(item.get("from_page_footer")),
-            -float(item.get("top") or 0.0),
-            float(item.get("left") or 0.0),
-            str(item.get("source_node_id") or ""),
-        ),
-    )
+    # ``content_items`` is already in the reconstructed reading order, including
+    # column order and embedded resources. Re-sorting by physical coordinates
+    # here can move a right-column barrier ahead of the selected endpoint.
+    return [item for item in page.get("content_items") or [] if isinstance(item, dict)]
 
 
 def _matches_left_endpoint(item: dict[str, Any], left: dict[str, Any]) -> bool:
