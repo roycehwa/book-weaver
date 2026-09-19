@@ -613,9 +613,9 @@ def _epub_collect_epub3_nav_labels(zipf: ZipFile, opf_path: str) -> dict[str, st
             for nav in soup.find_all("nav"):
                 epub_t = (_epub_element_type(nav) or "").lower()
                 role = (nav.get("role") or "").lower()
-                if epub_t not in {"toc", ""} and role not in {"doc-toc", "directory"}:
-                    if epub_t or role:
-                        continue
+                is_toc_nav = epub_t == "toc" or role in {"doc-toc", "directory"}
+                if not is_toc_nav:
+                    continue
                 for anchor in nav.find_all("a", href=True):
                     raw_href = str(anchor.get("href") or "").strip()
                     if not raw_href or raw_href.startswith("#"):
@@ -1158,6 +1158,8 @@ def _extract_epub_body_chapter(
     first_h2 = body.find("h2")
     title_heading: Tag | None = None
     title_guess = ""
+    title_from_p_ct = False
+    title_from_html_title = False
 
     if nav_title and nav_title.strip():
         title_guess = nav_title.strip()[:240]
@@ -1185,12 +1187,14 @@ def _extract_epub_body_chapter(
                 if tct:
                     title_guess = tct
                     title_heading = ct_el
+                    title_from_p_ct = True
         if not title_guess and soup.title and soup.title.string:
             st = soup.title.string.strip()[:240]
             if book_title and st == book_title.strip()[:240]:
                 pass
             else:
                 title_guess = st
+                title_from_html_title = True
     if not title_guess:
         title_guess = fallback_title.strip()[:240] or Path(internal_xhtml_path).stem.replace("_", " ").strip()
     if not title_guess:
@@ -1206,6 +1210,10 @@ def _extract_epub_body_chapter(
         title_source = "nav"
     elif has_explicit_heading:
         title_source = "heading"
+    elif title_from_p_ct:
+        title_source = "p_ct"
+    elif title_from_html_title:
+        title_source = "html_title"
     elif title_guess.strip() == fallback_title.strip()[:240]:
         title_source = "spine_id"
     if title_heading is not None:

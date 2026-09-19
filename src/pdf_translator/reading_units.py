@@ -168,6 +168,27 @@ def _continuation_decision_metadata(continuation: dict[str, Any]) -> dict[str, A
     style_evidence = continuation.get("style_evidence")
     if isinstance(style_evidence, dict):
         metadata["style_evidence"] = style_evidence
+    for field in (
+        "left_resource_path",
+        "right_resource_path",
+        "left_dom_path",
+        "right_dom_path",
+        "left_char_start",
+        "left_char_end",
+        "right_char_start",
+        "right_char_end",
+        "left_element_id",
+        "right_element_id",
+        "left_text",
+        "right_text",
+    ):
+        value = continuation.get(field)
+        if value is not None and value != "":
+            metadata[field] = value
+    for field in ("left_link_targets", "right_link_targets"):
+        targets = continuation.get(field)
+        if isinstance(targets, list) and targets:
+            metadata[field] = [str(target) for target in targets if str(target)]
     return {key: value for key, value in metadata.items() if value is not None}
 
 
@@ -380,8 +401,10 @@ def _epub_block_span_candidates(
                 "markdown": str(continuation.get("left_text") or ""),
                 "resource_path": continuation.get("left_resource_path"),
                 "dom_path": continuation.get("left_dom_path"),
-                "char_start": 0,
+                "char_start": continuation.get("left_char_start"),
                 "char_end": continuation.get("left_char_end"),
+                "element_id": continuation.get("left_element_id"),
+                "link_targets": continuation.get("left_link_targets"),
             },
             fallback_resource,
         )
@@ -392,6 +415,8 @@ def _epub_block_span_candidates(
                 "dom_path": continuation.get("right_dom_path"),
                 "char_start": continuation.get("right_char_start"),
                 "char_end": continuation.get("right_char_end"),
+                "element_id": continuation.get("right_element_id"),
+                "link_targets": continuation.get("right_link_targets"),
             },
             fallback_resource,
         )

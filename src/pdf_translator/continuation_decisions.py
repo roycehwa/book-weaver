@@ -803,10 +803,16 @@ def logical_continuations_from_ledger(ledger: dict[str, Any]) -> list[dict[str, 
                 "right_resource_path": decision.get("right_resource_path"),
                 "left_dom_path": decision.get("left_dom_path"),
                 "right_dom_path": decision.get("right_dom_path"),
+                "left_char_start": decision.get("left_char_start"),
                 "left_char_end": decision.get("left_char_end"),
                 "right_char_start": decision.get("right_char_start"),
+                "right_char_end": decision.get("right_char_end"),
                 "left_text": evidence.get("left_text"),
                 "right_text": evidence.get("right_text"),
+                "left_element_id": decision.get("left_element_id"),
+                "right_element_id": decision.get("right_element_id"),
+                "left_link_targets": list(decision.get("left_link_targets") or []),
+                "right_link_targets": list(decision.get("right_link_targets") or []),
             })
         style_evidence = evidence.get("style")
         if isinstance(style_evidence, dict):

@@ -156,6 +156,17 @@ def _hard_spine_boundary(left: dict[str, Any], right: dict[str, Any]) -> str | N
     return None
 
 
+def _right_weak_unlabeled_fallback(right: dict[str, Any]) -> bool:
+    """Right spine item has no nav label and only a weak spine/fallback title."""
+    if str(right.get("nav_label") or "").strip():
+        return False
+    title_source = str(right.get("title_source") or "")
+    if title_source not in {"spine_id", "fallback"}:
+        return False
+    right_title = str(right.get("title") or "")
+    return _weak_fallback_title(right_title, str(right.get("spine_id") or ""))
+
+
 def _positive_chapter_group_evidence(
     left: dict[str, Any],
     right: dict[str, Any],
@@ -173,11 +184,7 @@ def _positive_chapter_group_evidence(
         and left_nav == right_nav
     ):
         return True
-    if _explicit_nav_label(left_nav, left_spine) and (
-        not right_nav.strip()
-        or _weak_fallback_title(right_nav, right_spine)
-        or not _explicit_nav_label(right_nav, right_spine)
-    ):
+    if _explicit_nav_label(left_nav, left_spine) and _right_weak_unlabeled_fallback(right):
         return True
     return False
 
@@ -299,6 +306,13 @@ def evaluate_epub_paragraph_join(
     decision["evidence"]["repair"] = (
         "page_break_hyphen_removed" if syntax_reason == "hyphen_continuation" else "cross_resource_space_join"
     )
+    for side, unit in (("left", left_unit), ("right", right_unit)):
+        element_id = unit.get("element_id")
+        if element_id:
+            decision[f"{side}_element_id"] = str(element_id)
+        link_targets = [str(target) for target in unit.get("link_targets") or [] if str(target)]
+        if link_targets:
+            decision[f"{side}_link_targets"] = link_targets
     return decision
 
 
@@ -317,6 +331,10 @@ def _decision_fingerprint_entry(decision: dict[str, Any]) -> dict[str, Any]:
         "right_dom_path": decision.get("right_dom_path"),
         "left_char_end": decision.get("left_char_end"),
         "right_char_start": decision.get("right_char_start"),
+        "left_element_id": decision.get("left_element_id"),
+        "right_element_id": decision.get("right_element_id"),
+        "left_link_targets": decision.get("left_link_targets"),
+        "right_link_targets": decision.get("right_link_targets"),
         "evidence": {
             "joined_text": evidence.get("joined_text"),
             "repair": evidence.get("repair"),
@@ -427,10 +445,12 @@ def apply_epub_spine_continuations(
     index = 0
     while index < len(spine_chapters):
         current = dict(spine_chapters[index])
-        page_no = int(current.get("page_no") or current.get("page_start") or index + 1)
-        current["page_start"] = page_no
-        current["page_end"] = page_no
-        current["source_pages"] = [page_no]
+        chain_start = int(current.get("page_no") or current.get("page_start") or index + 1)
+        page_no = chain_start
+        current["page_start"] = chain_start
+        current["page_end"] = chain_start
+        source_pages: list[int] = [chain_start]
+        current["source_pages"] = list(source_pages)
         paths = [
             str(current.get("source_internal_path") or "").replace("\\", "/")
         ]
@@ -465,7 +485,9 @@ def apply_epub_spine_continuations(
                     dict.fromkeys([*(current.get("source_internal_paths") or []), right_path])
                 )
             current["page_end"] = right_page
-            current["source_pages"] = list(range(page_no, right_page + 1))
+            if right_page not in source_pages:
+                source_pages.append(right_page)
+            current["source_pages"] = list(source_pages)
             page_no = right_page
             next_index += 1
         if len(current.get("source_internal_paths") or []) == 1:

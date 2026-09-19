@@ -108,6 +108,62 @@ def test_ncx_nested_anchor_does_not_replace_spine_chapter_title() -> None:
     assert labels["c01.xhtml"] == "CHAPTER 1: The Beginning"
 
 
+def test_epub3_nav_label_collection_ignores_landmarks_and_untyped_nav(tmp_path: Path) -> None:
+    nav_xhtml = """<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+<body>
+<nav epub:type="landmarks"><ol><li><a href="chapter1.xhtml">Start Reading</a></li></ol></nav>
+<nav><ol><li><a href="chapter1.xhtml">Untyped Phantom</a></li></ol></nav>
+<nav epub:type="toc"><ol><li><a href="chapter1.xhtml">Real Chapter</a></li></ol></nav>
+</body></html>"""
+    chapter_xhtml = """<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head><body>
+<p>Chapter prose.</p>
+</body></html>"""
+    epub = tmp_path / "nav-filter.epub"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        z.writestr("mimetype", "application/epub+zip", compress_type=zipfile.ZIP_STORED)
+        z.writestr(
+            "META-INF/container.xml",
+            """<?xml version="1.0" encoding="utf-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml" />
+  </rootfiles>
+</container>
+""",
+        )
+        z.writestr(
+            "OEBPS/content.opf",
+            """<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" unique-identifier="bookid" version="3.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="bookid">urn:test</dc:identifier>
+    <dc:title>Test</dc:title>
+    <dc:language>en</dc:language>
+  </metadata>
+  <manifest>
+    <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav" />
+    <item id="chap1" href="chapter1.xhtml" media-type="application/xhtml+xml" />
+  </manifest>
+  <spine>
+    <itemref idref="chap1" />
+  </spine>
+</package>
+""",
+        )
+        z.writestr("OEBPS/nav.xhtml", nav_xhtml)
+        z.writestr("OEBPS/chapter1.xhtml", chapter_xhtml)
+    epub.write_bytes(buf.getvalue())
+    doc = ingest_epub(epub)
+    chapter = doc.structured["_epub_meta"]["chapters"][0]
+    assert chapter.get("nav_label") == "Real Chapter"
+    assert chapter["title"] == "Real Chapter"
+    assert chapter.get("nav_label") != "Start Reading"
+    assert chapter.get("nav_label") != "Untyped Phantom"
+
+
 def test_ingest_epub_drops_hidden_page_list_and_landmarks(tmp_path: Path) -> None:
     xhtml = """<?xml version="1.0" encoding="utf-8"?>
 <html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head><body>

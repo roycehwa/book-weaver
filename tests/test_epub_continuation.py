@@ -482,6 +482,160 @@ def test_epub3_nav_shared_label_groups_without_paragraph_join(tmp_path: Path) ->
     assert join["status"] == "rejected"
 
 
+def test_epub_chained_three_resource_group_preserves_source_pages(tmp_path: Path) -> None:
+    epub = tmp_path / "triple.epub"
+    _write_spine_epub(
+        epub,
+        opf_manifest="""    <item id="r1" href="r1.xhtml" media-type="application/xhtml+xml" />
+    <item id="r2" href="r2.xhtml" media-type="application/xhtml+xml" />
+    <item id="r3" href="r3.xhtml" media-type="application/xhtml+xml" />""",
+        opf_spine_items="""    <itemref idref="r1" />
+    <itemref idref="r2" />
+    <itemref idref="r3" />""",
+        ncx_xml=_shared_chapter_ncx_xml("r1.xhtml", "r2.xhtml", "r3.xhtml", label="Shared Triple"),
+        xhtml_files={
+            "OEBPS/r1.xhtml": """<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><body><p>Part one ends.</p></body></html>""",
+            "OEBPS/r2.xhtml": """<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><body><p>Part two ends.</p></body></html>""",
+            "OEBPS/r3.xhtml": """<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><body><p>Part three ends.</p></body></html>""",
+        },
+    )
+    first = _rebuild(epub)
+    second = _rebuild(epub)
+    chapter = first["chapters"][0]
+    assert len(first["chapters"]) == 1
+    assert chapter["source_pages"] == [1, 2, 3]
+    assert chapter["page_start"] == 1
+    assert chapter["page_end"] == 3
+    assert chapter["source_internal_paths"] == [
+        "OEBPS/r1.xhtml",
+        "OEBPS/r2.xhtml",
+        "OEBPS/r3.xhtml",
+    ]
+    assert "[[page: 1]]" in chapter["trace_markdown"]
+    assert "[[page: 2]]" in chapter["trace_markdown"]
+    assert "[[page: 3]]" in chapter["trace_markdown"]
+    assert first["chapters"][0]["chapter_id"] == second["chapters"][0]["chapter_id"]
+
+
+def _write_hyphen_join_link_epub(path: Path, *, right_href: str) -> None:
+    _write_spine_epub(
+        path,
+        opf_manifest="""    <item id="a" href="a.xhtml" media-type="application/xhtml+xml" />
+    <item id="b" href="b.xhtml" media-type="application/xhtml+xml" />""",
+        opf_spine_items="""    <itemref idref="a" />
+    <itemref idref="b" />""",
+        xhtml_files={
+            "OEBPS/a.xhtml": """<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><body>
+<p id="left-end">See <a href="notes.xhtml#n1">one</a> continues without ending</p>
+</body></html>""",
+            "OEBPS/b.xhtml": f"""<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><body>
+<p id="right-start">beta <a href="{right_href}">two</a> in the next file.</p>
+</body></html>""",
+        },
+    )
+
+
+def test_epub_paragraph_join_preserves_per_side_dom_provenance(tmp_path: Path) -> None:
+    epub = tmp_path / "join-prov.epub"
+    _write_hyphen_join_link_epub(epub, right_href="glossary.xhtml#g2")
+    book = _rebuild(epub)
+    join = _decision_pair(book, "epub_paragraph_join")
+    assert join["status"] == "accepted"
+    assert join["left_element_id"] == "left-end"
+    assert join["right_element_id"] == "right-start"
+    assert "OEBPS/notes.xhtml#n1" in join["left_link_targets"]
+    assert "OEBPS/glossary.xhtml#g2" in join["right_link_targets"]
+    continuation = next(item for item in book["logical_continuations"] if item.get("kind") == "epub_paragraph_join")
+    assert continuation["left_char_start"] == 0
+    assert isinstance(continuation["left_char_end"], int)
+    assert continuation["right_char_start"] == 0
+    assert isinstance(continuation["right_char_end"], int)
+    left_dom = book["chapters"][0]["dom_units"][0]
+    right_dom = next(
+        unit for unit in book["chapters"][0]["dom_units"] if unit.get("element_id") == "right-start"
+    )
+    assert left_dom["element_id"] == "left-end"
+    assert right_dom["element_id"] == "right-start"
+    units = build_reading_units(book, source_path=epub)
+    joined = next(unit for unit in units["units"] if "continues without ending beta" in unit["markdown"])
+    assert len(joined["provenance"]) == 2
+    assert joined["provenance"][0]["element_id"] == "left-end"
+    assert joined["provenance"][1]["element_id"] == "right-start"
+    assert joined["provenance"][0]["link_targets"] == ["OEBPS/notes.xhtml#n1"]
+    assert joined["provenance"][1]["link_targets"] == ["OEBPS/glossary.xhtml#g2"]
+    meta = joined["continuation_decision"]
+    assert meta["left_link_targets"] == ["OEBPS/notes.xhtml#n1"]
+    assert meta["right_link_targets"] == ["OEBPS/glossary.xhtml#g2"]
+
+    epub_changed = tmp_path / "join-prov-changed.epub"
+    _write_hyphen_join_link_epub(epub_changed, right_href="appendix.xhtml#a9")
+    changed_units = build_reading_units(_rebuild(epub_changed), source_path=epub_changed)
+    assert changed_units["document_fingerprint"] != units["document_fingerprint"]
+
+
+def test_epub_left_nav_groups_weak_unlabeled_right_only(tmp_path: Path) -> None:
+    epub = tmp_path / "weak-right.epub"
+    _write_spine_epub(
+        epub,
+        opf_manifest="""    <item id="lead" href="lead.xhtml" media-type="application/xhtml+xml" />
+    <item id="tail" href="tail.xhtml" media-type="application/xhtml+xml" />""",
+        opf_spine_items="""    <itemref idref="lead" />
+    <itemref idref="tail" />""",
+        ncx_xml="""<?xml version="1.0" encoding="UTF-8"?>
+<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
+  <navMap>
+    <navPoint id="np1"><navLabel><text>Lead Chapter</text></navLabel><content src="lead.xhtml"/></navPoint>
+  </navMap>
+</ncx>""",
+        xhtml_files={
+            "OEBPS/lead.xhtml": """<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><body><p>Lead body ends.</p></body></html>""",
+            "OEBPS/tail.xhtml": """<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><body><p>Tail continuation.</p></body></html>""",
+        },
+    )
+    book = _rebuild(epub)
+    assert len(book["chapters"]) == 1
+    group = _decision_pair(book, "epub_chapter_group")
+    assert group["status"] == "accepted"
+
+
+def test_epub_left_nav_rejects_strong_p_ct_right_title(tmp_path: Path) -> None:
+    epub = tmp_path / "strong-ct.epub"
+    _write_spine_epub(
+        epub,
+        opf_manifest="""    <item id="lead" href="lead.xhtml" media-type="application/xhtml+xml" />
+    <item id="tail" href="tail.xhtml" media-type="application/xhtml+xml" />""",
+        opf_spine_items="""    <itemref idref="lead" />
+    <itemref idref="tail" />""",
+        ncx_xml="""<?xml version="1.0" encoding="UTF-8"?>
+<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
+  <navMap>
+    <navPoint id="np1"><navLabel><text>Lead Chapter</text></navLabel><content src="lead.xhtml"/></navPoint>
+  </navMap>
+</ncx>""",
+        xhtml_files={
+            "OEBPS/lead.xhtml": """<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><body><p>Lead body ends.</p></body></html>""",
+            "OEBPS/tail.xhtml": """<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><body>
+<p class="ct">Distinct Continuation Title</p>
+<p>Tail continuation.</p>
+</body></html>""",
+        },
+    )
+    book = _rebuild(epub)
+    assert len(book["chapters"]) == 2
+    group = _decision_pair(book, "epub_chapter_group")
+    assert group["status"] == "rejected"
+    assert "insufficient_positive_evidence" in group["reasons"]
+
+
 def test_epub_image_barrier_blocks_paragraph_endpoint(tmp_path: Path) -> None:
     png_1x1 = (
         b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
