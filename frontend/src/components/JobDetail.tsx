@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import {
+  ApiError,
   jobsApi,
   workspaceApi,
   type BookJob,
@@ -20,6 +21,12 @@ import EpubViewer from './epub-viewer/EpubViewer'
 import { validateChapterQuality } from './chapterQuality'
 import { insertChapterRange } from './insertChapter'
 import { appendixChapterRecommendations, simplifiedChapterIds } from './simplifiedChapters'
+import {
+  activeContentPolicyDependencies,
+  warningsForChapter,
+  type ContentPolicyDependencyEvidence,
+  type ContentPolicyDependencyFinding,
+} from './contentPolicyDependencies'
 import { sectionStartsOpen } from './workspaceSections'
 import { useJobSourceInfo } from './useJobSourceInfo'
 import { chapterEpubPages, summarizeEpubPageRange } from './chapterPagePreview'
@@ -238,6 +245,13 @@ function JobDetail() {
   const [reprocessingMode, setReprocessingMode] = useState<CreateJobOptions['processingMode'] | null>(null)
   const [confirmingChapters, setConfirmingChapters] = useState(false)
   const [chapterDraft, setChapterDraft] = useState<JobChapterDraft[]>([])
+  const [dependencyEvidence, setDependencyEvidence] = useState<ContentPolicyDependencyEvidence[]>([])
+  const [dependencyFindings, setDependencyFindings] = useState<ContentPolicyDependencyFinding[]>([])
+  const [dependencyAckDialog, setDependencyAckDialog] = useState<{
+    chapters: JobChapterDraft[]
+    findings: ContentPolicyDependencyFinding[]
+  } | null>(null)
+  const [dependencyAckChecked, setDependencyAckChecked] = useState(false)
   const [newChapter, setNewChapter] = useState<{ title: string; start: string; end: string } | null>(null)
   const [newChapterError, setNewChapterError] = useState<string | null>(null)
   const simplifiedPrevious = useRef<Record<string, JobChapterDraft['content_policy']>>({})
@@ -296,6 +310,7 @@ function JobDetail() {
 
   const applyChapterDraft = useCallback((result: Awaited<ReturnType<typeof jobsApi.getChapterDraft>>) => {
     setChapterDraft(result.chapters)
+    setDependencyEvidence(result.content_policy_dependency_evidence ?? [])
     setChapterDraftSource(result.draft_source ?? null)
     setChapterDraftSourceDetail(result.draft_source_detail ?? null)
     setTocPageStart(result.toc_page_start != null ? String(result.toc_page_start) : '')
@@ -308,6 +323,16 @@ function JobDetail() {
     setCurrentPdfPage(firstPdfPage)
     syncCalibrationFromPdf(firstPdfPage, String(offset))
   }, [syncCalibrationFromPdf])
+
+  useEffect(() => {
+    let cancelled = false
+    void activeContentPolicyDependencies(chapterDraft, dependencyEvidence).then(findings => {
+      if (!cancelled) setDependencyFindings(findings)
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [chapterDraft, dependencyEvidence])
 
   const loadJob = useCallback(async () => {
     try {
@@ -584,44 +609,93 @@ function JobDetail() {
     }
   }
 
+  const normalizeChapterDraft = () =>
+    chapterDraft
+      .map((chapter, index) => {
+        const pageStart = toPositivePage(chapter.page_start)
+        const pageEnd = toPositivePage(chapter.page_end)
+        return {
+          ...chapter,
+          index: index + 1,
+          chapter_id: chapter.chapter_id || `manual-${index + 1}`,
+          title: chapter.title.trim() || `章节 ${index + 1}`,
+          page_start: pageStart,
+          page_end: pageEnd,
+          source_pages: makeSourcePages(pageStart, pageEnd),
+          content_policy: chapter.content_policy === 'auto' || !chapter.content_policy
+            ? (appendixRecommendations.get(chapter.chapter_id) || 'translate')
+            : chapter.content_policy,
+        }
+      })
+      .filter((chapter) => chapter.title.trim())
+
+  const submitChapterConfirmation = async (
+    normalized: JobChapterDraft[],
+    acknowledgedDependencyIds: string[] = [],
+  ) => {
+    const result = await jobsApi.confirmChapterDraft(
+      id,
+      normalized,
+      job?.source_revision || 0,
+      acknowledgedDependencyIds,
+    )
+    setJob(result.job)
+    setWorkspaceBook(result.workspace_book)
+    setChapterDraft(normalized)
+    setDependencyAckDialog(null)
+    setDependencyAckChecked(false)
+    setSelectedChapterIndex((current) => Math.max(0, Math.min(current, normalized.length - 1)))
+    setNotice(
+      isTranslatePath
+        ? '重建文档、章节和内容策略已确认。术语候选已按确认后的翻译范围生成，请继续定稿术语。'
+        : '重建文档、章节和内容策略已确认，可以继续完成 Phase A 导出。'
+    )
+  }
+
   const confirmEditedChapters = async () => {
     const quality = validateChapterQuality(chapterDraft, totalPdfPages)
     if (quality.blocking) {
       setError('章节边界仍有错误，请先处理质量控制中的红色问题。')
       return
     }
+    const normalized = normalizeChapterDraft()
+    const pendingFindings = await activeContentPolicyDependencies(normalized, dependencyEvidence)
+    if (pendingFindings.length > 0) {
+      setDependencyAckDialog({ chapters: normalized, findings: pendingFindings })
+      setDependencyAckChecked(false)
+      return
+    }
     setConfirmingChapters(true)
     setError(null)
     setNotice(null)
     try {
-      const normalized = chapterDraft
-        .map((chapter, index) => {
-          const pageStart = toPositivePage(chapter.page_start)
-          const pageEnd = toPositivePage(chapter.page_end)
-          return {
-            ...chapter,
-            index: index + 1,
-            chapter_id: chapter.chapter_id || `manual-${index + 1}`,
-            title: chapter.title.trim() || `章节 ${index + 1}`,
-            page_start: pageStart,
-            page_end: pageEnd,
-            source_pages: makeSourcePages(pageStart, pageEnd),
-            content_policy: chapter.content_policy === 'auto' || !chapter.content_policy
-              ? (appendixRecommendations.get(chapter.chapter_id) || 'translate')
-              : chapter.content_policy,
-          }
+      await submitChapterConfirmation(normalized)
+    } catch (confirmError) {
+      if (
+        confirmError instanceof ApiError
+        && confirmError.code === 'content_policy_dependencies_unacknowledged'
+        && Array.isArray(confirmError.details?.findings)
+      ) {
+        setDependencyAckDialog({
+          chapters: normalized,
+          findings: confirmError.details.findings as ContentPolicyDependencyFinding[],
         })
-        .filter((chapter) => chapter.title.trim())
-      const result = await jobsApi.confirmChapterDraft(id, normalized, job?.source_revision || 0)
-      setJob(result.job)
-      setWorkspaceBook(result.workspace_book)
-      setChapterDraft(normalized)
-      setSelectedChapterIndex((current) => Math.max(0, Math.min(current, normalized.length - 1)))
-      setNotice(
-        isTranslatePath
-          ? '重建文档、章节和内容策略已确认。术语候选已按确认后的翻译范围生成，请继续定稿术语。'
-          : '重建文档、章节和内容策略已确认，可以继续完成 Phase A 导出。'
-      )
+        setDependencyAckChecked(false)
+      } else {
+        setError(confirmError instanceof Error ? confirmError.message : '确认章节结构失败')
+      }
+    } finally {
+      setConfirmingChapters(false)
+    }
+  }
+
+  const confirmDependencyAcknowledgement = async () => {
+    if (!dependencyAckDialog || !dependencyAckChecked) return
+    setConfirmingChapters(true)
+    setError(null)
+    try {
+      const ids = dependencyAckDialog.findings.map(finding => finding.dependency_id)
+      await submitChapterConfirmation(dependencyAckDialog.chapters, ids)
     } catch (confirmError) {
       setError(confirmError instanceof Error ? confirmError.message : '确认章节结构失败')
     } finally {
@@ -1279,6 +1353,11 @@ function JobDetail() {
                             <option value="preserve">保留原文（不翻译）</option>
                             <option value="exclude">略过（不翻译、不导出）</option>
                           </select>
+                          {warningsForChapter(chapter.chapter_id, dependencyFindings).length > 0 && (
+                            <div className="rounded-md border border-amber-300 bg-amber-50 px-2 py-1 text-xs text-amber-900">
+                              正文中存在指向本章的链接；略过后引用会断裂，建议改为「保留原文（不翻译）」。
+                            </div>
+                          )}
                         </div>
                         <div className="grid grid-cols-2 gap-1">
                           <input
@@ -1424,6 +1503,60 @@ function JobDetail() {
             <div className="font-medium">{job.error.message}</div>
             {errorReason && <div className="mt-2 text-sm">{errorReason}</div>}
             <div className="mt-1 text-xs">{job.error.code}</div>
+          </div>
+        )}
+
+        {dependencyAckDialog && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4">
+            <div
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="dependency-ack-title"
+              className="max-h-[90vh] w-full max-w-lg overflow-y-auto rounded-xl border border-amber-200 bg-white p-5 shadow-xl"
+            >
+              <h3 id="dependency-ack-title" className="text-base font-semibold text-slate-900">
+                确认略过被引用的尾注
+              </h3>
+              <p className="mt-2 text-sm text-slate-600">
+                以下尾注章节被正文通过链接引用。系统建议保留原文；若仍选择略过，请确认您接受引用断裂。
+              </p>
+              <ul className="mt-3 space-y-2 text-sm text-slate-700">
+                {dependencyAckDialog.findings.map(finding => (
+                  <li key={finding.dependency_id} className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                    {finding.message}
+                  </li>
+                ))}
+              </ul>
+              <label className="mt-4 flex items-start gap-2 text-sm text-slate-700">
+                <input
+                  type="checkbox"
+                  className="mt-1"
+                  checked={dependencyAckChecked}
+                  onChange={event => setDependencyAckChecked(event.target.checked)}
+                />
+                <span>我已了解风险，仍要略过上述尾注章节。</span>
+              </label>
+              <div className="mt-5 flex justify-end gap-2">
+                <button
+                  type="button"
+                  className="rounded-lg border border-slate-300 px-4 py-2 text-sm text-slate-700"
+                  onClick={() => {
+                    setDependencyAckDialog(null)
+                    setDependencyAckChecked(false)
+                  }}
+                >
+                  返回修改
+                </button>
+                <button
+                  type="button"
+                  className="rounded-lg bg-amber-600 px-4 py-2 text-sm font-medium text-white disabled:opacity-50"
+                  disabled={!dependencyAckChecked || confirmingChapters}
+                  onClick={() => { void confirmDependencyAcknowledgement() }}
+                >
+                  确认并继续
+                </button>
+              </div>
+            </div>
           </div>
         )}
 

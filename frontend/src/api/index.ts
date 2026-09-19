@@ -40,7 +40,8 @@ export class ApiError extends Error {
   constructor(
     message: string,
     public status?: number,
-    public code?: string
+    public code?: string,
+    public details?: Record<string, unknown>,
   ) {
     super(message)
     this.name = 'ApiError'
@@ -89,10 +90,19 @@ async function request<T>(
     // 处理 HTTP 错误
     if (!response.ok) {
       const errorData = await response.json().catch(() => ({}))
+      const detail = errorData.detail
+      let code = typeof errorData.code === 'string' ? errorData.code : undefined
+      let details: Record<string, unknown> | undefined
+      if (detail && typeof detail === 'object' && !Array.isArray(detail)) {
+        const record = detail as Record<string, unknown>
+        if (typeof record.code === 'string') code = record.code
+        details = record
+      }
       throw new ApiError(
-        formatApiDetail(errorData.detail, `HTTP ${response.status}: ${response.statusText}`),
+        formatApiDetail(detail, `HTTP ${response.status}: ${response.statusText}`),
         response.status,
-        errorData.code
+        code,
+        details,
       )
     }
 
@@ -684,9 +694,29 @@ export interface JobChapterDraft {
   text_preview?: string | null
 }
 
+export interface ContentPolicyDependencyEvidence {
+  source_chapter_id: string
+  source_location?: string | null
+  target_chapter_id: string
+  link_evidence: string
+}
+
+export interface ContentPolicyDependencyFinding {
+  dependency_id: string
+  source_chapter_id: string
+  source_chapter_title?: string
+  target_chapter_id: string
+  target_chapter_title?: string
+  link_evidence: string
+  message: string
+  recommended_policy: 'preserve'
+}
+
 export interface JobChapterDraftResponse {
   job_id: string
   chapters: JobChapterDraft[]
+  content_policy_dependency_evidence?: ContentPolicyDependencyEvidence[]
+  content_policy_dependencies?: ContentPolicyDependencyFinding[]
   draft_source?: 'canonical_saved' | 'pdf_toc' | 'pdf_text_toc' | 'book_structure'
   draft_source_detail?: string | null
   suggested_page_offset?: number
@@ -954,12 +984,21 @@ export const jobsApi = {
       `/jobs/${encodeURIComponent(jobId)}/chapters/confirm`,
       { method: 'POST' }
     ),
-  confirmChapterDraft: (jobId: string, chapters: JobChapterDraft[], expectedSourceRevision = 0) =>
+  confirmChapterDraft: (
+    jobId: string,
+    chapters: JobChapterDraft[],
+    expectedSourceRevision = 0,
+    acknowledgedDependencyIds: string[] = [],
+  ) =>
     request<{ job: BookJob; workspace_book: WorkspaceBook }>(
       `/jobs/${encodeURIComponent(jobId)}/chapters/confirm`,
       {
         method: 'POST',
-        body: JSON.stringify({ chapters, expected_source_revision: expectedSourceRevision }),
+        body: JSON.stringify({
+          chapters,
+          expected_source_revision: expectedSourceRevision,
+          acknowledged_dependency_ids: acknowledgedDependencyIds,
+        }),
       }
     ),
   getReviewLink: (jobId: string) =>

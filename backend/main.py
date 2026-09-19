@@ -55,6 +55,13 @@ from app.services.chapter_mark_service import (
 )
 from job_service import BookJobService, JobNotFound, JobServiceError, get_job_service
 
+
+def _job_service_http_detail(exc: JobServiceError):
+    if exc.payload:
+        return exc.payload
+    return str(exc)
+
+
 # 配置日志
 logging.basicConfig(
     level=logging.INFO,
@@ -361,6 +368,7 @@ class JobChapterDraftPrefsRequest(BaseModel):
 class JobChapterConfirmationRequest(BaseModel):
     expected_source_revision: int = Field(default=0, ge=0)
     chapters: Optional[List[dict[str, Any]]] = None
+    acknowledged_dependency_ids: Optional[List[str]] = None
 
 
 class JobReprocessRequest(BaseModel):
@@ -1641,8 +1649,12 @@ async def confirm_job_chapters(
 ):
     try:
         service = get_job_service()
-        options = {"expected_source_revision": request.expected_source_revision} if request.expected_source_revision else {}
-        snapshot = service.confirm_chapters(job_id, chapters=request.chapters, **options)
+        snapshot = service.confirm_chapters(
+            job_id,
+            chapters=request.chapters,
+            expected_source_revision=request.expected_source_revision,
+            acknowledged_dependency_ids=request.acknowledged_dependency_ids,
+        )
         return {
             "job": snapshot,
             "workspace_book": _workspace_book_from_job(snapshot),
@@ -1650,7 +1662,7 @@ async def confirm_job_chapters(
     except JobNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except JobServiceError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_job_service_http_detail(exc)) from exc
 
 
 class SourceCorrectionRequest(BaseModel):
