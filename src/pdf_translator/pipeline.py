@@ -813,11 +813,21 @@ def run_translation_pipeline(
         else:
             observer.finish(status="completed")
 
-    artifacts.translated_markdown_path.write_text(
+    from pdf_translator.zh_markdown_cleanup import publish_translation_zh_cleanup
+
+    downstream_markdown, cleanup_files = publish_translation_zh_cleanup(
+        artifacts.output_dir,
         translated.translated_markdown,
+        target_language=settings.target_language,
+        text_operation=text_operation,
+    )
+    if cleanup_files:
+        extra_files.update(cleanup_files)
+    artifacts.translated_markdown_path.write_text(
+        downstream_markdown,
         encoding="utf-8",
     )
-    polished_markdown = translated.translated_markdown
+    polished_markdown = downstream_markdown
     if not skip_translation and text_operation == "translate":
         enter_stage("polishing")
         (artifacts.output_dir / 'polish-warning.json').unlink(missing_ok=True)
