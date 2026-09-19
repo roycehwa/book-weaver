@@ -585,6 +585,7 @@ class BookJobRunner:
             if stage == "polishing" and data.get("polish_outcome") in {
                 "applied",
                 "no_candidates",
+                "needs_review",
                 "waived",
                 "failed",
             }:
@@ -747,6 +748,7 @@ class BookJobRunner:
         if stage == "polishing" and completion_data.get("polish_outcome") in {
             "applied",
             "no_candidates",
+            "needs_review",
             "waived",
             "failed",
         }:

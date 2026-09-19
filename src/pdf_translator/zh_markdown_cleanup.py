@@ -144,6 +144,11 @@ def _merge_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
     return merged
 
 
+def protected_spans(line: str) -> list[tuple[int, int]]:
+    """Spans that polish/cleanup must not alter (URLs, code, link destinations, etc.)."""
+    return _protected_spans(line)
+
+
 def _protected_spans(line: str) -> list[tuple[int, int]]:
     spans: list[tuple[int, int]] = []
     for pattern in (
@@ -170,8 +175,16 @@ def _span_overlaps(start: int, end: int, spans: list[tuple[int, int]]) -> bool:
     return any(not (end <= span_start or start >= span_end) for span_start, span_end in spans)
 
 
-def _is_indented_code_line(line: str) -> bool:
+def is_indented_code_line(line: str) -> bool:
     return line.startswith("\t") or line.startswith("    ")
+
+
+def _is_indented_code_line(line: str) -> bool:
+    return is_indented_code_line(line)
+
+
+def is_table_row(line: str, *, prev_line: str | None, next_line: str | None) -> bool:
+    return _is_table_row(line, prev_line=prev_line, next_line=next_line)
 
 
 def _is_table_row(line: str, *, prev_line: str | None, next_line: str | None) -> bool:

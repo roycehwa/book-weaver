@@ -9,13 +9,15 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Literal
 
 import requests
 
+from pdf_translator.chunking import markdown_block_structure
 from pdf_translator.epub import render_epub_from_book
 from pdf_translator.models import TranslationChunk
 from pdf_translator.pipeline import safe_delivery_file_stem
+from pdf_translator.source_workspace import atomic_json
 from pdf_translator.translate import (
     BaseTranslator,
     MiniMaxAnthropicTranslator,
@@ -24,27 +26,28 @@ from pdf_translator.translate import (
     build_translator,
     translate_book_chapters,
 )
+from pdf_translator.zh_markdown_cleanup import (
+    FENCE_LINE_RE,
+    RULES_VERSION,
+    TRANSLATION_CLEANUP_REPORT_FILENAME,
+    is_indented_code_line,
+    is_table_row,
+    protected_spans,
+)
 
 
-POLISH_PROMPT_VERSION = "v3-strip-parenthetical-english"
+POLISH_PROMPT_VERSION = "v4-constrained-suspect-only"
 
 
-POLISH_SYSTEM_PROMPT = """你是中文译文精修编辑。任务不是重新翻译整段，而是修正中文译文中突兀夹杂的英文词或英文短语。
+POLISH_SYSTEM_PROMPT = """你是中文译文精修编辑。任务不是重新翻译，而是仅针对 suspects 中列出的英文夹杂做最小修改。
 
-规则：
-1. 每条输入都有 suspects 字段；这些英文词或短语已被判定为高置信度问题，必须尽量译成中文。
-2. 保留人名、地名、书名、机构名、专有名词、音译词。
-3. 如果英文裸词或短语后面已有中文括注，例如 popularity（流行）、visual culture（视觉文化），改为只保留中文“流行”、“视觉文化”。
-4. 如果中文术语后括注英文原文，例如 “感官（senses）”，保留括注。
-5. 保留 Markdown、脚注编号、引用编号、图片/表格标记。
-6. 可以为了通顺重写整句，但不能删减信息量，不能缩写段落，不能改变引用编号。
-7. 不要把 active、manifest、perceived、living、conception、precisely because 等英文裸词原样留在中文句子里。
-8. 只返回 JSON 数组，每项包含 line 和 polished_text。
-
-示例：
-- “感官是真实和 active 的核心假设” -> “感官是真实且活跃的核心假设”
-- “precisely because its vitality is inherent to every living organism” -> “正是因为其活力内在于每一个生命有机体”
-- “物质性被人类 denote 为稳定物体的 perceived solidness” -> “物质性被人类标示为稳定物体所呈现出的坚实感”
+硬性规则：
+1. 只处理 suspects 字段中列出的可疑英文词或短语；不得改动其他文字。
+2. 禁止整句重写、扩写、缩写或改写段落；不得改变行数或段落边界。
+3. 必须完整保留 Markdown 结构、链接语法与数量、锚点、图片标记、脚注与引用编号、数字字面量、专有名词，以及已批准术语表中的目标词与源词。
+4. 人名、地名、书名、机构名、音译词保留；中文术语后括注英文（如“感官（senses）”）保留括注。
+5. 若某 suspect 不应翻译，polished_text 必须与原文 text 完全一致。
+6. 只返回 JSON 数组，每项包含 line 和 polished_text；不要解释、不要 Markdown 围栏。
 """
 
 HIGH_CONFIDENCE_ENGLISH_WORDS = {
@@ -126,11 +129,17 @@ HIGH_CONFIDENCE_ENGLISH_WORDS = {
     "cross-fertilization",
 }
 
-ENGLISH_WORD_RE = re.compile(r"(?<![A-Za-z])([A-Za-z][A-Za-z'’-]{1,30})(?![A-Za-z])")
-CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+ENGLISH_WORD_RE = re.compile(r"(?<![A-Za-z])([A-Za-z][A-Za-z''-]{1,30})(?![A-Za-z])")
 ENGLISH_THEN_CHINESE_RE = re.compile(
-    r"(?P<english>[A-Za-z][A-Za-z'’\-/]*(?:\s+[A-Za-z][A-Za-z'’\-/]*){0,6})\s*[（(](?P<chinese>[\u4e00-\u9fff][^（）()A-Za-z]{0,80})[）)]"
+    r"(?P<english>[A-Za-z][A-Za-z''\-/]*(?:\s+[A-Za-z][A-Za-z''\-/]*){0,6})\s*[（(](?P<chinese>[\u4e00-\u9fff][^（）()A-Za-z]{0,80})[）)]"
 )
+CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+LATIN_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z''\-/]*(?:\s+[A-Za-z][A-Za-z''\-/]*)*")
+NUMERIC_LITERAL_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:\d{1,3}(?:,\d{3})+|\d+\.\d+|\d+)(?![A-Za-z0-9])"
+)
+MARKDOWN_LINK_RE = re.compile(r"(!?\[[^\]]*\]\([^)]*\))")
+PolishOutcome = Literal["applied", "needs_review", "no_candidates"]
 
 
 @dataclass(slots=True)
@@ -139,6 +148,22 @@ class PolishCandidate:
     text: str
     suspects: list[str]
     category: str = "high_confidence"
+
+
+@dataclass(slots=True)
+class CandidateModelResult:
+    line: int
+    polished_text: str | None
+    decision: str
+
+
+@dataclass(slots=True)
+class PolishAcceptContext:
+    suspects: list[str]
+    protected_literals: list[str]
+    glossary_terms: list[str]
+    book_title: str | None
+    book_author: str | None
 
 
 @dataclass(slots=True)
@@ -151,6 +176,11 @@ class PolishResult:
     accepted_count: int
     rejected_count: int
     changed_count: int
+    unchanged_count: int
+    needs_review_count: int
+    outcome: PolishOutcome
+    protected_skip_count: int
+    manual_skip_count: int
 
 
 class IncompletePolishBatchError(ValueError):
@@ -169,12 +199,26 @@ class CacheOnlyTranslator(BaseTranslator):
         raise ValueError(f"missing cached translation for chunk {chunk.index}")
 
 
-def _ascii_letter_count(text: str) -> int:
-    return sum(1 for char in text if char.isascii() and char.isalpha())
+def _sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def _cjk_count(text: str) -> int:
-    return sum(1 for char in text if "\u4e00" <= char <= "\u9fff")
+def _read_text_preserve_newlines(path: Path) -> str:
+    with path.open(encoding="utf-8", newline="") as handle:
+        return handle.read()
+
+
+def _write_text_preserve_newlines(path: Path, text: str) -> None:
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        handle.write(text)
+
+
+def _in_spans(index: int, spans: list[tuple[int, int]]) -> bool:
+    return any(start <= index < end for start, end in spans)
+
+
+def _span_overlaps(start: int, end: int, spans: list[tuple[int, int]]) -> bool:
+    return any(not (end <= span_start or start >= span_end) for span_start, span_end in spans)
 
 
 def _is_structural_line(text: str) -> bool:
@@ -188,29 +232,78 @@ def _inside_parenthetical(text: str, start: int, end: int) -> bool:
     return "(" in before or "（" in before or ")" in after or "）" in after
 
 
-def scan_polish_candidates(markdown_text: str) -> list[PolishCandidate]:
-    candidates: list[PolishCandidate] = []
-    for line_no, line in enumerate(markdown_text.splitlines(), 1):
-        stripped = line.strip()
-        if _is_structural_line(stripped) or not CJK_RE.search(stripped):
+def _scan_line_candidates(line: str) -> list[str]:
+    stripped = line.strip()
+    if _is_structural_line(stripped) or not CJK_RE.search(stripped):
+        return []
+    spans = protected_spans(stripped)
+    suspects: list[str] = []
+    for match in ENGLISH_THEN_CHINESE_RE.finditer(stripped):
+        if not _span_overlaps(match.start(), match.end(), spans):
+            english = match.group("english").strip()
+            if english and english not in suspects:
+                suspects.append(english)
+    for match in ENGLISH_WORD_RE.finditer(stripped):
+        if _in_spans(match.start(), spans):
             continue
-        suspects: list[str] = []
-        suspects.extend(match.group("english").strip() for match in ENGLISH_THEN_CHINESE_RE.finditer(stripped))
-        for match in ENGLISH_WORD_RE.finditer(stripped):
-            word = match.group(1).strip("'’-")
-            if not word or word not in HIGH_CONFIDENCE_ENGLISH_WORDS:
-                continue
-            if _inside_parenthetical(stripped, match.start(), match.end()):
-                continue
-            if word not in suspects:
-                suspects.append(word)
+        word = match.group(1).strip("''-")
+        if not word or word not in HIGH_CONFIDENCE_ENGLISH_WORDS:
+            continue
+        if _inside_parenthetical(stripped, match.start(), match.end()):
+            continue
+        if word not in suspects:
+            suspects.append(word)
+    return suspects
+
+
+def scan_polish_candidates(markdown_text: str) -> list[PolishCandidate]:
+    bare_lines = [piece.rstrip("\r\n") for piece in markdown_text.splitlines(keepends=True)]
+    candidates: list[PolishCandidate] = []
+    in_fence = False
+    fence_marker: str | None = None
+    line_no = 0
+    for line_index, content in enumerate(bare_lines):
+        line_no += 1
+        prev_line = bare_lines[line_index - 1] if line_index > 0 else None
+        next_line = bare_lines[line_index + 1] if line_index + 1 < len(bare_lines) else None
+        protected = False
+        fence_match = FENCE_LINE_RE.match(content)
+        if fence_match:
+            marker = fence_match.group(2)
+            if not in_fence:
+                in_fence = True
+                fence_marker = marker
+                protected = True
+            elif fence_marker and marker[0] == fence_marker[0] and len(marker) >= len(fence_marker):
+                protected = True
+                in_fence = False
+                fence_marker = None
+            else:
+                protected = True
+        elif in_fence:
+            protected = True
+        if (
+            protected
+            or is_indented_code_line(content)
+            or is_table_row(content, prev_line=prev_line, next_line=next_line)
+        ):
+            continue
+        suspects = _scan_line_candidates(content)
         if suspects:
-            candidates.append(PolishCandidate(line=line_no, text=stripped, suspects=suspects))
+            candidates.append(PolishCandidate(line=line_no, text=content.strip(), suspects=suspects))
     return candidates
 
 
-def _candidate_cache_path(cache_dir: Path, candidate: PolishCandidate) -> Path:
-    digest_input = f"{POLISH_PROMPT_VERSION}\n{candidate.text}"
+def _candidate_cache_path(
+    cache_dir: Path,
+    candidate: PolishCandidate,
+    *,
+    cleanup_rules_version: str,
+    prompt_context: str,
+) -> Path:
+    digest_input = (
+        f"{POLISH_PROMPT_VERSION}\n{cleanup_rules_version}\n{prompt_context}\n{candidate.text}"
+    )
     digest = hashlib.sha256(digest_input.encode("utf-8")).hexdigest()[:16]
     return cache_dir / f"line-{candidate.line:06d}-{digest}.json"
 
@@ -224,7 +317,7 @@ def _build_polish_prompt(candidates: list[PolishCandidate]) -> str:
         }
         for candidate in candidates
     ]
-    return "请精修以下中文译文行，必须处理 suspects 中列出的英文夹杂。返回 JSON 数组。\n\n" + json.dumps(
+    return "请仅对 suspects 做最小修改。返回 JSON 数组。\n\n" + json.dumps(
         payload,
         ensure_ascii=False,
         indent=2,
@@ -236,14 +329,6 @@ def _strip_json_fence(text: str) -> str:
     stripped = re.sub(r"^```(?:json)?\s*", "", stripped, flags=re.IGNORECASE)
     stripped = re.sub(r"\s*```$", "", stripped)
     return stripped.strip()
-
-
-def _rule_based_polish(text: str) -> str:
-    def replace_parenthesized_translation(match: re.Match[str]) -> str:
-        chinese = match.group("chinese").strip()
-        return chinese
-
-    return ENGLISH_THEN_CHINESE_RE.sub(replace_parenthesized_translation, text)
 
 
 def _complete_with_translator(
@@ -337,13 +422,91 @@ def _parse_polish_response(text: str) -> dict[int, str]:
     return parsed
 
 
-def _safe_accept_polish(before: str, after: str) -> tuple[bool, str]:
+def _protected_literals(line: str) -> list[str]:
+    spans = protected_spans(line)
+    return [line[start:end] for start, end in spans]
+
+
+def _latin_tokens(text: str, spans: list[tuple[int, int]]) -> list[str]:
+    tokens: list[str] = []
+    for match in LATIN_TOKEN_RE.finditer(text):
+        if _span_overlaps(match.start(), match.end(), spans):
+            continue
+        token = match.group(0).strip()
+        if token:
+            tokens.append(token)
+    return tokens
+
+
+def _numeric_literals(text: str, spans: list[tuple[int, int]]) -> list[str]:
+    values: list[str] = []
+    for match in NUMERIC_LITERAL_RE.finditer(text):
+        if _span_overlaps(match.start(), match.end(), spans):
+            continue
+        values.append(match.group(0))
+    return values
+
+
+def _markdown_links(text: str) -> list[str]:
+    return MARKDOWN_LINK_RE.findall(text)
+
+
+def _ascii_letter_count(text: str) -> int:
+    return sum(1 for char in text if char.isascii() and char.isalpha())
+
+
+def _cjk_count(text: str) -> int:
+    return sum(1 for char in text if "\u4e00" <= char <= "\u9fff")
+
+
+def _normalize_suspects(suspects: list[str]) -> set[str]:
+    return {item.strip().lower() for item in suspects if item.strip()}
+
+
+def _safe_accept_polish(
+    before: str,
+    after: str,
+    *,
+    context: PolishAcceptContext,
+    whole_before: str,
+    whole_after: str,
+) -> tuple[bool, str]:
     if not after.strip():
         return False, "empty"
     if before.count("\n") != after.count("\n"):
-        return False, "paragraph_boundary_changed"
+        return False, "newline_changed"
+    if len(before.splitlines()) != len(after.splitlines()):
+        return False, "line_count_changed"
     if _is_structural_line(before):
         return False, "structural"
+    if markdown_block_structure(before) != markdown_block_structure(after):
+        return False, "markdown_structure_changed"
+    if _markdown_links(before) != _markdown_links(after):
+        return False, "link_structure_changed"
+    if before.count("![") != after.count("!["):
+        return False, "image_marker_changed"
+    if before.count("[^") != after.count("[^"):
+        return False, "footnote_marker_changed"
+    before_spans = protected_spans(before)
+    after_spans = protected_spans(after)
+    if _protected_literals(before) != _protected_literals(after):
+        return False, "protected_literal_changed"
+    if _numeric_literals(before, before_spans) != _numeric_literals(after, after_spans):
+        return False, "numeric_literal_changed"
+    suspect_set = _normalize_suspects(context.suspects)
+    before_tokens = _latin_tokens(before, before_spans)
+    after_tokens = _latin_tokens(after, after_spans)
+    before_non_suspect = [token for token in before_tokens if token.lower() not in suspect_set]
+    after_non_suspect = [token for token in after_tokens if token.lower() not in suspect_set]
+    if before_non_suspect != after_non_suspect:
+        return False, "non_suspect_latin_changed"
+    for term in context.glossary_terms:
+        if term and term in before and term not in after:
+            return False, "glossary_term_changed"
+    if context.book_title and context.book_title in before and context.book_title not in after:
+        return False, "book_metadata_changed"
+    if context.book_author and context.book_author in before and context.book_author not in after:
+        return False, "book_metadata_changed"
     before_cjk = _cjk_count(before)
     after_cjk = _cjk_count(after)
     if before_cjk >= 80 and after_cjk < before_cjk * 0.82:
@@ -352,11 +515,61 @@ def _safe_accept_polish(before: str, after: str) -> tuple[bool, str]:
         return False, "length_drop"
     if re.search(r"^(以下是|精修|修改后|译文)", after):
         return False, "commentary"
-    if before.count("![") != after.count("!["):
-        return False, "image_marker_changed"
-    if before.count("[^") != after.count("[^"):
-        return False, "footnote_marker_changed"
+    if markdown_block_structure(whole_before) != markdown_block_structure(whole_after):
+        return False, "document_markdown_structure_changed"
+    if len(whole_before.splitlines()) != len(whole_after.splitlines()):
+        return False, "document_line_count_changed"
     return True, "accepted"
+
+
+def _load_glossary_terms(run_dir: Path) -> list[str]:
+    terms: list[str] = []
+    for relative in ("glossary/active.json", "jobs/glossary-constraints.json"):
+        path = run_dir / relative
+        if not path.is_file():
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        if relative.endswith("active.json") and isinstance(payload.get("entries"), list):
+            for entry in payload["entries"]:
+                if not isinstance(entry, dict):
+                    continue
+                for key in ("source", "target", "preferred_translation"):
+                    value = entry.get(key)
+                    if isinstance(value, str) and value.strip():
+                        terms.append(value.strip())
+        if relative.endswith("glossary-constraints.json") and isinstance(payload.get("terms"), list):
+            for entry in payload["terms"]:
+                if not isinstance(entry, dict):
+                    continue
+                for key in ("source", "target"):
+                    value = entry.get(key)
+                    if isinstance(value, str) and value.strip():
+                        terms.append(value.strip())
+    return terms
+
+
+def _load_cleanup_version(run_dir: Path) -> str:
+    report_path = run_dir / TRANSLATION_CLEANUP_REPORT_FILENAME
+    if report_path.is_file():
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return RULES_VERSION
+        version = report.get("version")
+        if isinstance(version, str) and version.strip():
+            return version.strip()
+    return RULES_VERSION
+
+
+def _prompt_context_for_candidate(candidate: PolishCandidate, glossary_terms: list[str]) -> str:
+    return json.dumps(
+        {"suspects": candidate.suspects, "glossary_terms": sorted(set(glossary_terms))[:40]},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
 
 
 def _translate_candidates(
@@ -368,24 +581,33 @@ def _translate_candidates(
     batch_size: int,
     concurrency: int,
     request_timeout_seconds: float | None,
-) -> dict[int, str]:
+    cleanup_rules_version: str,
+    glossary_terms: list[str],
+) -> dict[int, CandidateModelResult]:
     cache_dir.mkdir(parents=True, exist_ok=True)
-    results: dict[int, str] = {}
+    results: dict[int, CandidateModelResult] = {}
     uncached: list[PolishCandidate] = []
     for candidate in candidates:
-        rule_polished = _rule_based_polish(candidate.text)
-        if rule_polished != candidate.text:
-            results[candidate.line] = rule_polished
-            continue
-        cache_path = _candidate_cache_path(cache_dir, candidate)
+        prompt_context = _prompt_context_for_candidate(candidate, glossary_terms)
+        cache_path = _candidate_cache_path(
+            cache_dir,
+            candidate,
+            cleanup_rules_version=cleanup_rules_version,
+            prompt_context=prompt_context,
+        )
         if cache_path.exists():
             try:
                 cached = json.loads(cache_path.read_text(encoding="utf-8"))
             except json.JSONDecodeError:
                 cached = {}
             polished = cached.get("polished_text")
-            if isinstance(polished, str) and polished.strip():
-                results[candidate.line] = polished.strip()
+            decision = cached.get("decision")
+            if isinstance(polished, str) and isinstance(decision, str):
+                results[candidate.line] = CandidateModelResult(
+                    line=candidate.line,
+                    polished_text=polished.strip() if polished.strip() else None,
+                    decision=decision,
+                )
                 continue
         uncached.append(candidate)
 
@@ -409,6 +631,10 @@ def _translate_candidates(
                 if missing_lines:
                     raise IncompletePolishBatchError(f"missing polish lines: {sorted(missing_lines)}")
                 return {line: parsed[line] for line in expected_lines}
+            except IncompletePolishBatchError as exc:
+                last_error = exc
+                if attempt < 2:
+                    time.sleep(min(2**attempt, 8))
             except Exception as exc:
                 last_error = exc
                 if attempt < 2:
@@ -417,48 +643,63 @@ def _translate_candidates(
             raise last_error
         raise ValueError(f"Polish batch {batch_index} failed: {last_error}") from last_error
 
-    def run_batch_with_fallback(batch_index: int, batch: list[PolishCandidate]) -> dict[int, str]:
+    def run_batch_safe(batch_index: int, batch: list[PolishCandidate]) -> dict[int, CandidateModelResult]:
         try:
-            return run_batch(batch_index, batch)
+            parsed = run_batch(batch_index, batch)
+            return {
+                line: CandidateModelResult(line=line, polished_text=text, decision="model_suggested")
+                for line, text in parsed.items()
+            }
         except IncompletePolishBatchError:
-            if len(batch) == 1:
-                return {}
+            return {
+                candidate.line: CandidateModelResult(
+                    line=candidate.line,
+                    polished_text=None,
+                    decision="incomplete_response",
+                )
+                for candidate in batch
+            }
         except Exception:
-            return {}
-        fallback_results: dict[int, str] = {}
-        for offset, candidate in enumerate(batch):
-            single_index = (batch_index + 1) * 1000 + offset
-            try:
-                fallback_results.update(run_batch(single_index, [candidate]))
-            except Exception:
-                continue
-        return fallback_results
+            return {
+                candidate.line: CandidateModelResult(
+                    line=candidate.line,
+                    polished_text=None,
+                    decision="model_unavailable",
+                )
+                for candidate in batch
+            }
 
     if batches:
         if concurrency <= 1 or len(batches) <= 1:
             for batch_index, batch in enumerate(batches):
-                results.update(run_batch_with_fallback(batch_index, batch))
+                results.update(run_batch_safe(batch_index, batch))
         else:
             with ThreadPoolExecutor(max_workers=min(concurrency, len(batches))) as executor:
                 futures = {
-                    executor.submit(run_batch_with_fallback, batch_index, batch): batch
+                    executor.submit(run_batch_safe, batch_index, batch): batch
                     for batch_index, batch in enumerate(batches)
                 }
                 for future in as_completed(futures):
                     results.update(future.result())
 
     for candidate in candidates:
-        polished = results.get(candidate.line)
-        if not polished:
+        model_result = results.get(candidate.line)
+        if model_result is None:
             continue
-        cache_path = _candidate_cache_path(cache_dir, candidate)
+        cache_path = _candidate_cache_path(
+            cache_dir,
+            candidate,
+            cleanup_rules_version=cleanup_rules_version,
+            prompt_context=_prompt_context_for_candidate(candidate, glossary_terms),
+        )
         cache_path.write_text(
             json.dumps(
                 {
                     "line": candidate.line,
                     "text": candidate.text,
                     "suspects": candidate.suspects,
-                    "polished_text": polished,
+                    "polished_text": model_result.polished_text or "",
+                    "decision": model_result.decision,
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -466,6 +707,41 @@ def _translate_candidates(
             encoding="utf-8",
         )
     return results
+
+
+def _document_line_parts(markdown_text: str) -> tuple[list[str], list[str], str, bool]:
+    pieces = markdown_text.splitlines(keepends=True)
+    if not pieces and markdown_text:
+        pieces = [markdown_text]
+    bare_lines: list[str] = []
+    endings: list[str] = []
+    for piece in pieces:
+        bare = piece.rstrip("\r\n")
+        bare_lines.append(bare)
+        endings.append(piece[len(bare) :])
+    newline_style = "\r\n" if any(ending == "\r\n" for ending in endings) else "\n"
+    has_final_newline = markdown_text.endswith("\n") or markdown_text.endswith("\r\n")
+    return bare_lines, endings, newline_style, has_final_newline
+
+
+def _join_document_lines(
+    bare_lines: list[str],
+    endings: list[str],
+    newline_style: str,
+    has_final_newline: bool,
+) -> str:
+    if not bare_lines:
+        return "" if not has_final_newline else newline_style
+    joined_parts: list[str] = []
+    for index, bare in enumerate(bare_lines):
+        ending = endings[index] if index < len(endings) else newline_style
+        joined_parts.append(bare + ending)
+    body = "".join(joined_parts)
+    if has_final_newline and not body.endswith(("\n", "\r\n")):
+        body += newline_style
+    if not has_final_newline:
+        body = body.rstrip("\r\n")
+    return body
 
 
 TOP_LEVEL_HEADING_RE = re.compile(r"(?m)^#\s+.+$")
@@ -615,6 +891,56 @@ def _apply_polish_replacements_to_chapters(
     return patched
 
 
+def _collect_protected_manual_lines(run_dir: Path) -> tuple[set[str], int]:
+    from pdf_translator.translation_failures import read_failures
+
+    protected_lines: set[str] = set()
+    failure_items = read_failures(run_dir).get("items", {})
+    if isinstance(failure_items, dict):
+        for item in failure_items.values():
+            if not isinstance(item, dict):
+                continue
+            resolution = item.get("resolution", {})
+            if not isinstance(resolution, dict):
+                continue
+            for line in str(resolution.get("text") or "").splitlines():
+                stripped = line.strip()
+                if stripped:
+                    protected_lines.add(stripped)
+    review_state_path = run_dir / "review_state.json"
+    if review_state_path.exists():
+        try:
+            state = json.loads(review_state_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            state = {}
+        decisions = state.get("decisions", {})
+        if isinstance(decisions, dict):
+            for decision in decisions.values():
+                if not isinstance(decision, dict):
+                    continue
+                for line in str(decision.get("approved_text") or "").splitlines():
+                    stripped = line.strip()
+                    if stripped:
+                        protected_lines.add(stripped)
+    return protected_lines, len(protected_lines)
+
+
+def _compute_outcome(
+    *,
+    candidate_count: int,
+    accepted_count: int,
+    rejected_count: int,
+    unresolved_count: int,
+) -> PolishOutcome:
+    if candidate_count == 0:
+        return "no_candidates"
+    if rejected_count > 0 or unresolved_count > 0:
+        return "needs_review"
+    if accepted_count > 0:
+        return "applied"
+    return "no_candidates"
+
+
 def run_polish(
     *,
     run_dir: Path,
@@ -627,32 +953,29 @@ def run_polish(
 ) -> PolishResult:
     run_dir = run_dir.expanduser().resolve()
     book_path = run_dir / "book.json"
-    translated_path = run_dir / "translated.md"
+    cleaned_path = run_dir / "translated.cleaned.md"
     if not book_path.exists():
         raise FileNotFoundError(f"Missing book.json: {book_path}")
-    if not translated_path.exists():
-        raise FileNotFoundError(f"Missing translated.md: {translated_path}")
+    if not cleaned_path.is_file():
+        raise FileNotFoundError(f"Missing translated.cleaned.md: {cleaned_path}")
 
     book = json.loads(book_path.read_text(encoding="utf-8"))
-    markdown_text = translated_path.read_text(encoding="utf-8")
-    candidates = scan_polish_candidates(markdown_text)
-    # Human text is an authority, including an explicit decision to preserve source.
-    from pdf_translator.translation_failures import read_failures
-    protected_lines = {
-        line.strip()
-        for item in read_failures(run_dir)['items'].values()
-        for line in item.get('resolution', {}).get('text', '').splitlines()
-        if line.strip()
-    }
-    review_state_path = run_dir / 'review_state.json'
-    if review_state_path.exists():
-        state = json.loads(review_state_path.read_text(encoding='utf-8'))
-        for decision in state.get('decisions', {}).values():
-            protected_lines.update(line.strip() for line in str(decision.get('approved_text') or '').splitlines() if line.strip())
-    candidates = [candidate for candidate in candidates if candidate.text.strip() not in protected_lines]
+    markdown_text = _read_text_preserve_newlines(cleaned_path)
+    cleaned_input_sha256 = _sha256(markdown_text)
+    cleanup_rules_version = _load_cleanup_version(run_dir)
+    glossary_terms = _load_glossary_terms(run_dir)
+    metadata = book.get("metadata") if isinstance(book.get("metadata"), dict) else {}
+    book_title = metadata.get("title") if isinstance(metadata.get("title"), str) else None
+    book_author = metadata.get("author") if isinstance(metadata.get("author"), str) else None
+
+    all_candidates = scan_polish_candidates(markdown_text)
+    protected_lines, manual_skip_count = _collect_protected_manual_lines(run_dir)
+    candidates = [candidate for candidate in all_candidates if candidate.text.strip() not in protected_lines]
+    protected_skip_count = max(0, len(all_candidates) - len(candidates))
+
     translator = translator or build_translator(translator_name)
     cache_dir = run_dir / "polish-cache"
-    polished_by_line = _translate_candidates(
+    model_results = _translate_candidates(
         candidates=candidates,
         translator=translator,
         target_language=target_language,
@@ -660,17 +983,44 @@ def run_polish(
         batch_size=max(1, batch_size),
         concurrency=max(1, concurrency),
         request_timeout_seconds=request_timeout_seconds,
+        cleanup_rules_version=cleanup_rules_version,
+        glossary_terms=glossary_terms,
     )
 
-    original_lines = markdown_text.splitlines()
-    polished_lines = list(original_lines)
+    bare_lines, endings, newline_style, has_final_newline = _document_line_parts(markdown_text)
+    polished_bare = list(bare_lines)
     accepted: list[dict[str, Any]] = []
     rejected: list[dict[str, Any]] = []
     unchanged: list[dict[str, Any]] = []
+    unresolved: list[dict[str, Any]] = []
 
     for candidate in candidates:
-        before = original_lines[candidate.line - 1]
-        after = polished_by_line.get(candidate.line, before)
+        line_index = candidate.line - 1
+        if line_index < 0 or line_index >= len(polished_bare):
+            continue
+        before = polished_bare[line_index]
+        model_result = model_results.get(candidate.line)
+        if model_result is None:
+            unresolved.append(
+                {
+                    "line": candidate.line,
+                    "suspects": candidate.suspects,
+                    "text": before,
+                    "decision": "model_unavailable",
+                }
+            )
+            continue
+        if model_result.decision in {"model_unavailable", "incomplete_response"}:
+            unresolved.append(
+                {
+                    "line": candidate.line,
+                    "suspects": candidate.suspects,
+                    "text": before,
+                    "decision": model_result.decision,
+                }
+            )
+            continue
+        after = model_result.polished_text if model_result.polished_text is not None else before
         if after == before:
             unchanged.append(
                 {
@@ -681,7 +1031,24 @@ def run_polish(
                 }
             )
             continue
-        ok, reason = _safe_accept_polish(before, after)
+        accept_context = PolishAcceptContext(
+            suspects=candidate.suspects,
+            protected_literals=_protected_literals(before),
+            glossary_terms=glossary_terms,
+            book_title=book_title,
+            book_author=book_author,
+        )
+        trial_lines = list(polished_bare)
+        trial_lines[line_index] = after
+        whole_after = _join_document_lines(trial_lines, endings, newline_style, has_final_newline)
+        whole_before = _join_document_lines(polished_bare, endings, newline_style, has_final_newline)
+        ok, reason = _safe_accept_polish(
+            before,
+            after,
+            context=accept_context,
+            whole_before=whole_before,
+            whole_after=whole_after,
+        )
         record = {
             "line": candidate.line,
             "suspects": candidate.suspects,
@@ -690,14 +1057,19 @@ def run_polish(
             "decision": reason,
         }
         if ok:
-            polished_lines[candidate.line - 1] = after
+            polished_bare[line_index] = after
             accepted.append(record)
         else:
             rejected.append(record)
 
-    polished_markdown = "\n".join(polished_lines) + "\n"
+    polished_markdown = _join_document_lines(polished_bare, endings, newline_style, has_final_newline)
+    if markdown_block_structure(markdown_text) != markdown_block_structure(polished_markdown):
+        raise ValueError("Polish output changed document Markdown block structure.")
+    if len(markdown_text.splitlines()) != len(polished_markdown.splitlines()):
+        raise ValueError("Polish output changed document line count.")
+
     polished_markdown_path = run_dir / "translated.polished.md"
-    polished_markdown_path.write_text(polished_markdown, encoding="utf-8")
+    _write_text_preserve_newlines(polished_markdown_path, polished_markdown)
 
     translated_chapters = _load_translated_chapter_payloads(run_dir, book, target_language)
     if translated_chapters:
@@ -714,26 +1086,44 @@ def run_polish(
         language=target_language,
     )
 
+    needs_review_count = len(rejected) + len(unresolved)
+    outcome = _compute_outcome(
+        candidate_count=len(candidates),
+        accepted_count=len(accepted),
+        rejected_count=len(rejected),
+        unresolved_count=len(unresolved),
+    )
     report = {
         "schema": "polish_report_v1",
         "run_dir": str(run_dir),
         "target_language": target_language,
         "translator": translator.name,
+        "polish_prompt_version": POLISH_PROMPT_VERSION,
+        "zh_cleanup_rules_version": cleanup_rules_version,
+        "cleaned_input_sha256": cleaned_input_sha256,
+        "output_sha256": _sha256(polished_markdown),
         "candidate_count": len(candidates),
         "accepted_count": len(accepted),
         "rejected_count": len(rejected),
         "unchanged_count": len(unchanged),
+        "needs_review_count": needs_review_count,
+        "outcome": outcome,
+        "protected_skip_count": protected_skip_count,
+        "manual_skip_count": manual_skip_count,
         "outputs": {
             "translated_polished_markdown": str(polished_markdown_path),
             "translated_polished_epub": str(polished_epub_path),
             "polish_cache_dir": str(cache_dir),
+            "translated_cleaned_markdown": str(cleaned_path),
         },
         "accepted": accepted,
         "rejected": rejected,
         "unchanged": unchanged,
+        "unresolved": unresolved,
+        "decisions": accepted + rejected + unchanged + unresolved,
     }
     report_path = run_dir / "polish-report.json"
-    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_json(report_path, report)
 
     return PolishResult(
         run_dir=run_dir,
@@ -744,4 +1134,9 @@ def run_polish(
         accepted_count=len(accepted),
         rejected_count=len(rejected),
         changed_count=len(accepted),
+        unchanged_count=len(unchanged),
+        needs_review_count=needs_review_count,
+        outcome=outcome,
+        protected_skip_count=protected_skip_count,
+        manual_skip_count=manual_skip_count,
     )

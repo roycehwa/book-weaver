@@ -835,14 +835,14 @@ def run_translation_pipeline(
         if settings.target_language.lower().startswith("zh") and book is not None:
             from pdf_translator.polish import run_polish, scan_polish_candidates
 
-            if scan_polish_candidates(translated.translated_markdown):
+            if scan_polish_candidates(downstream_markdown):
                 try:
                     polish_result = run_polish(
                         run_dir=artifacts.output_dir,
                         target_language=settings.target_language,
                         translator_name=settings.translator,
                     )
-                except (ValueError, RuntimeError) as exc:
+                except (ValueError, RuntimeError, FileNotFoundError) as exc:
                     # Optional polishing must not discard valid machine translation.
                     from pdf_translator.source_workspace import atomic_json
                     polish_result = None
@@ -856,9 +856,10 @@ def run_translation_pipeline(
                     artifacts.translated_markdown_path.write_text(polished_markdown, encoding="utf-8")
                     extra_files["translated_polished_markdown"] = str(polished_path)
                     extra_files["polish_report"] = str(artifacts.output_dir / "polish-report.json")
-                polish_outcome = (
-                    "needs_review" if polish_result is None else "applied" if polish_result.accepted_count > 0 else "no_candidates"
-                )
+                if polish_result is None:
+                    polish_outcome = "needs_review"
+                else:
+                    polish_outcome = polish_result.outcome
         if on_stage is not None:
             on_stage(
                 "polishing",
