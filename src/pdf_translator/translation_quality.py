@@ -63,34 +63,6 @@ _BLOCKING_REVIEW_ISSUE_TYPES = frozenset(
     }
 )
 
-_NON_ADJUDICATABLE_BLOCKING_CODES = frozenset(
-    {
-        "translation_input_sha_mismatch",
-        "missing_raw_translation",
-        "empty_raw_translation",
-        "control_or_replacement_character",
-        "markdown_block_structure_loss",
-        "invented_link_targets",
-        "lost_link_targets",
-        "markdown_link_structure_loss",
-        "missing_translation_input",
-        "reading_units_not_authoritative",
-        "missing_reading_units_fingerprint",
-        "chapter_segments_stale",
-        "missing_cleaned_translation",
-        "missing_final_translation",
-        "line_count_regression",
-        "final_newline_regression",
-        "markdown_block_structure_regression",
-        "link_structure_regression",
-        "image_count_regression",
-        "footnote_marker_regression",
-        "protected_literal_regression",
-        "numeric_literal_regression",
-        "polished_markdown_not_published",
-    }
-)
-
 _NUMERIC_LITERAL_RE = re.compile(
     r"(?<![\w.])(?:\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)(?![\w.])"
 )
@@ -1041,9 +1013,11 @@ def _resolve_indexed_report_path(run_dir: Path, *, path_value: str) -> Path:
     return path
 
 
-def _load_indexed_quality_findings(run_dir: Path) -> list[dict[str, Any]]:
-    run_dir = run_dir.expanduser().resolve()
-    index = _read_json(run_dir / TRANSLATION_QUALITY_INDEX)
+def _load_indexed_quality_findings(
+    run_dir: Path,
+    *,
+    index: dict[str, Any],
+) -> list[dict[str, Any]]:
     reports = index.get("reports") if isinstance(index.get("reports"), dict) else {}
     findings: list[dict[str, Any]] = []
     for key in ("source", "raw_translation", "polished_output"):
@@ -1078,28 +1052,14 @@ def _segment_review_adjudicated(segment_id: str, decisions: dict[str, dict[str, 
     return status in {"approved", "resolved"}
 
 
-def _finding_code_non_adjudicable(code: str) -> bool:
-    if code in _NON_ADJUDICATABLE_BLOCKING_CODES:
-        return True
-    if code.startswith("stale_"):
-        return True
-    if code.endswith("_regression"):
-        return True
-    if code.startswith("polished_") and code.endswith("_regression"):
-        return True
-    if code.startswith("missing_"):
-        return True
-    return False
-
-
 def _finding_review_adjudicable(finding: dict[str, Any]) -> bool:
     if str(finding.get("severity") or "") != "blocking":
         return False
     stage = str(finding.get("stage") or "")
-    if stage == "source":
+    if stage != "raw_translation":
         return False
     code = str(finding.get("code") or "")
-    if _finding_code_non_adjudicable(code):
+    if code not in _BLOCKING_REVIEW_ISSUE_TYPES:
         return False
     segment_ids = [str(value) for value in finding.get("segment_ids") or [] if str(value)]
     return bool(segment_ids)
@@ -1118,22 +1078,114 @@ def _finding_effectively_blocking(
     return not all(_segment_review_adjudicated(segment_id, decisions) for segment_id in segment_ids)
 
 
+def _translation_quality_artifact_errors(
+    run_dir: Path,
+    *,
+    index: dict[str, Any],
+) -> list[str]:
+    required = [
+        SOURCE_QUALITY_REPORT,
+        RAW_TRANSLATION_QUALITY_REPORT,
+        POLISHED_OUTPUT_QUALITY_REPORT,
+        TRANSLATION_QUALITY_INDEX,
+    ]
+    missing = [name for name in required if not (run_dir / name).exists()]
+    if missing:
+        return [
+            "Export blocked: current translation quality artifacts are missing "
+            f"({', '.join(missing)}). Create a new task."
+        ]
+
+    signature = index.get("signature") if isinstance(index.get("signature"), dict) else {}
+    current = build_quality_signature(
+        run_dir,
+        text_operation=str(index.get("text_operation") or "translate"),
+    )
+    if signature != current:
+        return [
+            "Export blocked: translation-quality-index.json is stale relative to current inputs. "
+            "Re-run translation or create a new task."
+        ]
+
+    reports = index.get("reports") if isinstance(index.get("reports"), dict) else {}
+    run_resolved = run_dir.resolve()
+    errors: list[str] = []
+    for key in ("source", "raw_translation", "polished_output"):
+        meta = reports.get(key)
+        if not isinstance(meta, dict):
+            errors.append(
+                f"Export blocked: translation quality report metadata for {key} is missing or malformed."
+            )
+            continue
+        path_value = meta.get("path")
+        expected_hash = meta.get("sha256")
+        if not isinstance(path_value, str) or not path_value.strip():
+            errors.append(
+                f"Export blocked: translation quality report {key} path is missing or malformed."
+            )
+            continue
+        if not isinstance(expected_hash, str) or not expected_hash.strip():
+            errors.append(
+                f"Export blocked: translation quality report {key} hash is missing or malformed."
+            )
+            continue
+        path = _resolve_indexed_report_path(run_dir, path_value=path_value)
+        if not path.is_relative_to(run_resolved):
+            errors.append(
+                f"Export blocked: translation quality report {key} path is outside the run directory."
+            )
+            continue
+        if not path.exists() or sha256_file(path) != expected_hash:
+            errors.append(
+                f"Export blocked: translation quality report {key} is missing or stale. Create a new task."
+            )
+    return errors
+
+
 def effective_translation_quality_evaluation(run_dir: Path) -> dict[str, Any]:
     run_dir = run_dir.expanduser().resolve()
     index = _read_json(run_dir / TRANSLATION_QUALITY_INDEX)
-    if not index:
+    if not _requires_translation_quality(run_dir):
         return {
             "translation_quality_blocking": False,
-            "translation_quality_review_count": 0,
+            "translation_quality_review_count": int(index.get("review_count") or 0),
             "effective_blocking_count": 0,
+            "static_blocking_count": int(index.get("blocking_count") or 0),
+        }
+    if not index:
+        return {
+            "translation_quality_blocking": True,
+            "translation_quality_review_count": 0,
+            "effective_blocking_count": 1,
             "static_blocking_count": 0,
+            "artifact_errors": ["missing_translation_quality_index"],
+        }
+    artifact_errors = _translation_quality_artifact_errors(run_dir, index=index)
+    if artifact_errors:
+        return {
+            "translation_quality_blocking": True,
+            "translation_quality_review_count": int(index.get("review_count") or 0),
+            "effective_blocking_count": max(int(index.get("blocking_count") or 0), 1),
+            "static_blocking_count": int(index.get("blocking_count") or 0),
+            "artifact_errors": artifact_errors,
         }
     decisions = _load_review_decisions(run_dir)
-    findings = _load_indexed_quality_findings(run_dir)
+    findings = _load_indexed_quality_findings(run_dir, index=index)
+    static_blocking_count = int(index.get("blocking_count") or 0)
+    derived_blocking_count = sum(
+        1 for finding in findings if str(finding.get("severity") or "") == "blocking"
+    )
+    if derived_blocking_count != static_blocking_count:
+        return {
+            "translation_quality_blocking": True,
+            "translation_quality_review_count": int(index.get("review_count") or 0),
+            "effective_blocking_count": max(static_blocking_count, derived_blocking_count, 1),
+            "static_blocking_count": static_blocking_count,
+            "artifact_errors": ["translation_quality_index_count_mismatch"],
+        }
     effective_blocking = [
         finding for finding in findings if _finding_effectively_blocking(finding, decisions=decisions)
     ]
-    static_blocking_count = int(index.get("blocking_count") or 0)
     effective_blocking_count = len(effective_blocking)
     return {
         "translation_quality_blocking": effective_blocking_count > 0,
@@ -1240,9 +1292,6 @@ def write_translation_quality_bundle(
 
 
 def translation_quality_summary(run_dir: Path) -> dict[str, Any]:
-    run_dir = run_dir.expanduser().resolve()
-    if not (run_dir / TRANSLATION_QUALITY_INDEX).exists():
-        return {"translation_quality_blocking": False, "translation_quality_review_count": 0}
     return effective_translation_quality_evaluation(run_dir)
 
 
@@ -1263,60 +1312,10 @@ def assert_translation_quality_current(run_dir: Path) -> None:
     run_dir = run_dir.expanduser().resolve()
     if not _requires_translation_quality(run_dir):
         return
-    required = [
-        SOURCE_QUALITY_REPORT,
-        RAW_TRANSLATION_QUALITY_REPORT,
-        POLISHED_OUTPUT_QUALITY_REPORT,
-        TRANSLATION_QUALITY_INDEX,
-    ]
-    missing = [name for name in required if not (run_dir / name).exists()]
-    if missing:
-        raise ValueError(
-            "Export blocked: current translation quality artifacts are missing "
-            f"({', '.join(missing)}). Create a new task."
-        )
     index = _read_json(run_dir / TRANSLATION_QUALITY_INDEX)
-    signature = index.get("signature") if isinstance(index.get("signature"), dict) else {}
-    current = build_quality_signature(
-        run_dir,
-        text_operation=str(index.get("text_operation") or "translate"),
-    )
-    if signature != current:
-        raise ValueError(
-            "Export blocked: translation-quality-index.json is stale relative to current inputs. "
-            "Re-run translation or create a new task."
-        )
-    reports = index.get("reports") if isinstance(index.get("reports"), dict) else {}
-    run_resolved = run_dir.resolve()
-    for key in ("source", "raw_translation", "polished_output"):
-        meta = reports.get(key)
-        if not isinstance(meta, dict):
-            raise ValueError(
-                f"Export blocked: translation quality report metadata for {key} is missing or malformed."
-            )
-        path_value = meta.get("path")
-        expected_hash = meta.get("sha256")
-        if not isinstance(path_value, str) or not path_value.strip():
-            raise ValueError(
-                f"Export blocked: translation quality report {key} path is missing or malformed."
-            )
-        if not isinstance(expected_hash, str) or not expected_hash.strip():
-            raise ValueError(
-                f"Export blocked: translation quality report {key} hash is missing or malformed."
-            )
-        path = Path(path_value)
-        if not path.is_absolute():
-            path = (run_dir / path).resolve()
-        else:
-            path = path.expanduser().resolve()
-        if not path.is_relative_to(run_resolved):
-            raise ValueError(
-                f"Export blocked: translation quality report {key} path is outside the run directory."
-            )
-        if not path.exists() or sha256_file(path) != expected_hash:
-            raise ValueError(
-                f"Export blocked: translation quality report {key} is missing or stale. Create a new task."
-            )
+    artifact_errors = _translation_quality_artifact_errors(run_dir, index=index)
+    if artifact_errors:
+        raise ValueError(artifact_errors[0])
     evaluation = effective_translation_quality_evaluation(run_dir)
     if evaluation.get("translation_quality_blocking"):
         raise ValueError(

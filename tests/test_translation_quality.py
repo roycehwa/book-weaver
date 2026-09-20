@@ -481,6 +481,26 @@ def test_assert_translation_quality_current_fails_on_blocking_index(tmp_path: Pa
         assert_translation_quality_current(run_dir)
 
 
+def test_effective_quality_blocks_when_index_count_disagrees_with_reports(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    write_synthetic_reading_units(run_dir)
+    source = (run_dir / "translation-input.md").read_text(encoding="utf-8")
+    _write_passing_translation_outputs(run_dir, source=source)
+    index_path = run_dir / TRANSLATION_QUALITY_INDEX
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    index["blocking_count"] = 1
+    index["aggregate_status"] = "blocked"
+    index["acceptable"] = False
+    index_path.write_text(json.dumps(index), encoding="utf-8")
+
+    summary = translation_quality_summary(run_dir)
+    assert summary["translation_quality_blocking"] is True
+    assert "translation_quality_index_count_mismatch" in summary["artifact_errors"]
+    with pytest.raises(ValueError, match="blocking"):
+        assert_translation_quality_current(run_dir)
+
+
 def test_effective_quality_allows_adjudicated_segment_blocking_finding(tmp_path: Path) -> None:
     run_dir = tmp_path / "run"
     run_dir.mkdir()
@@ -500,6 +520,24 @@ def test_effective_quality_allows_adjudicated_segment_blocking_finding(tmp_path:
     assert_translation_quality_current(run_dir)
 
 
+def test_effective_quality_allows_adjudicated_missing_translation_finding(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    write_synthetic_reading_units(run_dir)
+    source = (run_dir / "translation-input.md").read_text(encoding="utf-8")
+    _write_passing_translation_outputs(
+        run_dir,
+        source=source,
+        review_items=[{"issue_type": "missing_translation", "segment_id": "seg-1", "evidence": {}}],
+    )
+    (run_dir / "review_state.json").write_text(
+        json.dumps({"decisions": {"seg-1": {"status": "resolved", "approved_text": "人工补译"}}}),
+        encoding="utf-8",
+    )
+    assert effective_translation_quality_evaluation(run_dir)["translation_quality_blocking"] is False
+    assert_translation_quality_current(run_dir)
+
+
 def test_effective_quality_blocks_unresolved_segment_finding(tmp_path: Path) -> None:
     run_dir = tmp_path / "run"
     run_dir.mkdir()
@@ -513,6 +551,21 @@ def test_effective_quality_blocks_unresolved_segment_finding(tmp_path: Path) -> 
     summary = translation_quality_summary(run_dir)
     assert summary["translation_quality_blocking"] is True
     with pytest.raises(ValueError, match="blocking"):
+        assert_translation_quality_current(run_dir)
+
+
+def test_quality_summary_blocks_when_indexed_report_is_missing(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    write_synthetic_reading_units(run_dir)
+    source = (run_dir / "translation-input.md").read_text(encoding="utf-8")
+    _write_passing_translation_outputs(run_dir, source=source)
+    (run_dir / RAW_TRANSLATION_QUALITY_REPORT).unlink()
+
+    summary = translation_quality_summary(run_dir)
+    assert summary["translation_quality_blocking"] is True
+    assert summary["effective_blocking_count"] >= 1
+    with pytest.raises(ValueError, match="artifacts are missing"):
         assert_translation_quality_current(run_dir)
 
 

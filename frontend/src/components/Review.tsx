@@ -7,7 +7,7 @@ import {
   nextPendingIssueIndex,
 } from './reviewNavigation'
 import { loadDraft, removeDraft, saveDraft, selectConfirmedText } from './reviewDrafts'
-import { reviewExportCompletionMessage } from './reviewExportReadiness'
+import { reviewExportCompletionMessage, reviewExportReady } from './reviewExportReadiness'
 
 const issueLabels: Record<string, string> = {
   missing_content: '算法提示：内容缺失',
@@ -419,6 +419,13 @@ function Review() {
   const isFullReviewComplete = orderedSegments.length > 0 && reviewedCount >= orderedSegments.length
   const translationQualityBlocking = Boolean(project?.translation_quality?.translation_quality_blocking)
   const exportCompletionMessage = reviewExportCompletionMessage({
+    pendingRewriteCount,
+    rewritesNeedingInstruction,
+    humanReviewMode,
+    isFullReviewComplete,
+    translationQualityBlocking,
+  })
+  const qualityExportReady = reviewExportReady({
     pendingRewriteCount,
     rewritesNeedingInstruction,
     humanReviewMode,
@@ -858,6 +865,10 @@ function Review() {
 
   const handleExport = async () => {
     if (!exportVersion.trim()) return
+    if (!qualityExportReady) {
+      setError(exportCompletionMessage)
+      return
+    }
     setExporting(true)
     setError(null)
     setActionMessage(null)
@@ -1114,7 +1125,9 @@ function Review() {
               )}
               <button
                 onClick={() => setShowAdvanced(true)}
-                className="rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white"
+                disabled={!qualityExportReady}
+                title={!qualityExportReady ? exportCompletionMessage : undefined}
+                className="rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white disabled:cursor-not-allowed disabled:opacity-50"
               >
                 导出定稿
               </button>
@@ -1180,7 +1193,8 @@ function Review() {
             </select>
             <button
               onClick={handleExport}
-              disabled={exporting || !exportVersion.trim()}
+              disabled={exporting || !exportVersion.trim() || !qualityExportReady}
+              title={!qualityExportReady ? exportCompletionMessage : undefined}
               className="rounded-lg bg-blue-600 px-3 py-1.5 text-xs font-medium text-white disabled:opacity-50"
             >
               {exporting ? '导出中…' : '导出'}

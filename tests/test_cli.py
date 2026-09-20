@@ -311,6 +311,9 @@ def test_render_review_export_invokes_quality_gate_before_publish(tmp_path: Path
         ),
         encoding="utf-8",
     )
+    source_markdown = (run_dir / "translation-input.md").read_text(encoding="utf-8")
+    for filename in ("translated.raw.md", "translated.cleaned.md", "translated.md"):
+        (run_dir / filename).write_text(source_markdown, encoding="utf-8")
     write_minimal_translation_quality_artifacts(run_dir)
     order: list[str] = []
 
@@ -356,6 +359,9 @@ def test_render_review_export_draft_skips_approved_review_validation(tmp_path: P
         ),
         encoding="utf-8",
     )
+    source_markdown = (run_dir / "translation-input.md").read_text(encoding="utf-8")
+    for filename in ("translated.raw.md", "translated.cleaned.md", "translated.md"):
+        (run_dir / filename).write_text(source_markdown, encoding="utf-8")
     write_minimal_translation_quality_artifacts(run_dir)
     index = json.loads((run_dir / "translation-quality-index.json").read_text(encoding="utf-8"))
     index["blocking_count"] = 0
@@ -404,6 +410,125 @@ def test_render_review_export_draft_skips_approved_review_validation(tmp_path: P
             approve=False,
             output_dir=run_dir / "versions" / "draft",
         )
+
+
+def test_render_review_export_publishes_after_segment_quality_finding_is_adjudicated(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from pdf_translator.cli import _render_review_export
+    from pdf_translator.translation_quality import (
+        translation_quality_summary,
+        write_translation_quality_bundle,
+    )
+    from tests.synthetic_quality_fixtures import write_synthetic_reading_units
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    write_synthetic_reading_units(run_dir)
+    source_markdown = (run_dir / "translation-input.md").read_text(encoding="utf-8")
+    for filename in ("translated.raw.md", "translated.cleaned.md", "translated.md"):
+        (run_dir / filename).write_text(source_markdown, encoding="utf-8")
+    (run_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "source_pdf": str(tmp_path / "synthetic-book.pdf"),
+                "text_operation": "translate",
+                "translation": {"mode": "translated"},
+                "files": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    source_segment = {
+        "segment_id": "seg-1",
+        "chapter_id": "ch-001",
+        "chapter_index": 1,
+        "chapter_title": "Chapter 1",
+        "block_index": 1,
+        "source_text": "Synthetic source paragraph.",
+        "translate": True,
+    }
+    (run_dir / "segments.json").write_text(
+        json.dumps({"segments": [source_segment]}),
+        encoding="utf-8",
+    )
+    (run_dir / "translated_segments.json").write_text(
+        json.dumps({"segments": [{**source_segment, "translated_text": ""}]}),
+        encoding="utf-8",
+    )
+    review_items = [
+        {
+            "item_id": "review-0001",
+            "segment_id": "seg-1",
+            "issue_type": "missing_translation",
+            "severity": "high",
+            "status": "approved",
+            "evidence": {},
+        }
+    ]
+    (run_dir / "review_items.json").write_text(
+        json.dumps({"items": review_items}),
+        encoding="utf-8",
+    )
+    (run_dir / "review_state.json").write_text(
+        json.dumps(
+            {
+                "decisions": {
+                    "seg-1": {
+                        "status": "approved",
+                        "action": "manual_edit",
+                        "approved_text": "人工补齐的完整译文。",
+                    }
+                },
+                "summary": {"total_items": 1, "open_items": 0, "approved_items": 1},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "pre_review.json").write_text(
+        json.dumps({"status": "completed"}),
+        encoding="utf-8",
+    )
+    write_translation_quality_bundle(
+        run_dir,
+        text_operation="translate",
+        source_markdown=source_markdown,
+        review_items=review_items,
+    )
+    assert translation_quality_summary(run_dir)["translation_quality_blocking"] is False
+
+    monkeypatch.setattr("pdf_translator.source_workspace.require_current_translation", lambda _run_dir: None)
+    monkeypatch.setattr(
+        cli_module,
+        "_load_complete_review_book",
+        lambda _run_dir, _manifest: {
+            "chapters": [
+                {
+                    "chapter_id": "ch-001",
+                    "title": "Chapter 1",
+                    "markdown": "Synthetic source paragraph.\n",
+                    "source_pages": [],
+                    "translate": True,
+                    "toc": True,
+                }
+            ]
+        },
+    )
+    monkeypatch.setattr(cli_module, "_review_image_roots", lambda _run_dir, _manifest: [])
+
+    result = _render_review_export(
+        run_dir=run_dir,
+        version_name="adjudicated",
+        parent_version=None,
+        target_language="zh-CN",
+        output_format="none",
+        approve=False,
+        output_dir=run_dir / "versions" / "adjudicated",
+    )
+
+    delivered = Path(result["version"]["translated_markdown_path"]).read_text(encoding="utf-8")
+    assert "人工补齐的完整译文。" in delivered
 
 
 def test_public_cli_accepts_polish_command() -> None:
