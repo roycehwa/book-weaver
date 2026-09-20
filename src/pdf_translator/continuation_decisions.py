@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from pathlib import Path
 from typing import Any
 
 from pdf_translator.reconstruct import LayoutBlock, _cluster_columns, _column_index
@@ -182,16 +183,19 @@ def _columns_compatible(
     right_col = _column_index(right_block, columns)
     same_column = left_col == right_col
     align_tol = _alignment_tolerance(left_page_width, right_page_width)
-    aligned = (
-        abs(left_geo["left"] - right_geo["left"]) <= align_tol
-        and abs(left_geo["right"] - right_geo["right"]) <= align_tol
-    )
-    return same_column and aligned, {
+    left_aligned = abs(left_geo["left"] - right_geo["left"]) <= align_tol
+    right_aligned = abs(left_geo["right"] - right_geo["right"]) <= align_tol
+    # Same-column body prose often has ragged right edges; left edge + column is enough.
+    compatible = same_column and left_aligned
+    return compatible, {
         "left_column": left_col,
         "right_column": right_col,
         "left_bbox": left_geo,
         "right_bbox": right_geo,
         "alignment_tolerance": round(align_tol, 6),
+        "left_aligned": left_aligned,
+        "right_aligned": right_aligned,
+        "ragged_right_edges": left_aligned and not right_aligned,
         "left_page_width": left_page_width,
         "right_page_width": right_page_width,
     }
@@ -259,18 +263,23 @@ def _join_source_node_fragments(left: str, right: str, separator: str) -> tuple[
 
 
 def _body_text_items(page: dict[str, Any]) -> list[dict[str, Any]]:
-    allowed_labels = {"text"}
-    return [
-        item
-        for item in page.get("content_items") or []
-        if isinstance(item, dict)
-        and item.get("kind") == "text"
-        and not item.get("from_page_footer")
-        and item.get("source_node_id")
-        and isinstance(item.get("source_char_start"), int)
-        and isinstance(item.get("source_char_end"), int)
-        and str(item.get("source_label") or "text") in allowed_labels
-    ]
+    items: list[dict[str, Any]] = []
+    for item in page.get("content_items") or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("kind") != "text":
+            continue
+        if item.get("from_page_footer"):
+            continue
+        if not item.get("source_node_id"):
+            continue
+        if not isinstance(item.get("source_char_start"), int) or not isinstance(item.get("source_char_end"), int):
+            continue
+        label = str(item.get("source_label") or "text")
+        if label not in {"text", "page_footer"}:
+            continue
+        items.append(item)
+    return items
 
 
 def evaluate_same_source_node_boundary(
@@ -833,6 +842,79 @@ def validate_continuation_decisions(payload: dict[str, Any]) -> None:
         seen.add(decision_id)
         if decision.get("status") not in STATUSES:
             raise ValueError("Continuation decision status is invalid")
+
+
+PLAUSIBLE_SYNTAX_REASONS = frozenset({"hyphen_continuation", "lowercase_continuation"})
+
+
+def load_continuation_ledger(run_dir: Path) -> dict[str, Any] | None:
+    path = run_dir / "continuation-decisions.json"
+    if path.is_file():
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else None
+    book_path = run_dir / "book.json"
+    if book_path.is_file():
+        book = json.loads(book_path.read_text(encoding="utf-8"))
+        payload = book.get("continuation_decisions")
+        return payload if isinstance(payload, dict) else None
+    return None
+
+
+def _decision_plausible_continuation(decision: dict[str, Any]) -> bool:
+    evidence = decision.get("evidence")
+    if not isinstance(evidence, dict):
+        return False
+    return str(evidence.get("syntax_reason") or "") in PLAUSIBLE_SYNTAX_REASONS
+
+
+def reconciles_possible_continuation_issue(decision: dict[str, Any], *, page: int) -> bool:
+    if decision.get("status") != "accepted":
+        return False
+    if int(decision.get("from_page") or 0) != page:
+        return False
+    evidence = decision.get("evidence") if isinstance(decision.get("evidence"), dict) else {}
+    if str(evidence.get("syntax_reason") or "") in PLAUSIBLE_SYNTAX_REASONS:
+        return True
+    repair = str(evidence.get("repair") or "")
+    return repair in {
+        "page_break_hyphen_removed",
+        "cross_node_space_join",
+        "cross_resource_space_join",
+    }
+
+
+def confirmation_quality_issues_from_ledger(ledger: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not ledger:
+        return []
+    issues: list[dict[str, Any]] = []
+    for decision in ledger.get("decisions") or []:
+        if not isinstance(decision, dict):
+            continue
+        status = str(decision.get("status") or "")
+        if status == "accepted" or status not in STATUSES:
+            continue
+        if status not in {"uncertain", "rejected"}:
+            continue
+        if not _decision_plausible_continuation(decision):
+            continue
+        from_page = int(decision.get("from_page") or 0)
+        to_page = int(decision.get("to_page") or 0)
+        status_label = "不确定" if status == "uncertain" else "已拒绝"
+        issues.append(
+            {
+                "severity": "warning",
+                "code": "unresolved_continuation",
+                "message": (
+                    f"第 {from_page} 页到第 {to_page} 页之间存在{status_label}的高置信续接候选，"
+                    "请在原文修正台核对。"
+                ),
+                "decision_id": decision.get("decision_id"),
+                "from_page": from_page,
+                "to_page": to_page,
+                "continuation_status": status,
+            }
+        )
+    return issues
 
 
 def write_continuation_decisions(

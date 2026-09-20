@@ -69,4 +69,17 @@ describe('validateChapterQuality', () => {
     expect(result.blocking).toBe(false)
     expect(result.issues).toEqual([])
   })
+
+  test('supports merging unresolved continuation warnings into confirmation summary', () => {
+    const chapterResult = validateChapterQuality([chapter('Body', 1, 4)], 4)
+    const continuationWarning = {
+      severity: 'warning' as const,
+      code: 'unresolved_continuation',
+      message: '第 3 页到第 4 页之间存在不确定的高置信续接候选，请在原文修正台核对。',
+    }
+    const combined = [...chapterResult.issues, continuationWarning]
+    const warnings = combined.filter((issue) => issue.severity === 'warning')
+
+    expect(warnings.some((issue) => issue.code === 'unresolved_continuation')).toBe(true)
+  })
 })

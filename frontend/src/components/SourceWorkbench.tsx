@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { jobsApi, type SourceBlock, type SourceWorkspace } from '../api'
 
 const labels: Record<string, string> = { hyphenated_line_break: '疑似跨行断词', possible_continuation: '疑似接续下一段', possible_heading_error: '疑似标题误识别' }
+const issueStatusLabels: Record<string, string> = { open: '待核对', accepted: '已注明接受理由', reconciled: '已由续接决策核对' }
 
 export default function SourceWorkbench({ jobId, page, onSaved, onSelectPage }: { jobId: string; page: number; onSaved: () => void; onSelectPage?: (page: number) => void }) {
   const [data, setData] = useState<SourceWorkspace | null>(null)
@@ -68,7 +69,7 @@ export default function SourceWorkbench({ jobId, page, onSaved, onSelectPage }: 
       <label className="block text-sm">段落<select aria-label="选择原文段落" className="my-2 w-full rounded border p-2" value={selected} onChange={e => setSelected(Number(e.target.value))}>
         {blocks.map((block, i) => <option key={block.id} value={i}>{i + 1}. {block.text.slice(0, 65)}</option>)}
       </select></label>
-      {data.issues.filter(i => i.block_id === current.id).map((issue, i) => <p key={i} className="text-xs text-amber-700">{labels[issue.code] || issue.code} · {issue.status === 'accepted' ? '已注明接受理由' : '待核对'}</p>)}
+      {data.issues.filter(i => i.block_id === current.id).map((issue, i) => <p key={i} className="text-xs text-amber-700">{labels[issue.code] || issue.code} · {issueStatusLabels[issue.status] || issue.status}</p>)}
       <textarea aria-label="原文段落内容" ref={selection} rows={9} className="w-full rounded border p-2 text-sm" value={current.text} onChange={e => change({ text: e.target.value })} />
       <div className="my-2 flex flex-wrap gap-2 text-xs">
         <button type="button" onClick={split}>在光标处分段</button><button type="button" onClick={merge} disabled={selected >= blocks.length - 1}>合并下一段</button>

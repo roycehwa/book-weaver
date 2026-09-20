@@ -1015,11 +1015,20 @@ class BookJobService:
         snapshot = self.get(job_id)
         prefs = self._chapter_draft_prefs(snapshot)
         dependency_payload = self._content_policy_dependency_payload(job_id, chapters)
+        run_dir = self.artifact_path(job_id, "book").parent
+        from pdf_translator.continuation_decisions import (
+            confirmation_quality_issues_from_ledger,
+            load_continuation_ledger,
+        )
+
         return {
             "job_id": job_id,
             "chapters": chapters,
             "content_policy_dependency_evidence": dependency_payload.get("evidence") or [],
             "content_policy_dependencies": dependency_payload.get("findings") or [],
+            "confirmation_quality_issues": confirmation_quality_issues_from_ledger(
+                load_continuation_ledger(run_dir)
+            ),
             "draft_source": draft_source,
             "draft_source_detail": draft_source_detail,
             "suggested_page_offset": int(

@@ -8,7 +8,7 @@ export interface ChapterBoundary {
 
 export interface ChapterQualityIssue {
   severity: ChapterQualitySeverity
-  code: 'missing_range' | 'invalid_range' | 'overlap' | 'gap'
+  code: 'missing_range' | 'invalid_range' | 'overlap' | 'gap' | 'unresolved_continuation' | string
   message: string
   chapterIndexes?: number[]
   pages?: number[]

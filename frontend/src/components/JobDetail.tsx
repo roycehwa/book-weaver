@@ -18,7 +18,7 @@ import SourceWorkbench from './SourceWorkbench'
 import TranslationFailures from './TranslationFailures'
 import PdfViewer from './pdf-viewer/PdfViewer'
 import EpubViewer from './epub-viewer/EpubViewer'
-import { validateChapterQuality } from './chapterQuality'
+import { validateChapterQuality, type ChapterQualityIssue } from './chapterQuality'
 import { insertChapterRange } from './insertChapter'
 import { appendixChapterRecommendations, simplifiedChapterIds } from './simplifiedChapters'
 import {
@@ -287,6 +287,7 @@ function JobDetail() {
   const [loadingChapters, setLoadingChapters] = useState(false)
   const [chapterDraftSource, setChapterDraftSource] = useState<string | null>(null)
   const [chapterDraftSourceDetail, setChapterDraftSourceDetail] = useState<string | null>(null)
+  const [confirmationQualityIssues, setConfirmationQualityIssues] = useState<ChapterQualityIssue[]>([])
   const [chapterSectionExpanded, setChapterSectionExpanded] = useState(true)
   const [tocPageStart, setTocPageStart] = useState('')
   const [tocPageEnd, setTocPageEnd] = useState('')
@@ -313,6 +314,13 @@ function JobDetail() {
     setDependencyEvidence(result.content_policy_dependency_evidence ?? [])
     setChapterDraftSource(result.draft_source ?? null)
     setChapterDraftSourceDetail(result.draft_source_detail ?? null)
+    setConfirmationQualityIssues(
+      (result.confirmation_quality_issues ?? []).map((issue) => ({
+        severity: issue.severity === 'error' ? 'error' : 'warning',
+        code: issue.code as ChapterQualityIssue['code'],
+        message: issue.message,
+      })),
+    )
     setTocPageStart(result.toc_page_start != null ? String(result.toc_page_start) : '')
     setTocPageEnd(result.toc_page_end != null ? String(result.toc_page_end) : '')
     const offset = result.page_offset ?? result.suggested_page_offset ?? 0
@@ -859,8 +867,9 @@ function JobDetail() {
     ? chapterEpubPages(selectedChapter, epubPages)
     : []
   const chapterQuality = validateChapterQuality(chapterDraft, totalPdfPages)
-  const qualityErrors = chapterQuality.issues.filter((issue) => issue.severity === 'error')
-  const qualityWarnings = chapterQuality.issues.filter((issue) => issue.severity === 'warning')
+  const combinedQualityIssues = [...chapterQuality.issues, ...confirmationQualityIssues]
+  const qualityErrors = combinedQualityIssues.filter((issue) => issue.severity === 'error')
+  const qualityWarnings = combinedQualityIssues.filter((issue) => issue.severity === 'warning')
   const chapterConfirmLabel = confirmingChapters
     ? '正在确认...'
     : chapterQuality.blocking
@@ -1286,9 +1295,9 @@ function JobDetail() {
                           : '未发现问题'}
                     </span>
                   </div>
-                  {chapterQuality.issues.length > 0 && (
+                  {combinedQualityIssues.length > 0 && (
                     <div className="mt-3 space-y-2">
-                      {chapterQuality.issues.map((issue, index) => (
+                      {combinedQualityIssues.map((issue, index) => (
                         <div
                           key={`${issue.code}-${index}`}
                           className={`rounded-lg border px-3 py-2 text-sm ${

@@ -718,6 +718,15 @@ export interface JobChapterDraftResponse {
   chapters: JobChapterDraft[]
   content_policy_dependency_evidence?: ContentPolicyDependencyEvidence[]
   content_policy_dependencies?: ContentPolicyDependencyFinding[]
+  confirmation_quality_issues?: Array<{
+    severity: 'warning' | 'error'
+    code: string
+    message: string
+    decision_id?: string
+    from_page?: number
+    to_page?: number
+    continuation_status?: string
+  }>
   draft_source?: 'canonical_saved' | 'pdf_toc' | 'pdf_text_toc' | 'book_structure'
   draft_source_detail?: string | null
   suggested_page_offset?: number
@@ -878,7 +887,7 @@ export const uploadApi = {
 }
 
 export interface SourceBlock { id: string; text: string; policy: 'translate' | 'preserve' | 'exclude'; reason: string }
-export interface SourceWorkspace { revision: number; page: number; blocks: SourceBlock[]; available_pages: number[]; can_undo: boolean; issue_groups?: {code: string; count: number; pages: number[]}[]; issues: { block_id: string; code: string; severity: string; status: string }[] }
+export interface SourceWorkspace { revision: number; page: number; blocks: SourceBlock[]; available_pages: number[]; can_undo: boolean; issue_groups?: {code: string; count: number; pages: number[]}[]; issues: { block_id: string; code: string; severity: string; status: string; continuation_decision_id?: string }[]; confirmation_quality_issues?: Array<{ severity: string; code: string; message: string }> }
 
 export const jobsApi = {
   pauseTranslation: (jobId: string) => request<{status: string; detail: string}>(`/jobs/${encodeURIComponent(jobId)}/translation-pause`, { method: 'POST' }),

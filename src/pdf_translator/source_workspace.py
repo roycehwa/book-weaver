@@ -12,6 +12,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from pdf_translator.continuation_decisions import (
+    confirmation_quality_issues_from_ledger,
+    load_continuation_ledger,
+    reconciles_possible_continuation_issue,
+)
+
 
 class SourceConflict(ValueError):
     pass
@@ -92,23 +98,53 @@ def inspect_page(run_dir: Path, pages: dict[int, str], page: int) -> dict:
     if page not in pages:
         raise ValueError('此页暂无可编辑文字；请核对原页，不能自动跳过内容。')
     state = read_source_state(run_dir)
+    ledger = load_continuation_ledger(run_dir)
     blocks = state['pages'].get(str(page), page_blocks(pages[page], page))
-    issues = page_issues(blocks, page, state['revision'])
+    issues = page_issues(blocks, page, state['revision'], ledger=ledger)
     grouped = {}
     for number, text in pages.items():
         current_blocks = state['pages'].get(str(number), page_blocks(text, number))
-        for issue in page_issues(current_blocks, number, state['revision']):
+        for issue in page_issues(current_blocks, number, state['revision'], ledger=ledger):
             if issue['status'] != 'open':
                 continue
             group = grouped.setdefault(issue['code'], {'code': issue['code'], 'count': 0, 'pages': set()})
             group['count'] += 1
             group['pages'].add(number)
-    return {'revision': state['revision'], 'page': page, 'blocks': blocks, 'issues': issues,
-            'issue_groups': [{**group, 'pages': sorted(group['pages'])} for group in grouped.values()],
-            'available_pages': sorted(pages), 'can_undo': any(not entry.get('undone') for entry in state['history'])}
+    return {
+        'revision': state['revision'],
+        'page': page,
+        'blocks': blocks,
+        'issues': issues,
+        'issue_groups': [{**group, 'pages': sorted(group['pages'])} for group in grouped.values()],
+        'available_pages': sorted(pages),
+        'can_undo': any(not entry.get('undone') for entry in state['history']),
+        'confirmation_quality_issues': confirmation_quality_issues_from_ledger(ledger),
+    }
 
 
-def page_issues(blocks: list[dict], page: int, revision: int) -> list[dict]:
+def _issue_status_for_code(
+    code: str,
+    *,
+    block: dict,
+    page: int,
+    ledger: dict[str, Any] | None,
+) -> str:
+    if block.get('reason'):
+        return 'accepted'
+    if code == 'possible_continuation' and ledger:
+        for decision in ledger.get('decisions') or []:
+            if isinstance(decision, dict) and reconciles_possible_continuation_issue(decision, page=page):
+                return 'reconciled'
+    return 'open'
+
+
+def page_issues(
+    blocks: list[dict],
+    page: int,
+    revision: int,
+    *,
+    ledger: dict[str, Any] | None = None,
+) -> list[dict]:
     issues = []
     for block in blocks:
         if block.get('policy') == 'exclude':
@@ -122,9 +158,21 @@ def page_issues(blocks: list[dict], page: int, revision: int) -> list[dict]:
         if re.match(r'^#{1,6} .{100,}', text):
             codes.append('possible_heading_error')
         for code in codes:
-            issues.append({'block_id': block['id'], 'page': page, 'code': code, 'severity': 'warning',
-                           'status': 'accepted' if block.get('reason') else 'open',
-                           'source_revision': revision})
+            status = _issue_status_for_code(code, block=block, page=page, ledger=ledger)
+            issue = {
+                'block_id': block['id'],
+                'page': page,
+                'code': code,
+                'severity': 'warning',
+                'status': status,
+                'source_revision': revision,
+            }
+            if status == 'reconciled' and ledger:
+                for decision in ledger.get('decisions') or []:
+                    if isinstance(decision, dict) and reconciles_possible_continuation_issue(decision, page=page):
+                        issue['continuation_decision_id'] = decision.get('decision_id')
+                        break
+            issues.append(issue)
     return issues
 
 

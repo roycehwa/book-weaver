@@ -255,7 +255,50 @@ def _book_page_footer_is_note_like(text: str) -> bool:
     return False
 
 
-def _is_book_noise_block(block: LayoutBlock) -> bool:
+def _book_page_footer_is_plausible_mislabeled_body(text: str) -> bool:
+    """Unique footer-band text that reads like body prose, not imprint or page furniture."""
+    cleaned = _clean_book_text(text)
+    if len(cleaned) < 24:
+        return False
+    if _book_page_footer_is_running_header(text):
+        return False
+    words = cleaned.split()
+    if len(words) < 5:
+        return False
+    if not re.search(r"[a-z]", cleaned):
+        return False
+    return True
+
+
+def _page_footer_text_counts(blocks: list[LayoutBlock]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for block in blocks:
+        if block.label != "page_footer":
+            continue
+        key = _clean_book_text(block.text)
+        if not key:
+            continue
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def _book_page_footer_treated_as_furniture(block: LayoutBlock) -> bool:
+    if block.label != "page_footer":
+        return False
+    if _book_page_footer_is_note_like(block.text):
+        return True
+    if _book_page_footer_is_running_header(block.text):
+        return True
+    if _book_page_footer_is_plausible_mislabeled_body(block.text):
+        return False
+    return True
+
+
+def _is_book_noise_block(
+    block: LayoutBlock,
+    *,
+    footer_text_counts: dict[str, int] | None = None,
+) -> bool:
     text = _normalize_text(block.text)
     upper = text.upper()
     if not text:
@@ -269,7 +312,10 @@ def _is_book_noise_block(block: LayoutBlock) -> bool:
             return False
         if _book_page_footer_is_running_header(block.text):
             return True
-        if len(_clean_book_text(block.text)) >= 80:
+        cleaned_footer = _clean_book_text(block.text)
+        if footer_text_counts and cleaned_footer and footer_text_counts.get(cleaned_footer, 0) >= 2:
+            return True
+        if _book_page_footer_is_plausible_mislabeled_body(block.text):
             return False
         return True
     if re.fullmatch(r"\d+", text):
@@ -402,10 +448,13 @@ def _ordered_page_blocks(
     excluded_block_ids: set[str] | None = None,
 ) -> dict[int, list[LayoutBlock]]:
     excluded = excluded_block_ids or set()
+    extracted = _extract_text_blocks(structured)
+    footer_text_counts = _page_footer_text_counts(extracted)
     blocks = [
         block
-        for block in _extract_text_blocks(structured)
-        if _layout_block_id(block) not in excluded and not _is_book_noise_block(block)
+        for block in extracted
+        if _layout_block_id(block) not in excluded
+        and not _is_book_noise_block(block, footer_text_counts=footer_text_counts)
     ]
     repaired_blocks = _repair_bylines(blocks)
 
@@ -876,7 +925,11 @@ def _page_content_items(
             left=block.left,
             top=block.top,
             bottom=block.bottom,
-            from_page_footer=block.label in {"footnote", "page_footer"},
+            from_page_footer=block.label == "footnote"
+            or (
+                block.label == "page_footer"
+                and _book_page_footer_treated_as_furniture(block)
+            ),
             right=block.right,
             source_label=str(block.label or "text"),
             source_node_id=block.source_node_id,

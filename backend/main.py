@@ -348,6 +348,7 @@ class JobChapterDraftResponse(BaseModel):
     chapters: List[dict[str, Any]]
     content_policy_dependency_evidence: List[dict[str, Any]] = Field(default_factory=list)
     content_policy_dependencies: List[dict[str, Any]] = Field(default_factory=list)
+    confirmation_quality_issues: List[dict[str, Any]] = Field(default_factory=list)
     draft_source: str = "book_structure"
     draft_source_detail: Optional[str] = None
     suggested_page_offset: int = 0
