@@ -738,6 +738,49 @@ def test_book_rebuild_adds_pdf_cover_chapter(monkeypatch, tmp_path) -> None:
     assert any(asset["kind"] == "cover" for asset in result["assets"])
 
 
+def test_book_rebuild_dedupes_outline_cover_with_rendered_pdf_cover(monkeypatch, tmp_path) -> None:
+    cover = tmp_path / "cover.png"
+    cover.write_bytes(b"png")
+    monkeypatch.setattr(book_rebuild, "_render_pdf_cover_page", lambda source_pdf, images_dir: cover)
+    monkeypatch.setattr(book_rebuild, "_crop_pdf_regions", lambda *args, **kwargs: {})
+    monkeypatch.setattr(
+        book_rebuild,
+        "_extract_pdf_outline_chapters",
+        lambda source_pdf, total_pages: [
+            {"title": "Cover", "page_no": 1, "depth": 0},
+            {"title": "Chapter 1", "page_no": 2, "depth": 0},
+        ],
+    )
+    structured = {
+        "body": {"children": [{"$ref": "#/texts/0"}, {"$ref": "#/texts/1"}]},
+        "texts": [
+            {"label": "text", "text": "Cover image only", "prov": _prov(1, 40, 400)},
+            {
+                "label": "text",
+                "text": "Chapter one body must remain after canonical cover dedupe.",
+                "prov": _prov(2, 40, 620),
+            },
+        ],
+        "pictures": [],
+        "tables": [],
+    }
+
+    result = build_book_reconstruction(structured, source_pdf=tmp_path / "book.pdf", images_dir=tmp_path)
+    from pdf_translator.page_integrity import build_page_ledger
+
+    cover_chapters = [chapter for chapter in result["chapters"] if chapter.get("cover")]
+    assert len(cover_chapters) == 1
+    assert cover_chapters[0]["title"] == "Cover"
+    assert cover_chapters[0]["source_pages"] == [1]
+    assert any(chapter["title"] == "Chapter 1" for chapter in result["chapters"])
+    ledger = build_page_ledger(result)
+    chapter_id_by_title = {chapter["title"]: chapter["chapter_id"] for chapter in result["chapters"]}
+    page_owners = {entry["page_no"]: entry["chapter_id"] for entry in ledger["pages"]}
+    assert page_owners[1] == chapter_id_by_title["Cover"]
+    assert page_owners[2] == chapter_id_by_title["Chapter 1"]
+    assert ledger["summary"]["required_coverage_ratio"] == 1
+
+
 def test_book_rebuild_runs_layout_fallback_when_only_cover_exists(monkeypatch, tmp_path) -> None:
     cover = tmp_path / "cover.png"
     table = tmp_path / "table-p0002-01.png"

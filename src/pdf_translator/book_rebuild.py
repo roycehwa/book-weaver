@@ -1525,12 +1525,69 @@ def _is_cover_chapter_title(title: str) -> bool:
     normalized = re.sub(r"[^a-z0-9]+", " ", str(title or "").lower()).strip()
     return normalized in {
         "cover",
+        "cover page",
         "half title",
         "title page",
         "title pages",
         "front matter",
         "frontmatter",
     }
+
+
+def _outline_entry_is_redundant_pdf_cover(entry: dict[str, Any]) -> bool:
+    try:
+        start_page = int(entry.get("page_no") or 0)
+    except (TypeError, ValueError):
+        return False
+    if start_page != 1:
+        return False
+    return _is_cover_chapter_title(str(entry.get("title") or ""))
+
+
+def _distinct_readable_text_from_page(page: dict[str, Any] | None, *, chapter_title: str) -> str:
+    if not isinstance(page, dict):
+        return ""
+    page_markdown = {
+        int(page["page_no"]): "\n".join(str(line) for line in page.get("content_lines") or [] if str(line).strip())
+    }
+    if _translatable_page_text_chars(page_markdown, int(page["page_no"])) < 1:
+        return ""
+    title_norm = re.sub(r"[^a-z0-9]+", " ", chapter_title.casefold()).strip()
+    kept_lines: list[str] = []
+    for line in page.get("content_lines") or []:
+        text = str(line).strip()
+        if not text:
+            continue
+        line_norm = re.sub(r"[^a-z0-9]+", " ", text.casefold()).strip()
+        if line_norm in {title_norm, "cover", "cover page"}:
+            continue
+        if _translatable_page_text_chars({int(page["page_no"]): text}, int(page["page_no"])) < 1:
+            continue
+        kept_lines.append(text)
+    return "\n\n".join(kept_lines).strip()
+
+
+def _partition_pdf_outline_for_canonical_cover(
+    outline_entries: list[dict[str, Any]],
+    pages_by_no: dict[int, dict[str, Any]],
+    *,
+    cover_path: Path | None,
+) -> tuple[list[dict[str, Any]], str]:
+    if cover_path is None or not outline_entries:
+        return outline_entries, ""
+    filtered: list[dict[str, Any]] = []
+    supplements: list[str] = []
+    for entry in outline_entries:
+        if _outline_entry_is_redundant_pdf_cover(entry):
+            supplement = _distinct_readable_text_from_page(
+                pages_by_no.get(1),
+                chapter_title=str(entry.get("title") or "Cover"),
+            )
+            if supplement:
+                supplements.append(supplement)
+            continue
+        filtered.append(entry)
+    return filtered, "\n\n".join(supplements).strip()
 
 
 def _is_title_pages_chapter_title(title: str) -> bool:
@@ -2231,10 +2288,18 @@ def _preserved_resource_title(page: dict[str, Any]) -> str:
     return title
 
 
-def _build_cover_chapter(cover_path: Path | None) -> dict[str, Any] | None:
+def _build_cover_chapter(
+    cover_path: Path | None,
+    *,
+    supplement_markdown: str = "",
+) -> dict[str, Any] | None:
     if cover_path is None:
         return None
     markdown = f"![Cover]({cover_path.as_posix()})\n"
+    supplement = str(supplement_markdown or "").strip()
+    if supplement:
+        markdown = markdown.rstrip() + "\n\n" + supplement + "\n"
+    trace_body = markdown
     return {
         "index": 0,
         "title": "Cover",
@@ -2242,7 +2307,7 @@ def _build_cover_chapter(cover_path: Path | None) -> dict[str, Any] | None:
         "page_end": 1,
         "source_pages": [1],
         "markdown": markdown,
-        "trace_markdown": "[[page: 1]]\n\n" + markdown,
+        "trace_markdown": "[[page: 1]]\n\n" + trace_body,
         "translate": False,
         "preserve_original": True,
         "resource_only": True,
@@ -2587,13 +2652,19 @@ def build_book_reconstruction(
         structured=structured,
     )
 
+    pages_by_no = {int(page["page_no"]): page for page in pages}
     outline_entries = _extract_pdf_outline_chapters(source_pdf, total_pages=total_pages)
+    outline_entries, cover_page_supplement = _partition_pdf_outline_for_canonical_cover(
+        outline_entries,
+        pages_by_no,
+        cover_path=cover_path,
+    )
     chapters: list[dict[str, Any]] = _chapter_pages_from_outline(
         pages,
         outline_entries,
         logical_continuations=logical_continuations,
     )
-    cover_chapter = _build_cover_chapter(cover_path)
+    cover_chapter = _build_cover_chapter(cover_path, supplement_markdown=cover_page_supplement)
     if cover_chapter is not None:
         chapters.insert(0, cover_chapter)
     current_pages: list[dict[str, Any]] = []
