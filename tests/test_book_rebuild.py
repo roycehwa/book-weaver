@@ -63,6 +63,43 @@ def test_same_source_node_crossing_pdf_pages_is_one_logical_paragraph() -> None:
     assert "[[page: 2]]" in canonical["chapters"][0]["trace_markdown"]
 
 
+def test_confirmed_contents_keeps_structural_kind_and_rebuilds_when_translated() -> None:
+    book = {
+        "chapters": [
+            {
+                "title": "Contents",
+                "kind": "toc",
+                "source_pages": [1],
+                "markdown": "Chapter One .... 1",
+                "trace_markdown": "[[page: 1]]\n\nChapter One .... 1",
+            }
+        ],
+        "pages": [{"page_no": 1, "page_kind": "toc", "has_content": True}],
+    }
+
+    result = apply_canonical_chapter_plan(
+        book,
+        {
+            "source_artifact": "user_confirmation",
+            "chapters": [
+                {
+                    "title": "Contents",
+                    "kind": "toc",
+                    "page_start": 1,
+                    "page_end": 1,
+                    "source_pages": [1],
+                    "content_policy": "translate",
+                }
+            ],
+        },
+    )
+
+    chapter = result["chapters"][0]
+    assert chapter["kind"] == "toc"
+    assert chapter["rebuild_toc"] is True
+    assert chapter["translate"] is True
+
+
 def test_different_source_nodes_on_adjacent_pdf_pages_remain_separate() -> None:
     structured = {
         "body": {"children": [{"$ref": "#/texts/0"}, {"$ref": "#/texts/1"}]},

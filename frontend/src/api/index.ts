@@ -700,6 +700,7 @@ export interface JobChapterDraft {
   index: number
   chapter_id: string
   title: string
+  kind?: string
   page_start?: number | null
   page_end?: number | null
   source_pages?: number[]

@@ -841,6 +841,12 @@ def _render_review_export(
         reviewed_chapters,
         book,
     )
+    from pdf_translator.book_views import rebuild_delivery_toc_chapters
+
+    delivery_chapters = rebuild_delivery_toc_chapters(
+        delivery_chapters,
+        target_language=target_language,
+    )
     delivery_markdown_parts: list[str] = []
     for chapter in delivery_chapters:
         body = strip_fail_open_notices(str(chapter.get("markdown") or "")).strip()

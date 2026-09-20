@@ -63,6 +63,30 @@ afterEach(() => {
 })
 
 describe('JobDetail Notes dependency acknowledgement', () => {
+  it('explains that translating a contents chapter rebuilds the target TOC', async () => {
+    vi.spyOn(jobsApi, 'get').mockResolvedValue(job)
+    vi.spyOn(jobsApi, 'sourceInfo').mockResolvedValue({
+      job_id: 'job-1', filename: 'synthetic.epub', size: 10, kind: 'other', download_url: '/source',
+    })
+    vi.spyOn(jobsApi, 'getChapterDraft').mockResolvedValue({
+      job_id: 'job-1',
+      chapters: [
+        { index: 1, chapter_id: 'contents', title: 'Contents', kind: 'toc', content_policy: 'translate' },
+      ],
+    })
+    vi.spyOn(workspaceApi, 'listBooks').mockResolvedValue({ total_books: 1, books: [workspaceBook] })
+
+    render(
+      <MemoryRouter initialEntries={['/jobs/job-1']}>
+        <Routes><Route path="/jobs/:id" element={<JobDetail />} /></Routes>
+      </MemoryRouter>,
+    )
+
+    const policy = await screen.findByRole('combobox', { name: '第 1 章处理方式' })
+    expect(policy).toHaveDisplayValue('重建译文目录')
+    expect(screen.getByText('将按最终译文章节名生成整洁目录，不翻译原目录的点线和页码。')).toBeInTheDocument()
+  })
+
   it('warns on exclusion and submits exact server dependency IDs only after acknowledgement', async () => {
     vi.spyOn(jobsApi, 'get').mockResolvedValue(job)
     vi.spyOn(jobsApi, 'sourceInfo').mockResolvedValue({

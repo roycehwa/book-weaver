@@ -870,6 +870,56 @@ def test_translated_segments_to_chapters_preserves_chapter_metadata() -> None:
     assert chapters[1]["chapter_id"] == "ch-002-body"
 
 
+def test_review_delivery_keeps_target_title_and_rebuilds_contents() -> None:
+    from pdf_translator.book_views import rebuild_delivery_toc_chapters
+
+    chapters = translated_segments_to_chapters(
+        [
+            {
+                "segment_id": "contents:seg0001",
+                "chapter_id": "contents",
+                "chapter_index": 1,
+                "chapter_title": "Contents",
+                "chapter_kind": "toc",
+                "block_index": 1,
+                "translated_text": "Chapter One .... 1",
+                "role": "prose",
+                "is_chapter_title": False,
+                "rebuild_toc": True,
+            },
+            {
+                "segment_id": "chapter-one:seg0001",
+                "chapter_id": "chapter-one",
+                "chapter_index": 2,
+                "chapter_title": "Chapter One",
+                "chapter_kind": "narrative",
+                "block_index": 1,
+                "translated_text": "## 第一章",
+                "role": "heading",
+                "is_chapter_title": True,
+            },
+            {
+                "segment_id": "chapter-one:seg0002",
+                "chapter_id": "chapter-one",
+                "chapter_index": 2,
+                "chapter_title": "Chapter One",
+                "chapter_kind": "narrative",
+                "block_index": 2,
+                "translated_text": "正文。",
+                "role": "prose",
+                "is_chapter_title": False,
+            },
+        ]
+    )
+    chapters[0]["toc"] = False
+    rebuilt = rebuild_delivery_toc_chapters(chapters, target_language="zh-CN")
+
+    assert rebuilt[0]["markdown"] == "# 目录\n\n- 第一章\n"
+    assert rebuilt[1]["title"] == "第一章"
+    assert rebuilt[1]["source_title"] == "Chapter One"
+    assert rebuilt[1]["markdown"] == "# 第一章\n\n正文。\n"
+
+
 def test_merge_reviewed_chapters_adds_only_uncovered_resources() -> None:
     reviewed = [
         {

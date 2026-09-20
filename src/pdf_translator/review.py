@@ -7,7 +7,11 @@ import re
 from pathlib import Path
 from typing import Any
 
-from pdf_translator.book_views import ensure_chapter_top_heading
+from pdf_translator.book_views import (
+    ensure_chapter_top_heading,
+    pop_leading_markdown_heading,
+    resolve_translated_chapter_heading,
+)
 from pdf_translator.glossary import (
     apply_glossary_source_substitutions,
     glossary_terms_missing_in_translation,
@@ -275,6 +279,10 @@ def build_aligned_review_segments(
                     "source_internal_path": segment.get("source_internal_path"),
                 },
                 "translate": translate,
+                "role": str(segment.get("role") or "prose"),
+                "is_chapter_title": bool(segment.get("is_chapter_title")),
+                "chapter_kind": str(segment.get("chapter_kind") or ""),
+                "rebuild_toc": bool(segment.get("rebuild_toc")),
                 "separator_before": segment.get("separator_before", "\n\n"),
             }
             if chunk_terms:
@@ -1418,28 +1426,18 @@ def _rewrite_review_requests(
 
 
 def translated_segments_to_markdown(translated_segments_payload: Any) -> str:
-    segments = _payload_segments(translated_segments_payload)
-    grouped: dict[tuple[int, str, str], list[dict[str, Any]]] = defaultdict(list)
-    for segment in segments:
-        key = (
-            int(segment.get("chapter_index") or 0),
-            str(segment.get("chapter_id") or ""),
-            str(segment.get("chapter_title") or "Chapter"),
-        )
-        grouped[key].append(segment)
-
-    chapter_parts: list[str] = []
-    for (_, _, title), chapter_segments in sorted(grouped.items(), key=lambda item: item[0]):
-        body = "\n\n".join(
-            str(segment.get("translated_text") or "").strip()
-            for segment in sorted(chapter_segments, key=lambda item: int(item.get("block_index") or 0))
-            if str(segment.get("translated_text") or "").strip()
+    chapters = translated_segments_to_chapters(translated_segments_payload)
+    return (
+        "\n\n".join(
+            ensure_chapter_top_heading(
+                str(chapter.get("markdown") or ""),
+                str(chapter.get("title") or "Chapter"),
+            ).strip()
+            for chapter in chapters
+            if str(chapter.get("markdown") or "").strip()
         ).strip()
-        if title and not re.match(r"^#\s+\S", body):
-            chapter_parts.append(ensure_chapter_top_heading(body, title).strip())
-        else:
-            chapter_parts.append(body)
-    return "\n\n".join(part for part in chapter_parts if part).strip() + "\n"
+        + "\n"
+    )
 
 
 def translated_segments_to_chapters(translated_segments_payload: Any) -> list[dict[str, Any]]:
@@ -1456,11 +1454,34 @@ def translated_segments_to_chapters(translated_segments_payload: Any) -> list[di
     chapters: list[dict[str, Any]] = []
     for (chapter_index, chapter_id, title), chapter_segments in sorted(grouped.items(), key=lambda item: item[0]):
         ordered = sorted(chapter_segments, key=lambda item: int(item.get("block_index") or 0))
+        translated_parts = [str(segment.get("translated_text") or "") for segment in ordered]
+        source_title = title
+        display_title = source_title
+        translated_heading_evidence = False
+        for position, segment in enumerate(ordered):
+            if segment.get("is_chapter_title") is not True:
+                continue
+            translated_title, remainder = pop_leading_markdown_heading(
+                translated_parts[position]
+            )
+            if translated_title:
+                display_title = translated_title
+                translated_parts[position] = remainder
+                translated_heading_evidence = True
+            break
         markdown = join_chunk_texts(
-            [str(segment.get("translated_text") or "") for segment in ordered],
+            translated_parts,
             [str(segment.get("separator_before", "\n\n")) for segment in ordered],
         ).strip()
         first = chapter_segments[0] if chapter_segments else {}
+        if translated_heading_evidence:
+            display_title, markdown = resolve_translated_chapter_heading(
+                markdown,
+                display_title,
+                translated_heading_evidence=False,
+            )
+        elif markdown:
+            markdown += "\n"
         pages = sorted({
             int(page)
             for segment in chapter_segments
@@ -1470,13 +1491,16 @@ def translated_segments_to_chapters(translated_segments_payload: Any) -> list[di
             {
                 "index": chapter_index,
                 "chapter_id": chapter_id or None,
-                "title": title,
+                "title": display_title,
+                "source_title": source_title,
                 "page_start": min(pages) if pages else (first.get("source_location") or {}).get("page_start"),
                 "page_end": max(pages) if pages else (first.get("source_location") or {}).get("page_end"),
                 "source_pages": pages,
                 "source_internal_path": (first.get("source_location") or {}).get("source_internal_path"),
-                "markdown": markdown + "\n" if markdown else "",
+                "markdown": markdown,
                 "toc": True,
+                "kind": str(first.get("chapter_kind") or "") or None,
+                "rebuild_toc": bool(first.get("rebuild_toc")),
             }
         )
     return chapters
@@ -1505,7 +1529,7 @@ def merge_reviewed_chapters_with_resources(
     for chapter in reviewed_chapters:
         source = source_by_id.get(chapter.get("chapter_id"))
         if source:
-            for key in ("preserve_original", "resource_only", "toc"):
+            for key in ("preserve_original", "resource_only", "toc", "kind", "rebuild_toc"):
                 if key in source:
                     chapter[key] = source[key]
     covered_pages = {
@@ -1564,7 +1588,15 @@ def restore_review_chapter_apparatus(
         if not isinstance(base, dict):
             restored.append(merged)
             continue
-        for key in ("source_internal_path", "toc", "preserve_original", "resource_only"):
+        for key in (
+            "source_internal_path",
+            "toc",
+            "preserve_original",
+            "resource_only",
+            "source_title",
+            "kind",
+            "rebuild_toc",
+        ):
             if key in base:
                 merged[key] = base[key]
         reviewed_markdown = str(merged.get("markdown") or "").rstrip()

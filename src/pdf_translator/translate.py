@@ -19,7 +19,13 @@ from typing import Protocol
 from openai import OpenAI
 import requests
 
-from pdf_translator.book_views import ensure_chapter_top_heading, join_chapter_delivery_markdown
+from pdf_translator.book_views import (
+    ensure_chapter_top_heading,
+    join_chapter_delivery_markdown,
+    pop_leading_markdown_heading,
+    rebuild_delivery_toc_chapters,
+    resolve_translated_chapter_heading,
+)
 from pdf_translator.chunking import split_markdown_into_chunks, join_chunk_texts, markdown_block_structure, untranslated_prose_blocks, markdown_source_blocks
 from pdf_translator.segment_conservation import (
     translatable_segment_ids,
@@ -2307,6 +2313,29 @@ def estimate_chapter_segment_translation_chunk_count(
     )
 
 
+def _chapter_title_key(value: str) -> str:
+    return re.sub(r"[^\w\u4e00-\u9fff]+", "", str(value or "").casefold())
+
+
+def _segment_is_chapter_title_heading(segment: dict, source_title: str) -> bool:
+    if segment.get("is_chapter_title") is True:
+        return True
+    if str(segment.get("role") or "") != "heading":
+        return False
+    heading, _ = pop_leading_markdown_heading(str(segment.get("markdown") or ""))
+    if not heading:
+        return False
+    heading_key = _chapter_title_key(heading)
+    source_key = _chapter_title_key(source_title)
+    if not heading_key or not source_key:
+        return False
+    return (
+        heading_key == source_key
+        or (min(len(heading_key), len(source_key)) >= 6 and heading_key in source_key)
+        or (min(len(heading_key), len(source_key)) >= 6 and source_key in heading_key)
+    )
+
+
 def translate_book_chapters(
     *,
     book: dict,
@@ -2339,8 +2368,12 @@ def translate_book_chapters(
             chapter["kind"] = classify_chapter(chapter, pages=pages)
         chapter_source_markdown = _chapter_markdown_for_translation(chapter)
         chapter_id = str(chapter.get("chapter_id") or chapter.get("id") or f"chapter-{fallback_index:03d}")
+        source_title = str(chapter.get("title") or f"Chapter {fallback_index}")
+        chapter_kind = str(chapter.get("kind") or classify_chapter(chapter, pages=pages))
         if not should_translate_chapter(chapter):
-            translated_markdown = chapter_source_markdown.strip()
+            translated_markdown = (
+                "" if chapter.get("rebuild_toc") else chapter_source_markdown.strip()
+            )
             if translated_markdown:
                 translated_markdown += "\n"
                 translated_markdown_parts.append(translated_markdown.strip())
@@ -2349,13 +2382,16 @@ def translate_book_chapters(
                 TranslatedChapter(
                     index=int(chapter.get("index", len(translated_chapters) + 1)),
                     chapter_id=chapter_id,
-                    title=str(chapter.get("title") or f"Chapter {len(translated_chapters) + 1}"),
+                    title=source_title,
                     page_start=chapter.get("page_start"),
                     page_end=chapter.get("page_end"),
                     source_pages=[int(page_no) for page_no in chapter.get("source_pages", [])],
                     markdown=translated_markdown,
                     source_internal_path=sip if isinstance(sip, str) else None,
                     toc=bool(chapter.get("toc", True)),
+                    source_title=source_title,
+                    kind=chapter_kind,
+                    rebuild_toc=bool(chapter.get("rebuild_toc")),
                 )
             )
             continue
@@ -2363,7 +2399,12 @@ def translate_book_chapters(
         translated_parts: list[str] = []
         chapter_jobs: list[tuple[int, TranslationChunk, dict, str]] = []
         planned_segments = segments_by_chapter.get(chapter_id or "")
-        for planned_segment in planned_segments or []:
+        nonempty_planned_segments = [
+            segment
+            for segment in planned_segments or []
+            if str(segment.get("markdown") or "").strip()
+        ]
+        for planned_segment in nonempty_planned_segments:
             segment_markdown = str(planned_segment.get("markdown") or "").strip()
             if not segment_markdown:
                 continue
@@ -2473,7 +2514,30 @@ def translate_book_chapters(
                     future.cancel()
                 raise
 
-        translated_markdown = join_chunk_texts(translated_parts, [str(part.get("separator_before", "\n\n")) for part in planned_segments or [] if str(part.get("markdown") or "").strip()]).strip()
+        display_title = source_title
+        translated_heading_evidence = False
+        for position, planned_segment in enumerate(nonempty_planned_segments):
+            if not _segment_is_chapter_title_heading(planned_segment, source_title):
+                continue
+            translated_title, remainder = pop_leading_markdown_heading(
+                translated_parts[position]
+            )
+            if translated_title:
+                display_title = translated_title
+                translated_parts[position] = remainder
+                translated_heading_evidence = True
+            break
+
+        translated_markdown = join_chunk_texts(
+            translated_parts,
+            [str(part.get("separator_before", "\n\n")) for part in nonempty_planned_segments],
+        ).strip()
+        if translated_heading_evidence:
+            display_title, translated_markdown = resolve_translated_chapter_heading(
+                translated_markdown,
+                display_title,
+                translated_heading_evidence=False,
+            )
         if translated_markdown:
             translated_markdown += "\n"
             translated_markdown_parts.append(translated_markdown.strip())
@@ -2483,13 +2547,16 @@ def translate_book_chapters(
             TranslatedChapter(
                 index=int(chapter.get("index", len(translated_chapters) + 1)),
                 chapter_id=chapter_id,
-                title=str(chapter.get("title") or f"Chapter {len(translated_chapters) + 1}"),
+                title=display_title,
                 page_start=chapter.get("page_start"),
                 page_end=chapter.get("page_end"),
                 source_pages=[int(page_no) for page_no in chapter.get("source_pages", [])],
                 markdown=translated_markdown,
                 source_internal_path=sip if isinstance(sip, str) else None,
                 toc=bool(chapter.get("toc", True)),
+                source_title=source_title,
+                kind=chapter_kind,
+                rebuild_toc=bool(chapter.get("rebuild_toc")),
             )
         )
 
@@ -2693,11 +2760,18 @@ def translate_book_chapters(
     delivery_chapters: list[TranslatedChapter] = []
     for chapter in translated_chapters:
         markdown = str(chapter.markdown or "").strip()
-        if markdown and chapter.toc:
+        if chapter.toc and (markdown or chapter.title):
             markdown = ensure_chapter_top_heading(markdown, chapter.title).strip()
         if markdown:
             markdown += "\n"
         delivery_chapters.append(replace(chapter, markdown=markdown))
+    delivery_chapters = [
+        TranslatedChapter(**payload)
+        for payload in rebuild_delivery_toc_chapters(
+            [asdict(chapter) for chapter in delivery_chapters],
+            target_language=settings.target_language,
+        )
+    ]
 
     conservation_failures = verify_segment_processing_order(
         expected_ids=translatable_segment_ids(segment_plan),
@@ -2759,6 +2833,8 @@ def render_translation_quality_source(book: dict) -> str:
                 "title": str(chapter.get("title") or f"Chapter {fallback_index}"),
                 "markdown": markdown,
                 "toc": bool(chapter.get("toc", True)),
+                "rebuild_toc": bool(chapter.get("rebuild_toc")),
             }
         )
+    delivery = rebuild_delivery_toc_chapters(delivery, target_language="en")
     return join_chapter_delivery_markdown(delivery)

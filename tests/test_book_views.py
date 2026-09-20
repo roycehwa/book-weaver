@@ -214,6 +214,36 @@ def test_join_chapter_delivery_markdown_adds_chapter_headings() -> None:
     assert "# Chapter 2\n\n更多。" in joined
 
 
+def test_resolve_translated_chapter_heading_promotes_target_title_once() -> None:
+    from pdf_translator.book_views import resolve_translated_chapter_heading
+
+    title, markdown = resolve_translated_chapter_heading(
+        "## 第一章：开端\n\n正文。",
+        "Chapter One: Beginnings",
+        translated_heading_evidence=True,
+    )
+
+    assert title == "第一章：开端"
+    assert markdown == "# 第一章：开端\n\n正文。\n"
+    assert "Chapter One" not in markdown
+
+
+def test_rebuild_delivery_toc_uses_final_display_titles() -> None:
+    from pdf_translator.book_views import rebuild_delivery_toc_chapters
+
+    chapters = rebuild_delivery_toc_chapters(
+        [
+            {"title": "Contents", "markdown": "", "toc": False, "rebuild_toc": True},
+            {"title": "第一章", "markdown": "# 第一章\n\n正文。", "toc": True},
+            {"title": "第二章", "markdown": "# 第二章\n\n正文。", "toc": True},
+        ],
+        target_language="zh-CN",
+    )
+
+    assert chapters[0]["title"] == "目录"
+    assert chapters[0]["markdown"] == "# 目录\n\n- 第一章\n- 第二章\n"
+
+
 def test_sanitize_cover_chapter_markdown_keeps_single_cover_image() -> None:
     from pdf_translator.book_views import sanitize_cover_chapter_markdown
 

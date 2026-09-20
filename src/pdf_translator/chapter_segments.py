@@ -11,6 +11,25 @@ SCHEMA = "bookweaver_chapter_segments_v1"
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 
 
+def _title_key(value: str) -> str:
+    return re.sub(r"[^\w\u4e00-\u9fff]+", "", str(value or "").casefold())
+
+
+def _is_chapter_title_heading(markdown: str, chapter_title: str) -> bool:
+    heading = _heading(markdown)
+    if heading is None:
+        return False
+    heading_key = _title_key(heading[1])
+    title_key = _title_key(chapter_title)
+    if not heading_key or not title_key:
+        return False
+    return (
+        heading_key == title_key
+        or (min(len(heading_key), len(title_key)) >= 6 and heading_key in title_key)
+        or (min(len(heading_key), len(title_key)) >= 6 and title_key in heading_key)
+    )
+
+
 def build_chapter_segments_from_reading_units(
     reading_units: dict[str, Any],
     *,
@@ -79,6 +98,7 @@ def build_chapter_segments_from_reading_units(
             "chapter_index": int(first.get("chapter_index") or meta.get("index") or 0),
             "chapter_title": str(meta.get("title") or chapter_id),
             "chapter_kind": str(meta.get("kind") or "narrative"),
+            "rebuild_toc": bool(meta.get("rebuild_toc")),
             "segment_index": len(segments),
             "segment_index_in_chapter": sequence,
             "section_title": section_title,
@@ -90,6 +110,10 @@ def build_chapter_segments_from_reading_units(
             "separator_before": separator_before,
             "preserve_block_structure": True,
             "role": role,
+            "is_chapter_title": role == "heading" and _is_chapter_title_heading(
+                markdown,
+                str(meta.get("title") or chapter_id),
+            ),
             "translate": translate,
             "knowledge_eligible": translate,
             "unit_ids": [str(unit["unit_id"]) for unit in units],
@@ -186,6 +210,7 @@ def build_chapter_segments(book: dict[str, Any], *, max_chars: int) -> dict[str,
                         "chapter_index": int(chapter.get("index") or fallback_index),
                         "chapter_title": chapter_title,
                         "chapter_kind": str(chapter.get("kind") or "narrative"),
+                        "rebuild_toc": bool(chapter.get("rebuild_toc")),
                         "segment_index": len(segments),
                         "segment_index_in_chapter": segment_in_chapter,
                         "section_title": section_title,
@@ -201,6 +226,10 @@ def build_chapter_segments(book: dict[str, Any], *, max_chars: int) -> dict[str,
                         "separator_before": separator_before,
                         "preserve_block_structure": True,
                         "role": role,
+                        "is_chapter_title": role == "heading" and _is_chapter_title_heading(
+                            part,
+                            chapter_title,
+                        ),
                         "translate": chapter_translate and not media,
                         "knowledge_eligible": chapter_translate and not media,
                     }

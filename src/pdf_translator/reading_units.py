@@ -536,6 +536,7 @@ def build_reading_units(
             "index": chapter_index,
             "title": chapter_title,
             "kind": chapter_kind,
+            "rebuild_toc": bool(chapter.get("rebuild_toc")),
             "policy": policy,
             "policy_confirmed": bool(chapter.get("translation_policy_confirmed")),
             "unit_ids": unit_ids,

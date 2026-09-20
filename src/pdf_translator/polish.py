@@ -15,6 +15,7 @@ from typing import Any, Literal
 import requests
 
 from pdf_translator.chunking import markdown_block_structure
+from pdf_translator.book_views import pop_leading_markdown_heading
 from pdf_translator.epub import render_epub_from_book
 from pdf_translator.models import TranslationChunk
 from pdf_translator.pipeline import safe_delivery_file_stem
@@ -1031,6 +1032,9 @@ def _load_translated_chapter_payloads(run_dir: Path, book: dict[str, Any], targe
             "source_pages": chapter.source_pages,
             "source_internal_path": chapter.source_internal_path,
             "toc": chapter.toc,
+            "source_title": chapter.source_title,
+            "kind": chapter.kind,
+            "rebuild_toc": chapter.rebuild_toc,
         }
         for chapter in translated.translated_chapters
     ]
@@ -1059,7 +1063,14 @@ def _apply_polish_replacements_to_chapters(
             replacement = replacements.get(line.strip())
             lines.append(f"{leading}{replacement}{trailing}" if replacement is not None else line)
         markdown = "\n".join(lines).strip()
-        patched.append({**chapter, "markdown": markdown + "\n" if markdown else ""})
+        display_title, _ = pop_leading_markdown_heading(markdown)
+        patched.append(
+            {
+                **chapter,
+                "title": display_title or chapter.get("title"),
+                "markdown": markdown + "\n" if markdown else "",
+            }
+        )
     return patched
 
 

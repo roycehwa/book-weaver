@@ -1816,6 +1816,107 @@ def test_translate_book_chapters_keeps_preserved_original_without_model_call(tmp
     assert "Chapter 1 .... 10" in result.translated_markdown
 
 
+def test_translate_book_chapters_uses_translated_heading_for_title_and_rebuilds_toc(
+    tmp_path: Path,
+) -> None:
+    class TitleTranslator(BaseTranslator):
+        name = "title-translator"
+
+        def translate_chunk(
+            self,
+            chunk: TranslationChunk,
+            source_language: str | None,
+            target_language: str,
+        ) -> str:
+            return {
+                "# Chapter One": "## 第一章",
+                "Body text.": "正文。",
+            }[chunk.markdown]
+
+    settings = RunSettings(
+        source_pdf=tmp_path / "source.epub",
+        output_dir=tmp_path,
+        target_language="zh-CN",
+        source_language="en",
+        translator="mock",
+        max_chunk_chars=1000,
+    )
+    book = {
+        "chapters": [
+            {
+                "index": 1,
+                "chapter_id": "contents",
+                "title": "Contents",
+                "kind": "toc",
+                "markdown": "Chapter One .... 1",
+                "translate": True,
+                "translation_policy_confirmed": True,
+                "rebuild_toc": True,
+                "toc": False,
+            },
+            {
+                "index": 2,
+                "chapter_id": "chapter-one",
+                "title": "Chapter One",
+                "kind": "narrative",
+                "markdown": "# Chapter One\n\nBody text.",
+                "translate": True,
+                "translation_policy_confirmed": True,
+                "toc": True,
+            },
+        ],
+        "chapter_segments": [
+            {
+                "segment_id": "chapter-one:seg0001",
+                "chapter_id": "chapter-one",
+                "chapter_index": 2,
+                "chapter_title": "Chapter One",
+                "chapter_kind": "narrative",
+                "segment_index_in_chapter": 1,
+                "markdown": "# Chapter One",
+                "separator_before": "\n\n",
+                "role": "heading",
+                "translate": True,
+            },
+            {
+                "segment_id": "chapter-one:seg0002",
+                "chapter_id": "chapter-one",
+                "chapter_index": 2,
+                "chapter_title": "Chapter One",
+                "chapter_kind": "narrative",
+                "segment_index_in_chapter": 2,
+                "markdown": "Body text.",
+                "separator_before": "\n\n",
+                "role": "prose",
+                "translate": True,
+            },
+        ],
+    }
+
+    result = translate_book_chapters(
+        book=book,
+        settings=settings,
+        translator=TitleTranslator(),
+        cache_dir=tmp_path / "cache",
+    )
+
+    assert result.translated_chapters[0].title == "目录"
+    assert result.translated_chapters[0].markdown == "# 目录\n\n- 第一章\n"
+    assert result.translated_chapters[1].title == "第一章"
+    assert result.translated_chapters[1].source_title == "Chapter One"
+    assert result.translated_chapters[1].markdown == "# 第一章\n\n正文。\n"
+    assert "# Chapter One" not in result.translated_markdown
+
+    from pdf_translator.chunking import markdown_block_structure
+    from pdf_translator.translate import render_translation_quality_source
+
+    comparison_source = render_translation_quality_source(book)
+    assert "Chapter One .... 1" not in comparison_source
+    assert markdown_block_structure(comparison_source) == markdown_block_structure(
+        result.translated_markdown
+    )
+
+
 def test_translate_book_chapters_restores_media_blocks_after_translation(tmp_path: Path) -> None:
     class DroppingTranslator(BaseTranslator):
         name = "dropping"

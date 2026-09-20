@@ -48,6 +48,11 @@ class TranslatedChapter:
     # EPUB spine XHTML path inside the source zip (posix); used to rewrite internal links in output EPUB.
     source_internal_path: str | None = None
     toc: bool = True
+    # ``title`` is the target-language display/navigation title.  Keep the
+    # canonical source label separately for provenance and review alignment.
+    source_title: str | None = None
+    kind: str | None = None
+    rebuild_toc: bool = False
 
 
 @dataclass(slots=True)

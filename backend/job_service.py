@@ -2314,7 +2314,7 @@ class BookJobService:
         policy = chapter.get("content_policy", "auto")
         if policy not in {"auto", "translate", "preserve", "exclude"}:
             raise JobServiceError("未知章节处理方式。")
-        return {
+        canonical = {
             "index": int(chapter.get("index") or fallback_index),
             "chapter_id": str(chapter.get("chapter_id") or f"chapter-{fallback_index:03d}"),
             "title": title or f"Chapter {fallback_index}",
@@ -2323,6 +2323,10 @@ class BookJobService:
             "source_pages": chapter.get("source_pages") if isinstance(chapter.get("source_pages"), list) else [],
             "content_policy": policy,
         }
+        kind = str(chapter.get("kind") or "").strip()
+        if kind:
+            canonical["kind"] = kind
+        return canonical
 
 
 _job_service: BookJobService | None = None

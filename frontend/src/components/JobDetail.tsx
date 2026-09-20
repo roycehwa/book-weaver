@@ -1323,6 +1323,7 @@ function JobDetail() {
                     const pageStart = toPositivePage(chapter.page_start)
                     const pageEnd = toPositivePage(chapter.page_end)
                     const invalidRange = Boolean(pageStart && pageEnd && pageEnd < pageStart)
+                    const isContents = chapter.kind === 'toc' && !/^list of\s+/i.test(chapter.title.trim())
                     return (
                       <div
                         key={`${chapter.chapter_id}-${index}`}
@@ -1352,11 +1353,16 @@ function JobDetail() {
                           <select aria-label={`第 ${index + 1} 章处理方式`} value={chapter.content_policy || 'auto'}
                             onChange={event => setChapterDraft(chapters => chapters.map((item, i) => i === index ? { ...item, content_policy: event.target.value as JobChapterDraft['content_policy'] } : item))}
                             className="w-full rounded border border-slate-300 px-2 py-1 text-sm">
-                            <option value="auto">采用自动建议（确认时默认翻译）</option>
-                            <option value="translate">翻译</option>
+                            <option value="auto">{isContents ? '采用自动建议（重建译文目录）' : '采用自动建议（确认时默认翻译）'}</option>
+                            <option value="translate">{isContents ? '重建译文目录' : '翻译'}</option>
                             <option value="preserve">保留原文（不翻译）</option>
                             <option value="exclude">略过（不翻译、不导出）</option>
                           </select>
+                          {isContents && (chapter.content_policy === 'translate' || chapter.content_policy === 'auto' || !chapter.content_policy) && (
+                            <div className="rounded-md border border-blue-200 bg-blue-50 px-2 py-1 text-xs text-blue-800">
+                              将按最终译文章节名生成整洁目录，不翻译原目录的点线和页码。
+                            </div>
+                          )}
                           {warningsForChapter(chapter.chapter_id, dependencyFindings).length > 0 && (
                             <div className="rounded-md border border-amber-300 bg-amber-50 px-2 py-1 text-xs text-amber-900">
                               正文中存在指向本章的链接；略过后引用会断裂，建议改为「保留原文（不翻译）」。

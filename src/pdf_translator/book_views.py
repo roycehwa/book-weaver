@@ -47,6 +47,49 @@ _IMAGE_REF_RE = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
 _ORIGINAL_PAGE_IMAGE_RE = re.compile(r"original-page-p\d+\.png", re.IGNORECASE)
 
 
+def pop_leading_markdown_heading(markdown: str) -> tuple[str | None, str]:
+    """Return a leading Markdown heading and the remaining body.
+
+    Translation output commonly retains the source chapter-title block as a
+    translated H1/H2.  Delivery code needs to promote that translated text to
+    the chapter's display title instead of inserting the source title above it.
+    Only the first standalone heading block is consumed; later section headings
+    remain part of the chapter body.
+    """
+
+    blocks = [block.strip() for block in str(markdown or "").split("\n\n") if block.strip()]
+    if not blocks:
+        return None, ""
+    match = _HEADING_RE.fullmatch(blocks[0])
+    if match is None:
+        return None, str(markdown or "").strip()
+    title = match.group(2).strip()
+    return (title or None), "\n\n".join(blocks[1:]).strip()
+
+
+def resolve_translated_chapter_heading(
+    markdown: str,
+    source_title: str,
+    *,
+    translated_heading_evidence: bool,
+) -> tuple[str, str]:
+    """Resolve one target-language display title and one normalized body.
+
+    ``translated_heading_evidence`` must come from the transport plan (the
+    leading source unit was a heading).  This prevents a chapter whose source
+    omitted its title from accidentally promoting its first subsection.
+    """
+
+    display_title = str(source_title or "").strip() or "Chapter"
+    body = str(markdown or "").strip()
+    if translated_heading_evidence:
+        translated_title, remainder = pop_leading_markdown_heading(body)
+        if translated_title:
+            display_title = translated_title
+            body = remainder
+    return display_title, normalize_chapter_headings(body, display_title)
+
+
 def _heading_line(level: int, title: str, chapter_index: int | None) -> str:
     safe_title = (title or "").strip() or (f"Chapter {chapter_index}" if chapter_index else "")
     return f"{'#' * level} {safe_title}".rstrip()
@@ -134,13 +177,16 @@ def normalize_chapter_headings(markdown: str, title: str) -> str:
         return f"# {safe_title}\n"
 
     kept_blocks: list[str] = []
-    for block in body.split("\n\n"):
+    for block_index, block in enumerate(body.split("\n\n")):
         stripped = block.strip()
         if not stripped:
             continue
-        heading = _HEADING_RE.match(stripped)
+        heading = _HEADING_RE.fullmatch(stripped)
         if heading and len(heading.group(1)) == 1:
-            continue
+            heading_text = heading.group(2).strip()
+            if block_index == 0:
+                continue
+            stripped = f"## {heading_text}"
         kept_blocks.append(stripped)
     body = "\n\n".join(kept_blocks).strip()
     if not body:
@@ -308,6 +354,42 @@ def join_chapter_delivery_markdown(chapters: list[dict]) -> str:
     return "\n\n".join(parts) + "\n"
 
 
+def rebuild_delivery_toc_chapters(
+    chapters: list[dict],
+    *,
+    target_language: str,
+) -> list[dict]:
+    """Replace opted-in source contents pages with a deterministic TOC.
+
+    Printed page numbers and dot leaders describe the source pagination and are
+    invalid after reflow.  The translated delivery therefore lists the final
+    display titles while EPUB navigation remains responsible for clickable
+    destinations.  Chapters explicitly preserved by the user never set
+    ``rebuild_toc`` and pass through unchanged.
+    """
+
+    rebuilt = [dict(chapter) for chapter in chapters]
+    language = str(target_language or "").lower()
+    contents_title = "目录" if language.startswith("zh") else "Contents"
+    entries = [
+        str(chapter.get("title") or "").strip()
+        for chapter in rebuilt
+        if chapter.get("toc", True)
+        and not chapter.get("rebuild_toc")
+        and str(chapter.get("title") or "").strip()
+    ]
+    for chapter in rebuilt:
+        if not chapter.get("rebuild_toc"):
+            continue
+        chapter["title"] = contents_title
+        chapter["toc"] = False
+        items = "\n".join(f"- {title}" for title in entries)
+        chapter["markdown"] = (
+            f"# {contents_title}\n\n{items}\n" if items else f"# {contents_title}\n"
+        )
+    return rebuilt
+
+
 # kept for backward-compatibility with other call sites
 __all__ = [
     "dedupe_markdown_image_blocks",
@@ -315,8 +397,11 @@ __all__ = [
     "is_scrape_watermark_block",
     "join_chapter_delivery_markdown",
     "normalize_chapter_headings",
+    "pop_leading_markdown_heading",
+    "rebuild_delivery_toc_chapters",
     "render_book_markdown",
     "render_translation_input_markdown",
+    "resolve_translated_chapter_heading",
     "sanitize_apparatus_chapter_markdown",
     "sanitize_cover_chapter_markdown",
     "strip_scrape_watermarks",

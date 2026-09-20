@@ -1720,6 +1720,11 @@ def _is_resource_chapter_title(title: str) -> bool:
     }
 
 
+def _is_main_contents_title(title: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", " ", str(title or "").lower()).strip()
+    return normalized in {"contents", "table of contents", "目录", "目錄"}
+
+
 def _canonical_chapter_preserve_original(
     *,
     title: str,
@@ -2015,6 +2020,17 @@ def apply_canonical_chapter_plan(
             for unit in source_chapter.get("dom_units") or []
             if isinstance(unit, dict)
         ]
+        chapter_kind = str(canonical_chapter.get("kind") or "").strip()
+        if not chapter_kind:
+            chapter_kind = classify_chapter(
+                {"title": chapter_title, "source_pages": pages},
+                pages=book.get("pages") or [],
+            )
+        rebuild_toc = (
+            chapter_kind == "toc"
+            and policy == "translate"
+            and _is_main_contents_title(chapter_title)
+        )
         chapters.append(
             {
                 "title": chapter_title,
@@ -2025,6 +2041,8 @@ def apply_canonical_chapter_plan(
                 "trace_markdown": trace_markdown,
                 "translate": not preserve_original,
                 "translation_policy_confirmed": user_confirmed,
+                "kind": chapter_kind,
+                "rebuild_toc": rebuild_toc,
                 "page_slices": chapter_slices,
                 "source_internal_path": source_internal_paths[0] if len(source_internal_paths) == 1 else None,
                 "source_internal_paths": source_internal_paths,

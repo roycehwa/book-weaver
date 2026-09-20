@@ -177,11 +177,11 @@ def classify_chapter(
     4. Otherwise, fall back to the majority page kind from ``pages``.
     5. Final default: ``narrative``.
     """
-    if chapter.get("translation_policy_confirmed") and chapter.get("translate") is True:
-        return "narrative"
     explicit = chapter.get("kind")
     if isinstance(explicit, str) and explicit in CHAPTER_KINDS:
         return explicit
+    if chapter.get("translation_policy_confirmed") and chapter.get("translate") is True:
+        return "narrative"
 
     title_kind = _title_kind(str(chapter.get("title") or ""))
     preserve = bool(chapter.get("preserve_original"))
@@ -237,12 +237,18 @@ def should_translate_chapter(chapter: dict[str, Any]) -> bool:
         return False
     if chapter.get("translate") is False:
         return False
+    kind = classify_chapter(chapter)
+    # A confirmed "translate" action for a printed contents chapter means
+    # rebuild it from final translated display titles.  Its source dot leaders
+    # and page numbers must never be translated as prose.
+    if kind == "toc":
+        return False
     if chapter.get("translation_policy_confirmed") and chapter.get("translate") is True:
         return True
     if bool(chapter.get("preserve_original")) and bool(chapter.get("resource_only")):
         # preserved resource chapters are never translated regardless of kind
         return False
-    return classify_chapter(chapter) not in NON_TRANSLATABLE_CHAPTER_KINDS
+    return kind not in NON_TRANSLATABLE_CHAPTER_KINDS
 
 
 def should_translate_block(block: dict[str, Any]) -> bool:
