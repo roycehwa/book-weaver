@@ -53,6 +53,44 @@ _REVIEW_ISSUE_TO_CODE: dict[str, str] = {
     "suspect_ocr": "suspect_ocr",
 }
 
+_BLOCKING_REVIEW_ISSUE_TYPES = frozenset(
+    {
+        "missing_translation",
+        "missing_content",
+        "untranslated",
+        "possibly_incomplete",
+        "translation_failed_open",
+    }
+)
+
+_NON_ADJUDICATABLE_BLOCKING_CODES = frozenset(
+    {
+        "translation_input_sha_mismatch",
+        "missing_raw_translation",
+        "empty_raw_translation",
+        "control_or_replacement_character",
+        "markdown_block_structure_loss",
+        "invented_link_targets",
+        "lost_link_targets",
+        "markdown_link_structure_loss",
+        "missing_translation_input",
+        "reading_units_not_authoritative",
+        "missing_reading_units_fingerprint",
+        "chapter_segments_stale",
+        "missing_cleaned_translation",
+        "missing_final_translation",
+        "line_count_regression",
+        "final_newline_regression",
+        "markdown_block_structure_regression",
+        "link_structure_regression",
+        "image_count_regression",
+        "footnote_marker_regression",
+        "protected_literal_regression",
+        "numeric_literal_regression",
+        "polished_markdown_not_published",
+    }
+)
+
 _NUMERIC_LITERAL_RE = re.compile(
     r"(?<![\w.])(?:\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)(?![\w.])"
 )
@@ -524,15 +562,9 @@ def _review_items_to_findings(
         if issue_type.startswith("polish_"):
             continue
         code = _REVIEW_ISSUE_TO_CODE.get(issue_type, issue_type)
-        severity: QualitySeverity = "review"
-        if issue_type in {
-            "missing_translation",
-            "translation_failed_open",
-            "missing_content",
-            "untranslated",
-            "possibly_incomplete",
-        }:
-            severity = "review"
+        severity: QualitySeverity = (
+            "blocking" if issue_type in _BLOCKING_REVIEW_ISSUE_TYPES else "review"
+        )
         segment_id = str(item.get("segment_id") or "")
         segment = segment_by_id.get(segment_id) or {}
         unit_ids = segment.get("unit_ids") if isinstance(segment.get("unit_ids"), list) else []
@@ -1000,6 +1032,117 @@ def build_translation_quality_index(
     }
 
 
+def _resolve_indexed_report_path(run_dir: Path, *, path_value: str) -> Path:
+    path = Path(path_value)
+    if not path.is_absolute():
+        path = (run_dir / path).resolve()
+    else:
+        path = path.expanduser().resolve()
+    return path
+
+
+def _load_indexed_quality_findings(run_dir: Path) -> list[dict[str, Any]]:
+    run_dir = run_dir.expanduser().resolve()
+    index = _read_json(run_dir / TRANSLATION_QUALITY_INDEX)
+    reports = index.get("reports") if isinstance(index.get("reports"), dict) else {}
+    findings: list[dict[str, Any]] = []
+    for key in ("source", "raw_translation", "polished_output"):
+        meta = reports.get(key)
+        if not isinstance(meta, dict):
+            continue
+        path_value = meta.get("path")
+        if not isinstance(path_value, str) or not path_value.strip():
+            continue
+        path = _resolve_indexed_report_path(run_dir, path_value=path_value)
+        payload = _read_json(path)
+        for item in payload.get("findings") or []:
+            if isinstance(item, dict):
+                findings.append(item)
+    return findings
+
+
+def _load_review_decisions(run_dir: Path) -> dict[str, dict[str, Any]]:
+    payload = _read_json(run_dir / "review_state.json")
+    decisions = payload.get("decisions")
+    if not isinstance(decisions, dict):
+        return {}
+    return {
+        str(segment_id): dict(decision)
+        for segment_id, decision in decisions.items()
+        if isinstance(decision, dict)
+    }
+
+
+def _segment_review_adjudicated(segment_id: str, decisions: dict[str, dict[str, Any]]) -> bool:
+    status = str((decisions.get(segment_id) or {}).get("status") or "open")
+    return status in {"approved", "resolved"}
+
+
+def _finding_code_non_adjudicable(code: str) -> bool:
+    if code in _NON_ADJUDICATABLE_BLOCKING_CODES:
+        return True
+    if code.startswith("stale_"):
+        return True
+    if code.endswith("_regression"):
+        return True
+    if code.startswith("polished_") and code.endswith("_regression"):
+        return True
+    if code.startswith("missing_"):
+        return True
+    return False
+
+
+def _finding_review_adjudicable(finding: dict[str, Any]) -> bool:
+    if str(finding.get("severity") or "") != "blocking":
+        return False
+    stage = str(finding.get("stage") or "")
+    if stage == "source":
+        return False
+    code = str(finding.get("code") or "")
+    if _finding_code_non_adjudicable(code):
+        return False
+    segment_ids = [str(value) for value in finding.get("segment_ids") or [] if str(value)]
+    return bool(segment_ids)
+
+
+def _finding_effectively_blocking(
+    finding: dict[str, Any],
+    *,
+    decisions: dict[str, dict[str, Any]],
+) -> bool:
+    if str(finding.get("severity") or "") != "blocking":
+        return False
+    if not _finding_review_adjudicable(finding):
+        return True
+    segment_ids = [str(value) for value in finding.get("segment_ids") or [] if str(value)]
+    return not all(_segment_review_adjudicated(segment_id, decisions) for segment_id in segment_ids)
+
+
+def effective_translation_quality_evaluation(run_dir: Path) -> dict[str, Any]:
+    run_dir = run_dir.expanduser().resolve()
+    index = _read_json(run_dir / TRANSLATION_QUALITY_INDEX)
+    if not index:
+        return {
+            "translation_quality_blocking": False,
+            "translation_quality_review_count": 0,
+            "effective_blocking_count": 0,
+            "static_blocking_count": 0,
+        }
+    decisions = _load_review_decisions(run_dir)
+    findings = _load_indexed_quality_findings(run_dir)
+    effective_blocking = [
+        finding for finding in findings if _finding_effectively_blocking(finding, decisions=decisions)
+    ]
+    static_blocking_count = int(index.get("blocking_count") or 0)
+    effective_blocking_count = len(effective_blocking)
+    return {
+        "translation_quality_blocking": effective_blocking_count > 0,
+        "translation_quality_review_count": int(index.get("review_count") or 0),
+        "effective_blocking_count": effective_blocking_count,
+        "static_blocking_count": static_blocking_count,
+    }
+
+
 def invalidate_stale_translation_postprocess(run_dir: Path, *, text_operation: str) -> list[str]:
     run_dir = run_dir.expanduser().resolve()
     if text_operation != "translate":
@@ -1097,14 +1240,10 @@ def write_translation_quality_bundle(
 
 
 def translation_quality_summary(run_dir: Path) -> dict[str, Any]:
-    index = _read_json(run_dir / TRANSLATION_QUALITY_INDEX)
-    if not index:
+    run_dir = run_dir.expanduser().resolve()
+    if not (run_dir / TRANSLATION_QUALITY_INDEX).exists():
         return {"translation_quality_blocking": False, "translation_quality_review_count": 0}
-    return {
-        "translation_quality_blocking": not bool(index.get("acceptable", False))
-        and index.get("aggregate_status") == "blocked",
-        "translation_quality_review_count": int(index.get("review_count") or 0),
-    }
+    return effective_translation_quality_evaluation(run_dir)
 
 
 def _requires_translation_quality(run_dir: Path) -> bool:
@@ -1178,7 +1317,8 @@ def assert_translation_quality_current(run_dir: Path) -> None:
             raise ValueError(
                 f"Export blocked: translation quality report {key} is missing or stale. Create a new task."
             )
-    if int(index.get("blocking_count") or 0) > 0 or index.get("aggregate_status") == "blocked":
+    evaluation = effective_translation_quality_evaluation(run_dir)
+    if evaluation.get("translation_quality_blocking"):
         raise ValueError(
             "Export blocked: blocking translation quality findings remain. "
             f"See {run_dir / TRANSLATION_QUALITY_INDEX}."

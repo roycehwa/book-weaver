@@ -3952,6 +3952,9 @@ def _build_review_project_payload(path: Path) -> dict:
         )
         if isinstance(groups, list):
             chapter_groups = groups
+    from pdf_translator.translation_quality import translation_quality_summary
+
+    quality_summary = translation_quality_summary(path)
     return {
         "run_dir": str(path),
         "manifest": manifest,
@@ -3963,6 +3966,7 @@ def _build_review_project_payload(path: Path) -> dict:
         "chapter_marks": chapter_marks,
         "chapter_groups": chapter_groups if isinstance(chapter_groups, list) else [],
         "workflow": workflow,
+        "translation_quality": quality_summary,
     }
 
 

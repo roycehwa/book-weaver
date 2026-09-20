@@ -237,6 +237,10 @@ export interface ReviewProject {
   chapter_marks?: ReviewChapterMarks
   chapter_groups?: ReviewChapterGroup[]
   workflow?: ReviewWorkflow
+  translation_quality?: {
+    translation_quality_blocking?: boolean
+    translation_quality_review_count?: number
+  }
   review_state: {
     revision?: number
     schema: string

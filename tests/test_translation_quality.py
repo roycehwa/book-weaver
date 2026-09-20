@@ -18,18 +18,28 @@ from pdf_translator.translation_quality import (
     build_raw_translation_quality_report,
     build_source_quality_report,
     build_translation_quality_index,
+    build_quality_context,
+    effective_translation_quality_evaluation,
     invalidate_stale_translation_postprocess,
     run_source_quality_gate_before_translation,
     sha256_file,
     sha256_text,
     stable_finding_id,
+    translation_quality_summary,
     write_translation_quality_bundle,
+    _finding,
 )
 from pdf_translator.zh_markdown_cleanup import publish_translation_zh_cleanup
 from tests.synthetic_quality_fixtures import write_synthetic_reading_units
 
 
-def _write_passing_translation_outputs(run_dir: Path, *, source: str, raw: str | None = None) -> None:
+def _write_passing_translation_outputs(
+    run_dir: Path,
+    *,
+    source: str,
+    raw: str | None = None,
+    review_items: list[dict] | None = None,
+) -> None:
     raw_text = raw if raw is not None else source
     cleaned = raw_text
     final = cleaned
@@ -44,7 +54,7 @@ def _write_passing_translation_outputs(run_dir: Path, *, source: str, raw: str |
         run_dir,
         text_operation="translate",
         source_markdown=source,
-        review_items=[],
+        review_items=review_items or [],
     )
 
 
@@ -444,11 +454,102 @@ def test_assert_translation_quality_current_fails_on_blocking_index(tmp_path: Pa
     write_synthetic_reading_units(run_dir)
     source = (run_dir / "translation-input.md").read_text(encoding="utf-8")
     _write_passing_translation_outputs(run_dir, source=source)
-    index = json.loads((run_dir / TRANSLATION_QUALITY_INDEX).read_text(encoding="utf-8"))
-    index["blocking_count"] = 2
-    index["aggregate_status"] = "blocked"
-    index["acceptable"] = False
+    raw_path = run_dir / RAW_TRANSLATION_QUALITY_REPORT
+    raw_report = json.loads(raw_path.read_text(encoding="utf-8"))
+    raw_report["findings"].append(
+        _finding(
+            stage="raw_translation",
+            code="untranslated",
+            severity="blocking",
+            message="Synthetic blocking segment finding.",
+            segment_ids=["seg-1"],
+        )
+    )
+    raw_path.write_text(json.dumps(raw_report), encoding="utf-8")
+    index = build_translation_quality_index(
+        run_dir,
+        reports={
+            "source": json.loads((run_dir / SOURCE_QUALITY_REPORT).read_text(encoding="utf-8")),
+            "raw_translation": raw_report,
+            "polished_output": json.loads((run_dir / POLISHED_OUTPUT_QUALITY_REPORT).read_text(encoding="utf-8")),
+        },
+        context=build_quality_context(run_dir),
+        text_operation="translate",
+    )
     (run_dir / TRANSLATION_QUALITY_INDEX).write_text(json.dumps(index), encoding="utf-8")
+    with pytest.raises(ValueError, match="blocking"):
+        assert_translation_quality_current(run_dir)
+
+
+def test_effective_quality_allows_adjudicated_segment_blocking_finding(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    write_synthetic_reading_units(run_dir)
+    source = (run_dir / "translation-input.md").read_text(encoding="utf-8")
+    _write_passing_translation_outputs(
+        run_dir,
+        source=source,
+        review_items=[{"issue_type": "untranslated", "segment_id": "seg-1", "evidence": {}}],
+    )
+    (run_dir / "review_state.json").write_text(
+        json.dumps({"decisions": {"seg-1": {"status": "approved", "approved_text": "人工"}}}),
+        encoding="utf-8",
+    )
+    summary = translation_quality_summary(run_dir)
+    assert summary["translation_quality_blocking"] is False
+    assert_translation_quality_current(run_dir)
+
+
+def test_effective_quality_blocks_unresolved_segment_finding(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    write_synthetic_reading_units(run_dir)
+    source = (run_dir / "translation-input.md").read_text(encoding="utf-8")
+    _write_passing_translation_outputs(
+        run_dir,
+        source=source,
+        review_items=[{"issue_type": "untranslated", "segment_id": "seg-1", "evidence": {}}],
+    )
+    summary = translation_quality_summary(run_dir)
+    assert summary["translation_quality_blocking"] is True
+    with pytest.raises(ValueError, match="blocking"):
+        assert_translation_quality_current(run_dir)
+
+
+def test_effective_quality_keeps_global_blocking_finding(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    write_synthetic_reading_units(run_dir)
+    source = (run_dir / "translation-input.md").read_text(encoding="utf-8")
+    _write_passing_translation_outputs(run_dir, source=source)
+    raw_path = run_dir / RAW_TRANSLATION_QUALITY_REPORT
+    raw_report = json.loads(raw_path.read_text(encoding="utf-8"))
+    raw_report["findings"].append(
+        _finding(
+            stage="raw_translation",
+            code="markdown_block_structure_loss",
+            severity="blocking",
+            message="Global structure regression must remain blocking.",
+            segment_ids=["seg-1"],
+        )
+    )
+    raw_path.write_text(json.dumps(raw_report), encoding="utf-8")
+    index = build_translation_quality_index(
+        run_dir,
+        reports={
+            "source": json.loads((run_dir / SOURCE_QUALITY_REPORT).read_text(encoding="utf-8")),
+            "raw_translation": raw_report,
+            "polished_output": json.loads((run_dir / POLISHED_OUTPUT_QUALITY_REPORT).read_text(encoding="utf-8")),
+        },
+        context=build_quality_context(run_dir),
+        text_operation="translate",
+    )
+    (run_dir / TRANSLATION_QUALITY_INDEX).write_text(json.dumps(index), encoding="utf-8")
+    (run_dir / "review_state.json").write_text(
+        json.dumps({"decisions": {"seg-1": {"status": "approved"}}}),
+        encoding="utf-8",
+    )
+    assert effective_translation_quality_evaluation(run_dir)["translation_quality_blocking"] is True
     with pytest.raises(ValueError, match="blocking"):
         assert_translation_quality_current(run_dir)
 

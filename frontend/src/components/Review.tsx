@@ -7,6 +7,7 @@ import {
   nextPendingIssueIndex,
 } from './reviewNavigation'
 import { loadDraft, removeDraft, saveDraft, selectConfirmedText } from './reviewDrafts'
+import { reviewExportCompletionMessage } from './reviewExportReadiness'
 
 const issueLabels: Record<string, string> = {
   missing_content: '算法提示：内容缺失',
@@ -416,6 +417,14 @@ function Review() {
   const scopeProgressPercent = scopeTotal ? Math.round((scopeReviewedCount / scopeTotal) * 100) : 0
   const isScopeComplete = scopeTotal > 0 && scopeReviewedCount >= scopeTotal
   const isFullReviewComplete = orderedSegments.length > 0 && reviewedCount >= orderedSegments.length
+  const translationQualityBlocking = Boolean(project?.translation_quality?.translation_quality_blocking)
+  const exportCompletionMessage = reviewExportCompletionMessage({
+    pendingRewriteCount,
+    rewritesNeedingInstruction,
+    humanReviewMode,
+    isFullReviewComplete,
+    translationQualityBlocking,
+  })
 
   const goToIssueSegment = (segmentId: string) => {
     const index = orderedSegments.findIndex((segment) => segment.segment_id === segmentId)
@@ -1087,13 +1096,7 @@ function Review() {
               {humanReviewMode === 'issues_only' ? '本轮可疑段已全部审完' : '全书段落已全部审完'}
             </div>
             <p className="mt-1 text-xs">
-              {pendingRewriteCount > 0
-                ? rewritesNeedingInstruction > 0
-                  ? `有 ${rewritesNeedingInstruction} 段尚未填写重译要求。当前已自动定位，请在下方填写后执行。`
-                  : `有 ${pendingRewriteCount} 段已保存模型重译要求。请先生成并确认候选译文，再导出定稿。`
-                : humanReviewMode === 'issues_only' && !isFullReviewComplete
-                  ? '现在可以直接导出，也可以切换到全书逐段继续检查。'
-                  : '现在可以导出定稿 EPUB/PDF，或结束本次审阅稍后继续。'}
+              {exportCompletionMessage}
             </p>
             <div className="mt-2 flex flex-wrap gap-2">
               {pendingRewriteCount > 0 && (
