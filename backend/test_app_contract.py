@@ -42,6 +42,7 @@ def test_public_route_contract_removes_instant_translation():
     assert ("/api/books/{book_id}/overview", "POST") in routes
     assert ("/api/books/{book_id}/chapters/{chapter_index}/summary", "POST") in routes
     assert ("/api/review/project", "GET") in routes
+    assert ("/api/review/quality/revalidate", "POST") in routes
     assert ("/api/review/chapter-marks", "POST") in routes
     assert ("/api/jobs", "POST") in routes
     assert ("/api/jobs/duplicates", "POST") in routes

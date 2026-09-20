@@ -240,6 +240,14 @@ export interface ReviewProject {
   translation_quality?: {
     translation_quality_blocking?: boolean
     translation_quality_review_count?: number
+    effective_blocking_count?: number
+    revalidation_required?: boolean
+    effective_blocking_findings?: Array<{
+      code: string
+      stage: string
+      message: string
+      segment_ids?: string[]
+    }>
   }
   review_state: {
     revision?: number
@@ -1126,6 +1134,15 @@ export const reviewApi = {
       params: { run_dir: runDir },
       body: JSON.stringify(data),
     }),
+
+  revalidateQuality: (runDir: string) =>
+    request<{ status: string; translation_quality: NonNullable<ReviewProject['translation_quality']> }>(
+      '/review/quality/revalidate',
+      {
+        method: 'POST',
+        params: { run_dir: runDir },
+      }
+    ),
 
   exportVersion: (runDir: string, data: ReviewExportRequest) =>
     request<ReviewExportResponse>('/review/export', {

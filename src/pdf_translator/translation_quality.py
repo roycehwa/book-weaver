@@ -23,6 +23,7 @@ from pdf_translator.zh_markdown_cleanup import (
     AUTO_LINK_RE,
     EMAIL_RE,
     FOOTNOTE_REF_RE,
+    HTML_TAG_RE,
     INLINE_CODE_RE,
     PRESERVE_MARKER_RE,
     RULES_VERSION,
@@ -36,6 +37,8 @@ SOURCE_QUALITY_REPORT = "source-quality-report.json"
 RAW_TRANSLATION_QUALITY_REPORT = "raw-translation-quality-report.json"
 POLISHED_OUTPUT_QUALITY_REPORT = "polished-output-quality-report.json"
 TRANSLATION_QUALITY_INDEX = "translation-quality-index.json"
+TRANSLATION_QUALITY_SOURCE = "translation-quality-source.md"
+TRANSLATION_QUALITY_RULES_VERSION = "translation_quality_v5_semantic_html"
 
 QualityStage = Literal["source", "raw_translation", "polished_output"]
 QualitySeverity = Literal["blocking", "review"]
@@ -245,6 +248,7 @@ def build_quality_context(run_dir: Path) -> dict[str, Any]:
     raw_path = run_dir / "translated.raw.md"
     cleaned_path = run_dir / "translated.cleaned.md"
     final_path = run_dir / "translated.md"
+    quality_source_path = run_dir / TRANSLATION_QUALITY_SOURCE
     return {
         "run_dir": str(run_dir),
         "reading_units_document_fingerprint": reading_units.get("document_fingerprint"),
@@ -263,6 +267,10 @@ def build_quality_context(run_dir: Path) -> dict[str, Any]:
         "raw_sha256": sha256_file(raw_path) if raw_path.exists() else None,
         "cleaned_sha256": sha256_file(cleaned_path) if cleaned_path.exists() else None,
         "final_sha256": sha256_file(final_path) if final_path.exists() else None,
+        "translation_quality_source_sha256": sha256_file(quality_source_path)
+        if quality_source_path.exists()
+        else None,
+        "translation_quality_rules_version": TRANSLATION_QUALITY_RULES_VERSION,
         "translation_prompt_version": TRANSLATION_PROMPT_VERSION,
         "zh_cleanup_rules_version": RULES_VERSION,
         "polish_prompt_version": POLISH_PROMPT_VERSION,
@@ -283,6 +291,8 @@ def build_quality_signature(run_dir: Path, *, text_operation: str) -> dict[str, 
         "translation_prompt_version": context.get("translation_prompt_version"),
         "zh_cleanup_rules_version": context.get("zh_cleanup_rules_version"),
         "polish_prompt_version": context.get("polish_prompt_version"),
+        "translation_quality_source_sha256": context.get("translation_quality_source_sha256"),
+        "translation_quality_rules_version": context.get("translation_quality_rules_version"),
         "text_operation": text_operation,
     }
 
@@ -294,10 +304,34 @@ def _html_anchor_targets(text: str) -> list[str]:
 
 def _markdown_link_targets(text: str) -> set[str]:
     targets = set(_html_anchor_targets(text))
-    targets.update(url.rstrip(".,;:!?)]") for url in re.findall(r"https?://[^\s<>]+", text))
+    targets.update(_url_literals(text))
     for _is_image, destination in _markdown_link_specs(text):
         targets.add(destination)
     return targets
+
+
+_URL_TRAILING_PUNCTUATION = ".,;:!?)]}，。；：！？）】》」』"
+
+
+def _url_literals(text: str) -> list[str]:
+    return sorted(url.rstrip(_URL_TRAILING_PUNCTUATION) for url in URL_RE.findall(text))
+
+
+def _semantic_html_tags(text: str) -> list[str]:
+    return sorted(
+        tag
+        for tag in HTML_TAG_RE.findall(text)
+        if re.match(r"</?\s*[A-Za-z][\w:.-]*(?:\s|/?>)", tag)
+    )
+
+
+def _html_tag_names(tags: list[str]) -> list[str]:
+    names: set[str] = set()
+    for tag in tags:
+        match = re.match(r"</?\s*([A-Za-z][\w:.-]*)", tag)
+        if match:
+            names.add(match.group(1).lower())
+    return sorted(names)
 
 
 def _protected_literal_multiset(text: str) -> list[str]:
@@ -316,11 +350,11 @@ def _raw_protected_multisets(text: str) -> dict[str, list[str]]:
         "preserve_markers": sorted(PRESERVE_MARKER_RE.findall(text)),
         "inline_code": sorted(INLINE_CODE_RE.findall(text)),
         "auto_links": sorted(AUTO_LINK_RE.findall(text)),
-        "urls": sorted(URL_RE.findall(text)),
+        "urls": _url_literals(text),
         "emails": sorted(EMAIL_RE.findall(text)),
+        "html_tags": _semantic_html_tags(text),
         "html_anchors": _html_anchor_targets(text),
         "link_destinations": sorted(destination for _is_image, destination in _markdown_link_specs(text)),
-        "protected_literals": _protected_literal_multiset(text),
     }
 
 
@@ -566,6 +600,7 @@ def build_raw_translation_quality_report(
     *,
     text_operation: str,
     source_markdown: str,
+    comparison_source_markdown: str | None = None,
     review_items: list[dict[str, Any]] | None = None,
     context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -633,7 +668,12 @@ def build_raw_translation_quality_report(
                     evidence={},
                 )
             )
-        if markdown_block_structure(source_markdown) != markdown_block_structure(raw_text):
+        comparison_source = (
+            comparison_source_markdown
+            if comparison_source_markdown is not None
+            else source_markdown
+        )
+        if markdown_block_structure(comparison_source) != markdown_block_structure(raw_text):
             findings.append(
                 _finding(
                     stage="raw_translation",
@@ -641,12 +681,12 @@ def build_raw_translation_quality_report(
                     severity="blocking",
                     message="Raw translation changed Markdown block structure relative to source input.",
                     evidence={
-                        "source_structure": list(markdown_block_structure(source_markdown)),
+                        "source_structure": list(markdown_block_structure(comparison_source)),
                         "raw_structure": list(markdown_block_structure(raw_text)),
                     },
                 )
             )
-        source_targets = _markdown_link_targets(source_markdown)
+        source_targets = _markdown_link_targets(comparison_source)
         raw_targets = _markdown_link_targets(raw_text)
         invented = raw_targets - source_targets
         lost = source_targets - raw_targets
@@ -670,7 +710,7 @@ def build_raw_translation_quality_report(
                     evidence={"targets": sorted(lost)[:20], "count": len(lost)},
                 )
             )
-        source_specs = _markdown_link_specs(source_markdown)
+        source_specs = _markdown_link_specs(comparison_source)
         raw_specs = _markdown_link_specs(raw_text)
         if Counter(source_specs) != Counter(raw_specs):
             findings.append(
@@ -685,20 +725,34 @@ def build_raw_translation_quality_report(
                     },
                 )
             )
-        source_protected = _raw_protected_multisets(source_markdown)
+        source_protected = _raw_protected_multisets(comparison_source)
         raw_protected = _raw_protected_multisets(raw_text)
         for key, source_values in source_protected.items():
             if Counter(source_values) != Counter(raw_protected.get(key, [])):
+                evidence: dict[str, Any] = {
+                    "source_count": len(source_values),
+                    "raw_count": len(raw_protected.get(key, [])),
+                }
+                message = f"Raw translation changed protected {key} relative to source."
+                if key == "html_tags":
+                    source_names = _html_tag_names(source_values)
+                    raw_names = _html_tag_names(raw_protected.get(key, []))
+                    evidence.update(
+                        source_tag_names=source_names,
+                        raw_tag_names=raw_names,
+                    )
+                    message = (
+                        "Raw translation changed protected HTML tags "
+                        f"(source: {', '.join(source_names) or 'none'}; "
+                        f"raw: {', '.join(raw_names) or 'none'})."
+                    )
                 findings.append(
                     _finding(
                         stage="raw_translation",
                         code=f"{key}_regression",
                         severity="blocking",
-                        message=f"Raw translation changed protected {key} relative to source.",
-                        evidence={
-                            "source_count": len(source_values),
-                            "raw_count": len(raw_protected.get(key, [])),
-                        },
+                        message=message,
+                        evidence=evidence,
                     )
                 )
 
@@ -989,6 +1043,7 @@ def build_translation_quality_index(
     review_count = sum(1 for item in findings if item.get("severity") == "review")
     return {
         "schema": INDEX_SCHEMA,
+        "quality_rules_version": TRANSLATION_QUALITY_RULES_VERSION,
         "text_operation": text_operation,
         "reports": {
             key: {"path": report_paths[key], "sha256": report_hashes[key]}
@@ -1078,6 +1133,17 @@ def _finding_effectively_blocking(
     return not all(_segment_review_adjudicated(segment_id, decisions) for segment_id in segment_ids)
 
 
+def _public_blocking_finding(finding: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "code": str(finding.get("code") or "quality_blocking"),
+        "stage": str(finding.get("stage") or "unknown"),
+        "message": str(finding.get("message") or "Translation quality validation failed."),
+        "segment_ids": [
+            str(value) for value in finding.get("segment_ids") or [] if str(value)
+        ],
+    }
+
+
 def _translation_quality_artifact_errors(
     run_dir: Path,
     *,
@@ -1159,6 +1225,31 @@ def effective_translation_quality_evaluation(run_dir: Path) -> dict[str, Any]:
             "effective_blocking_count": 1,
             "static_blocking_count": 0,
             "artifact_errors": ["missing_translation_quality_index"],
+            "effective_blocking_findings": [
+                {
+                    "code": "missing_translation_quality_index",
+                    "stage": "quality_artifacts",
+                    "message": "当前任务缺少翻译质量索引，需要重新运行翻译或新建任务。",
+                    "segment_ids": [],
+                }
+            ],
+        }
+    if index.get("quality_rules_version") != TRANSLATION_QUALITY_RULES_VERSION:
+        return {
+            "translation_quality_blocking": True,
+            "translation_quality_review_count": int(index.get("review_count") or 0),
+            "effective_blocking_count": 1,
+            "static_blocking_count": int(index.get("blocking_count") or 0),
+            "artifact_errors": ["translation_quality_rules_stale"],
+            "revalidation_required": True,
+            "effective_blocking_findings": [
+                {
+                    "code": "translation_quality_rules_stale",
+                    "stage": "quality_artifacts",
+                    "message": "质量校验规则已更新，请重新校验现有译文后再导出。",
+                    "segment_ids": [],
+                }
+            ],
         }
     artifact_errors = _translation_quality_artifact_errors(run_dir, index=index)
     if artifact_errors:
@@ -1168,6 +1259,14 @@ def effective_translation_quality_evaluation(run_dir: Path) -> dict[str, Any]:
             "effective_blocking_count": max(int(index.get("blocking_count") or 0), 1),
             "static_blocking_count": int(index.get("blocking_count") or 0),
             "artifact_errors": artifact_errors,
+            "effective_blocking_findings": [
+                {
+                    "code": "quality_artifact_invalid",
+                    "stage": "quality_artifacts",
+                    "message": "翻译质量工件缺失、过期或不一致，需要重新运行翻译或新建任务。",
+                    "segment_ids": [],
+                }
+            ],
         }
     decisions = _load_review_decisions(run_dir)
     findings = _load_indexed_quality_findings(run_dir, index=index)
@@ -1182,6 +1281,14 @@ def effective_translation_quality_evaluation(run_dir: Path) -> dict[str, Any]:
             "effective_blocking_count": max(static_blocking_count, derived_blocking_count, 1),
             "static_blocking_count": static_blocking_count,
             "artifact_errors": ["translation_quality_index_count_mismatch"],
+            "effective_blocking_findings": [
+                {
+                    "code": "translation_quality_index_count_mismatch",
+                    "stage": "quality_artifacts",
+                    "message": "翻译质量索引与报告不一致，需要重新运行翻译或新建任务。",
+                    "segment_ids": [],
+                }
+            ],
         }
     effective_blocking = [
         finding for finding in findings if _finding_effectively_blocking(finding, decisions=decisions)
@@ -1192,6 +1299,9 @@ def effective_translation_quality_evaluation(run_dir: Path) -> dict[str, Any]:
         "translation_quality_review_count": int(index.get("review_count") or 0),
         "effective_blocking_count": effective_blocking_count,
         "static_blocking_count": static_blocking_count,
+        "effective_blocking_findings": [
+            _public_blocking_finding(finding) for finding in effective_blocking
+        ],
     }
 
 
@@ -1245,10 +1355,16 @@ def write_translation_quality_bundle(
     *,
     text_operation: str,
     source_markdown: str,
+    comparison_source_markdown: str | None = None,
     review_items: list[dict[str, Any]] | None = None,
     invalidated_artifacts: list[str] | None = None,
 ) -> dict[str, str]:
     run_dir = run_dir.expanduser().resolve()
+    if comparison_source_markdown is not None:
+        (run_dir / TRANSLATION_QUALITY_SOURCE).write_text(
+            comparison_source_markdown,
+            encoding="utf-8",
+        )
     context = build_quality_context(run_dir)
     _write_translation_source_revision(run_dir, context=context)
     source_report = build_source_quality_report(run_dir, text_operation=text_operation, context=context)
@@ -1256,6 +1372,7 @@ def write_translation_quality_bundle(
         run_dir,
         text_operation=text_operation,
         source_markdown=source_markdown,
+        comparison_source_markdown=comparison_source_markdown,
         review_items=review_items,
         context=context,
     )
@@ -1288,7 +1405,58 @@ def write_translation_quality_bundle(
         "raw_translation_quality_report": str(raw_path),
         "polished_output_quality_report": str(polished_path),
         "translation_quality_index": str(index_path),
+        **(
+            {"translation_quality_source": str(run_dir / TRANSLATION_QUALITY_SOURCE)}
+            if (run_dir / TRANSLATION_QUALITY_SOURCE).exists()
+            else {}
+        ),
     }
+
+
+def revalidate_translation_quality(run_dir: Path) -> dict[str, Any]:
+    """Rebuild derived quality reports from frozen task artifacts only."""
+
+    run_dir = run_dir.expanduser().resolve()
+    required = [
+        "translation-input.md",
+        "manifest.json",
+        "book.json",
+        "chapter-segments.json",
+        "translated.raw.md",
+        "translated.cleaned.md",
+        "translated.md",
+        "review_items.json",
+    ]
+    missing = [name for name in required if not (run_dir / name).is_file()]
+    if missing:
+        raise TranslationQualityBlockedError(
+            "Quality revalidation requires current frozen artifacts: " + ", ".join(missing)
+        )
+
+    book = _read_json(run_dir / "book.json")
+    segment_payload = _read_json(run_dir / "chapter-segments.json")
+    segments = segment_payload.get("segments")
+    if not isinstance(segments, list):
+        raise TranslationQualityBlockedError("chapter-segments.json is invalid.")
+    book["chapter_segments"] = segments
+    from pdf_translator.translate import render_translation_quality_source
+
+    comparison_source = render_translation_quality_source(book)
+    source_markdown = (run_dir / "translation-input.md").read_text(encoding="utf-8")
+    review_payload = _read_json(run_dir / "review_items.json")
+    review_items = review_payload.get("items")
+    if not isinstance(review_items, list):
+        raise TranslationQualityBlockedError("review_items.json is invalid.")
+    manifest = _read_json(run_dir / "manifest.json")
+    text_operation = str(manifest.get("text_operation") or "translate")
+    write_translation_quality_bundle(
+        run_dir,
+        text_operation=text_operation,
+        source_markdown=source_markdown,
+        comparison_source_markdown=comparison_source,
+        review_items=review_items,
+    )
+    return effective_translation_quality_evaluation(run_dir)
 
 
 def translation_quality_summary(run_dir: Path) -> dict[str, Any]:

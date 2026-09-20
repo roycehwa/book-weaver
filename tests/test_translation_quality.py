@@ -11,6 +11,7 @@ from pdf_translator.translation_quality import (
     RAW_TRANSLATION_QUALITY_REPORT,
     SOURCE_QUALITY_REPORT,
     TRANSLATION_QUALITY_INDEX,
+    TRANSLATION_QUALITY_SOURCE,
     TranslationQualityBlockedError,
     assert_translation_quality_current,
     build_quality_signature,
@@ -21,6 +22,7 @@ from pdf_translator.translation_quality import (
     build_quality_context,
     effective_translation_quality_evaluation,
     invalidate_stale_translation_postprocess,
+    revalidate_translation_quality,
     run_source_quality_gate_before_translation,
     sha256_file,
     sha256_text,
@@ -118,6 +120,127 @@ def test_raw_report_flags_structure_and_link_regressions(tmp_path: Path) -> None
     )
     codes = {item["code"] for item in report["findings"]}
     assert "invented_link_targets" in codes
+
+
+def test_raw_report_compares_delivery_shape_separately_from_transport_input(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    write_synthetic_reading_units(run_dir)
+    transport = (
+        "<!-- translation input: generated -->\n\n"
+        "## Chapter\n\nRead the [source](https://example.com/source).\n"
+    )
+    comparison = (
+        "<!-- internal chapter boundary -->\n\n<!DOCTYPE html>\n\n"
+        "# Cover\n\n![Cover](book-images/cover.jpg)\n\n"
+        "# Chapter\n\nRead the [source](https://example.com/source).\n"
+    )
+    raw = (
+        "# Cover\n\n![封面](book-images/cover.jpg)\n\n"
+        "# Chapter\n\n请阅读[来源](https://example.com/source)。\n"
+    )
+    (run_dir / "translation-input.md").write_text(transport, encoding="utf-8")
+    (run_dir / "translated.raw.md").write_text(raw, encoding="utf-8")
+    report = build_raw_translation_quality_report(
+        run_dir,
+        text_operation="translate",
+        source_markdown=transport,
+        comparison_source_markdown=comparison,
+        review_items=[],
+    )
+    codes = {item["code"] for item in report["findings"]}
+    assert not codes.intersection(
+        {
+            "markdown_block_structure_loss",
+            "invented_link_targets",
+            "lost_link_targets",
+            "markdown_link_structure_loss",
+            "urls_regression",
+            "link_destinations_regression",
+            "html_tags_regression",
+        }
+    )
+
+
+def test_raw_report_still_blocks_real_external_link_change_with_delivery_shape(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    write_synthetic_reading_units(run_dir)
+    transport = "## Chapter\n\nRead the source.\n"
+    comparison = "# Chapter\n\n[Source](https://example.com/source).\n"
+    raw = "# Chapter\n\n[来源](https://evil.example/changed)。\n"
+    (run_dir / "translation-input.md").write_text(transport, encoding="utf-8")
+    (run_dir / "translated.raw.md").write_text(raw, encoding="utf-8")
+    report = build_raw_translation_quality_report(
+        run_dir,
+        text_operation="translate",
+        source_markdown=transport,
+        comparison_source_markdown=comparison,
+        review_items=[],
+    )
+    codes = {item["code"] for item in report["findings"]}
+    assert "invented_link_targets" in codes
+    assert "lost_link_targets" in codes
+    assert "urls_regression" in codes
+
+
+def test_raw_report_still_blocks_semantic_html_tag_change(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    write_synthetic_reading_units(run_dir)
+    source = "# Chapter\n\n<span id=\"source-note\">Text</span>\n"
+    raw = "# Chapter\n\n<span id=\"changed-note\">文字</span>\n"
+    (run_dir / "translation-input.md").write_text(source, encoding="utf-8")
+    (run_dir / "translated.raw.md").write_text(raw, encoding="utf-8")
+    report = build_raw_translation_quality_report(
+        run_dir,
+        text_operation="translate",
+        source_markdown=source,
+        comparison_source_markdown=source,
+        review_items=[],
+    )
+    assert any(item["code"] == "html_tags_regression" for item in report["findings"])
+
+
+def test_revalidate_translation_quality_rebuilds_only_derived_reports(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    write_synthetic_reading_units(run_dir)
+    source = (run_dir / "translation-input.md").read_text(encoding="utf-8")
+    (run_dir / "book.json").write_text(
+        json.dumps(
+            {
+                "chapters": [
+                    {
+                        "index": 1,
+                        "chapter_id": "ch-1",
+                        "title": "Chapter",
+                        "kind": "narrative",
+                        "markdown": source,
+                        "translate": True,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    raw = "# Chapter\n\n你好，世界。\n"
+    for name in ("translated.raw.md", "translated.cleaned.md", "translated.md"):
+        (run_dir / name).write_text(raw, encoding="utf-8")
+    (run_dir / "review_items.json").write_text('{"items": []}', encoding="utf-8")
+    (run_dir / "manifest.json").write_text(
+        json.dumps({"text_operation": "translate", "translation": {"mode": "translated"}}),
+        encoding="utf-8",
+    )
+
+    summary = revalidate_translation_quality(run_dir)
+
+    assert summary["translation_quality_blocking"] is False
+    assert (run_dir / TRANSLATION_QUALITY_SOURCE).read_text(encoding="utf-8") == source
 
 
 def test_polished_report_flags_protected_regression(tmp_path: Path) -> None:

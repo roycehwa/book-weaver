@@ -4172,6 +4172,26 @@ async def run_review_rewrite(run_dir: str, request: ReviewRewriteRequest):
     }
 
 
+@api_router.post("/review/quality/revalidate")
+async def revalidate_review_quality(run_dir: str):
+    """Rebuild derived quality reports from the task's frozen source and outputs."""
+    path = _resolve_review_run_dir(run_dir)
+    from pdf_translator.translation_quality import (
+        TranslationQualityBlockedError,
+        revalidate_translation_quality,
+    )
+
+    loop = asyncio.get_running_loop()
+    try:
+        summary = await loop.run_in_executor(
+            None,
+            lambda: revalidate_translation_quality(path),
+        )
+    except TranslationQualityBlockedError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    return {"status": "completed", "translation_quality": summary}
+
+
 @api_router.post("/review/export")
 async def run_review_export(run_dir: str, request: ReviewExportRequest):
     """Apply review decisions and export a versioned reviewed output."""

@@ -14,12 +14,14 @@ vi.mock('../api', () => ({
     addChapterMark: vi.fn(),
     deleteChapterMark: vi.fn(),
     rewrite: vi.fn(),
+    revalidateQuality: vi.fn(),
     exportVersion: vi.fn(),
   },
 }))
 
 const getProject = vi.mocked(reviewApi.getProject)
 const saveDecision = vi.mocked(reviewApi.saveDecision)
+const revalidateQuality = vi.mocked(reviewApi.revalidateQuality)
 
 const project: ReviewProject = {
   run_dir: '/tmp/review-run',
@@ -228,5 +230,39 @@ describe('Review draft navigation', () => {
     expect(
       screen.queryByText((content) => content.includes('![Original page') || content.includes('/Users/'))
     ).toBeNull()
+  })
+
+  test('revalidates stale quality rules from the completed review screen', async () => {
+    const staleProject: ReviewProject = {
+      ...project,
+      translation_quality: {
+        translation_quality_blocking: true,
+        revalidation_required: true,
+        effective_blocking_findings: [
+          {
+            code: 'translation_quality_rules_stale',
+            stage: 'quality_artifacts',
+            message: '质量校验规则已更新，请重新校验现有译文后再导出。',
+          },
+        ],
+      },
+      review_state: {
+        ...project.review_state,
+        decisions: {
+          s1: { status: 'approved' },
+          s2: { status: 'approved' },
+        },
+      },
+    }
+    getProject.mockResolvedValue(staleProject)
+    revalidateQuality.mockResolvedValue({
+      status: 'completed',
+      translation_quality: { translation_quality_blocking: false },
+    })
+
+    render(<Review />)
+    await userEvent.click(await screen.findByRole('button', { name: '重新校验现有译文' }))
+
+    expect(revalidateQuality).toHaveBeenCalledWith('/tmp/review-run')
   })
 })

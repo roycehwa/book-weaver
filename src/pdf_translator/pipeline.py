@@ -55,6 +55,7 @@ from pdf_translator.translate import (
     estimate_chapter_segment_translation_chunk_count,
     estimate_translation_chunk_count,
     estimate_semantic_translation_chunk_count,
+    render_translation_quality_source,
     translate_book_chapters,
     translate_markdown,
 )
@@ -945,10 +946,12 @@ def run_translation_pipeline(
     from pdf_translator.review import extend_pre_review_with_translation_quality
 
     source_markdown_for_quality = translation_input_markdown
+    comparison_source_markdown = render_translation_quality_source(book)
     quality_files = write_translation_quality_bundle(
         artifacts.output_dir,
         text_operation=text_operation,
         source_markdown=source_markdown_for_quality,
+        comparison_source_markdown=comparison_source_markdown,
         review_items=review_artifacts["review_items"]["items"],
         invalidated_artifacts=invalidated_postprocess or None,
     )

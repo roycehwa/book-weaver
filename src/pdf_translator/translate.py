@@ -2714,3 +2714,51 @@ def translate_book_chapters(
         chunk_count=chunk_index,
         semantic_content=semantic_content if isinstance(semantic_content, dict) else None,
     )
+
+
+def render_translation_quality_source(book: dict) -> str:
+    """Render the frozen source in the same delivery shape as translated.raw.md.
+
+    ``translation-input.md`` is a transport view: it omits preserved chapters,
+    uses generated comments, and does not necessarily use delivery heading
+    levels.  The raw translation is a complete delivery view.  Structural and
+    protected-token checks must compare like with like while the transport
+    file keeps its independent hash check.
+    """
+
+    segment_plan = chapter_segments_for_translation(book, max_chars=1)
+    segments_by_chapter: dict[str, list[dict]] = {}
+    for segment in segment_plan:
+        segments_by_chapter.setdefault(str(segment.get("chapter_id") or ""), []).append(segment)
+
+    delivery: list[dict] = []
+    pages = book.get("pages") if isinstance(book, dict) else []
+    pages = pages if isinstance(pages, list) else []
+    for fallback_index, chapter in enumerate(book.get("chapters", []), 1):
+        if not isinstance(chapter, dict):
+            continue
+        if not chapter.get("kind"):
+            chapter["kind"] = classify_chapter(chapter, pages=pages)
+        chapter_id = str(
+            chapter.get("chapter_id") or chapter.get("id") or f"chapter-{fallback_index:03d}"
+        )
+        if should_translate_chapter(chapter):
+            planned = [
+                segment
+                for segment in segments_by_chapter.get(chapter_id, [])
+                if str(segment.get("markdown") or "").strip()
+            ]
+            markdown = join_chunk_texts(
+                [str(segment.get("markdown") or "") for segment in planned],
+                [str(segment.get("separator_before", "\n\n")) for segment in planned],
+            ).strip()
+        else:
+            markdown = _chapter_markdown_for_translation(chapter).strip()
+        delivery.append(
+            {
+                "title": str(chapter.get("title") or f"Chapter {fallback_index}"),
+                "markdown": markdown,
+                "toc": bool(chapter.get("toc", True)),
+            }
+        )
+    return join_chapter_delivery_markdown(delivery)

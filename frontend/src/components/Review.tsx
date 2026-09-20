@@ -242,6 +242,7 @@ function Review() {
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
   const [rewriting, setRewriting] = useState(false)
+  const [revalidatingQuality, setRevalidatingQuality] = useState(false)
   const [exporting, setExporting] = useState(false)
   const [showAdvanced, setShowAdvanced] = useState(false)
   const [bookmarkSegmentId, setBookmarkSegmentId] = useState<string | null>(null)
@@ -418,6 +419,7 @@ function Review() {
   const isScopeComplete = scopeTotal > 0 && scopeReviewedCount >= scopeTotal
   const isFullReviewComplete = orderedSegments.length > 0 && reviewedCount >= orderedSegments.length
   const translationQualityBlocking = Boolean(project?.translation_quality?.translation_quality_blocking)
+  const qualityBlockingFindings = project?.translation_quality?.effective_blocking_findings || []
   const exportCompletionMessage = reviewExportCompletionMessage({
     pendingRewriteCount,
     rewritesNeedingInstruction,
@@ -891,6 +893,25 @@ function Review() {
     }
   }
 
+  const handleRevalidateQuality = async () => {
+    setRevalidatingQuality(true)
+    setError(null)
+    setActionMessage(null)
+    try {
+      const result = await reviewApi.revalidateQuality(runDir)
+      setActionMessage(
+        result.translation_quality.translation_quality_blocking
+          ? '质量校验已更新，仍有需要处理的真实问题。'
+          : '质量校验已更新，现有译文已通过导出门。'
+      )
+      await loadProject(selectedSegmentId)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '重新校验失败')
+    } finally {
+      setRevalidatingQuality(false)
+    }
+  }
+
   const progressPercent = orderedSegments.length ? Math.round((reviewedCount / orderedSegments.length) * 100) : 0
   const displayTranslation = selectedDecision?.approved_text || selectedTranslation?.translated_text || ''
   const alignedBlocks = useMemo(
@@ -1109,7 +1130,23 @@ function Review() {
             <p className="mt-1 text-xs">
               {exportCompletionMessage}
             </p>
+            {translationQualityBlocking && qualityBlockingFindings.length > 0 && (
+              <ul className="mt-2 space-y-1 text-xs text-red-800">
+                {qualityBlockingFindings.map((finding, index) => (
+                  <li key={`${finding.code}-${index}`}>{finding.message}</li>
+                ))}
+              </ul>
+            )}
             <div className="mt-2 flex flex-wrap gap-2">
+              {project?.translation_quality?.revalidation_required && (
+                <button
+                  onClick={() => void handleRevalidateQuality()}
+                  disabled={revalidatingQuality}
+                  className="rounded-lg bg-blue-700 px-3 py-1.5 text-xs font-medium text-white disabled:opacity-50"
+                >
+                  {revalidatingQuality ? '重新校验中…' : '重新校验现有译文'}
+                </button>
+              )}
               {pendingRewriteCount > 0 && (
                 <button
                   onClick={() => void handleRewrite()}
