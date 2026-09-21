@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -20,18 +21,25 @@ _GLUE_EACHOF = re.compile(r"\bEachofthe\b", re.IGNORECASE)
 _SPACED_OF_QUOTE = re.compile(r"of'\s*")
 _DOUBLE_SPACED_WORD = re.compile(r"\b([a-z]+)  +([a-z]+)\b", re.IGNORECASE)
 _LOGIC_SYMBOL_LINE = re.compile(r"[◻◇φ∀∃⊢⊨≤≥]")
-# Docling occasionally leaks a page/flow marker as an isolated ``f`` wrapped
-# in one or more dashes (``f-``, ``-f-``, ``---f-`` or ``f --``).  It is not
+# Docling occasionally leaks a page/flow marker as an isolated ``f`` or ``x``
+# wrapped in one or more dashes (``f-``, ``-f-``, ``---f-``, ``f --`` or
+# ``-x-``).  It is not
 # prose and, when it lands at a paragraph boundary, resembles an unrepaired
 # hyphenated word to the source quality gate.  Whitespace boundaries keep the
 # repair away from real words and ordinary hyphenation.
-_ORPHAN_FLOW_MARKER = re.compile(r"(?<!\S)-{0,3}f\s*-{1,3}(?!\S)", re.IGNORECASE)
+_ORPHAN_FLOW_MARKER = re.compile(r"(?<!\S)-{0,3}[fx]\s*-{1,3}(?!\S)", re.IGNORECASE)
+_WORD_TOKEN = re.compile(r"[A-Za-z]+")
+_DICTIONARY_PATHS = (Path("/usr/share/dict/words"), Path("/usr/share/dict/web2"))
+_CORE_REPAIR_WORDS = {
+    "and", "as", "could", "of", "singular", "the", "their", "there", "these", "they",
+    "this", "those", "through", "toward", "towards", "with", "without", "would",
+}
 
 INGEST_ISSUE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("orphan_footnote_y", re.compile(r"\. y\.|^\s*y\.\s*$", re.IGNORECASE | re.MULTILINE)),
     (
         "midword_space",
-        re.compile(r"(?<![A-Za-z'’])\b[b-hj-z] [a-z]{3,}\b", re.IGNORECASE),
+        re.compile(r"(?<![A-Za-z'’])\b[b-hj-z] [a-z]{3,}\b"),
     ),
     ("glued_words", re.compile(r"\bformalsystems\b", re.IGNORECASE)),
 )
@@ -82,7 +90,73 @@ def _merge_broken_word(match: re.Match[str]) -> str:
     return merged
 
 
-def repair_pdf_markdown(text: str) -> str:
+@lru_cache(maxsize=1)
+def _system_english_words() -> frozenset[str]:
+    words = set(_CORE_REPAIR_WORDS)
+    for path in _DICTIONARY_PATHS:
+        try:
+            words.update(
+                line.strip().casefold()
+                for line in path.read_text(encoding="utf-8", errors="ignore").splitlines()
+                if line.strip().isalpha()
+            )
+        except OSError:
+            continue
+    return frozenset(words)
+
+
+def _known_words(texts: list[str]) -> set[str]:
+    words = set(_system_english_words())
+    for text in texts:
+        words.update(token.group(0).casefold() for token in _WORD_TOKEN.finditer(text))
+    return words
+
+
+def _is_known_joined_word(value: str, known_words: set[str]) -> bool:
+    word = value.casefold()
+    if word in known_words:
+        return True
+    for suffix, replacement in (("ies", "y"), ("es", ""), ("s", ""), ("ed", ""), ("ing", "")):
+        if word.endswith(suffix) and len(word) - len(suffix) >= 3:
+            stem = word[: -len(suffix)] + replacement
+            if stem in known_words or (suffix == "es" and f"{stem}e" in known_words):
+                return True
+    return False
+
+
+def _repair_split_words(text: str, known_words: set[str]) -> str:
+    """Join high-confidence PDF glyph splits without touching normal word spaces."""
+    tokens = list(_WORD_TOKEN.finditer(text))
+    candidates: list[tuple[int, int, str]] = []
+    for width in (3, 2):
+        for index in range(0, len(tokens) - width + 1):
+            window = tokens[index:index + width]
+            if any(text[left.end():right.start()] != " " for left, right in zip(window, window[1:])):
+                continue
+            values = [token.group(0) for token in window]
+            if not any(len(value) == 1 for value in values):
+                continue
+            if width == 2 and values[0].casefold() in {"a", "i"} and len(values[1]) > 1:
+                continue
+            if width == 2 and values[1].casefold() in {"a", "i"} and len(values[0]) > 1:
+                continue
+            joined = "".join(values)
+            if width == 2 and len(values[1]) == 1 and joined.casefold() not in _CORE_REPAIR_WORDS:
+                continue
+            if _is_known_joined_word(joined, known_words):
+                candidates.append((window[0].start(), window[-1].end(), joined))
+
+    accepted: list[tuple[int, int, str]] = []
+    for start, end, joined in sorted(candidates, key=lambda item: (-(item[1] - item[0]), item[0])):
+        if any(start < existing_end and end > existing_start for existing_start, existing_end, _ in accepted):
+            continue
+        accepted.append((start, end, joined))
+    for start, end, joined in sorted(accepted, reverse=True):
+        text = f"{text[:start]}{joined}{text[end:]}"
+    return text
+
+
+def repair_pdf_markdown(text: str, *, known_words: set[str] | None = None) -> str:
     if not text:
         return text
     repaired = text
@@ -95,6 +169,7 @@ def repair_pdf_markdown(text: str) -> str:
     repaired = _GLUE_EACHOF.sub("Each of the", repaired)
     repaired = _SPACED_OF_QUOTE.sub("of' ", repaired)
     repaired = _ORPHAN_FLOW_MARKER.sub("", repaired)
+    repaired = _repair_split_words(repaired, known_words or _known_words([repaired]))
     repaired = _DOUBLE_SPACED_WORD.sub(r"\1 \2", repaired)
     repaired = re.sub(r"[ \t]+(?=\n|$)", "", repaired)
     repaired = re.sub(r"\n{3,}", "\n\n", repaired)
@@ -156,6 +231,18 @@ def repair_book_dict(book: dict[str, Any]) -> dict[str, Any]:
     chapters = book.get("chapters")
     if not isinstance(chapters, list):
         return book
+    corpus = [
+        value
+        for chapter in chapters
+        if isinstance(chapter, dict)
+        for value in (chapter.get("markdown"), chapter.get("trace_markdown"))
+        if isinstance(value, str)
+    ]
+    for key in ("full_markdown", "trace_markdown"):
+        value = book.get(key)
+        if isinstance(value, str):
+            corpus.append(value)
+    known_words = _known_words(corpus)
     repaired_chapters: list[dict[str, Any]] = []
     for chapter in chapters:
         if not isinstance(chapter, dict):
@@ -165,13 +252,13 @@ def repair_book_dict(book: dict[str, Any]) -> dict[str, Any]:
         for key in ("markdown", "trace_markdown"):
             value = entry.get(key)
             if isinstance(value, str) and value.strip():
-                entry[key] = repair_pdf_markdown(value)
+                entry[key] = repair_pdf_markdown(value, known_words=known_words)
         repaired_chapters.append(entry)
     book["chapters"] = repaired_chapters
     if isinstance(book.get("full_markdown"), str):
-        book["full_markdown"] = repair_pdf_markdown(book["full_markdown"])
+        book["full_markdown"] = repair_pdf_markdown(book["full_markdown"], known_words=known_words)
     if isinstance(book.get("trace_markdown"), str):
-        book["trace_markdown"] = repair_pdf_markdown(book["trace_markdown"])
+        book["trace_markdown"] = repair_pdf_markdown(book["trace_markdown"], known_words=known_words)
     return book
 
 

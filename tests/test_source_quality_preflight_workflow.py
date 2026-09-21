@@ -60,7 +60,7 @@ def test_confirmation_quality_issues_include_nonblocking_source_warnings() -> No
         {
             "severity": "warning",
             "code": "midword_space",
-            "message": "源文存在需处理的「词内异常空格」（章节「Introduction」，约第 8 行）；片段：an d hundreds of articles",
+            "message": "源文质量提示「词内异常空格」（章节「Introduction」，约第 8 行）；不会阻止继续；片段：an d hundreds of articles",
             "chapter": "Introduction",
             "line": 8,
             "excerpt": "an d hundreds of articles",

@@ -11,15 +11,31 @@ def test_repair_pdf_markdown_fixes_common_extraction_artifacts() -> None:
         "Eachofthe modal operators ◻ and ◇ behave syntactically like formalsystems."
     )
     repaired = repair_pdf_markdown(source)
-    assert "s ingular terms" in repaired
+    assert "singular terms" in repaired
     assert ". y." not in repaired
     assert "formal systems" in repaired
     assert "Each of the" in repaired
 
 
 def test_repair_does_not_glue_normal_short_words():
-    text = "In the beginning we saw a book. It is in the room, on a desk, as an example of the method."
+    text = "In the beginning we saw a book and a rise in interest. It is in the room, on a desk, as an example of the method, from t to x."
     assert repair_pdf_markdown(text) == text
+
+
+def test_repair_joins_high_confidence_single_glyph_word_splits() -> None:
+    text = (
+        "Husserl is central here. Henry e mphasizes that an d hundreds of examples c ould clarify the point. "
+        "Hus s erl describes the pri mar y circumstances a s pathos and praxis."
+    )
+
+    repaired = repair_pdf_markdown(text)
+
+    assert "emphasizes" in repaired
+    assert "and hundreds" in repaired
+    assert "could" in repaired
+    assert "Husserl" in repaired
+    assert "primary" in repaired
+    assert "as pathos" in repaired
 
 
 def test_scan_ingest_quality_reports_issues() -> None:
@@ -63,6 +79,7 @@ def test_repair_removes_isolated_docling_flow_markers_without_hiding_real_hyphen
         "The argument ends here. f-\n\n"
         "The next paragraph ends here. -f-\n\n"
         "A third paragraph ends here. ---f-\n\n"
+        "A fourth paragraph ends here. -x-\n\n"
         "The involuntary f -- and voluntary remain distinct.\n\n"
         "A real trans-\nformation break remains."
     )
@@ -72,6 +89,7 @@ def test_repair_removes_isolated_docling_flow_markers_without_hiding_real_hyphen
     assert " f-" not in repaired
     assert "-f-" not in repaired
     assert "---f-" not in repaired
+    assert "-x-" not in repaired
     assert "f --" not in repaired
     assert "involuntary and voluntary" in repaired
     assert "trans-\nformation" in repaired

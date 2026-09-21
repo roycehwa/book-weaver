@@ -159,6 +159,44 @@ describe('JobDetail Notes dependency acknowledgement', () => {
     expect(screen.getAllByRole('button', { name: '先保存或放弃原文修改' })[0]).toBeDisabled()
   })
 
+  it('shows source blockers as errors and offers an unchanged-plan recheck', async () => {
+    const confirmedJob = { ...job, revision: 3, source_revision: 0 }
+    vi.spyOn(jobsApi, 'get').mockResolvedValue(confirmedJob)
+    vi.spyOn(jobsApi, 'sourceInfo').mockResolvedValue({
+      job_id: 'job-1', filename: 'synthetic.pdf', size: 10, kind: 'other', download_url: '/source',
+    })
+    vi.spyOn(jobsApi, 'getChapterDraft').mockResolvedValue({
+      job_id: 'job-1',
+      chapters: [
+        { index: 1, chapter_id: 'body', title: 'Body', page_start: 1, page_end: 2, content_policy: 'translate' },
+      ],
+      confirmation_quality_issues: [
+        { severity: 'error', code: 'reading_units_invalid', message: '阅读单元无效' },
+        { severity: 'warning', code: 'midword_space', message: '疑似词内空格' },
+      ],
+    })
+    vi.spyOn(workspaceApi, 'listBooks').mockResolvedValue({
+      total_books: 1,
+      books: [{
+        ...workspaceBook,
+        job: confirmedJob,
+        steps: {
+          ...workspaceBook.steps,
+          chapter_confirmation: { status: 'done', label: '已确认', description: '已确认' },
+        },
+      }],
+    })
+
+    render(
+      <MemoryRouter initialEntries={['/jobs/job-1']}>
+        <Routes><Route path="/jobs/:id" element={<JobDetail />} /></Routes>
+      </MemoryRouter>,
+    )
+
+    expect(await screen.findByText('1 个错误 · 1 条提示')).toBeInTheDocument()
+    expect(screen.getAllByRole('button', { name: '重新检查确认版' })).not.toHaveLength(0)
+  })
+
   it('explains that translating a contents chapter rebuilds the target TOC', async () => {
     vi.spyOn(jobsApi, 'get').mockResolvedValue(job)
     vi.spyOn(jobsApi, 'sourceInfo').mockResolvedValue({

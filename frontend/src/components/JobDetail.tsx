@@ -957,6 +957,8 @@ function JobDetail() {
       ? '正在重建书籍、阅读单元与术语…'
     : chapterQuality.blocking
       ? '先处理章节错误'
+      : qualityErrors.length > 0 && !needsChapterConfirmation
+        ? '重新检查确认版'
       : needsChapterConfirmation
         ? '确认源书章节目录'
         : '更新章节目录'
@@ -1367,14 +1369,14 @@ function JobDetail() {
                       </div>
                     </div>
                     <span className={`rounded-full px-3 py-1 text-xs font-medium ${
-                      chapterQuality.blocking
+                      qualityErrors.length > 0
                         ? 'bg-red-100 text-red-700'
                         : qualityWarnings.length
                           ? 'bg-amber-100 text-amber-700'
                           : 'bg-emerald-100 text-emerald-700'
                     }`}>
-                      {chapterQuality.blocking
-                        ? `${qualityErrors.length} 个错误`
+                      {qualityErrors.length > 0
+                        ? `${qualityErrors.length} 个错误${qualityWarnings.length ? ` · ${qualityWarnings.length} 条提示` : ''}`
                         : qualityWarnings.length
                           ? `${qualityWarnings.length} 个警告`
                           : informationalContinuations.length

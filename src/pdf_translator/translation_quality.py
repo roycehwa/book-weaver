@@ -566,7 +566,12 @@ def confirmation_quality_issues_from_source_report(
         if isinstance(line, int) and line > 0:
             location_parts.append(f"约第 {line} 行")
         location = "，".join(location_parts) if location_parts else "待翻译输入稿"
-        message = f"源文存在需处理的「{label}」（{location}）"
+        blocking = finding.get("severity") == "blocking"
+        message = (
+            f"源文存在必须处理的「{label}」（{location}）"
+            if blocking
+            else f"源文质量提示「{label}」（{location}）；不会阻止继续"
+        )
         if isinstance(excerpt, str) and excerpt.strip():
             snippet = excerpt.strip()
             if len(snippet) > 96:
@@ -574,7 +579,7 @@ def confirmation_quality_issues_from_source_report(
             message = f"{message}；片段：{snippet}"
         issues.append(
             {
-                "severity": "error" if finding.get("severity") == "blocking" else "warning",
+                "severity": "error" if blocking else "warning",
                 "code": code,
                 "message": message,
                 "chapter": chapter,
