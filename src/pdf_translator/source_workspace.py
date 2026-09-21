@@ -158,8 +158,12 @@ def page_issues(
         codes = []
         if re.search(r'[A-Za-z]-\s*\n+\s*[a-z]', text):
             codes.append('hyphenated_line_break')
-        if text.rstrip().endswith('-'):
-            codes.append('possible_continuation')
+        # Cross-page continuation candidates are owned by the structured
+        # continuation ledger.  A plain trailing hyphen is common in PDF
+        # extraction and is not enough evidence to create a user task.  The
+        # ledger's uncertain boundaries are exposed once through
+        # ``confirmation_quality_issues`` instead of flooding this workbench
+        # with one entry for every layout fragment.
         if re.match(r'^#{1,6} .{100,}', text):
             codes.append('possible_heading_error')
         for code in codes:

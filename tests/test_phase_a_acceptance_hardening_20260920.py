@@ -89,7 +89,7 @@ def test_ragged_right_edges_same_column_hyphen_continuation_is_accepted() -> Non
     assert decision["evidence"]["geometry"]["ragged_right_edges"] is True
 
 
-def test_accepted_continuation_reconciles_open_source_workspace_issue(tmp_path: Path) -> None:
+def test_accepted_continuation_does_not_create_source_workspace_task(tmp_path: Path) -> None:
     page_one = "Opening paragraph on the first page ends with a broken hyphenated fron-"
     pages = {1: page_one, 2: "tier text continues here."}
     ledger = {
@@ -110,12 +110,27 @@ def test_accepted_continuation_reconciles_open_source_workspace_issue(tmp_path: 
     workspace = inspect_page(tmp_path, pages, 1)
     continuation_issues = [issue for issue in workspace["issues"] if issue["code"] == "possible_continuation"]
 
-    assert continuation_issues
-    assert continuation_issues[0]["status"] == "reconciled"
+    assert continuation_issues == []
     assert not any(
         group["code"] == "possible_continuation"
         for group in workspace["issue_groups"]
     )
+
+
+def test_trailing_hyphens_without_structured_boundary_evidence_do_not_create_user_tasks(
+    tmp_path: Path,
+) -> None:
+    workspace = inspect_page(
+        tmp_path,
+        {
+            1: "A page may contain many extracted layout fragments ending in fron-",
+            2: "tier text may or may not continue here.",
+        },
+        1,
+    )
+
+    assert workspace["issues"] == []
+    assert workspace["issue_groups"] == []
 
 
 def test_unresolved_continuation_surfaces_in_confirmation_quality_summary(tmp_path: Path) -> None:
