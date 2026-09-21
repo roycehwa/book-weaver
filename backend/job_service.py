@@ -1148,7 +1148,16 @@ class BookJobService:
             embedded_toc, embedded_meta = self._pdf_embedded_toc_draft_chapters(job_id)
             if embedded_toc:
                 meta.update(embedded_meta)
-                return embedded_toc, "pdf_toc", "PDF 内置目录", meta
+                return (
+                    [
+                        self._canonical_chapter(chapter, index)
+                        for index, chapter in enumerate(embedded_toc, start=1)
+                        if isinstance(chapter, dict)
+                    ],
+                    "pdf_toc",
+                    "PDF 内置目录",
+                    meta,
+                )
 
         text_toc, text_meta = self._pdf_text_toc_draft_chapters(
             job_id,
@@ -1162,7 +1171,16 @@ class BookJobService:
             detail = "PDF 目录页文本"
             if text_meta.get("toc_page_start") and text_meta.get("toc_page_end"):
                 detail += f"（第 {text_meta['toc_page_start']}–{text_meta['toc_page_end']} 页）"
-            return text_toc, "pdf_text_toc", detail, meta
+            return (
+                [
+                    self._canonical_chapter(chapter, index)
+                    for index, chapter in enumerate(text_toc, start=1)
+                    if isinstance(chapter, dict)
+                ],
+                "pdf_text_toc",
+                detail,
+                meta,
+            )
 
         book_path = self.artifact_path(job_id, "book")
         baseline = book_path.parent / "source-baseline-book.json"
@@ -2324,8 +2342,11 @@ class BookJobService:
             "content_policy": policy,
         }
         kind = str(chapter.get("kind") or "").strip()
-        if kind:
-            canonical["kind"] = kind
+        if not kind:
+            from pdf_translator.chapter_kind import classify_chapter
+
+            kind = classify_chapter({"title": canonical["title"]})
+        canonical["kind"] = kind
         return canonical
 
 

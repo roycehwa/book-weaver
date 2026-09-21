@@ -781,6 +781,52 @@ def test_draft_chapters_prefers_saved_canonical_chapters(tmp_path: Path) -> None
     assert chapters[0]["title"] == "Saved"
 
 
+def test_canonical_chapter_infers_contents_kind_from_pdf_toc_draft() -> None:
+    chapter = BookJobService._canonical_chapter(
+        {
+            "index": 5,
+            "chapter_id": "contents",
+            "title": "Contents",
+            "page_start": 8,
+            "page_end": 9,
+            "content_policy": "auto",
+        },
+        5,
+    )
+
+    assert chapter["kind"] == "toc"
+
+
+def test_draft_chapters_normalizes_embedded_pdf_toc_kinds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = BookJobService(project_home=tmp_path, jobs_dir=tmp_path / "jobs")
+    job_dir = service.jobs_dir / "job-1"
+    job_dir.mkdir(parents=True)
+    (job_dir / "job.json").write_text(json.dumps(_snapshot("job-1")), encoding="utf-8")
+    monkeypatch.setattr(
+        service,
+        "_pdf_embedded_toc_draft_chapters",
+        lambda _job_id: (
+            [
+                {
+                    "index": 1,
+                    "chapter_id": "contents",
+                    "title": "Contents",
+                    "page_start": 8,
+                    "page_end": 9,
+                }
+            ],
+            {},
+        ),
+    )
+
+    chapters = service.draft_chapters("job-1")
+
+    assert chapters[0]["kind"] == "toc"
+
+
 def test_delete_removes_job_directory(tmp_path: Path) -> None:
     service = BookJobService(project_home=tmp_path, jobs_dir=tmp_path / "jobs")
     job_dir = service.jobs_dir / "job-1"
