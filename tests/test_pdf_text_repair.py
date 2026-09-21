@@ -46,6 +46,14 @@ def test_repair_uses_book_local_evidence_for_uncommon_multi_fragment_words() -> 
     assert "same modal operator" in repaired
 
 
+def test_repair_joins_uncommon_word_after_stray_single_glyph() -> None:
+    repaired = repair_pdf_markdown(
+        "Birth is an interesting c oncatenation of necessity and contingency."
+    )
+
+    assert "interesting concatenation" in repaired
+
+
 def test_scan_ingest_quality_reports_issues() -> None:
     report = scan_ingest_quality("that-clauses as s ingular terms. y.")
     assert report.issue_counts["midword_space"] >= 1

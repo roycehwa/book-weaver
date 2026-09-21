@@ -145,6 +145,12 @@ def _split_has_word_evidence(values: list[str], joined: str, known_words: set[st
         return joined_score >= 1.5
     if all_singletons:
         return joined_score >= 3.0 and gain >= 0.75
+    if suspicious_singleton:
+        # A stray consonant followed by a non-word remainder is strong PDF
+        # glyph-split evidence even for uncommon scholarly vocabulary (for
+        # example ``c oncatenation``).  Common valid one-letter words were
+        # excluded above.
+        return joined_score >= 2.0 and gain >= 1.25
     return joined_score >= 2.5 and gain >= 1.0 and (suspicious_singleton or rare_fragment)
 
 
