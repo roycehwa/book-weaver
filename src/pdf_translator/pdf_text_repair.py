@@ -20,6 +20,12 @@ _GLUE_EACHOF = re.compile(r"\bEachofthe\b", re.IGNORECASE)
 _SPACED_OF_QUOTE = re.compile(r"of'\s*")
 _DOUBLE_SPACED_WORD = re.compile(r"\b([a-z]+)  +([a-z]+)\b", re.IGNORECASE)
 _LOGIC_SYMBOL_LINE = re.compile(r"[◻◇φ∀∃⊢⊨≤≥]")
+# Docling occasionally leaks a page/flow marker as an isolated ``f`` wrapped
+# in one or more dashes (``f-``, ``-f-``, ``---f-`` or ``f --``).  It is not
+# prose and, when it lands at a paragraph boundary, resembles an unrepaired
+# hyphenated word to the source quality gate.  Whitespace boundaries keep the
+# repair away from real words and ordinary hyphenation.
+_ORPHAN_FLOW_MARKER = re.compile(r"(?<!\S)-{0,3}f\s*-{1,3}(?!\S)", re.IGNORECASE)
 
 INGEST_ISSUE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("orphan_footnote_y", re.compile(r"\. y\.|^\s*y\.\s*$", re.IGNORECASE | re.MULTILINE)),
@@ -88,7 +94,9 @@ def repair_pdf_markdown(text: str) -> str:
     repaired = _GLUE_FORMALS.sub("formal systems", repaired)
     repaired = _GLUE_EACHOF.sub("Each of the", repaired)
     repaired = _SPACED_OF_QUOTE.sub("of' ", repaired)
+    repaired = _ORPHAN_FLOW_MARKER.sub("", repaired)
     repaired = _DOUBLE_SPACED_WORD.sub(r"\1 \2", repaired)
+    repaired = re.sub(r"[ \t]+(?=\n|$)", "", repaired)
     repaired = re.sub(r"\n{3,}", "\n\n", repaired)
     return repaired.strip() + ("\n" if text.endswith("\n") else "")
 

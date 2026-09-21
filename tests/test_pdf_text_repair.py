@@ -56,3 +56,24 @@ def test_scan_ingest_quality_blocks_unrepaired_hyphenated_line_break() -> None:
     assert report.blocking_issues[0]["chapter"] == "Chapter"
     assert report.blocking_issues[0]["line"] == 3
     assert "trans-\\nformation" in report.blocking_issues[0]["excerpt"]
+
+
+def test_repair_removes_isolated_docling_flow_markers_without_hiding_real_hyphenation() -> None:
+    source = (
+        "The argument ends here. f-\n\n"
+        "The next paragraph ends here. -f-\n\n"
+        "A third paragraph ends here. ---f-\n\n"
+        "The involuntary f -- and voluntary remain distinct.\n\n"
+        "A real trans-\nformation break remains."
+    )
+
+    repaired = repair_pdf_markdown(source)
+
+    assert " f-" not in repaired
+    assert "-f-" not in repaired
+    assert "---f-" not in repaired
+    assert "f --" not in repaired
+    assert "involuntary and voluntary" in repaired
+    assert "trans-\nformation" in repaired
+    report = scan_ingest_quality(repaired)
+    assert report.issue_counts["hyphenated_line_break"] == 1
