@@ -84,9 +84,12 @@ def test_scan_ingest_quality_blocks_unrepaired_hyphenated_line_break() -> None:
 
 def test_repair_removes_structural_flow_markers_regardless_of_glyph() -> None:
     source = (
-        "The argument ends here. q-\n\n"
+        "The argument ends here. -q-\n\n"
+        "the next paragraph continues the thought.\n\n"
         "The next paragraph ends here. -m-\n\n"
+        "more prose continues below.\n\n"
         "A third paragraph ends here. ---z-\n\n"
+        "still more lowercase continuation.\n\n"
         "The involuntary r -- and voluntary remain distinct.\n\n"
         "Let -x- denote the inverse in this sentence.\n\n"
         "The variable x-\n\n"
@@ -95,7 +98,7 @@ def test_repair_removes_structural_flow_markers_regardless_of_glyph() -> None:
 
     repaired = repair_pdf_markdown(source)
 
-    assert " q-" not in repaired
+    assert "-q-" not in repaired
     assert "-m-" not in repaired
     assert "---z-" not in repaired
     assert "r --" not in repaired
@@ -105,3 +108,30 @@ def test_repair_removes_structural_flow_markers_regardless_of_glyph() -> None:
     assert "trans-\nformation" in repaired
     report = scan_ingest_quality(repaired)
     assert report.issue_counts["hyphenated_line_break"] == 2
+
+
+def test_repair_removes_docling_flow_marker_before_lowercase_paragraph_break() -> None:
+    source = (
+        "The division—namely, -x-\n\n"
+        "the subjective side of the argument continues.\n\n"
+        "This description -x-\n\n"
+        "into question remains readable after cleanup."
+    )
+
+    repaired = repair_pdf_markdown(source)
+
+    assert "-x-" not in repaired
+    assert "division—namely,\n\nthe subjective" in repaired
+    assert "This description\n\ninto question" in repaired
+    assert "Let -x- denote" in repair_pdf_markdown("Let -x- denote a placeholder.\n\n")
+    report = scan_ingest_quality(repaired)
+    assert report.issue_counts["hyphenated_line_break"] == 0
+    assert report.blocking_issues == []
+
+
+def test_scan_ignores_docling_flow_marker_hyphen_before_lowercase_paragraph() -> None:
+    unrepaired = "description -x-\n\ninto question"
+
+    report = scan_ingest_quality(unrepaired)
+
+    assert report.issue_counts["hyphenated_line_break"] == 0

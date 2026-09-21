@@ -26,12 +26,17 @@ _LOGIC_SYMBOL_LINE = re.compile(r"[◻◇φ∀∃⊢⊨≤≥]")
 # glyph itself is not stable across books, so detection uses layout and syntax:
 # a marker must occupy its own line, follow completed prose at a paragraph
 # boundary, or interrupt a coordination with a double dash.
+_SINGLE_GLYPH_DASH_FLOW_MARKER = r"-{0,3}[A-Za-z]\s*-{1,3}"
 _STANDALONE_FLOW_MARKER = re.compile(
-    r"^\s*-{0,3}[A-Za-z]\s*-{1,3}\s*$",
+    rf"^\s*{_SINGLE_GLYPH_DASH_FLOW_MARKER}\s*$",
     re.MULTILINE,
 )
 _SENTENCE_END_FLOW_MARKER = re.compile(
-    r"(?<=[.!?])\s+-{0,3}[A-Za-z]\s*-{1,3}(?=[ \t]*(?:\n\s*\n|\Z))",
+    rf"(?<=[.!?])\s+{_SINGLE_GLYPH_DASH_FLOW_MARKER}(?=[ \t]*(?:\n\s*\n|\Z))",
+    re.MULTILINE,
+)
+_PROSE_PARAGRAPH_FLOW_MARKER = re.compile(
+    rf"(?<=\S)\s+{_SINGLE_GLYPH_DASH_FLOW_MARKER}(?=\s*\n\s*\n\s*[a-z])",
     re.MULTILINE,
 )
 _COORDINATION_FLOW_MARKER = re.compile(
@@ -51,7 +56,15 @@ INGEST_ISSUE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 BLOCKING_INGEST_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("replacement_character", re.compile("\ufffd")),
     ("soft_hyphen", re.compile("\u00ad")),
-    ("hyphenated_line_break", re.compile(r"(?<=[^\W\d_])-\s*\n\s*(?=[^\W\d_])", re.UNICODE)),
+    (
+        "hyphenated_line_break",
+        re.compile(
+            r"(?<=[^\W\d_])"
+            r"(?<!-[A-Za-z])(?<!--[A-Za-z])(?<!---[A-Za-z])"
+            r"-\s*\n\s*(?=[^\W\d_])",
+            re.UNICODE,
+        ),
+    ),
     ("control_character", re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")),
 )
 
@@ -175,6 +188,7 @@ def repair_pdf_markdown(text: str, *, known_words: set[str] | None = None) -> st
     repaired = _SPACED_OF_QUOTE.sub("of' ", repaired)
     repaired = _STANDALONE_FLOW_MARKER.sub("", repaired)
     repaired = _SENTENCE_END_FLOW_MARKER.sub("", repaired)
+    repaired = _PROSE_PARAGRAPH_FLOW_MARKER.sub("", repaired)
     repaired = _COORDINATION_FLOW_MARKER.sub(" ", repaired)
     repaired = _repair_split_words(repaired, known_words or _known_words([repaired]))
     repaired = _DOUBLE_SPACED_WORD.sub(r"\1 \2", repaired)
