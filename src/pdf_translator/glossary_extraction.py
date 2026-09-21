@@ -374,6 +374,66 @@ def _is_fragment_phrase(phrase: str) -> bool:
     )
 
 
+_CLAUSE_LEADING_WORDS = frozenset(
+    {
+        "after",
+        "although",
+        "and",
+        "as",
+        "because",
+        "before",
+        "but",
+        "if",
+        "nor",
+        "once",
+        "or",
+        "since",
+        "so",
+        "than",
+        "though",
+        "unless",
+        "until",
+        "when",
+        "where",
+        "whereas",
+        "whether",
+        "while",
+        "yet",
+    }
+)
+_POSSESSIVE_DETERMINERS = frozenset({"her", "his", "its", "my", "our", "their", "your"})
+_AUXILIARY_VERBS = frozenset(
+    {
+        "am",
+        "are",
+        "be",
+        "been",
+        "being",
+        "can",
+        "could",
+        "did",
+        "do",
+        "does",
+        "had",
+        "has",
+        "have",
+        "is",
+        "may",
+        "might",
+        "must",
+        "shall",
+        "should",
+        "was",
+        "were",
+        "will",
+        "would",
+    }
+)
+_WH_WORDS = frozenset({"how", "what", "when", "where", "which", "who", "whom", "whose", "why"})
+_PHRASAL_VERB_PARTICLES = frozenset(
+    {"about", "along", "around", "away", "back", "down", "off", "on", "out", "over", "through", "up"}
+)
+
 _INCOMPLETE_TRAILING_MODIFIERS = frozenset(
     {
         "advisory",
@@ -396,6 +456,44 @@ _INCOMPLETE_TRAILING_MODIFIERS = frozenset(
         "western",
     }
 )
+
+
+def _word_casefold(word: str) -> str:
+    return word.casefold().strip("'’-")
+
+
+def termhood_structural_rejection(phrase: str) -> str | None:
+    """Reject title-cased sentence fragments that are not book-level terms."""
+    normalized = _normalize_phrase(phrase)
+    if not normalized:
+        return None
+    if re.search(r"\b[A-Za-z]{2,}-[A-Za-z]{2,}\b", normalized):
+        return None
+    words = _phrase_words(normalized)
+    if len(words) < 2:
+        return None
+
+    first = _word_casefold(words[0])
+    last = _word_casefold(words[-1])
+    lowered_words = [_word_casefold(word) for word in words]
+
+    if first in _POSSESSIVE_DETERMINERS:
+        return "sentence_fragment"
+    if first in _AUXILIARY_VERBS:
+        return "sentence_fragment"
+    if first in _WH_WORDS and any(word in _AUXILIARY_VERBS for word in lowered_words[1:]):
+        return "sentence_fragment"
+    if len(words) == 2 and first in _CLAUSE_LEADING_WORDS:
+        return "sentence_fragment"
+    if len(words) == 2 and last in _PHRASAL_VERB_PARTICLES:
+        return "sentence_fragment"
+    return None
+
+
+def _is_glossary_phrase_candidate(phrase: str) -> bool:
+    if not _is_valid_phrase(phrase):
+        return False
+    return termhood_structural_rejection(phrase) is None
 
 
 def candidate_integrity_rejection(phrase: str) -> str | None:
@@ -421,6 +519,9 @@ def candidate_integrity_rejection(phrase: str) -> str | None:
         return "generic century phrase"
     if _GENERIC_COMPASS_RE.fullmatch(normalized):
         return "generic geographic phrase"
+    termhood_reason = termhood_structural_rejection(normalized)
+    if termhood_reason is not None:
+        return termhood_reason
     return None
 
 
@@ -550,7 +651,7 @@ def extract_candidate_phrases(text: str) -> list[str]:
         phrase = _normalize_phrase(match.group(0))
         if phrase.startswith("The "):
             phrase = phrase[4:]
-        if len(_phrase_words(phrase)) < 2 or not _is_valid_phrase(phrase):
+        if len(_phrase_words(phrase)) < 2 or not _is_glossary_phrase_candidate(phrase):
             continue
         seen[phrase] = seen.get(phrase, 0) + 1
     return list(seen.keys())
@@ -564,7 +665,7 @@ def extract_connector_phrases(text: str) -> list[str]:
             phrase = phrase[4:]
         words = _phrase_words(phrase)
         content_words = [word for word in words if word.lower() not in {"of", "and", "the"}]
-        if len(content_words) >= 2 and _is_valid_phrase(phrase):
+        if len(content_words) >= 2 and _is_glossary_phrase_candidate(phrase):
             seen.add(phrase)
     return sorted(seen)
 
@@ -587,7 +688,7 @@ def extract_quoted_terms(text: str) -> list[str]:
         if len(phrase) < 3:
             continue
         words = _phrase_words(phrase)
-        if len(words) >= 2 and _is_valid_phrase(phrase):
+        if len(words) >= 2 and _is_glossary_phrase_candidate(phrase):
             phrases.add(phrase)
         elif len(words) == 1 and len(phrase) >= 4:
             phrases.add(phrase)
@@ -598,11 +699,11 @@ def extract_index_phrases(text: str) -> list[str]:
     phrases: set[str] = set()
     for match in INDEX_ENTRY_RE.finditer(text):
         phrase = _normalize_phrase(match.group(1).strip(" ."))
-        if len(_phrase_words(phrase)) >= 2 and len(phrase) >= 5 and _is_valid_phrase(phrase):
+        if len(_phrase_words(phrase)) >= 2 and len(phrase) >= 5 and _is_glossary_phrase_candidate(phrase):
             phrases.add(phrase)
     for chunk in re.split(r"[,;\n]", text):
         chunk = _normalize_phrase(chunk.strip(" ."))
-        if not chunk or len(chunk) < 5 or not _is_valid_phrase(chunk):
+        if not chunk or len(chunk) < 5 or not _is_glossary_phrase_candidate(chunk):
             continue
         if PERSON_NAME_RE.fullmatch(chunk) or len(_phrase_words(chunk)) >= 2:
             if chunk[0].isupper():

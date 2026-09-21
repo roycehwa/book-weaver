@@ -14,7 +14,9 @@ from pdf_translator.glossary_extraction import (
     candidate_integrity_rejection,
     canonical_source_key,
     canonical_source_term,
+    extract_candidate_phrases,
     extract_connector_phrases,
+    termhood_structural_rejection,
 )
 
 
@@ -251,6 +253,54 @@ def test_connector_extraction_keeps_complete_title_cased_tail() -> None:
     assert "Mother of All Battles" in phrases
     assert "Federation of Iraqi" not in phrases
     assert "Institute of Peace" not in phrases
+
+
+def test_termhood_filter_rejects_sentence_fragments_and_keeps_named_phrases() -> None:
+    rejected = [
+        "What Is",
+        "But Henry",
+        "Although Henry",
+        "Whereas Ricoeur",
+        "As Henry",
+        "His Phenomenology",
+        "Living Up",
+    ]
+    for phrase in rejected:
+        assert termhood_structural_rejection(phrase) == "sentence_fragment"
+        assert candidate_integrity_rejection(phrase) == "sentence_fragment"
+
+    retained = [
+        "Federation of Iraqi Women",
+        "Mother of All Battles",
+        "Michel Henry",
+        "Material Phenomenology",
+        "Iran-Iraq War",
+        "Non-Being",
+    ]
+    for phrase in retained:
+        assert termhood_structural_rejection(phrase) is None
+        assert candidate_integrity_rejection(phrase) is None
+
+
+def test_termhood_filter_applied_during_phrase_extraction() -> None:
+    text = (
+        "What Is phenomenology? But Henry disagreed. Although Henry wrote, Whereas Ricoeur "
+        "responded. As Henry argued, His Phenomenology mattered. Living Up to ideals. "
+        "Michel Henry and Material Phenomenology shaped Iran-Iraq War studies. "
+        "The Federation of Iraqi Women discussed the Mother of All Battles."
+    )
+    candidates = set(extract_candidate_phrases(text))
+    connectors = set(extract_connector_phrases(text))
+
+    assert "What Is" not in candidates
+    assert "But Henry" not in candidates
+    assert "Although Henry" not in candidates
+    assert "His Phenomenology" not in candidates
+    assert "Living Up" not in candidates
+    assert "Michel Henry" in candidates
+    assert "Material Phenomenology" in candidates
+    assert "Federation of Iraqi Women" in connectors
+    assert "Mother of All Battles" in connectors
 
 
 def test_candidate_integrity_rejects_clause_leads_and_incomplete_modifiers() -> None:
