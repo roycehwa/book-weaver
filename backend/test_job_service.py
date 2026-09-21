@@ -703,6 +703,57 @@ def test_confirming_translation_chapters_extracts_glossary_from_confirmed_book(t
     assert reading_units["units"][0]["policy_confirmed"] is True
 
 
+def test_confirm_chapters_blocks_glossary_when_source_quality_fails(tmp_path: Path) -> None:
+    service = BookJobService(project_home=tmp_path, jobs_dir=tmp_path / "jobs")
+    job_dir = service.jobs_dir / "job-soft-hyphen"
+    artifacts_dir = job_dir / "artifacts"
+    artifacts_dir.mkdir(parents=True)
+    book = {
+        "metadata": {"chapter_source": "automatic"},
+        "chapters": [{
+            "title": "Body",
+            "source_pages": [1],
+            "trace_markdown": "[[page: 1]]\n\nbro\u00adken agency in practice.",
+            "markdown": "bro\u00adken agency in practice.",
+        }],
+        "pages": [{"page_no": 1, "has_content": True, "page_kind": "body"}],
+    }
+    (artifacts_dir / "book.json").write_text(json.dumps(book), encoding="utf-8")
+    snapshot = _snapshot("job-soft-hyphen")
+    snapshot["state"] = "awaiting_chapter_confirmation"
+    snapshot["request"] = {
+        "processing_mode": "translate",
+        "source_language": "en",
+        "target_language": "zh-CN",
+    }
+    snapshot["resolved"] = {"text_operation": "translate", "source_language": "en"}
+    snapshot["artifacts"] = {"book": {"href": "artifacts/book.json"}}
+    (job_dir / "job.json").write_text(json.dumps(snapshot), encoding="utf-8")
+
+    result = service.confirm_chapters(
+        "job-soft-hyphen",
+        expected_job_revision=int(snapshot.get("revision") or 0),
+        chapters=[{
+            "index": 1,
+            "chapter_id": "body",
+            "title": "Body",
+            "page_start": 1,
+            "page_end": 1,
+            "source_pages": [1],
+            "content_policy": "translate",
+        }],
+    )
+
+    assert result["state"] == "awaiting_chapter_confirmation"
+    assert "glossary_candidates" not in result.get("artifacts", {})
+    assert (artifacts_dir / "source-quality-report.json").is_file()
+    draft = service.chapter_draft("job-soft-hyphen")
+    assert any(
+        issue.get("code") == "soft_hyphen" and issue.get("severity") == "error"
+        for issue in draft.get("confirmation_quality_issues") or []
+    )
+
+
 def test_confirm_chapters_preview_error_includes_underlying_reason(tmp_path: Path, monkeypatch) -> None:
     def fail_preview(*args, **kwargs):
         raise ValueError("no extractable embedded text")

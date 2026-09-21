@@ -249,6 +249,7 @@ function JobDetail() {
   const resumeNoticeUntil = useRef(0)
   const [reprocessingMode, setReprocessingMode] = useState<CreateJobOptions['processingMode'] | null>(null)
   const [confirmingChapters, setConfirmingChapters] = useState(false)
+  const glossarySectionRef = useRef<HTMLDivElement | null>(null)
   const [chapterDraft, setChapterDraft] = useState<JobChapterDraft[]>([])
   const [dependencyEvidence, setDependencyEvidence] = useState<ContentPolicyDependencyEvidence[]>([])
   const [dependencyFindings, setDependencyFindings] = useState<ContentPolicyDependencyFinding[]>([])
@@ -650,11 +651,34 @@ function JobDetail() {
     setDependencyAckDialog(null)
     setDependencyAckChecked(false)
     setSelectedChapterIndex((current) => Math.max(0, Math.min(current, normalized.length - 1)))
-    setNotice(
-      isTranslatePath
-        ? '重建文档、章节和内容策略已确认。术语候选已按确认后的翻译范围生成，请继续定稿术语。'
-        : '重建文档、章节和内容策略已确认，可以继续完成 Phase A 导出。'
-    )
+    if (result.job.state === 'awaiting_glossary') {
+      setNotice(
+        isTranslatePath
+          ? '章节与源文范围已确认，阅读单元与术语候选已重建完成。请向下滚动到「术语定稿」继续。'
+          : '重建文档、章节和内容策略已确认，可以继续完成 Phase A 导出。',
+      )
+      await refreshGlossary()
+      window.setTimeout(() => {
+        glossarySectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+      }, 120)
+    } else if (result.job.state === 'awaiting_chapter_confirmation' && isTranslatePath) {
+      try {
+        const draft = await jobsApi.getChapterDraft(id)
+        applyChapterDraft(draft)
+      } catch {
+        // keep current draft if refresh fails
+      }
+      setNotice(
+        '源文质量检查未通过，任务仍停留在章节确认。请根据下方质量控制提示修正原文或章节范围后重新确认。',
+      )
+    } else {
+      setNotice(
+        isTranslatePath
+          ? '重建文档、章节和内容策略已确认。术语候选已按确认后的翻译范围生成，请继续定稿术语。'
+          : '重建文档、章节和内容策略已确认，可以继续完成 Phase A 导出。',
+      )
+    }
+    return result
   }
 
   const confirmEditedChapters = async () => {
@@ -930,7 +954,7 @@ function JobDetail() {
   const chapterConfirmLabel = sourceWorkbenchDirty
     ? '先保存或放弃原文修改'
     : confirmingChapters
-      ? '正在确认...'
+      ? '正在重建书籍、阅读单元与术语…'
     : chapterQuality.blocking
       ? '先处理章节错误'
       : needsChapterConfirmation
@@ -1105,16 +1129,18 @@ function JobDetail() {
           </p>
         )}
 
-        {glossary && (glossary.candidates.length > 0 || job.state === 'awaiting_glossary') && (
-          <GlossaryWorkbench
-            jobId={id}
-            glossary={glossary}
-            jobState={job.state}
-            chaptersConfirmed={chaptersConfirmed}
-            onUpdated={handleGlossaryUpdated}
-            onGlossaryChange={setGlossary}
-          />
-        )}
+        <div ref={glossarySectionRef}>
+          {glossary && (glossary.candidates.length > 0 || job.state === 'awaiting_glossary') && (
+            <GlossaryWorkbench
+              jobId={id}
+              glossary={glossary}
+              jobState={job.state}
+              chaptersConfirmed={chaptersConfirmed}
+              onUpdated={handleGlossaryUpdated}
+              onGlossaryChange={setGlossary}
+            />
+          )}
+        </div>
 
         {workspaceBook && (
           <details className="mt-6 rounded-xl border border-slate-200 bg-slate-50 p-4">
@@ -1617,6 +1643,18 @@ function JobDetail() {
                   </div>
                 </div>
               </div>
+              {confirmingChapters && (
+                <div
+                  className="mt-4 rounded-xl border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-900"
+                  role="status"
+                  aria-live="polite"
+                >
+                  <p className="font-medium">正在根据章节目录重建确认版内容</p>
+                  <p className="mt-1 text-xs leading-5 text-blue-800">
+                    依次生成确认版书籍、权威阅读单元、运输分块与术语候选。请勿关闭页面；完成后会自动进入术语定稿，若源文质量未通过则留在本章并显示具体位置。
+                  </p>
+                </div>
+              )}
               {showChapterConfirmButton && (
                 <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-200 bg-amber-50 p-4">
                   <p className="text-sm text-amber-900">

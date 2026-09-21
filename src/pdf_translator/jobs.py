@@ -861,12 +861,22 @@ class BookJobRunner:
                 return "invalid_source", False
         except ImportError:
             pass
+        try:
+            from pdf_translator.translation_quality import TranslationQualityBlockedError
+
+            if isinstance(exc, TranslationQualityBlockedError):
+                return getattr(exc, "error_code", "source_quality_blocked"), False
+        except ImportError:
+            pass
         return "job_stage_failed", True
 
     @staticmethod
     def _safe_failure_reason(exc: Exception, error_code: str) -> str | None:
         if error_code == "translation_intervention_required":
             return f"{exc.count} 个片段未通过翻译检查；其余结果已保存。可局部重试或人工修正，无需重跑整本书。"
+        if error_code == "source_quality_blocked":
+            reason = getattr(exc, "reason_zh", None)
+            return str(reason).strip() if reason else None
         if error_code != "configuration_error":
             return None
         message = str(exc).strip()

@@ -1016,19 +1016,14 @@ class BookJobService:
         prefs = self._chapter_draft_prefs(snapshot)
         dependency_payload = self._content_policy_dependency_payload(job_id, chapters)
         run_dir = self.artifact_path(job_id, "book").parent
-        from pdf_translator.continuation_decisions import (
-            confirmation_quality_issues_from_ledger,
-            load_continuation_ledger,
-        )
+        from pdf_translator.translation_quality import load_confirmation_quality_issues
 
         return {
             "job_id": job_id,
             "chapters": chapters,
             "content_policy_dependency_evidence": dependency_payload.get("evidence") or [],
             "content_policy_dependencies": dependency_payload.get("findings") or [],
-            "confirmation_quality_issues": confirmation_quality_issues_from_ledger(
-                load_continuation_ledger(run_dir)
-            ),
+            "confirmation_quality_issues": load_confirmation_quality_issues(run_dir),
             "draft_source": draft_source,
             "draft_source_detail": draft_source_detail,
             "suggested_page_offset": int(
@@ -1454,27 +1449,60 @@ class BookJobService:
                     str(request.get("target_language") or "zh-CN"),
                 )
             if text_operation == "translate" and canonical_book is not None:
-                from pdf_translator.glossary import (
-                    extract_glossary_candidates,
-                    reconcile_active_glossary_to_book,
+                from pdf_translator.book_views import render_translation_input_markdown
+                from pdf_translator.translation_quality import (
+                    SOURCE_QUALITY_REPORT,
+                    TRANSLATION_QUALITY_INDEX,
+                    write_source_quality_preflight,
                 )
                 from pdf_translator.workflow import write_workflow
+
                 run_dir = self.artifact_path(job_id, "book").parent
-                if chapter_scope_changed and (run_dir / "glossary").is_dir():
-                    reconcile_active_glossary_to_book(run_dir, canonical_book)
-                extract_glossary_candidates(run_dir, book=canonical_book)
-                write_workflow(run_dir, stage="awaiting_glossary")
+                translation_input = render_translation_input_markdown(canonical_book)
+                self._write_text_atomic(
+                    run_dir / "translation-input.md",
+                    translation_input if translation_input.endswith("\n") else f"{translation_input}\n",
+                )
+                preflight = write_source_quality_preflight(run_dir, text_operation=text_operation)
                 for name, relative in {
-                    "glossary_candidates": "glossary/candidates.json",
-                    "glossary_active": "glossary/active.json",
-                    "glossary_decisions": "glossary/decisions.jsonl",
+                    "source_quality_report": SOURCE_QUALITY_REPORT,
+                    "translation_quality_index": TRANSLATION_QUALITY_INDEX,
                 }.items():
                     path = run_dir / relative
                     if path.is_file():
                         snapshot.setdefault("artifacts", {})[name] = {
-                            "href": path.relative_to(job_dir).as_posix()
+                            "href": path.relative_to(job_dir).as_posix(),
                         }
-                snapshot["state"] = "awaiting_glossary"
+                if preflight["blocked"]:
+                    write_workflow(run_dir, stage="awaiting_chapter_confirmation")
+                    snapshot["state"] = "awaiting_chapter_confirmation"
+                    for name in (
+                        "glossary_candidates",
+                        "glossary_active",
+                        "glossary_decisions",
+                    ):
+                        snapshot.setdefault("artifacts", {}).pop(name, None)
+                else:
+                    from pdf_translator.glossary import (
+                        extract_glossary_candidates,
+                        reconcile_active_glossary_to_book,
+                    )
+
+                    if chapter_scope_changed and (run_dir / "glossary").is_dir():
+                        reconcile_active_glossary_to_book(run_dir, canonical_book)
+                    extract_glossary_candidates(run_dir, book=canonical_book)
+                    write_workflow(run_dir, stage="awaiting_glossary")
+                    for name, relative in {
+                        "glossary_candidates": "glossary/candidates.json",
+                        "glossary_active": "glossary/active.json",
+                        "glossary_decisions": "glossary/decisions.jsonl",
+                    }.items():
+                        path = run_dir / relative
+                        if path.is_file():
+                            snapshot.setdefault("artifacts", {})[name] = {
+                                "href": path.relative_to(job_dir).as_posix()
+                            }
+                    snapshot["state"] = "awaiting_glossary"
             elif mode == "convert":
                 snapshot["state"] = "awaiting_glossary"
         snapshot["updated_at"] = canonical["created_at"]
@@ -2324,6 +2352,13 @@ class BookJobService:
             json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
+        temp_path.replace(path)
+
+    @staticmethod
+    def _write_text_atomic(path: Path, text: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = path.with_suffix(path.suffix + ".tmp")
+        temp_path.write_text(text, encoding="utf-8")
         temp_path.replace(path)
 
     @staticmethod

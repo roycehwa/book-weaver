@@ -21,6 +21,20 @@ const chapter = (
 })
 
 describe('confirmationQuality helpers', () => {
+  test('mapConfirmationQualityIssues preserves source quality metadata', () => {
+    const mapped = mapConfirmationQualityIssues([
+      {
+        severity: 'error',
+        code: 'soft_hyphen',
+        message: '源文存在需处理的「软连字符」（章节「Body」，约第 3 行）',
+      },
+    ])
+    expect(mapped[0]).toMatchObject({
+      severity: 'error',
+      code: 'soft_hyphen',
+    })
+  })
+
   test('mapConfirmationQualityIssues preserves continuation metadata', () => {
     const mapped = mapConfirmationQualityIssues([
       {

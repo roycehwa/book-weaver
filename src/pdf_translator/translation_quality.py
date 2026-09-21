@@ -33,6 +33,21 @@ from pdf_translator.zh_markdown_cleanup import (
 REPORT_SCHEMA = "bookweaver_translation_quality_report_v1"
 INDEX_SCHEMA = "bookweaver_translation_quality_index_v1"
 
+SOURCE_QUALITY_BLOCKED_ERROR_CODE = "source_quality_blocked"
+
+SOURCE_ISSUE_LABELS_ZH: dict[str, str] = {
+    "hyphenated_line_break": "疑似跨行断词",
+    "soft_hyphen": "软连字符",
+    "replacement_character": "替换字符",
+    "control_character": "控制字符",
+    "missing_translation_input": "缺少翻译输入稿",
+    "reading_units_not_authoritative": "阅读单元未冻结为翻译权威",
+    "missing_reading_units_fingerprint": "章节分块缺少阅读单元指纹",
+    "chapter_segments_stale": "章节分块与阅读单元不一致",
+    "reading_units_invalid": "阅读单元无效",
+    "reading_units_validation_failed": "阅读单元校验失败",
+}
+
 SOURCE_QUALITY_REPORT = "source-quality-report.json"
 RAW_TRANSLATION_QUALITY_REPORT = "raw-translation-quality-report.json"
 POLISHED_OUTPUT_QUALITY_REPORT = "polished-output-quality-report.json"
@@ -74,6 +89,20 @@ _CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ufffd\u00ad]")
 
 class TranslationQualityBlockedError(ValueError):
     """Raised when a blocking translation-quality finding prevents downstream work."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_code: str = SOURCE_QUALITY_BLOCKED_ERROR_CODE,
+        reason_zh: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.error_code = error_code
+        self.reason_zh = reason_zh or (
+            "源文质量检查未通过。请在原文与章节确认区查看具体位置并修正后重新确认，"
+            "不要启动翻译或依赖自动重试。"
+        )
 
 
 def utc_now() -> str:
@@ -510,11 +539,75 @@ def build_source_quality_report(
     )
 
 
-def run_source_quality_gate_before_translation(
+def confirmation_quality_issues_from_source_report(
+    report: dict[str, Any] | None,
+    *,
+    limit: int = 25,
+) -> list[dict[str, Any]]:
+    if not report or report.get("status") != "blocked":
+        return []
+    issues: list[dict[str, Any]] = []
+    findings = report.get("findings") if isinstance(report.get("findings"), list) else []
+    for finding in findings:
+        if not isinstance(finding, dict) or finding.get("severity") != "blocking":
+            continue
+        code = str(finding.get("code") or "source_quality")
+        evidence = finding.get("evidence") if isinstance(finding.get("evidence"), dict) else {}
+        label = SOURCE_ISSUE_LABELS_ZH.get(code, code)
+        chapter = evidence.get("chapter")
+        line = evidence.get("line")
+        excerpt = evidence.get("excerpt")
+        location_parts: list[str] = []
+        if chapter:
+            location_parts.append(f"章节「{chapter}」")
+        if isinstance(line, int) and line > 0:
+            location_parts.append(f"约第 {line} 行")
+        location = "，".join(location_parts) if location_parts else "待翻译输入稿"
+        message = f"源文存在需处理的「{label}」（{location}）"
+        if isinstance(excerpt, str) and excerpt.strip():
+            snippet = excerpt.strip()
+            if len(snippet) > 96:
+                snippet = f"{snippet[:93]}…"
+            message = f"{message}；片段：{snippet}"
+        issues.append(
+            {
+                "severity": "error",
+                "code": code,
+                "message": message,
+                "chapter": chapter,
+                "line": line,
+                "excerpt": excerpt,
+            }
+        )
+        if len(issues) >= limit:
+            break
+    return issues
+
+
+def load_confirmation_quality_issues(run_dir: Path) -> list[dict[str, Any]]:
+    from pdf_translator.continuation_decisions import (
+        confirmation_quality_issues_from_ledger,
+        load_continuation_ledger,
+    )
+
+    run_dir = run_dir.expanduser().resolve()
+    issues = list(confirmation_quality_issues_from_ledger(load_continuation_ledger(run_dir)))
+    report_path = run_dir / SOURCE_QUALITY_REPORT
+    if report_path.is_file():
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            report = {}
+        if isinstance(report, dict):
+            issues.extend(confirmation_quality_issues_from_source_report(report))
+    return issues
+
+
+def write_source_quality_preflight(
     run_dir: Path,
     *,
     text_operation: str,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     run_dir = run_dir.expanduser().resolve()
     context = build_quality_context(run_dir)
     if text_operation == "translate":
@@ -534,14 +627,32 @@ def run_source_quality_gate_before_translation(
     )
     index_path = run_dir / TRANSLATION_QUALITY_INDEX
     write_quality_report(index_path, index)
-    if report["status"] == "blocked":
-        raise TranslationQualityBlockedError(
-            "Source translation quality gate blocked model translation. "
-            f"See {source_path} and {index_path}."
-        )
+    blocked = report.get("status") == "blocked"
     return {
+        "blocked": blocked,
+        "report": report,
         "source_quality_report": str(source_path),
         "translation_quality_index": str(index_path),
+    }
+
+
+def run_source_quality_gate_before_translation(
+    run_dir: Path,
+    *,
+    text_operation: str,
+) -> dict[str, str]:
+    result = write_source_quality_preflight(run_dir, text_operation=text_operation)
+    if result["blocked"]:
+        raise TranslationQualityBlockedError(
+            "Source translation quality gate blocked model translation. "
+            f"See {result['source_quality_report']} and {result['translation_quality_index']}.",
+            reason_zh=(
+                "源文质量检查未通过。请在原文与章节确认区查看具体位置并修正后重新确认。"
+            ),
+        )
+    return {
+        "source_quality_report": result["source_quality_report"],
+        "translation_quality_index": result["translation_quality_index"],
     }
 
 

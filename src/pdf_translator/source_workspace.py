@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Any
 
 from pdf_translator.continuation_decisions import (
-    confirmation_quality_issues_from_ledger,
     load_continuation_ledger,
     reconciles_possible_continuation_issue,
 )
@@ -94,6 +93,12 @@ def page_blocks(text: str, page: int) -> list[dict]:
             for index, block in enumerate(blocks)]
 
 
+def _load_confirmation_quality_issues(run_dir: Path) -> list[dict[str, Any]]:
+    from pdf_translator.translation_quality import load_confirmation_quality_issues
+
+    return load_confirmation_quality_issues(run_dir)
+
+
 def inspect_page(run_dir: Path, pages: dict[int, str], page: int) -> dict:
     if page not in pages:
         raise ValueError('此页暂无可编辑文字；请核对原页，不能自动跳过内容。')
@@ -118,7 +123,7 @@ def inspect_page(run_dir: Path, pages: dict[int, str], page: int) -> dict:
         'issue_groups': [{**group, 'pages': sorted(group['pages'])} for group in grouped.values()],
         'available_pages': sorted(pages),
         'can_undo': any(not entry.get('undone') for entry in state['history']),
-        'confirmation_quality_issues': confirmation_quality_issues_from_ledger(ledger),
+        'confirmation_quality_issues': _load_confirmation_quality_issues(run_dir),
     }
 
 
