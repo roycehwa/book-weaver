@@ -38,6 +38,14 @@ def test_repair_joins_high_confidence_single_glyph_word_splits() -> None:
     assert "as pathos" in repaired
 
 
+def test_repair_uses_book_local_evidence_for_uncommon_multi_fragment_words() -> None:
+    text = "Modal logic is discussed first. Later the same mo dal operator returns."
+
+    repaired = repair_pdf_markdown(text)
+
+    assert "same modal operator" in repaired
+
+
 def test_scan_ingest_quality_reports_issues() -> None:
     report = scan_ingest_quality("that-clauses as s ingular terms. y.")
     assert report.issue_counts["midword_space"] >= 1
@@ -74,24 +82,26 @@ def test_scan_ingest_quality_blocks_unrepaired_hyphenated_line_break() -> None:
     assert "trans-\\nformation" in report.blocking_issues[0]["excerpt"]
 
 
-def test_repair_removes_isolated_docling_flow_markers_without_hiding_real_hyphenation() -> None:
+def test_repair_removes_structural_flow_markers_regardless_of_glyph() -> None:
     source = (
-        "The argument ends here. f-\n\n"
-        "The next paragraph ends here. -f-\n\n"
-        "A third paragraph ends here. ---f-\n\n"
-        "A fourth paragraph ends here. -x-\n\n"
-        "The involuntary f -- and voluntary remain distinct.\n\n"
+        "The argument ends here. q-\n\n"
+        "The next paragraph ends here. -m-\n\n"
+        "A third paragraph ends here. ---z-\n\n"
+        "The involuntary r -- and voluntary remain distinct.\n\n"
+        "Let -x- denote the inverse in this sentence.\n\n"
+        "The variable x-\n\n"
         "A real trans-\nformation break remains."
     )
 
     repaired = repair_pdf_markdown(source)
 
-    assert " f-" not in repaired
-    assert "-f-" not in repaired
-    assert "---f-" not in repaired
-    assert "-x-" not in repaired
-    assert "f --" not in repaired
+    assert " q-" not in repaired
+    assert "-m-" not in repaired
+    assert "---z-" not in repaired
+    assert "r --" not in repaired
     assert "involuntary and voluntary" in repaired
+    assert "Let -x- denote" in repaired
+    assert "The variable x-" in repaired
     assert "trans-\nformation" in repaired
     report = scan_ingest_quality(repaired)
-    assert report.issue_counts["hyphenated_line_break"] == 1
+    assert report.issue_counts["hyphenated_line_break"] == 2

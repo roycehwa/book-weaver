@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
-from functools import lru_cache
 from pathlib import Path
 from typing import Any
+
+from wordfreq import zipf_frequency
 
 
 # Mid-word breaks from PDF column / hyphen reflow (e.g. "s ingular", "mo dal").
@@ -21,19 +22,23 @@ _GLUE_EACHOF = re.compile(r"\bEachofthe\b", re.IGNORECASE)
 _SPACED_OF_QUOTE = re.compile(r"of'\s*")
 _DOUBLE_SPACED_WORD = re.compile(r"\b([a-z]+)  +([a-z]+)\b", re.IGNORECASE)
 _LOGIC_SYMBOL_LINE = re.compile(r"[◻◇φ∀∃⊢⊨≤≥]")
-# Docling occasionally leaks a page/flow marker as an isolated ``f`` or ``x``
-# wrapped in one or more dashes (``f-``, ``-f-``, ``---f-``, ``f --`` or
-# ``-x-``).  It is not
-# prose and, when it lands at a paragraph boundary, resembles an unrepaired
-# hyphenated word to the source quality gate.  Whitespace boundaries keep the
-# repair away from real words and ordinary hyphenation.
-_ORPHAN_FLOW_MARKER = re.compile(r"(?<!\S)-{0,3}[fx]\s*-{1,3}(?!\S)", re.IGNORECASE)
+# Docling can leak a single glyph wrapped in dashes at a flow boundary.  The
+# glyph itself is not stable across books, so detection uses layout and syntax:
+# a marker must occupy its own line, follow completed prose at a paragraph
+# boundary, or interrupt a coordination with a double dash.
+_STANDALONE_FLOW_MARKER = re.compile(
+    r"^\s*-{0,3}[A-Za-z]\s*-{1,3}\s*$",
+    re.MULTILINE,
+)
+_SENTENCE_END_FLOW_MARKER = re.compile(
+    r"(?<=[.!?])\s+-{0,3}[A-Za-z]\s*-{1,3}(?=[ \t]*(?:\n\s*\n|\Z))",
+    re.MULTILINE,
+)
+_COORDINATION_FLOW_MARKER = re.compile(
+    r"(?<=\w)\s+[A-Za-z]\s+--\s+(?=(?:and|or|nor|but|yet|so)\b)",
+    re.IGNORECASE,
+)
 _WORD_TOKEN = re.compile(r"[A-Za-z]+")
-_DICTIONARY_PATHS = (Path("/usr/share/dict/words"), Path("/usr/share/dict/web2"))
-_CORE_REPAIR_WORDS = {
-    "and", "as", "could", "of", "singular", "the", "their", "there", "these", "they",
-    "this", "those", "through", "toward", "towards", "with", "without", "would",
-}
 
 INGEST_ISSUE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("orphan_footnote_y", re.compile(r"\. y\.|^\s*y\.\s*$", re.IGNORECASE | re.MULTILINE)),
@@ -90,42 +95,46 @@ def _merge_broken_word(match: re.Match[str]) -> str:
     return merged
 
 
-@lru_cache(maxsize=1)
-def _system_english_words() -> frozenset[str]:
-    words = set(_CORE_REPAIR_WORDS)
-    for path in _DICTIONARY_PATHS:
-        try:
-            words.update(
-                line.strip().casefold()
-                for line in path.read_text(encoding="utf-8", errors="ignore").splitlines()
-                if line.strip().isalpha()
-            )
-        except OSError:
-            continue
-    return frozenset(words)
-
-
 def _known_words(texts: list[str]) -> set[str]:
-    words = set(_system_english_words())
+    """Return intact words observed elsewhere in this book.
+
+    This evidence is deliberately book-local.  It supports names and technical
+    vocabulary without a growing list of fixes for individual books.
+    """
+    words: set[str] = set()
     for text in texts:
         words.update(token.group(0).casefold() for token in _WORD_TOKEN.finditer(text))
     return words
 
 
-def _is_known_joined_word(value: str, known_words: set[str]) -> bool:
-    word = value.casefold()
-    if word in known_words:
-        return True
-    for suffix, replacement in (("ies", "y"), ("es", ""), ("s", ""), ("ed", ""), ("ing", "")):
-        if word.endswith(suffix) and len(word) - len(suffix) >= 3:
-            stem = word[: -len(suffix)] + replacement
-            if stem in known_words or (suffix == "es" and f"{stem}e" in known_words):
-                return True
-    return False
+def _split_has_word_evidence(values: list[str], joined: str, known_words: set[str]) -> bool:
+    """Require lexical evidence that joining is safer than preserving spaces."""
+    joined_score = zipf_frequency(joined, "en")
+    phrase_score = zipf_frequency(" ".join(values), "en")
+    gain = joined_score - phrase_score
+    lowered = [value.casefold() for value in values]
+    suspicious_singleton = any(len(value) == 1 and value not in {"a", "i"} for value in lowered)
+    short_fragment = any(len(value) <= 2 and value not in {"a", "i"} for value in lowered)
+    rare_fragment = any(len(value) > 1 and zipf_frequency(value, "en") < 3.0 for value in lowered)
+    all_singletons = all(len(value) == 1 for value in lowered)
+
+    # Exact intact use elsewhere in the same book is the strongest evidence,
+    # but still needs a fragment-shaped split to avoid merging open compounds.
+    corpus_shape_evidence = (
+        suspicious_singleton
+        or rare_fragment
+        or gain >= 1.5
+        or (short_fragment and phrase_score <= joined_score + 0.25)
+    )
+    if joined.casefold() in known_words and corpus_shape_evidence:
+        return joined_score >= 1.5
+    if all_singletons:
+        return joined_score >= 3.0 and gain >= 0.75
+    return joined_score >= 2.5 and gain >= 1.0 and (suspicious_singleton or rare_fragment)
 
 
 def _repair_split_words(text: str, known_words: set[str]) -> str:
-    """Join high-confidence PDF glyph splits without touching normal word spaces."""
+    """Join high-confidence glyph splits using corpus and language evidence."""
     tokens = list(_WORD_TOKEN.finditer(text))
     candidates: list[tuple[int, int, str]] = []
     for width in (3, 2):
@@ -134,16 +143,12 @@ def _repair_split_words(text: str, known_words: set[str]) -> str:
             if any(text[left.end():right.start()] != " " for left, right in zip(window, window[1:])):
                 continue
             values = [token.group(0) for token in window]
-            if not any(len(value) == 1 for value in values):
-                continue
             if width == 2 and values[0].casefold() in {"a", "i"} and len(values[1]) > 1:
                 continue
-            if width == 2 and values[1].casefold() in {"a", "i"} and len(values[0]) > 1:
-                continue
             joined = "".join(values)
-            if width == 2 and len(values[1]) == 1 and joined.casefold() not in _CORE_REPAIR_WORDS:
+            if not 2 <= len(joined) <= 32:
                 continue
-            if _is_known_joined_word(joined, known_words):
+            if _split_has_word_evidence(values, joined, known_words):
                 candidates.append((window[0].start(), window[-1].end(), joined))
 
     accepted: list[tuple[int, int, str]] = []
@@ -168,7 +173,9 @@ def repair_pdf_markdown(text: str, *, known_words: set[str] | None = None) -> st
     repaired = _GLUE_FORMALS.sub("formal systems", repaired)
     repaired = _GLUE_EACHOF.sub("Each of the", repaired)
     repaired = _SPACED_OF_QUOTE.sub("of' ", repaired)
-    repaired = _ORPHAN_FLOW_MARKER.sub("", repaired)
+    repaired = _STANDALONE_FLOW_MARKER.sub("", repaired)
+    repaired = _SENTENCE_END_FLOW_MARKER.sub("", repaired)
+    repaired = _COORDINATION_FLOW_MARKER.sub(" ", repaired)
     repaired = _repair_split_words(repaired, known_words or _known_words([repaired]))
     repaired = _DOUBLE_SPACED_WORD.sub(r"\1 \2", repaired)
     repaired = re.sub(r"[ \t]+(?=\n|$)", "", repaired)
