@@ -27,6 +27,7 @@ _LOGIC_SYMBOL_LINE = re.compile(r"[◻◇φ∀∃⊢⊨≤≥]")
 # a marker must occupy its own line, follow completed prose at a paragraph
 # boundary, or interrupt a coordination with a double dash.
 _SINGLE_GLYPH_DASH_FLOW_MARKER = r"-{0,3}[A-Za-z]\s*-{1,3}"
+_WRAPPED_SINGLE_GLYPH_DASH_FLOW_MARKER = r"-{1,3}[A-Za-z]\s*-{1,3}"
 _STANDALONE_FLOW_MARKER = re.compile(
     rf"^\s*{_SINGLE_GLYPH_DASH_FLOW_MARKER}\s*$",
     re.MULTILINE,
@@ -36,7 +37,8 @@ _SENTENCE_END_FLOW_MARKER = re.compile(
     re.MULTILINE,
 )
 _PROSE_PARAGRAPH_FLOW_MARKER = re.compile(
-    rf"(?<=\S)\s+{_SINGLE_GLYPH_DASH_FLOW_MARKER}(?=\s*\n\s*\n\s*[a-z])",
+    rf"(?<=\S)[ \t]+{_WRAPPED_SINGLE_GLYPH_DASH_FLOW_MARKER}"
+    r"[ \t]*\n[ \t]*\n[ \t]*(?=[a-z])",
     re.MULTILINE,
 )
 _COORDINATION_FLOW_MARKER = re.compile(
@@ -188,7 +190,7 @@ def repair_pdf_markdown(text: str, *, known_words: set[str] | None = None) -> st
     repaired = _SPACED_OF_QUOTE.sub("of' ", repaired)
     repaired = _STANDALONE_FLOW_MARKER.sub("", repaired)
     repaired = _SENTENCE_END_FLOW_MARKER.sub("", repaired)
-    repaired = _PROSE_PARAGRAPH_FLOW_MARKER.sub("", repaired)
+    repaired = _PROSE_PARAGRAPH_FLOW_MARKER.sub(" ", repaired)
     repaired = _COORDINATION_FLOW_MARKER.sub(" ", repaired)
     repaired = _repair_split_words(repaired, known_words or _known_words([repaired]))
     repaired = _DOUBLE_SPACED_WORD.sub(r"\1 \2", repaired)

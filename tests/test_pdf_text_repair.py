@@ -121,9 +121,10 @@ def test_repair_removes_docling_flow_marker_before_lowercase_paragraph_break() -
     repaired = repair_pdf_markdown(source)
 
     assert "-x-" not in repaired
-    assert "division—namely,\n\nthe subjective" in repaired
-    assert "This description\n\ninto question" in repaired
+    assert "division—namely, the subjective" in repaired
+    assert "This description into question" in repaired
     assert "Let -x- denote" in repair_pdf_markdown("Let -x- denote a placeholder.\n\n")
+    assert "The variable x-\n\naxis" in repair_pdf_markdown("The variable x-\n\naxis remains explicit.")
     report = scan_ingest_quality(repaired)
     assert report.issue_counts["hyphenated_line_break"] == 0
     assert report.blocking_issues == []
