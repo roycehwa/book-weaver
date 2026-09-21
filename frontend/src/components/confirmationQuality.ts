@@ -61,8 +61,11 @@ export const contentPolicyLabel = (policy: EffectiveChapterPolicy): string => {
   }
 }
 
-export const continuationPolicyNeedsUserAction = (policy: EffectiveChapterPolicy): boolean =>
-  policy !== 'preserve' && policy !== 'exclude'
+export const continuationNeedsUserAction = (
+  policy: EffectiveChapterPolicy,
+  status: string,
+): boolean =>
+  policy !== 'preserve' && policy !== 'exclude' && status !== 'rejected'
 
 export interface UnresolvedContinuationPresentation {
   owningChapterIndex: number | null
@@ -86,7 +89,9 @@ export const presentUnresolvedContinuationIssue = (
     (owningChapter as JobChapterDraft | undefined)?.content_policy,
   )
   const continuationStatus = issue.continuation_status || 'uncertain'
-  const statusLabel = continuationStatus === 'rejected' ? '已拒绝' : '不确定'
+  const statusLabel = continuationStatus === 'rejected'
+    ? '系统判定保持分开'
+    : '系统无法确定，暂时保持分开'
   const boundaryLabel = fromPage && toPage
     ? `第 ${fromPage} 页 → 第 ${toPage} 页`
     : issue.message
@@ -96,7 +101,7 @@ export const presentUnresolvedContinuationIssue = (
     owningChapterTitle: owningChapter?.title ?? null,
     policy,
     policyLabel: contentPolicyLabel(policy),
-    needsAction: continuationPolicyNeedsUserAction(policy),
+    needsAction: continuationNeedsUserAction(policy, continuationStatus),
     boundaryLabel,
     statusLabel,
   }

@@ -738,22 +738,47 @@ function JobDetail() {
   const selectPreviewPage = useCallback((page: number) => {
     const normalized = toPositivePage(page) || 1
     setCurrentPdfPage(normalized)
+    if (chapterRangeAdjustMode) return
     const chapterIndex = findChapterIndexForPage(chapterDraft, normalized)
     if (chapterIndex !== null) {
       setSelectedChapterIndex(chapterIndex)
     }
+  }, [chapterDraft, chapterRangeAdjustMode])
+
+  const inspectSourcePage = useCallback((page: number) => {
+    setChapterRangeAdjustMode(false)
+    const normalized = toPositivePage(page) || 1
+    setCurrentPdfPage(normalized)
+    const chapterIndex = findChapterIndexForPage(chapterDraft, normalized)
+    if (chapterIndex !== null) {
+      setSelectedChapterIndex(chapterIndex)
+      window.setTimeout(() => {
+        const row = document.getElementById(`chapter-row-${chapterIndex}`)
+        if (typeof row?.scrollIntoView === 'function') {
+          row.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
+        }
+      }, 0)
+    }
   }, [chapterDraft])
 
   const jumpToChapter = (index: number) => {
+    setChapterRangeAdjustMode(false)
     setSelectedChapterIndex(index)
     setCurrentPdfPage(toPositivePage(chapterDraft[index]?.page_start) || currentPdfPage || 1)
   }
 
   const viewContinuationBoundary = useCallback((fromPage: number | undefined) => {
+    setChapterRangeAdjustMode(false)
     const page = toPositivePage(fromPage) || 1
     const chapterIndex = findChapterIndexForPage(chapterDraft, page)
     if (chapterIndex !== null) {
       setSelectedChapterIndex(chapterIndex)
+      window.setTimeout(() => {
+        const row = document.getElementById(`chapter-row-${chapterIndex}`)
+        if (typeof row?.scrollIntoView === 'function') {
+          row.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
+        }
+      }, 0)
     }
     setCurrentPdfPage(page)
   }, [chapterDraft])
@@ -888,7 +913,14 @@ function JobDetail() {
   const chapterQuality = validateChapterQuality(chapterDraft, totalPdfPages)
   const combinedQualityIssues = [...chapterQuality.issues, ...confirmationQualityIssues]
   const qualityErrors = combinedQualityIssues.filter((issue) => issue.severity === 'error')
-  const qualityWarnings = combinedQualityIssues.filter((issue) => issue.severity === 'warning')
+  const informationalContinuations = combinedQualityIssues.filter(
+    issue => issue.code === 'unresolved_continuation'
+      && !presentUnresolvedContinuationIssue(issue, chapterDraft).needsAction,
+  )
+  const informationalContinuationSet = new Set(informationalContinuations)
+  const qualityWarnings = combinedQualityIssues.filter(
+    issue => issue.severity === 'warning' && !informationalContinuationSet.has(issue),
+  )
   const chapterConfirmLabel = confirmingChapters
     ? '正在确认...'
     : chapterQuality.blocking
@@ -1297,7 +1329,7 @@ function JobDetail() {
                     <div>
                       <div className="text-sm font-medium text-slate-900">确认前质量控制</div>
                       <div className="mt-1 text-xs text-slate-500">
-                        检查页码范围、重叠页和未覆盖页。红色问题会阻止确认，黄色问题需要人工判断是否接受。
+                        检查页码范围、重叠页和未覆盖页。红色问题会阻止确认，黄色问题需要判断，绿色记录无需操作。
                       </div>
                     </div>
                     <span className={`rounded-full px-3 py-1 text-xs font-medium ${
@@ -1311,7 +1343,9 @@ function JobDetail() {
                         ? `${qualityErrors.length} 个错误`
                         : qualityWarnings.length
                           ? `${qualityWarnings.length} 个警告`
-                          : '未发现问题'}
+                          : informationalContinuations.length
+                            ? `${informationalContinuations.length} 条记录，无需处理`
+                            : '未发现问题'}
                     </span>
                   </div>
                   {combinedQualityIssues.length > 0 && (
@@ -1322,14 +1356,17 @@ function JobDetail() {
                           return (
                             <div
                               key={`${issue.code}-${issue.decision_id ?? index}`}
-                              className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-3 text-sm text-amber-950"
+                              className={`rounded-lg border px-3 py-3 text-sm ${
+                                presentation.needsAction
+                                  ? 'border-amber-200 bg-amber-50 text-amber-950'
+                                  : 'border-emerald-200 bg-emerald-50 text-emerald-950'
+                              }`}
                             >
-                              <p className="font-medium">跨页续接边界已保持分离</p>
-                              <p className="mt-1 text-xs leading-5 text-amber-900">
-                                系统未自动合并 {presentation.boundaryLabel} 之间的正文（状态：{presentation.statusLabel}）。
-                                这是重建算法的记录，不是章节页码错误。
+                              <p className="font-medium">跨页段落：{presentation.statusLabel}</p>
+                              <p className="mt-1 text-xs leading-5">
+                                {presentation.boundaryLabel} 之间没有自动合并。这是段落重建记录，不是章节页码错误。
                               </p>
-                              <p className="mt-2 text-xs leading-5 text-amber-900">
+                              <p className="mt-2 text-xs leading-5">
                                 归属章节：
                                 {presentation.owningChapterTitle
                                   ? `「${presentation.owningChapterTitle}」`
@@ -1337,19 +1374,19 @@ function JobDetail() {
                                 · 处理策略：{presentation.policyLabel}
                               </p>
                               {!presentation.needsAction && (
-                                <p className="mt-2 text-xs leading-5 text-emerald-900">
-                                  该章已设为保留原文或略过，无需为此边界额外操作；不影响该章的翻译或导出范围。
+                                <p className="mt-2 text-xs font-medium leading-5 text-emerald-900">
+                                  无需处理。系统已按保守规则保持分开；当前内容策略不会让这个边界进入翻译。
                                 </p>
                               )}
                               {presentation.needsAction && (
                                 <p className="mt-2 text-xs leading-5 text-amber-900">
-                                  若需核对原文，可在右侧预览对应页面；只有确认章节范围有误时才进入「调整章节范围」模式修改起止页。
+                                  请查看前后页。可接受当前分段时直接确认章节；若原文明显是同一段，请暂不确认。
                                 </p>
                               )}
                               {issue.from_page && (
                                 <button
                                   type="button"
-                                  className="mt-3 rounded-lg border border-amber-400 bg-white px-3 py-1.5 text-xs font-medium text-amber-950"
+                                  className="mt-3 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-800"
                                   onClick={() => viewContinuationBoundary(issue.from_page)}
                                 >
                                   查看相关页面（第 {issue.from_page} 页）
@@ -1460,13 +1497,13 @@ function JobDetail() {
                       </div>
                     )
                   })}
-                  <SourceWorkbench jobId={id} page={currentPdfPage} onSelectPage={selectPreviewPage} onSaved={() => { void loadJob() }} />
+                  <SourceWorkbench jobId={id} page={currentPdfPage} onSelectPage={inspectSourcePage} onSaved={() => { void loadJob() }} />
                 </div>
 
                 <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
                   <div className="mb-3 rounded-lg border border-slate-200 bg-white p-3 text-sm">
                     <div className="font-medium text-slate-900">
-                      当前校准：{selectedChapter?.title || '未选择章节'}
+                      {chapterRangeAdjustMode ? '正在调整' : '当前查看章节'}：{selectedChapter?.title || '未选择章节'}
                     </div>
                     <div className="mt-1 text-xs text-slate-500">
                       页码范围：{selectedPageRange} · {pageUnitLabel}当前页：{currentPdfPage}
@@ -1479,18 +1516,11 @@ function JobDetail() {
                       </div>
                     )}
                     <div className="mt-3 space-y-2">
-                      <label className="flex items-start gap-2 text-xs text-slate-600">
-                        <input
-                          type="checkbox"
-                          className="mt-0.5"
-                          checked={chapterRangeAdjustMode}
-                          onChange={(event) => setChapterRangeAdjustMode(event.target.checked)}
-                        />
-                        <span>
-                          <span className="font-medium text-slate-800">调整章节范围</span>
-                          ：勾选后才可用当前预览页修改本章起止页。查看续接提示或核对原文时请勿勾选。
-                        </span>
-                      </label>
+                      {chapterRangeAdjustMode && (
+                        <p className="rounded-md bg-amber-50 px-2 py-1.5 text-xs text-amber-900">
+                          章界编辑已开启。下面的按钮会真正改动「{selectedChapter?.title || '当前章节'}」的起止页。
+                        </p>
+                      )}
                       <div className="flex flex-wrap gap-2">
                         <button
                           type="button"
@@ -1517,6 +1547,13 @@ function JobDetail() {
                             </button>
                           </>
                         )}
+                        <button
+                          type="button"
+                          onClick={() => setChapterRangeAdjustMode(current => !current)}
+                          className="rounded-lg border border-slate-300 px-3 py-2 text-xs text-slate-700"
+                        >
+                          {chapterRangeAdjustMode ? '完成章节范围调整' : '需要修改本章起止页'}
+                        </button>
                       </div>
                     </div>
                   </div>

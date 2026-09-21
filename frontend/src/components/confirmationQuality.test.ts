@@ -44,7 +44,7 @@ describe('confirmationQuality helpers', () => {
   })
 
   test('findChapterIndexForPage selects inclusive owning chapter', () => {
-    const chapters = [chapter('Cover', 1, 3), chapter('Body', 4, 200)]
+    const chapters = [chapter('Cover', 1, 3), chapter('Body', 4, 300)]
     expect(findChapterIndexForPage(chapters, 223)).toBe(1)
     expect(findChapterIndexForPage(chapters, 3)).toBe(0)
     expect(findChapterIndexForPage(chapters, 999)).toBeNull()
@@ -70,7 +70,7 @@ describe('confirmationQuality helpers', () => {
     expect(view.needsAction).toBe(false)
   })
 
-  test('presentUnresolvedContinuationIssue keeps translate chapters actionable for review', () => {
+  test('presentUnresolvedContinuationIssue treats rejected decisions as completed records', () => {
     const chapters = [chapter('Body', 1, 300, 'translate')]
     const issue = mapConfirmationQualityIssues([
       {
@@ -84,7 +84,21 @@ describe('confirmationQuality helpers', () => {
     ])[0]
     const view = presentUnresolvedContinuationIssue(issue, chapters)
 
-    expect(view.needsAction).toBe(true)
-    expect(view.statusLabel).toBe('已拒绝')
+    expect(view.statusLabel).toBe('系统判定保持分开')
+    expect(view.needsAction).toBe(false)
+  })
+
+  test('only uncertain boundaries in translated chapters need review', () => {
+    const chapters = [chapter('Body', 1, 300, 'translate')]
+    const issue = mapConfirmationQualityIssues([{
+      severity: 'warning',
+      code: 'unresolved_continuation',
+      message: 'msg',
+      from_page: 10,
+      to_page: 11,
+      continuation_status: 'uncertain',
+    }])[0]
+
+    expect(presentUnresolvedContinuationIssue(issue, chapters).needsAction).toBe(true)
   })
 })

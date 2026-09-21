@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import '@testing-library/jest-dom/vitest'
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -10,7 +10,11 @@ import { jobsApi, workspaceApi, type BookJob, type WorkspaceBook } from '../api'
 import JobDetail from './JobDetail'
 
 vi.mock('./GlossaryWorkbench', () => ({ default: () => null }))
-vi.mock('./SourceWorkbench', () => ({ default: () => null }))
+vi.mock('./SourceWorkbench', () => ({
+  default: ({ onSelectPage }: { onSelectPage?: (page: number) => void }) => (
+    <button type="button" onClick={() => onSelectPage?.(223)}>模拟跳到问题页</button>
+  ),
+}))
 vi.mock('./TranslationFailures', () => ({ default: () => null }))
 vi.mock('./pdf-viewer/PdfViewer', () => ({ default: () => null }))
 vi.mock('./epub-viewer/EpubViewer', () => ({ default: () => null }))
@@ -59,10 +63,51 @@ const workspaceBook: WorkspaceBook = {
 }
 
 afterEach(() => {
+  cleanup()
   vi.restoreAllMocks()
 })
 
 describe('JobDetail Notes dependency acknowledgement', () => {
+  it('opens a continuation record in its owning chapter without exposing range edits', async () => {
+    vi.spyOn(jobsApi, 'get').mockResolvedValue(job)
+    vi.spyOn(jobsApi, 'sourceInfo').mockResolvedValue({
+      job_id: 'job-1', filename: 'synthetic.pdf', size: 10, kind: 'other', download_url: '/source',
+    })
+    vi.spyOn(jobsApi, 'getChapterDraft').mockResolvedValue({
+      job_id: 'job-1',
+      chapters: [
+        { index: 1, chapter_id: 'cover', title: 'Cover', page_start: 1, page_end: 3, content_policy: 'preserve' },
+        { index: 2, chapter_id: 'body', title: 'Body', page_start: 4, page_end: 191, content_policy: 'translate' },
+        { index: 3, chapter_id: 'notes', title: 'Notes', page_start: 192, page_end: 229, content_policy: 'preserve' },
+      ],
+      confirmation_quality_issues: [{
+        severity: 'warning',
+        code: 'unresolved_continuation',
+        message: 'legacy message',
+        decision_id: 'decision-223',
+        from_page: 223,
+        to_page: 224,
+        continuation_status: 'rejected',
+      }],
+    })
+    vi.spyOn(workspaceApi, 'listBooks').mockResolvedValue({ total_books: 1, books: [workspaceBook] })
+
+    render(
+      <MemoryRouter initialEntries={['/jobs/job-1']}>
+        <Routes><Route path="/jobs/:id" element={<JobDetail />} /></Routes>
+      </MemoryRouter>,
+    )
+
+    expect(await screen.findByText('1 条记录，无需处理')).toBeInTheDocument()
+    expect(screen.getByText('无需处理。系统已按保守规则保持分开；当前内容策略不会让这个边界进入翻译。')).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: '查看相关页面（第 223 页）' }))
+    expect(screen.getByText('当前查看章节：Notes')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '当前页设为开始' })).not.toBeInTheDocument()
+
+    await userEvent.click(screen.getByRole('button', { name: '需要修改本章起止页' }))
+    expect(screen.getByRole('button', { name: '当前页设为开始' })).toBeInTheDocument()
+  })
+
   it('explains that translating a contents chapter rebuilds the target TOC', async () => {
     vi.spyOn(jobsApi, 'get').mockResolvedValue(job)
     vi.spyOn(jobsApi, 'sourceInfo').mockResolvedValue({
