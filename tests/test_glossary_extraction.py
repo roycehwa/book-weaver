@@ -156,6 +156,34 @@ def test_extraction_policy_file_written(tmp_path: Path) -> None:
     assert policy["stats"]["surfaced"] >= 1
 
 
+def test_reextract_preserves_user_excluded_sources(tmp_path: Path) -> None:
+    book = {
+        "metadata": {"title": "Sample Book"},
+        "chapters": [
+            {"chapter_id": "ch-001", "markdown": "Embodied Agency shapes practice."},
+            {"chapter_id": "ch-002", "markdown": "Embodied Agency shapes institutions."},
+        ],
+    }
+    run_dir = tmp_path / "run"
+    glossary_dir = run_dir / "glossary"
+    glossary_dir.mkdir(parents=True)
+    (run_dir / "book.json").write_text(json.dumps(book), encoding="utf-8")
+    (glossary_dir / "extraction-policy.json").write_text(
+        json.dumps({
+            "schema": "phase_a_glossary_extraction_v2",
+            "excluded_sources": ["Embodied Agency"],
+            "excluded_sources_updated_at": "2026-09-21T09:00:00Z",
+        }),
+        encoding="utf-8",
+    )
+
+    extract_glossary_candidates(run_dir, max_candidates=20)
+
+    policy = json.loads((glossary_dir / "extraction-policy.json").read_text(encoding="utf-8"))
+    assert policy["excluded_sources"] == ["Embodied Agency"]
+    assert policy["excluded_sources_updated_at"] == "2026-09-21T09:00:00Z"
+
+
 def test_extract_merges_trailing_apostrophe_variants(tmp_path: Path) -> None:
     assert canonical_source_key("Soviet Union") == canonical_source_key("Soviet Union'")
     assert canonical_source_key("Soviet Union") == canonical_source_key("Soviet Union’")

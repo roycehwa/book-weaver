@@ -374,6 +374,20 @@ def extract_glossary_candidates(
         "metadata_exclusions": sorted(exclusions),
         **detection,
     }
+    if existing_policy:
+        # Exclusion is a durable user decision, not a property of one
+        # extraction pass.  Rebuilding chapters or changing the extraction
+        # profile must not silently put excluded terms back into the review
+        # list.
+        excluded_sources = existing_policy.get("excluded_sources")
+        if isinstance(excluded_sources, list):
+            policy["excluded_sources"] = [
+                source for source in excluded_sources if isinstance(source, str)
+            ]
+        if existing_policy.get("excluded_sources_updated_at"):
+            policy["excluded_sources_updated_at"] = existing_policy[
+                "excluded_sources_updated_at"
+            ]
     if overridden and existing_policy and existing_policy.get("glossary_profile") != profile_id:
         policy["glossary_profile_previous"] = existing_policy.get("glossary_profile")
 
