@@ -19,6 +19,11 @@ import TranslationFailures from './TranslationFailures'
 import PdfViewer from './pdf-viewer/PdfViewer'
 import EpubViewer from './epub-viewer/EpubViewer'
 import { validateChapterQuality, type ChapterQualityIssue } from './chapterQuality'
+import {
+  findChapterIndexForPage,
+  mapConfirmationQualityIssues,
+  presentUnresolvedContinuationIssue,
+} from './confirmationQuality'
 import { insertChapterRange } from './insertChapter'
 import { appendixChapterRecommendations, simplifiedChapterIds } from './simplifiedChapters'
 import {
@@ -288,6 +293,7 @@ function JobDetail() {
   const [chapterDraftSource, setChapterDraftSource] = useState<string | null>(null)
   const [chapterDraftSourceDetail, setChapterDraftSourceDetail] = useState<string | null>(null)
   const [confirmationQualityIssues, setConfirmationQualityIssues] = useState<ChapterQualityIssue[]>([])
+  const [chapterRangeAdjustMode, setChapterRangeAdjustMode] = useState(false)
   const [chapterSectionExpanded, setChapterSectionExpanded] = useState(true)
   const [tocPageStart, setTocPageStart] = useState('')
   const [tocPageEnd, setTocPageEnd] = useState('')
@@ -314,13 +320,8 @@ function JobDetail() {
     setDependencyEvidence(result.content_policy_dependency_evidence ?? [])
     setChapterDraftSource(result.draft_source ?? null)
     setChapterDraftSourceDetail(result.draft_source_detail ?? null)
-    setConfirmationQualityIssues(
-      (result.confirmation_quality_issues ?? []).map((issue) => ({
-        severity: issue.severity === 'error' ? 'error' : 'warning',
-        code: issue.code as ChapterQualityIssue['code'],
-        message: issue.message,
-      })),
-    )
+    setConfirmationQualityIssues(mapConfirmationQualityIssues(result.confirmation_quality_issues))
+    setChapterRangeAdjustMode(false)
     setTocPageStart(result.toc_page_start != null ? String(result.toc_page_start) : '')
     setTocPageEnd(result.toc_page_end != null ? String(result.toc_page_end) : '')
     const offset = result.page_offset ?? result.suggested_page_offset ?? 0
@@ -734,10 +735,28 @@ function JobDetail() {
     )
   }
 
+  const selectPreviewPage = useCallback((page: number) => {
+    const normalized = toPositivePage(page) || 1
+    setCurrentPdfPage(normalized)
+    const chapterIndex = findChapterIndexForPage(chapterDraft, normalized)
+    if (chapterIndex !== null) {
+      setSelectedChapterIndex(chapterIndex)
+    }
+  }, [chapterDraft])
+
   const jumpToChapter = (index: number) => {
     setSelectedChapterIndex(index)
     setCurrentPdfPage(toPositivePage(chapterDraft[index]?.page_start) || currentPdfPage || 1)
   }
+
+  const viewContinuationBoundary = useCallback((fromPage: number | undefined) => {
+    const page = toPositivePage(fromPage) || 1
+    const chapterIndex = findChapterIndexForPage(chapterDraft, page)
+    if (chapterIndex !== null) {
+      setSelectedChapterIndex(chapterIndex)
+    }
+    setCurrentPdfPage(page)
+  }, [chapterDraft])
 
   const setCurrentPageAsBoundary = (field: 'page_start' | 'page_end') => {
     updateChapterPage(selectedChapterIndex, field, String(currentPdfPage))
@@ -1297,18 +1316,61 @@ function JobDetail() {
                   </div>
                   {combinedQualityIssues.length > 0 && (
                     <div className="mt-3 space-y-2">
-                      {combinedQualityIssues.map((issue, index) => (
-                        <div
-                          key={`${issue.code}-${index}`}
-                          className={`rounded-lg border px-3 py-2 text-sm ${
-                            issue.severity === 'error'
-                              ? 'border-red-200 bg-red-50 text-red-700'
-                              : 'border-amber-200 bg-amber-50 text-amber-800'
-                          }`}
-                        >
-                          {issue.message}
-                        </div>
-                      ))}
+                      {combinedQualityIssues.map((issue, index) => {
+                        if (issue.code === 'unresolved_continuation') {
+                          const presentation = presentUnresolvedContinuationIssue(issue, chapterDraft)
+                          return (
+                            <div
+                              key={`${issue.code}-${issue.decision_id ?? index}`}
+                              className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-3 text-sm text-amber-950"
+                            >
+                              <p className="font-medium">跨页续接边界已保持分离</p>
+                              <p className="mt-1 text-xs leading-5 text-amber-900">
+                                系统未自动合并 {presentation.boundaryLabel} 之间的正文（状态：{presentation.statusLabel}）。
+                                这是重建算法的记录，不是章节页码错误。
+                              </p>
+                              <p className="mt-2 text-xs leading-5 text-amber-900">
+                                归属章节：
+                                {presentation.owningChapterTitle
+                                  ? `「${presentation.owningChapterTitle}」`
+                                  : '（未能根据页码匹配章节）'}
+                                · 处理策略：{presentation.policyLabel}
+                              </p>
+                              {!presentation.needsAction && (
+                                <p className="mt-2 text-xs leading-5 text-emerald-900">
+                                  该章已设为保留原文或略过，无需为此边界额外操作；不影响该章的翻译或导出范围。
+                                </p>
+                              )}
+                              {presentation.needsAction && (
+                                <p className="mt-2 text-xs leading-5 text-amber-900">
+                                  若需核对原文，可在右侧预览对应页面；只有确认章节范围有误时才进入「调整章节范围」模式修改起止页。
+                                </p>
+                              )}
+                              {issue.from_page && (
+                                <button
+                                  type="button"
+                                  className="mt-3 rounded-lg border border-amber-400 bg-white px-3 py-1.5 text-xs font-medium text-amber-950"
+                                  onClick={() => viewContinuationBoundary(issue.from_page)}
+                                >
+                                  查看相关页面（第 {issue.from_page} 页）
+                                </button>
+                              )}
+                            </div>
+                          )
+                        }
+                        return (
+                          <div
+                            key={`${issue.code}-${index}`}
+                            className={`rounded-lg border px-3 py-2 text-sm ${
+                              issue.severity === 'error'
+                                ? 'border-red-200 bg-red-50 text-red-700'
+                                : 'border-amber-200 bg-amber-50 text-amber-800'
+                            }`}
+                          >
+                            {issue.message}
+                          </div>
+                        )
+                      })}
                     </div>
                   )}
                 </div>
@@ -1398,7 +1460,7 @@ function JobDetail() {
                       </div>
                     )
                   })}
-                  <SourceWorkbench jobId={id} page={currentPdfPage} onSelectPage={setCurrentPdfPage} onSaved={() => { void loadJob() }} />
+                  <SourceWorkbench jobId={id} page={currentPdfPage} onSelectPage={selectPreviewPage} onSaved={() => { void loadJob() }} />
                 </div>
 
                 <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
@@ -1416,28 +1478,46 @@ function JobDetail() {
                         {epubPagesError && <div className="mt-1 text-red-600">{epubPagesError}</div>}
                       </div>
                     )}
-                    <div className="mt-3 flex flex-wrap gap-2">
-                      <button
-                        type="button"
-                        onClick={() => setCurrentPdfPage(selectedPageStart || 1)}
-                        className="rounded-lg border border-slate-300 px-3 py-2 text-xs text-slate-700"
-                      >
-                        跳到开始页
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setCurrentPageAsBoundary('page_start')}
-                        className="rounded-lg bg-blue-600 px-3 py-2 text-xs font-medium text-white"
-                      >
-                        当前页设为开始
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setCurrentPageAsBoundary('page_end')}
-                        className="rounded-lg bg-slate-700 px-3 py-2 text-xs font-medium text-white"
-                      >
-                        当前页设为结束
-                      </button>
+                    <div className="mt-3 space-y-2">
+                      <label className="flex items-start gap-2 text-xs text-slate-600">
+                        <input
+                          type="checkbox"
+                          className="mt-0.5"
+                          checked={chapterRangeAdjustMode}
+                          onChange={(event) => setChapterRangeAdjustMode(event.target.checked)}
+                        />
+                        <span>
+                          <span className="font-medium text-slate-800">调整章节范围</span>
+                          ：勾选后才可用当前预览页修改本章起止页。查看续接提示或核对原文时请勿勾选。
+                        </span>
+                      </label>
+                      <div className="flex flex-wrap gap-2">
+                        <button
+                          type="button"
+                          onClick={() => selectPreviewPage(selectedPageStart || 1)}
+                          className="rounded-lg border border-slate-300 px-3 py-2 text-xs text-slate-700"
+                        >
+                          跳到开始页
+                        </button>
+                        {chapterRangeAdjustMode && (
+                          <>
+                            <button
+                              type="button"
+                              onClick={() => setCurrentPageAsBoundary('page_start')}
+                              className="rounded-lg bg-blue-600 px-3 py-2 text-xs font-medium text-white"
+                            >
+                              当前页设为开始
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setCurrentPageAsBoundary('page_end')}
+                              className="rounded-lg bg-slate-700 px-3 py-2 text-xs font-medium text-white"
+                            >
+                              当前页设为结束
+                            </button>
+                          </>
+                        )}
+                      </div>
                     </div>
                   </div>
                   <div className="h-[640px] overflow-hidden rounded-lg border border-slate-200 bg-white">
@@ -1450,7 +1530,7 @@ function JobDetail() {
                         url={jobsApi.sourceUrl(job.job_id)}
                         initialPage={currentPdfPage}
                         initialScale={0.9}
-                        onPageChange={setCurrentPdfPage}
+                        onPageChange={selectPreviewPage}
                         onDocumentLoad={setTotalPdfPages}
                       />
                     ) : sourceKind === 'epub' ? (
@@ -1458,7 +1538,7 @@ function JobDetail() {
                         url={jobsApi.sourceUrl(job.job_id)}
                         initialPage={currentPdfPage}
                         initialScale={1.0}
-                        onPageChange={setCurrentPdfPage}
+                        onPageChange={selectPreviewPage}
                         onDocumentLoad={setTotalPdfPages}
                       />
                     ) : (

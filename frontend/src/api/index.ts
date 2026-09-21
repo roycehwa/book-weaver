@@ -900,7 +900,7 @@ export const uploadApi = {
 }
 
 export interface SourceBlock { id: string; text: string; policy: 'translate' | 'preserve' | 'exclude'; reason: string }
-export interface SourceWorkspace { revision: number; page: number; blocks: SourceBlock[]; available_pages: number[]; can_undo: boolean; issue_groups?: {code: string; count: number; pages: number[]}[]; issues: { block_id: string; code: string; severity: string; status: string; continuation_decision_id?: string }[]; confirmation_quality_issues?: Array<{ severity: string; code: string; message: string }> }
+export interface SourceWorkspace { revision: number; page: number; blocks: SourceBlock[]; available_pages: number[]; can_undo: boolean; issue_groups?: {code: string; count: number; pages: number[]}[]; issues: { block_id: string; code: string; severity: string; status: string; continuation_decision_id?: string }[]; confirmation_quality_issues?: JobChapterDraftResponse['confirmation_quality_issues'] }
 
 export const jobsApi = {
   pauseTranslation: (jobId: string) => request<{status: string; detail: string}>(`/jobs/${encodeURIComponent(jobId)}/translation-pause`, { method: 'POST' }),

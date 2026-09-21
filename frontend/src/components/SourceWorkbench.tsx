@@ -1,7 +1,11 @@
 import { useEffect, useRef, useState } from 'react'
 import { jobsApi, type SourceBlock, type SourceWorkspace } from '../api'
 
-const labels: Record<string, string> = { hyphenated_line_break: '疑似跨行断词', possible_continuation: '疑似接续下一段', possible_heading_error: '疑似标题误识别' }
+const labels: Record<string, string> = {
+  hyphenated_line_break: '疑似跨行断词',
+  possible_continuation: '段落排版待核对',
+  possible_heading_error: '疑似标题误识别',
+}
 const issueStatusLabels: Record<string, string> = { open: '待核对', accepted: '已注明接受理由', reconciled: '已由续接决策核对' }
 
 export default function SourceWorkbench({ jobId, page, onSaved, onSelectPage }: { jobId: string; page: number; onSaved: () => void; onSelectPage?: (page: number) => void }) {
@@ -55,7 +59,9 @@ export default function SourceWorkbench({ jobId, page, onSaved, onSelectPage }: 
   const current = blocks[selected]
   return <section className="mt-4 rounded-lg border border-slate-300 bg-white p-3" aria-label="原文修正台">
     <h3 className="font-semibold">原文修正 · 第 {data?.page ?? page} 页</h3>
-    <p className="my-2 text-xs text-slate-500">核对右侧原页后修正。这里只调整原文，不会替你确认章节。排除、保留原文或接受疑点时请说明理由。</p>
+    <p className="my-2 text-xs text-slate-500">
+      对照右侧原页修正段落文字、顺序与处理方式（翻译／保留原文／排除）。这里不能裁决跨页续接边界；顶部「确认前质量控制」中的续接提示请用预览核对，只有确实要改章界时才勾选「调整章节范围」。
+    </p>
     {!!data?.issue_groups?.length && <label className="block text-xs">按问题跳转<select aria-label="待核对问题页" className="my-2 w-full rounded border p-2" value="" disabled={dirty || busy} onChange={e => onSelectPage?.(Number(e.target.value))}>
       <option value="">选择待核对页（同类问题已归组）</option>
       {data.issue_groups.map(group => <optgroup key={group.code} label={`${labels[group.code] || group.code} · ${group.count} 处`}>

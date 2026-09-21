@@ -13,6 +13,10 @@ export interface ChapterQualityIssue {
   chapterIndexes?: number[]
   pages?: number[]
   ranges?: string[]
+  decision_id?: string
+  from_page?: number
+  to_page?: number
+  continuation_status?: string
 }
 
 export interface ChapterQualityResult {

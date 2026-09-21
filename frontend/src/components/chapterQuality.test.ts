@@ -76,10 +76,13 @@ describe('validateChapterQuality', () => {
       severity: 'warning' as const,
       code: 'unresolved_continuation',
       message: '第 3 页到第 4 页之间存在不确定的高置信续接候选，请在原文修正台核对。',
+      from_page: 3,
+      to_page: 4,
+      continuation_status: 'uncertain',
     }
     const combined = [...chapterResult.issues, continuationWarning]
     const warnings = combined.filter((issue) => issue.severity === 'warning')
 
-    expect(warnings.some((issue) => issue.code === 'unresolved_continuation')).toBe(true)
+    expect(warnings.some((issue) => issue.code === 'unresolved_continuation' && issue.from_page === 3)).toBe(true)
   })
 })
