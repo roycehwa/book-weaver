@@ -213,7 +213,7 @@ def test_extract_writes_profile_v2_policy(tmp_path: Path) -> None:
     assert policy["schema"] == "phase_a_glossary_extraction_v2"
     assert policy["glossary_profile"] == HUMANITIES_HISTORY
     assert policy["glossary_profile_label"] == "人文·历史·艺术"
-    assert policy["profile_policy_version"] == 3
+    assert policy["profile_policy_version"] == 4
     sources = [item["source"] for item in result["candidates"]]
     assert "Cultural Revolution" in sources
     assert "Gang of Four" in sources
@@ -282,6 +282,52 @@ def test_logic_profile_termhood_requires_evidence_not_frequency(tmp_path: Path) 
         evidence_kinds=frozenset({EVIDENCE_QUOTED, EVIDENCE_INDEX}),
     )
     assert not has_independent_termhood("Truth", evidence_kinds=frozenset({EVIDENCE_MULTIWORD_PHRASE}))
+    assert not has_independent_termhood("Truth", evidence_kinds=frozenset({EVIDENCE_QUOTED}))
+    assert has_independent_termhood("Supervenience", evidence_kinds=frozenset({EVIDENCE_QUOTED}))
+
+
+def test_person_surnames_and_plain_name_coordinations_do_not_become_concepts(tmp_path: Path) -> None:
+    body = (
+        "Michel Henry frames the dispute. Paul Ricoeur responds. "
+        "Michel Henry and Paul Ricoeur disagree. Henry and Ricoeur disagree. "
+        "Both Henry and Ricoeur return to Material Phenomenology. "
+        "Material Phenomenology shapes the account. "
+    ) * 8
+    book = {
+        "metadata": {"title": "Phenomenology"},
+        "chapters": [
+            {"chapter_id": "body", "title": "Body", "markdown": body},
+            {
+                "chapter_id": "notes",
+                "title": "Notes",
+                "markdown": 'The citation calls Henry "Henry" and says As a result, 12.',
+            },
+        ],
+    }
+    run_dir = tmp_path / "run-person-coordination"
+    run_dir.mkdir()
+    (run_dir / "book.json").write_text(json.dumps(book), encoding="utf-8")
+
+    result = extract_glossary_candidates(run_dir, profile=FORMAL_LOGIC_PHILOSOPHY)
+    sources = {item["source"] for item in result["candidates"]}
+
+    assert "Michel Henry" in sources
+    assert "Paul Ricoeur" in sources
+    assert "Material Phenomenology" in sources
+    assert "Henry" not in sources
+    assert "Henry and Ricoeur" not in sources
+    assert "Both Henry and Ricoeur" not in sources
+    assert "As a result" not in sources
+
+
+def test_term_type_classifier_does_not_label_concept_titles_as_people() -> None:
+    from pdf_translator.glossary_extraction import _classify_term
+
+    assert _classify_term("Michel Henry") == "person"
+    assert _classify_term("Jean-Luc Marion") == "person"
+    assert _classify_term("Material Phenomenology") == "concept"
+    assert _classify_term("Primitive Fact") == "concept"
+    assert _classify_term("German Ideology") == "concept"
 
 
 def test_profile_switch_changes_candidate_set(tmp_path: Path) -> None:

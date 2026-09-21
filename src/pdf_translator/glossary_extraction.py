@@ -4,6 +4,8 @@ import re
 import unicodedata
 from typing import TYPE_CHECKING, Any
 
+from wordfreq import zipf_frequency
+
 if TYPE_CHECKING:
     from pdf_translator.glossary_profiles import GlossaryProfilePolicy
 
@@ -217,28 +219,42 @@ EVENT_MARKERS = frozenset(
     }
 )
 
-PERSON_NAME_RE = re.compile(r"^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2}$")
+PERSON_NAME_RE = re.compile(r"^[A-Z][A-Za-z'’-]+(?:\s+[A-Z][A-Za-z'’-]+){1,2}$")
 CONCEPT_HEAD_WORDS = frozenset(
     {
         "analysis",
+        "account",
         "approach",
+        "bibliography",
         "evidence",
+        "fact",
         "history",
+        "ideology",
         "investigation",
         "investigations",
         "landscape",
         "landscapes",
+        "man",
+        "meditation",
+        "meditations",
+        "phenomenology",
         "production",
+        "reader",
         "research",
+        "review",
         "series",
         "sources",
         "study",
         "survey",
         "system",
         "systems",
+        "teleology",
+        "turn",
     }
 )
-PHRASE_RE = re.compile(r"\b(?:[A-Z][A-Za-z.'-]+(?:\s+|$)){2,5}")
+PHRASE_RE = re.compile(
+    r"\b(?:[A-Z][A-Za-z'’-]*(?:\s+|(?=[,.;:!?]|$))){2,5}"
+)
 CONNECTOR_PHRASE_RE = re.compile(
     r"\b("
     r"(?:[A-Z][A-Za-z'-]*\s+){1,4}"
@@ -346,10 +362,15 @@ def _classify_term(phrase: str) -> str:
         return "policy_term"
     if any(marker in lowered for marker in INSTITUTION_MARKERS):
         return "institution"
+    concept_head = words[-1].casefold().strip("'’-") if words else ""
+    concept_morphology = concept_head.endswith(
+        ("ism", "ology", "ics", "ity", "tion", "ment", "ness", "graphy", "nomy")
+    )
     if (
         PERSON_NAME_RE.fullmatch(phrase)
         and len(words) <= 3
-        and words[-1].casefold() not in CONCEPT_HEAD_WORDS
+        and concept_head not in CONCEPT_HEAD_WORDS
+        and not concept_morphology
     ):
         return "person"
     return "concept"
@@ -427,6 +448,7 @@ _CLAUSE_LEADING_WORDS = frozenset(
     }
 )
 _POSSESSIVE_DETERMINERS = frozenset({"her", "his", "its", "my", "our", "their", "your"})
+_COORDINATION_DETERMINERS = frozenset({"both", "either", "neither"})
 _AUXILIARY_VERBS = frozenset(
     {
         "am",
@@ -456,8 +478,12 @@ _AUXILIARY_VERBS = frozenset(
 )
 _WH_WORDS = frozenset({"how", "what", "when", "where", "which", "who", "whom", "whose", "why"})
 _PHRASAL_VERB_PARTICLES = frozenset(
-    {"about", "along", "around", "away", "back", "down", "off", "on", "out", "over", "through", "up"}
+    {"about", "after", "along", "around", "away", "back", "down", "off", "on", "out", "over", "through", "up"}
 )
+_GRAMMATICAL_FRAGMENT_LEADS = frozenset(
+    {"how", "insofar", "like", "there", "what", "when", "where", "which", "who", "whom", "whose", "why"}
+)
+_TRAILING_PRONOUNS = frozenset({"he", "her", "him", "i", "it", "me", "she", "them", "they", "us", "we", "you"})
 
 _INCOMPLETE_TRAILING_MODIFIERS = frozenset(
     {
@@ -504,6 +530,10 @@ def termhood_structural_rejection(phrase: str) -> str | None:
 
     if first in _POSSESSIVE_DETERMINERS:
         return "sentence_fragment"
+    if first in _COORDINATION_DETERMINERS:
+        return "sentence_fragment"
+    if first in _GRAMMATICAL_FRAGMENT_LEADS:
+        return "sentence_fragment"
     if first in _AUXILIARY_VERBS:
         return "sentence_fragment"
     if first in _WH_WORDS and any(word in _AUXILIARY_VERBS for word in lowered_words[1:]):
@@ -511,6 +541,8 @@ def termhood_structural_rejection(phrase: str) -> str | None:
     if len(words) == 2 and first in _CLAUSE_LEADING_WORDS:
         return "sentence_fragment"
     if len(words) == 2 and last in _PHRASAL_VERB_PARTICLES:
+        return "sentence_fragment"
+    if last in _TRAILING_PRONOUNS:
         return "sentence_fragment"
     return None
 
@@ -538,6 +570,14 @@ def candidate_integrity_rejection(phrase: str) -> str | None:
     if _is_fragment_phrase(normalized):
         return "clause_fragment"
     words = _phrase_words(normalized)
+    if len(words) == 1 and _word_casefold(words[0]) in (
+        _CLAUSE_LEADING_WORDS
+        | _AUXILIARY_VERBS
+        | _GRAMMATICAL_FRAGMENT_LEADS
+        | _POSSESSIVE_DETERMINERS
+        | _TRAILING_PRONOUNS
+    ):
+        return "grammatical_word"
     if words and words[-1].casefold().strip("'’-") in _INCOMPLETE_TRAILING_MODIFIERS:
         return "incomplete_trailing_modifier"
     if _ORDINAL_CENTURY_RE.fullmatch(normalized):
@@ -560,7 +600,12 @@ def has_independent_termhood(
     if len(words) >= 2:
         return bool(evidence_kinds & MULTIWORD_TERMHOOD_EVIDENCE)
     if len(words) == 1:
-        return bool(evidence_kinds & STRONG_SINGLE_WORD_EVIDENCE)
+        if evidence_kinds & {EVIDENCE_INDEX, EVIDENCE_DEFINITION}:
+            return True
+        # Quotation alone is useful only for lexically uncommon words. Common
+        # prose words are often quoted rhetorically or inside citations and do
+        # not, by themselves, create a translation-consistency decision.
+        return EVIDENCE_QUOTED in evidence_kinds and zipf_frequency(words[0], "en") <= 4.0
     return False
 
 

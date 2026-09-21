@@ -1950,6 +1950,12 @@ class BookJobService:
             ],
         }
 
+    def _confirmed_glossary_context(self, job_id: str) -> tuple[Path, dict[str, Any]]:
+        run_dir = self._require_awaiting_glossary(job_id)
+        self._require_user_confirmed_canonical_chapters(job_id)
+        canonical = self._read_json_any(self.artifact_path(job_id, "canonical_chapters"))
+        return run_dir, self._build_confirmed_book(job_id, canonical)
+
     def glossary_set_profile(self, job_id: str, profile: str) -> dict[str, Any]:
         valid = {
             "humanities_history",
@@ -1959,17 +1965,13 @@ class BookJobService:
         }
         if profile not in valid:
             raise JobServiceError(f"Unsupported glossary profile: {profile}")
-        run_dir = self._require_awaiting_glossary(job_id)
-        self._run(
-            [
-                "glossary",
-                "extract",
-                str(run_dir),
-                "--profile",
-                profile,
-                "--profile-source",
-                "user",
-            ]
+        run_dir, confirmed_book = self._confirmed_glossary_context(job_id)
+        from pdf_translator.glossary import extract_glossary_candidates
+        extract_glossary_candidates(
+            run_dir,
+            book=confirmed_book,
+            profile=profile,
+            profile_source="user",
         )
         return self.glossary(job_id)
 
@@ -2041,15 +2043,21 @@ class BookJobService:
         return self.glossary(job_id)
 
     def glossary_reextract(self, job_id: str) -> dict[str, Any]:
-        run_dir = self._require_awaiting_glossary(job_id)
+        run_dir, confirmed_book = self._confirmed_glossary_context(job_id)
         policy_path = run_dir / "glossary" / "extraction-policy.json"
-        args = ["glossary", "extract", str(run_dir)]
+        profile = None
         if policy_path.is_file():
             policy = self._read_json_any(policy_path)
             current = policy.get("glossary_profile")
             if isinstance(current, str) and current:
-                args.extend(["--profile", current])
-        self._run(args)
+                profile = current
+        from pdf_translator.glossary import extract_glossary_candidates
+        extract_glossary_candidates(
+            run_dir,
+            book=confirmed_book,
+            profile=profile,
+            profile_source="user" if profile else None,
+        )
         return self.glossary(job_id)
 
     def glossary_suggest(

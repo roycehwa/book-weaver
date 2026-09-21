@@ -264,6 +264,13 @@ def test_termhood_filter_rejects_sentence_fragments_and_keeps_named_phrases() ->
         "As Henry",
         "His Phenomenology",
         "Living Up",
+        "Both Henry and Ricoeur",
+        "what it",
+        "insofar as it",
+        "there is",
+        "like a language",
+        "Ricoeur and I",
+        "living after",
     ]
     for phrase in rejected:
         assert termhood_structural_rejection(phrase) == "sentence_fragment"
@@ -313,6 +320,7 @@ def test_candidate_integrity_rejects_clause_leads_and_incomplete_modifiers() -> 
     assert candidate_integrity_rejection("Iraq in Wartime*") == "markup_contamination"
     assert candidate_integrity_rejection("Iran-Iraq War") is None
     assert candidate_integrity_rejection("United States Institute of Peace") is None
+    assert candidate_integrity_rejection("which") == "grammatical_word"
 
 
 def test_extract_filters_fragment_lead_phrases(tmp_path: Path) -> None:

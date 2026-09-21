@@ -703,6 +703,76 @@ def test_confirming_translation_chapters_extracts_glossary_from_confirmed_book(t
     assert reading_units["units"][0]["policy_confirmed"] is True
 
 
+def test_glossary_reextract_and_profile_change_keep_confirmed_scope(tmp_path: Path) -> None:
+    service = BookJobService(project_home=tmp_path, jobs_dir=tmp_path / "jobs")
+    job_dir = service.jobs_dir / "job-scope"
+    artifacts_dir = job_dir / "artifacts"
+    artifacts_dir.mkdir(parents=True)
+    book = {
+        "metadata": {"title": "Example"},
+        "chapters": [{
+            "title": "Automatic",
+            "source_pages": [1, 2],
+            "trace_markdown": (
+                "[[page: 1]]\n\n" + ("Embodied Agency shapes practice. " * 8) + "\n\n"
+                "[[page: 2]]\n\n" + ("Reference Noise repeats in citations. " * 8)
+            ),
+            "markdown": (
+                ("Embodied Agency shapes practice. " * 8) + "\n\n"
+                + ("Reference Noise repeats in citations. " * 8)
+            ),
+        }],
+        "pages": [
+            {"page_no": 1, "has_content": True, "page_kind": "body"},
+            {"page_no": 2, "has_content": True, "page_kind": "notes"},
+        ],
+    }
+    (artifacts_dir / "book.json").write_text(json.dumps(book), encoding="utf-8")
+    snapshot = _snapshot("job-scope")
+    snapshot["state"] = "awaiting_chapter_confirmation"
+    snapshot["request"] = {
+        "processing_mode": "translate",
+        "source_language": "en",
+        "target_language": "zh-CN",
+    }
+    snapshot["resolved"] = {"text_operation": "translate", "source_language": "en"}
+    snapshot["artifacts"] = {"book": {"href": "artifacts/book.json"}}
+    (job_dir / "job.json").write_text(json.dumps(snapshot), encoding="utf-8")
+
+    service.confirm_chapters(
+        "job-scope",
+        expected_job_revision=int(snapshot.get("revision") or 0),
+        chapters=[
+            {
+                "index": 1,
+                "chapter_id": "body",
+                "title": "Body",
+                "page_start": 1,
+                "page_end": 1,
+                "source_pages": [1],
+                "content_policy": "translate",
+            },
+            {
+                "index": 2,
+                "chapter_id": "notes",
+                "title": "Notes",
+                "page_start": 2,
+                "page_end": 2,
+                "source_pages": [2],
+                "content_policy": "preserve",
+            },
+        ],
+    )
+
+    for glossary in (
+        service.glossary_reextract("job-scope"),
+        service.glossary_set_profile("job-scope", "formal_logic_philosophy"),
+    ):
+        sources = {item["source"] for item in glossary["candidates"]}
+        assert "Embodied Agency" in sources
+        assert "Reference Noise" not in sources
+
+
 def test_confirm_chapters_writes_chapter_segments_next_to_nested_run_book(tmp_path: Path) -> None:
     service = BookJobService(project_home=tmp_path, jobs_dir=tmp_path / "jobs")
     job_dir = service.jobs_dir / "job-nested-run"

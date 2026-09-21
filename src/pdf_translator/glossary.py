@@ -90,9 +90,39 @@ def _book_text_corpus(book: dict[str, Any]) -> tuple[str, dict[str, str]]:
     return "\n\n".join(parts), chapter_text
 
 
-def _is_index_chapter(chapter: dict[str, Any]) -> bool:
+def _is_reference_chapter(chapter: dict[str, Any]) -> bool:
     title = str(chapter.get("title") or chapter.get("chapter_id") or "").lower()
     return any(token in title for token in ("index", "glossary", "notes", "bibliography"))
+
+
+def _is_index_chapter(chapter: dict[str, Any]) -> bool:
+    """Return whether the chapter contains real index/glossary entry syntax."""
+    title = str(chapter.get("title") or chapter.get("chapter_id") or "").lower()
+    return any(token in title for token in ("index", "glossary"))
+
+
+def _person_surnames(stats: dict[str, dict[str, Any]]) -> set[str]:
+    surnames: set[str] = set()
+    for entry in stats.values():
+        source = str(entry.get("source") or "")
+        words = source.split()
+        if len(words) >= 2 and _classify_term(source) == "person":
+            surnames.add(words[-1].casefold())
+        possessive = re.match(r"^([A-Z][A-Za-z'’-]+)['’]s\b", source)
+        if possessive:
+            surnames.add(possessive.group(1).casefold())
+    return surnames
+
+
+def _is_person_name_coordination(phrase: str, surnames: set[str]) -> bool:
+    normalized = re.sub(r"^Both\s+", "", phrase, flags=re.IGNORECASE)
+    parts = [part.strip() for part in re.split(r"\s+(?:and|or)\s+", normalized, flags=re.IGNORECASE)]
+    return len(parts) >= 2 and all(
+        part.split()
+        and part.split()[-1].casefold() in surnames
+        and (len(part.split()) == 1 or _classify_term(part) == "person")
+        for part in parts
+    )
 
 
 def _load_extraction_policy(run_dir: Path) -> dict[str, Any] | None:
@@ -175,6 +205,7 @@ def extract_glossary_candidates(
     for chapter in book.get("chapters", []):
         chapter_id = str(chapter.get("chapter_id") or chapter.get("id") or "unknown")
         markdown = chapter_text.get(chapter_id, "")
+        in_reference = _is_reference_chapter(chapter)
         in_index = _is_index_chapter(chapter)
         phrase_sources: list[tuple[str, str]] = [
             (phrase, EVIDENCE_MULTIWORD_PHRASE) for phrase in extract_candidate_phrases(markdown)
@@ -211,7 +242,7 @@ def extract_glossary_candidates(
             entry["variants"].add(phrase)
             entry["occurrences"] += _count_occurrences(markdown, phrase)
             entry["chapters"].add(chapter_id)
-            if not in_index:
+            if not in_reference:
                 entry["body_chapters"].add(chapter_id)
             entry["in_index"] = entry["in_index"] or in_index
 
@@ -223,7 +254,7 @@ def extract_glossary_candidates(
         )
         canonical_term = str(entry["source"])
         for chapter in book.get("chapters", []):
-            if _is_index_chapter(chapter):
+            if _is_reference_chapter(chapter):
                 continue
             chapter_id = str(chapter.get("chapter_id") or chapter.get("id") or "unknown")
             markdown = chapter_text.get(chapter_id, "")
@@ -234,8 +265,26 @@ def extract_glossary_candidates(
     rejected_count = 0
     reference_only_rejected = 0
     integrity_rejected = 0
+    person_surnames = _person_surnames(stats)
     for entry in stats.values():
         phrase = str(entry["source"])
+        words = phrase.split()
+        kinds = frozenset(entry.get("evidence_kinds") or ())
+        if (
+            len(words) == 1
+            and phrase[:1].isupper()
+            and phrase.casefold() in person_surnames
+        ):
+            rejected_count += 1
+            integrity_rejected += 1
+            continue
+        if (
+            _is_person_name_coordination(phrase, person_surnames)
+            and not kinds.intersection({EVIDENCE_QUOTED, EVIDENCE_INDEX, EVIDENCE_DEFINITION})
+        ):
+            rejected_count += 1
+            integrity_rejected += 1
+            continue
         integrity_reason = candidate_integrity_rejection(phrase)
         if integrity_reason is not None:
             rejected_count += 1
@@ -251,7 +300,7 @@ def extract_glossary_candidates(
             chapter_count=len(entry["chapters"]),
             exclusions=exclusions,
             in_index=bool(entry["in_index"]),
-            evidence_kinds=frozenset(entry.get("evidence_kinds") or ()),
+            evidence_kinds=kinds,
             policy=active_policy,
         )
         if rejected:
@@ -305,7 +354,7 @@ def extract_glossary_candidates(
         "schema": EXTRACTION_POLICY_SCHEMA,
         "generated_at": _now(),
         "max_candidates": limit,
-        "profile_policy_version": 3,
+        "profile_policy_version": 4,
         "principles": list(active_policy.principles),
         "stats": {
             "raw_phrases_seen": len(stats),
