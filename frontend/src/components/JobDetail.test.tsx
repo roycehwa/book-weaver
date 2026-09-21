@@ -14,13 +14,18 @@ vi.mock('./SourceWorkbench', () => ({
   default: ({
     onSelectPage,
     onDirtyChange,
+    chapterTitle,
+    chapterPolicy,
   }: {
     onSelectPage?: (page: number) => void
     onDirtyChange?: (dirty: boolean) => void
+    chapterTitle?: string
+    chapterPolicy?: string
   }) => (
     <>
       <button type="button" onClick={() => onSelectPage?.(223)}>模拟跳到问题页</button>
       <button type="button" onClick={() => onDirtyChange?.(true)}>模拟未保存原文</button>
+      <output aria-label="原文修正台章节策略">{chapterTitle}:{chapterPolicy}</output>
     </>
   ),
 }))
@@ -111,6 +116,7 @@ describe('JobDetail Notes dependency acknowledgement', () => {
     expect(screen.getByText('无需处理。系统已按保守规则保持分开；当前内容策略不会让这个边界进入翻译。')).toBeInTheDocument()
     await userEvent.click(screen.getByRole('button', { name: '查看相关页面（第 223 页）' }))
     expect(screen.getByText('当前查看章节：Notes')).toBeInTheDocument()
+    expect(screen.getByLabelText('原文修正台章节策略')).toHaveTextContent('Notes:preserve')
     expect(screen.queryByRole('button', { name: '当前页设为开始' })).not.toBeInTheDocument()
 
     await userEvent.click(screen.getByRole('button', { name: '需要修改本章起止页' }))
@@ -143,6 +149,33 @@ describe('JobDetail Notes dependency acknowledgement', () => {
     const policy = await screen.findByRole('combobox', { name: '第 1 章处理方式' })
     expect(policy).toHaveDisplayValue('重建译文目录')
     expect(screen.getByText('将按最终译文章节名生成整洁目录，不翻译原目录的点线和页码。')).toBeInTheDocument()
+  })
+
+  it('shows the selected chapter automatic recommendation as the inherited paragraph policy', async () => {
+    vi.spyOn(jobsApi, 'get').mockResolvedValue(job)
+    vi.spyOn(jobsApi, 'sourceInfo').mockResolvedValue({
+      job_id: 'job-1', filename: 'synthetic.pdf', size: 10, kind: 'other', download_url: '/source',
+    })
+    vi.spyOn(jobsApi, 'getChapterDraft').mockResolvedValue({
+      job_id: 'job-1',
+      chapters: [
+        { index: 1, chapter_id: 'body', title: 'Body', page_start: 1, page_end: 100, content_policy: 'translate' },
+        { index: 2, chapter_id: 'notes', title: 'Notes', page_start: 101, page_end: 120, content_policy: 'auto' },
+      ],
+    })
+    vi.spyOn(workspaceApi, 'listBooks').mockResolvedValue({ total_books: 1, books: [workspaceBook] })
+
+    render(
+      <MemoryRouter initialEntries={['/jobs/job-1']}>
+        <Routes><Route path="/jobs/:id" element={<JobDetail />} /></Routes>
+      </MemoryRouter>,
+    )
+
+    const notesPolicy = await screen.findByRole('combobox', { name: '第 2 章处理方式' })
+    await userEvent.click(notesPolicy)
+    expect(screen.getByText('当前查看章节：Notes')).toBeInTheDocument()
+    expect(screen.getByLabelText('原文修正台章节策略')).toHaveTextContent('Notes:preserve')
+    expect(screen.getByText(/页码范围：101-120 · PDF 页码当前页：101/)).toBeInTheDocument()
   })
 
   it('warns on exclusion and submits exact server dependency IDs only after acknowledgement', async () => {

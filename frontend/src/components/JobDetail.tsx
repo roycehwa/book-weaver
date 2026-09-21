@@ -876,6 +876,11 @@ function JobDetail() {
         ? '机器预审进行中：请等待预审完成后再进入人工审阅。'
         : '书籍正在处理中：部分编辑操作已锁定，请等待当前阶段完成。'
   const selectedChapter = chapterDraft[selectedChapterIndex]
+  const selectedChapterPolicy = selectedChapter
+    ? (selectedChapter.content_policy === 'auto' || !selectedChapter.content_policy
+        ? (appendixRecommendations.get(selectedChapter.chapter_id) || 'translate')
+        : selectedChapter.content_policy)
+    : undefined
   const selectedDraftStart = toPositivePage(selectedChapter?.page_start)
   const selectedDraftEnd = toPositivePage(selectedChapter?.page_end)
   const readingChapterByPage = readingUnits?.chapters
@@ -1453,6 +1458,7 @@ function JobDetail() {
                             {invalidRange && <span className="ml-2 text-red-600">结束页早于开始页</span>}
                           </div>
                           <select aria-label={`第 ${index + 1} 章处理方式`} value={chapter.content_policy || 'auto'}
+                            onFocus={() => jumpToChapter(index)}
                             onChange={event => setChapterDraft(chapters => chapters.map((item, i) => i === index ? { ...item, content_policy: event.target.value as JobChapterDraft['content_policy'] } : item))}
                             className="w-full rounded border border-slate-300 px-2 py-1 text-sm">
                             <option value="auto">{isContents ? '采用自动建议（重建译文目录）' : '采用自动建议（确认时默认翻译）'}</option>
@@ -1504,7 +1510,7 @@ function JobDetail() {
                     jobId={id}
                     page={currentPdfPage}
                     chapterTitle={selectedChapter?.title}
-                    chapterPolicy={selectedChapter?.content_policy}
+                    chapterPolicy={selectedChapterPolicy}
                     onSelectPage={inspectSourcePage}
                     onDirtyChange={setSourceWorkbenchDirty}
                     onSaved={() => { void loadJob() }}
