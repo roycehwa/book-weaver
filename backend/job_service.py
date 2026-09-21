@@ -1505,6 +1505,12 @@ class BookJobService:
                     snapshot["state"] = "awaiting_glossary"
             elif mode == "convert":
                 snapshot["state"] = "awaiting_glossary"
+        if snapshot.get("state") != "failed":
+            # A successful chapter rebuild supersedes the prior failed run.
+            # Leaving these fields behind makes the UI look failed even after
+            # source quality has been recomputed successfully.
+            snapshot["failed_stage"] = None
+            snapshot["error"] = None
         snapshot["updated_at"] = canonical["created_at"]
         snapshot["revision"] = int(snapshot.get("revision") or 0) + 1
         self._write_json_atomic(job_dir / "job.json", snapshot)

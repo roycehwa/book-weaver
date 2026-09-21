@@ -692,6 +692,8 @@ def test_confirming_translation_chapters_extracts_glossary_from_confirmed_book(t
     )
 
     assert result["state"] == "awaiting_glossary"
+    assert result["failed_stage"] is None
+    assert result["error"] is None
     assert result["artifacts"]["glossary_candidates"]["href"] == "artifacts/glossary/candidates.json"
     assert (artifacts_dir / "glossary" / "candidates.json").is_file()
     workflow = json.loads((artifacts_dir / "workflow.json").read_text(encoding="utf-8"))
@@ -790,7 +792,13 @@ def test_confirm_chapters_writes_chapter_segments_next_to_nested_run_book(tmp_pa
     }
     (run_dir / "book.json").write_text(json.dumps(book), encoding="utf-8")
     snapshot = _snapshot("job-nested-run")
-    snapshot["state"] = "awaiting_chapter_confirmation"
+    snapshot["state"] = "failed"
+    snapshot["failed_stage"] = "translating"
+    snapshot["error"] = {
+        "code": "source_quality_blocked",
+        "message": "Job failed during translating.",
+        "retryable": False,
+    }
     snapshot["request"] = {
         "processing_mode": "translate",
         "source_language": "en",
@@ -818,6 +826,8 @@ def test_confirm_chapters_writes_chapter_segments_next_to_nested_run_book(tmp_pa
     assert segment_path.is_file()
     assert not (job_dir / "artifacts" / "chapter-segments.json").exists()
     assert result["state"] == "awaiting_glossary"
+    assert result["failed_stage"] is None
+    assert result["error"] is None
     assert result["artifacts"]["chapter_segments"]["href"] == "artifacts/run/chapter-segments.json"
     quality = json.loads((run_dir / "source-quality-report.json").read_text(encoding="utf-8"))
     blocking_codes = {
