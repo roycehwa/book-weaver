@@ -1,6 +1,12 @@
 from __future__ import annotations
 
-from pdf_translator.pdf_text_repair import repair_pdf_markdown, scan_ingest_quality
+import json
+
+from pdf_translator.pdf_text_repair import (
+    repair_pdf_markdown,
+    scan_ingest_quality,
+    write_ingest_quality_report,
+)
 
 
 def test_repair_pdf_markdown_fixes_common_extraction_artifacts() -> None:
@@ -111,6 +117,35 @@ def test_repair_does_not_guess_when_broken_fragments_have_no_lexical_evidence() 
     report = scan_ingest_quality(repaired)
     assert report.acceptable is True
     assert report.issue_counts["hyphenated_line_break"] == 1
+
+
+def test_ingest_quality_report_maps_issue_to_pdf_page_and_block(tmp_path) -> None:
+    path = write_ingest_quality_report(
+        tmp_path,
+        source_markdown="# Acknowledgments\n\nsteadfast sup-\n\nnevitably changed",
+        page_texts={338: "## Acknowledgments\n\nsteadfast sup-\n\nnevitably changed"},
+        source_format="pdf",
+    )
+
+    report = json.loads(path.read_text(encoding="utf-8"))
+    issue = report["warning_issues"][0]
+    assert issue["page"] == 338
+    assert issue["block_index"] == 2
+    assert "steadfast sup-" in issue["block_excerpt"]
+    assert issue["source_format"] == "pdf"
+
+
+def test_ingest_quality_report_maps_repeated_issues_in_reading_order(tmp_path) -> None:
+    path = write_ingest_quality_report(
+        tmp_path,
+        source_markdown="bad \ufffd first\n\nbad \ufffd second",
+        page_texts={7: "bad \ufffd first", 8: "bad \ufffd second"},
+        source_format="pdf",
+    )
+
+    report = json.loads(path.read_text(encoding="utf-8"))
+    assert [issue["page"] for issue in report["blocking_issues"]] == [7, 8]
+    assert [issue["block_index"] for issue in report["blocking_issues"]] == [1, 1]
 
 
 def test_repair_removes_structural_flow_markers_regardless_of_glyph() -> None:

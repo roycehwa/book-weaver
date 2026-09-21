@@ -274,6 +274,7 @@ def _quality_evidence(
                     "chapter": chapter,
                     "line": text.count("\n", 0, match.start()) + 1,
                     "excerpt": excerpt,
+                    "match": match.group(0),
                 }
             )
             if len(evidence) >= 100:
@@ -321,9 +322,70 @@ def write_ingest_quality_report(
     run_dir: Path,
     *,
     source_markdown: str,
+    page_texts: dict[int, str] | None = None,
+    source_format: str | None = None,
     block_on_errors: bool = False,
 ) -> Path:
     report = scan_ingest_quality(source_markdown)
+    if page_texts:
+        issues = [*report.blocking_issues, *report.warning_issues]
+        grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for issue in issues:
+            needle = str(issue.get("match") or "")
+            if not needle:
+                continue
+            grouped.setdefault((str(issue.get("code") or ""), needle), []).append(issue)
+
+        for (_, needle), matching_issues in grouped.items():
+            locations: list[tuple[int, int, str]] = []
+            for page, text in sorted(page_texts.items()):
+                # Find the issue in the complete page before assigning a block.
+                # A broken word can itself cross a blank-line separator, so
+                # looking for the complete match inside already split blocks
+                # loses the page location precisely where it is most useful.
+                starts: list[int] = []
+                cursor = 0
+                while True:
+                    start = text.find(needle, cursor)
+                    if start < 0:
+                        break
+                    starts.append(start)
+                    cursor = start + max(1, len(needle))
+                if not starts:
+                    continue
+                block_spans = [
+                    (match.start(), match.end(), match.group(0).strip())
+                    for match in re.finditer(r"(?ms)\S(?:.*?\S)?(?=\n\s*\n|\Z)", text)
+                    if match.group(0).strip()
+                ]
+                for start in starts:
+                    containing = next(
+                        (
+                            (block_index, block)
+                            for block_index, (block_start, block_end, block) in enumerate(
+                                block_spans,
+                                start=1,
+                            )
+                            if block_start <= start < block_end
+                        ),
+                        None,
+                    )
+                    if containing is None:
+                        continue
+                    block_index, block = containing
+                    locations.append((int(page), block_index, block))
+            # Repeated damage is still locatable: scan results and page
+            # occurrences are both in reading order, so pair them only when
+            # their counts agree.  A count mismatch remains unlocated rather
+            # than sending the user to the wrong page.
+            if len(locations) != len(matching_issues):
+                continue
+            for issue, (page, block_index, block) in zip(matching_issues, locations):
+                issue["page"] = page
+                issue["block_index"] = block_index
+                issue["block_excerpt"] = block[:180]
+                if source_format in {"pdf", "epub"}:
+                    issue["source_format"] = source_format
     path = run_dir / "ingest-quality-report.json"
     path.write_text(json.dumps(report.as_dict(), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     if block_on_errors and not report.acceptable:

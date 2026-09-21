@@ -739,6 +739,10 @@ export interface JobChapterDraftResponse {
     from_page?: number
     to_page?: number
     continuation_status?: string
+    page?: number
+    block_index?: number
+    block_excerpt?: string
+    source_format?: 'pdf' | 'epub'
   }>
   draft_source?: 'canonical_saved' | 'pdf_toc' | 'pdf_text_toc' | 'book_structure'
   draft_source_detail?: string | null

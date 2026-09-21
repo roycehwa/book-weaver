@@ -12,6 +12,27 @@ def markdown_block_structure(text: str) -> tuple[str, ...]:
     return tuple(node.name for node in soup.children if getattr(node, "name", None))
 
 
+def markdown_protected_block_structure(text: str) -> tuple[str, ...]:
+    """Return structural Markdown elements that translation must preserve.
+
+    Prose paragraph boundaries are intentionally excluded. They are already
+    enforced for every translation chunk and can legitimately change when the
+    complete delivery view is assembled. Headings, lists, quotes, code,
+    tables, rules and images remain blocking document structure.
+    """
+    soup = BeautifulSoup(render_markdown(text, extensions=["tables", "fenced_code"]), "html.parser")
+    protected = {
+        "h1", "h2", "h3", "h4", "h5", "h6",
+        "blockquote", "pre", "ul", "ol", "li", "hr", "img",
+        "table", "thead", "tbody", "tr", "th", "td",
+    }
+    return tuple(
+        node.name
+        for node in soup.descendants
+        if getattr(node, "name", None) in protected
+    )
+
+
 def untranslated_prose_blocks(source: str, translated: str) -> list[int]:
     """Conservative exact-copy detection, independent of whole-chunk CJK ratio.
 

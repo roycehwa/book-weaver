@@ -174,6 +174,87 @@ describe('Review draft navigation', () => {
     expect(document.activeElement).toBe(editor)
   })
 
+  test('serializes final approval after an in-flight draft save', async () => {
+    let finishDraftSave: (() => void) | undefined
+    saveDecision
+      .mockImplementationOnce(
+        () => new Promise((resolve) => {
+          finishDraftSave = () => resolve({
+            status: 'saved',
+            segment_id: 's1',
+            review_state: {
+              ...project.review_state,
+              revision: 1,
+              decisions: {
+                s1: {
+                  status: 'open',
+                  action: 'manual_edit',
+                  approved_text: '需要持久保存的修订',
+                  updated_at: new Date().toISOString(),
+                },
+              },
+            },
+          })
+        })
+      )
+      .mockResolvedValueOnce({
+        status: 'saved',
+        segment_id: 's1',
+        review_state: {
+          ...project.review_state,
+          revision: 2,
+          decisions: {
+            s1: { status: 'approved', action: 'manual_edit', approved_text: '需要持久保存的修订' },
+          },
+        },
+      })
+
+    const user = userEvent.setup()
+    const { container } = render(<Review />)
+    await screen.findByText('Source one')
+    await user.click(screen.getByRole('button', { name: '手动修改' }))
+    fireEvent.change(container.querySelector('textarea') as HTMLTextAreaElement, {
+      target: { value: '需要持久保存的修订' },
+    })
+    await user.click(screen.getByRole('button', { name: '确认修改并到下一审阅项' }))
+
+    await waitFor(() => expect(saveDecision).toHaveBeenCalledTimes(1))
+    await act(async () => finishDraftSave?.())
+    await waitFor(() => expect(saveDecision).toHaveBeenCalledTimes(2))
+    expect(saveDecision.mock.calls[1][2]).toMatchObject({
+      expected_revision: 1,
+      status: 'approved',
+      approved_text: '需要持久保存的修订',
+    })
+  })
+
+  test('offers an explicit project-file save without approving the paragraph', async () => {
+    saveDecision.mockResolvedValue({
+      status: 'saved',
+      segment_id: 's1',
+      review_state: { ...project.review_state, revision: 1 },
+    })
+    const user = userEvent.setup()
+    const { container } = render(<Review />)
+    await screen.findByText('Source one')
+    await user.click(screen.getByRole('button', { name: '手动修改' }))
+    fireEvent.change(container.querySelector('textarea') as HTMLTextAreaElement, {
+      target: { value: '只保存为项目草稿' },
+    })
+    await user.click(screen.getByRole('button', { name: '保存当前修改' }))
+
+    await waitFor(() => expect(saveDecision).toHaveBeenCalledWith(
+      '/tmp/review-run',
+      's1',
+      expect.objectContaining({
+        expected_revision: 0,
+        status: 'open',
+        approved_text: '只保存为项目草稿',
+      }),
+    ))
+    expect(await screen.findByText('当前修改已保存到项目文件。')).toBeTruthy()
+  })
+
   test('renders structured OCR evidence without raw markdown paths', async () => {
     getProject.mockResolvedValue({
       ...project,

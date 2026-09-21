@@ -27,11 +27,17 @@ describe('confirmationQuality helpers', () => {
         severity: 'error',
         code: 'soft_hyphen',
         message: '源文存在需处理的「软连字符」（章节「Body」，约第 3 行）',
+        page: 12,
+        block_index: 4,
+        block_excerpt: 'damaged source block',
       },
     ])
     expect(mapped[0]).toMatchObject({
       severity: 'error',
       code: 'soft_hyphen',
+      page: 12,
+      block_index: 4,
+      block_excerpt: 'damaged source block',
     })
   })
 

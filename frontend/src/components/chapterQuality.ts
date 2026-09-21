@@ -17,6 +17,10 @@ export interface ChapterQualityIssue {
   from_page?: number
   to_page?: number
   continuation_status?: string
+  page?: number
+  block_index?: number
+  block_excerpt?: string
+  source_format?: 'pdf' | 'epub'
 }
 
 export interface ChapterQualityResult {

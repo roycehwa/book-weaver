@@ -266,6 +266,8 @@ function Review() {
   const translationScrollRef = useRef<HTMLDivElement>(null)
   const syncingScrollRef = useRef(false)
   const draftSavePromiseRef = useRef<Promise<boolean> | null>(null)
+  const reviewRevisionRef = useRef(0)
+  const reviewDecisionsRef = useRef<ReviewProject['review_state']['decisions']>({})
   const initializedEditorKeyRef = useRef<string | null>(null)
   const initializedTranslationRef = useRef<unknown>(null)
 
@@ -486,6 +488,8 @@ function Review() {
       setError(null)
       try {
         const data = await reviewApi.getProject(runDir)
+        reviewRevisionRef.current = data.review_state.revision || 0
+        reviewDecisionsRef.current = data.review_state.decisions
         setProject(data)
         const sorted = [...data.segments].sort((a, b) => {
           const left = segmentSortKey(a)
@@ -584,7 +588,7 @@ function Review() {
       }
 
       const savePendingDrafts = async (): Promise<boolean> => {
-        let revision = project?.review_state.revision || 0
+        let revision = reviewRevisionRef.current
         let draft = loadDraft(localStorage, runDir, segmentId)
         while (draft) {
           setDraftSaveState('saving')
@@ -597,6 +601,8 @@ function Review() {
               reviewer_comment: draft.comment,
             })
             revision = saved.review_state.revision || 0
+            reviewRevisionRef.current = revision
+            reviewDecisionsRef.current = saved.review_state.decisions
             setProject(current => current ? { ...current, review_state: saved.review_state } : current)
           } catch {
             setDraftSaveState('error')
@@ -631,7 +637,7 @@ function Review() {
         }
       }
     },
-    [runDir, project?.review_state.revision]
+    [runDir]
   )
 
   useEffect(() => {
@@ -641,6 +647,16 @@ function Review() {
     }, 800)
     return () => window.clearTimeout(timer)
   }, [draftSaveState, flushDraft, selectedSegmentId])
+
+  useEffect(() => {
+    const warnBeforeLeaving = (event: BeforeUnloadEvent) => {
+      if (!['dirty', 'saving', 'error'].includes(draftSaveState)) return
+      event.preventDefault()
+      event.returnValue = ''
+    }
+    window.addEventListener('beforeunload', warnBeforeLeaving)
+    return () => window.removeEventListener('beforeunload', warnBeforeLeaving)
+  }, [draftSaveState])
 
   const updateDraft = (
     nextApprovedText: string,
@@ -670,6 +686,10 @@ function Review() {
   const changeHumanReviewMode = async (mode: HumanReviewMode) => {
     setError(null)
     try {
+      if (!(await flushDraft(selectedSegmentId))) {
+        setError('当前修改尚未保存到项目文件，请重试后再切换审阅范围。')
+        return
+      }
       await reviewApi.updateWorkflow(runDir, mode)
       await loadProject(selectedSegmentId)
       setActionMessage(mode === 'issues_only' ? '已切换：仅审机器标记的可疑段' : '已切换：全书逐段审阅')
@@ -689,6 +709,10 @@ function Review() {
     setSavingChapterMark(true)
     setError(null)
     try {
+      if (!(await flushDraft(selectedSegmentId))) {
+        setError('当前修改尚未保存到项目文件，请重试后再保存章节标记。')
+        return
+      }
       await reviewApi.addChapterMark(runDir, {
         segment_id: selectedSegmentId,
         chapter_title: chapterMarkTitle.trim(),
@@ -707,6 +731,10 @@ function Review() {
   const handleDeleteChapterMark = async (markId: string) => {
     setError(null)
     try {
+      if (!(await flushDraft(selectedSegmentId))) {
+        setError('当前修改尚未保存到项目文件，请重试后再删除章节标记。')
+        return
+      }
       await reviewApi.deleteChapterMark(runDir, markId)
       await loadProject(selectedSegmentId)
       setActionMessage('已删除章节标记。')
@@ -727,7 +755,11 @@ function Review() {
     if (target) goToChapter(target.firstSegmentIndex)
   }
 
-  const backToCenter = () => {
+  const backToCenter = async () => {
+    if (!(await flushDraft(selectedSegmentId))) {
+      setError('当前修改尚未保存到项目文件，请重试保存后再返回。')
+      return
+    }
     window.location.href = '/review-center'
   }
 
@@ -766,8 +798,12 @@ function Review() {
     const action = options?.actionOverride ?? resolutionMode
     const text = options?.approvedTextOverride ?? approvedText
     try {
-      await reviewApi.saveDecision(runDir, selectedSegmentId, {
-        expected_revision: project?.review_state.revision || 0,
+      if (!(await flushDraft(selectedSegmentId))) {
+        setError('当前修改尚未保存到项目文件，请重试后再确认。')
+        return false
+      }
+      const saved = await reviewApi.saveDecision(runDir, selectedSegmentId, {
+        expected_revision: reviewRevisionRef.current,
         status,
         action,
         approved_text: action === 'manual_edit' ? text : undefined,
@@ -775,6 +811,9 @@ function Review() {
           ? comment.trim() || '请根据原文完整重新翻译本段，遵循已确认术语，保留段落、引文和链接，不遗漏、不概括；不要输出翻译失败占位提示或处理说明。'
           : comment,
       })
+      reviewRevisionRef.current = saved.review_state.revision || reviewRevisionRef.current
+      reviewDecisionsRef.current = saved.review_state.decisions
+      setProject(current => current ? { ...current, review_state: saved.review_state } : current)
       removeDraft(localStorage, runDir, selectedSegmentId)
       setDraftSaveState('saved')
       setDraftSavedAt(new Date().toISOString())
@@ -801,6 +840,20 @@ function Review() {
     } catch (err) {
       setError(err instanceof Error ? err.message : '保存审阅决定失败')
       return false
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const handleSaveDraft = async () => {
+    setSaving(true)
+    setError(null)
+    try {
+      if (await flushDraft(selectedSegmentId)) {
+        setActionMessage('当前修改已保存到项目文件。')
+      } else {
+        setError('当前修改尚未保存到项目文件，请检查服务状态后重试。')
+      }
     } finally {
       setSaving(false)
     }
@@ -867,14 +920,29 @@ function Review() {
 
   const handleExport = async () => {
     if (!exportVersion.trim()) return
-    if (!qualityExportReady) {
-      setError(exportCompletionMessage)
-      return
-    }
     setExporting(true)
     setError(null)
     setActionMessage(null)
     try {
+      if (!(await flushDraft(selectedSegmentId))) {
+        setError('当前修改尚未保存到项目文件，请重试后再导出。')
+        return
+      }
+      const currentDecision = selectedSegmentId
+        ? reviewDecisionsRef.current[selectedSegmentId]
+        : undefined
+      if (
+        currentDecision?.status === 'open' &&
+        currentDecision.action === 'manual_edit' &&
+        currentDecision.approved_text?.trim()
+      ) {
+        setError('当前段落的修改已保存为草稿，请先点击“确认修改并到下一审阅项”，再导出。')
+        return
+      }
+      if (!qualityExportReady) {
+        setError(exportCompletionMessage)
+        return
+      }
       const result = await reviewApi.exportVersion(runDir, {
         version: exportVersion.trim(),
         output_format: exportFormat,
@@ -898,6 +966,10 @@ function Review() {
     setError(null)
     setActionMessage(null)
     try {
+      if (!(await flushDraft(selectedSegmentId))) {
+        setError('当前修改尚未保存到项目文件，请重试后再重新校验。')
+        return
+      }
       const result = await reviewApi.revalidateQuality(runDir)
       setActionMessage(
         result.translation_quality.translation_quality_blocking
@@ -1553,6 +1625,13 @@ function Review() {
             {draftSaveState === 'error' && '服务端同步失败，本机草稿仍保留；请保持页面打开后重试。'}
           </div>
           <div className="mt-3 pb-1 flex flex-wrap gap-2">
+            <button
+              disabled={!selectedSegmentId || saving || draftSaveState === 'saving'}
+              onClick={() => void handleSaveDraft()}
+              className="rounded-lg border border-blue-300 bg-white px-4 py-2 text-sm font-medium text-blue-800 disabled:opacity-50"
+            >
+              {draftSaveState === 'error' ? '重试保存当前修改' : '保存当前修改'}
+            </button>
             {selectedDecision?.status === 'candidate' && (
               <button
                 disabled={!selectedSegmentId || saving}

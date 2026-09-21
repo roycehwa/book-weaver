@@ -16,16 +16,19 @@ vi.mock('./SourceWorkbench', () => ({
     onDirtyChange,
     chapterTitle,
     chapterPolicy,
+    targetBlockIndex,
   }: {
     onSelectPage?: (page: number) => void
     onDirtyChange?: (dirty: boolean) => void
     chapterTitle?: string
     chapterPolicy?: string
+    targetBlockIndex?: number
   }) => (
     <>
       <button type="button" onClick={() => onSelectPage?.(223)}>模拟跳到问题页</button>
       <button type="button" onClick={() => onDirtyChange?.(true)}>模拟未保存原文</button>
       <output aria-label="原文修正台章节策略">{chapterTitle}:{chapterPolicy}</output>
+      <output aria-label="原文修正台目标段落">{targetBlockIndex ?? ''}</output>
     </>
   ),
 }))
@@ -172,7 +175,14 @@ describe('JobDetail Notes dependency acknowledgement', () => {
       ],
       confirmation_quality_issues: [
         { severity: 'error', code: 'reading_units_invalid', message: '阅读单元无效' },
-        { severity: 'warning', code: 'midword_space', message: '疑似词内空格' },
+        {
+          severity: 'warning',
+          code: 'midword_space',
+          message: '疑似词内空格（PDF 第 2 页第 3 段）',
+          page: 2,
+          block_index: 3,
+          block_excerpt: 'damaged source text',
+        },
       ],
     })
     vi.spyOn(workspaceApi, 'listBooks').mockResolvedValue({
@@ -195,6 +205,8 @@ describe('JobDetail Notes dependency acknowledgement', () => {
 
     expect(await screen.findByText('1 个错误 · 1 条提示')).toBeInTheDocument()
     expect(screen.getAllByRole('button', { name: '重新检查确认版' })).not.toHaveLength(0)
+    await userEvent.click(screen.getByRole('button', { name: '查看 PDF 第 2 页第 3 段' }))
+    expect(screen.getByLabelText('原文修正台目标段落')).toHaveTextContent('3')
   })
 
   it('explains that translating a contents chapter rebuilds the target TOC', async () => {

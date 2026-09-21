@@ -108,6 +108,17 @@ def test_raw_report_flags_structure_and_link_regressions(tmp_path: Path) -> None
         source_markdown=source,
         review_items=[],
     )
+    findings = {item["code"]: item for item in report["findings"]}
+    assert findings["markdown_prose_block_shape_changed"]["severity"] == "review"
+    assert "markdown_block_structure_loss" not in findings
+
+    (run_dir / "translated.raw.md").write_text("Hello world.\n", encoding="utf-8")
+    report = build_raw_translation_quality_report(
+        run_dir,
+        text_operation="translate",
+        source_markdown=source,
+        review_items=[],
+    )
     codes = {item["code"] for item in report["findings"]}
     assert "markdown_block_structure_loss" in codes
 

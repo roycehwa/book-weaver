@@ -285,6 +285,7 @@ function JobDetail() {
   }
   const [selectedChapterIndex, setSelectedChapterIndex] = useState(0)
   const [currentPdfPage, setCurrentPdfPage] = useState(1)
+  const [sourceWorkbenchBlockIndex, setSourceWorkbenchBlockIndex] = useState<number | undefined>()
   const [totalPdfPages, setTotalPdfPages] = useState<number | null>(null)
   const { kind: sourceKind, loaded: sourceInfoLoaded } = useJobSourceInfo(
     job?.job_id ?? null,
@@ -771,6 +772,7 @@ function JobDetail() {
   }, [chapterDraft, chapterRangeAdjustMode])
 
   const inspectSourcePage = useCallback((page: number) => {
+    setSourceWorkbenchBlockIndex(undefined)
     setChapterRangeAdjustMode(false)
     const normalized = toPositivePage(page) || 1
     setCurrentPdfPage(normalized)
@@ -784,6 +786,15 @@ function JobDetail() {
         }
       }, 0)
     }
+  }, [chapterDraft])
+
+  const inspectSourceIssue = useCallback((page: number, blockIndex?: number) => {
+    setSourceWorkbenchBlockIndex(blockIndex)
+    setChapterRangeAdjustMode(false)
+    const normalized = toPositivePage(page) || 1
+    setCurrentPdfPage(normalized)
+    const chapterIndex = findChapterIndexForPage(chapterDraft, normalized)
+    if (chapterIndex !== null) setSelectedChapterIndex(chapterIndex)
   }, [chapterDraft])
 
   const jumpToChapter = (index: number) => {
@@ -1440,7 +1451,19 @@ function JobDetail() {
                                 : 'border-amber-200 bg-amber-50 text-amber-800'
                             }`}
                           >
-                            {issue.message}
+                            <p>{issue.message}</p>
+                            {issue.page && (
+                              <button
+                                type="button"
+                                className="mt-2 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-800"
+                                onClick={() => inspectSourceIssue(issue.page!, issue.block_index)}
+                              >
+                                查看{sourceKind === 'epub'
+                                  ? ` EPUB 第 ${issue.page} 个阅读页`
+                                  : ` PDF 第 ${issue.page} 页`}
+                                {issue.block_index ? `第 ${issue.block_index} 段` : ''}
+                              </button>
+                            )}
                           </div>
                         )
                       })}
@@ -1539,6 +1562,7 @@ function JobDetail() {
                     page={currentPdfPage}
                     chapterTitle={selectedChapter?.title}
                     chapterPolicy={selectedChapterPolicy}
+                    targetBlockIndex={sourceWorkbenchBlockIndex}
                     onSelectPage={inspectSourcePage}
                     onDirtyChange={setSourceWorkbenchDirty}
                     onSaved={() => { void loadJob() }}

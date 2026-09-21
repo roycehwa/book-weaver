@@ -16,6 +16,7 @@ interface SourceWorkbenchProps {
   onDirtyChange?: (dirty: boolean) => void
   chapterTitle?: string
   chapterPolicy?: JobChapterDraft['content_policy']
+  targetBlockIndex?: number
 }
 
 const chapterPolicyLabel = (policy: JobChapterDraft['content_policy'] | undefined): string | null => {
@@ -50,6 +51,7 @@ export default function SourceWorkbench({
   onDirtyChange,
   chapterTitle,
   chapterPolicy,
+  targetBlockIndex,
 }: SourceWorkbenchProps) {
   const [data, setData] = useState<SourceWorkspace | null>(null)
   const [blocks, setBlocks] = useState<SourceBlock[]>([])
@@ -70,6 +72,10 @@ export default function SourceWorkbench({
     finally { if (sequence === requestSequence.current) setBusy(false) }
   }
   useEffect(() => { if (!dirty) void load() }, [jobId, page]) // Unsaved edits stay pinned to their original page.
+  useEffect(() => {
+    if (!data || data.page !== page || !targetBlockIndex) return
+    setSelected(Math.min(Math.max(targetBlockIndex - 1, 0), Math.max(blocks.length - 1, 0)))
+  }, [blocks.length, data, page, targetBlockIndex])
   useEffect(() => { onDirtyChange?.(dirty) }, [dirty, onDirtyChange])
   const update = (next: SourceBlock[]) => {
     setBlocks(next)

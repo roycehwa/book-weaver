@@ -51,6 +51,15 @@ def _patch_book_intake(monkeypatch, *, markdown: str, chapter_id: str = "ch-001"
     monkeypatch.setattr(pipeline_module, "ingest_pdf_guarded", fake_ingest)
     monkeypatch.setattr(pipeline_module, "build_document_profile", lambda *a, **k: {"profile": "book"})
     monkeypatch.setattr(pipeline_module, "build_book_reconstruction", fake_book)
+    monkeypatch.setattr(
+        pipeline_module,
+        "source_workspace_pages",
+        lambda book, **_kwargs: {
+            int(page): str(chapter.get("markdown") or "")
+            for chapter in book.get("chapters", [])
+            for page in chapter.get("source_pages", [])
+        },
+    )
     from pdf_translator.translation_quality import run_source_quality_gate_before_translation
     from tests.synthetic_quality_fixtures import ensure_confirmed_reading_units_for_translation
 

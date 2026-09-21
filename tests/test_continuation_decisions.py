@@ -79,6 +79,61 @@ def test_cross_node_paragraph_break_is_rejected() -> None:
     assert "terminal_punctuation" in result["continuation_decisions"]["decisions"][0]["reasons"]
 
 
+def test_cross_node_page_break_before_uppercase_name_keeps_one_logical_paragraph() -> None:
+    structured = {
+        "pages": _docling_pages(),
+        "body": {"children": [{"$ref": "#/texts/0"}, {"$ref": "#/texts/1"}]},
+        "texts": [
+            {
+                "label": "text",
+                "text": "The account now turns toward",
+                "prov": _prov(1, 50, 80, bottom=40),
+            },
+            {
+                "label": "text",
+                "text": "Henry and his account of affective life.",
+                "prov": _prov(2, 50, 740, bottom=700),
+            },
+        ],
+        "pictures": [],
+        "tables": [],
+    }
+
+    result = build_book_reconstruction(structured)
+
+    assert "toward Henry and his account" in result["chapters"][0]["markdown"]
+    decision = result["continuation_decisions"]["decisions"][0]
+    assert decision["status"] == "accepted"
+    assert decision["evidence"]["syntax_reason"] == "same_paragraph_page_break"
+
+
+def test_cross_node_uppercase_continuation_with_new_indent_is_rejected() -> None:
+    structured = {
+        "pages": _docling_pages(),
+        "body": {"children": [{"$ref": "#/texts/0"}, {"$ref": "#/texts/1"}]},
+        "texts": [
+            {
+                "label": "text",
+                "text": "The account now turns toward",
+                "prov": _prov(1, 50, 80, bottom=40),
+            },
+            {
+                "label": "text",
+                "text": "Henry and his account of affective life.",
+                "prov": _prov(2, 90, 740, bottom=700),
+            },
+        ],
+        "pictures": [],
+        "tables": [],
+    }
+
+    result = build_book_reconstruction(structured)
+
+    decision = result["continuation_decisions"]["decisions"][0]
+    assert decision["status"] == "rejected"
+    assert "new_paragraph_indent" in decision["reasons"]
+
+
 def test_cross_node_multi_column_mismatch_is_rejected() -> None:
     structured = {
         "pages": _docling_pages(),

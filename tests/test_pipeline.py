@@ -91,6 +91,15 @@ def _patch_intake_dependencies(monkeypatch) -> None:
     monkeypatch.setattr(pipeline_module, "ingest_pdf_guarded", fake_ingest)
     monkeypatch.setattr(pipeline_module, "build_document_profile", fake_profile)
     monkeypatch.setattr(pipeline_module, "build_book_reconstruction", fake_book)
+    monkeypatch.setattr(
+        pipeline_module,
+        "source_workspace_pages",
+        lambda book, **_kwargs: {
+            int(page): str(chapter.get("markdown") or "")
+            for chapter in book.get("chapters", [])
+            for page in chapter.get("source_pages", [])
+        },
+    )
 
 
 def test_run_intake_pipeline_writes_bookir_without_translation_cache(tmp_path: Path, monkeypatch) -> None:

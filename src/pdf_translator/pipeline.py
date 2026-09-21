@@ -60,6 +60,7 @@ from pdf_translator.translate import (
     translate_markdown,
 )
 from pdf_translator.segment_conservation import write_segment_order_ledger
+from pdf_translator.source_workspace import source_pages as source_workspace_pages
 from pdf_translator.workflow import (
     STAGE_AWAITING_CHAPTER_CONFIRMATION,
     STAGE_AWAITING_GLOSSARY,
@@ -329,6 +330,12 @@ def _load_existing_run_context(
             write_ingest_quality_report(
                 run_dir,
                 source_markdown=repaired_input,
+                page_texts=source_workspace_pages(
+                    book,
+                    source_path=source_pdf,
+                    asset_dir=run_dir / "book-images",
+                ),
+                source_format=source_pdf.suffix.lower().lstrip("."),
                 block_on_errors=source_pdf.suffix.lower() == ".epub",
             )
         confirmed = (
@@ -477,6 +484,16 @@ def _prepare_intake_artifacts(settings: RunSettings) -> tuple[
     write_ingest_quality_report(
         artifacts.output_dir,
         source_markdown=translation_input_markdown,
+        page_texts=(
+            source_workspace_pages(
+                book,
+                source_path=settings.source_pdf,
+                asset_dir=artifacts.output_dir / "book-images",
+            )
+            if book is not None
+            else None
+        ),
+        source_format=settings.source_pdf.suffix.lower().lstrip("."),
         block_on_errors=not is_pdf_source,
     )
 

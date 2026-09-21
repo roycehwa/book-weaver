@@ -9,6 +9,10 @@ export type ConfirmationQualityIssueInput = {
   from_page?: number
   to_page?: number
   continuation_status?: string
+  page?: number
+  block_index?: number
+  block_excerpt?: string
+  source_format?: 'pdf' | 'epub'
 }
 
 const toPositivePage = (value: unknown): number | null => {
@@ -27,6 +31,10 @@ export const mapConfirmationQualityIssues = (
     from_page: toPositivePage(issue.from_page) ?? undefined,
     to_page: toPositivePage(issue.to_page) ?? undefined,
     continuation_status: issue.continuation_status,
+    page: toPositivePage(issue.page) ?? undefined,
+    block_index: toPositivePage(issue.block_index) ?? undefined,
+    block_excerpt: issue.block_excerpt,
+    source_format: issue.source_format,
   }))
 
 export const findChapterIndexForPage = (

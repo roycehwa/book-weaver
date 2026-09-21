@@ -1,5 +1,17 @@
-from pdf_translator.chunking import split_markdown_into_chunks
-from pdf_translator.chunking import join_chunk_texts
+from pdf_translator.chunking import (
+    join_chunk_texts,
+    markdown_protected_block_structure,
+    split_markdown_into_chunks,
+)
+
+
+def test_protected_block_structure_ignores_prose_boundaries_but_keeps_document_structure() -> None:
+    source = "# Chapter\n\nFirst paragraph.\n\nSecond paragraph.\n\n- One\n- Two\n"
+    merged_prose = "# 章节\n\n第一段与第二段。\n\n- 一\n- 二\n"
+    missing_heading = "第一段与第二段。\n\n- 一\n- 二\n"
+
+    assert markdown_protected_block_structure(source) == markdown_protected_block_structure(merged_prose)
+    assert markdown_protected_block_structure(source) != markdown_protected_block_structure(missing_heading)
 
 
 def test_review_merge_and_export_preserve_continuation_boundaries():

@@ -82,6 +82,10 @@ def test_preconfirmation_loads_ingest_warnings_before_source_report_exists(tmp_p
                         "chapter": "Acknowledgments",
                         "line": 1176,
                         "excerpt": "steadfast sup-\\n\\nnevitably changed",
+                        "match": "sup-\n\nnevitably",
+                        "page": 338,
+                        "block_index": 2,
+                        "block_excerpt": "steadfast sup-\n\nnevitably changed",
                     }
                 ],
             }
@@ -94,6 +98,9 @@ def test_preconfirmation_loads_ingest_warnings_before_source_report_exists(tmp_p
     assert issues[0]["severity"] == "warning"
     assert issues[0]["code"] == "hyphenated_line_break"
     assert "不会阻止继续" in issues[0]["message"]
+    assert "PDF 第 338 页第 2 段" in issues[0]["message"]
+    assert issues[0]["page"] == 338
+    assert issues[0]["block_index"] == 2
 
 
 def test_source_preflight_does_not_block_ambiguous_hyphenated_break(tmp_path: Path) -> None:

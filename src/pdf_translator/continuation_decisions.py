@@ -595,10 +595,12 @@ def evaluate_cross_source_node_boundary(
             right_page_width=right_page_size[0],
         )
     decision["evidence"]["geometry"] = {**column_evidence, **page_geometry_evidence}
+    new_paragraph_indent = False
     if left_page_size and right_page_size:
         indent_tol = _indent_tolerance(left_page_size[0])
         decision["evidence"]["geometry"]["indent_tolerance"] = round(indent_tol, 6)
         if right_geo["left"] > left_geo["left"] + indent_tol:
+            new_paragraph_indent = True
             decision["reasons"].append("new_paragraph_indent")
     if not columns_ok and left_page_size and right_page_size:
         decision["reasons"].append("column_or_alignment_mismatch")
@@ -609,6 +611,24 @@ def evaluate_cross_source_node_boundary(
     left_text = str(left.get("text") or "")
     right_text = str(right.get("text") or "")
     syntax_ok, syntax_reason, joined = _syntax_continuation(left_text, right_text)
+    # A physical page boundary is not a paragraph boundary.  When an
+    # unterminated sentence continues with an uppercase proper name or quote,
+    # syntax alone cannot prove the join.  Strong page-edge, column,
+    # indentation and style evidence can.  A completed sentence remains
+    # separate because layout alone cannot distinguish it from a real new
+    # paragraph in books that do not indent every paragraph.
+    if (
+        not syntax_ok
+        and syntax_reason == "syntax_not_continuation"
+        and page_geometry_ok
+        and columns_ok
+        and style_ok
+        and not new_paragraph_indent
+        and not structural_barriers
+    ):
+        syntax_ok = True
+        syntax_reason = "same_paragraph_page_break"
+        joined = f"{left_text.rstrip()} {right_text.lstrip()}"
     decision["evidence"]["syntax_reason"] = syntax_reason
     if not syntax_ok:
         decision["reasons"].append(syntax_reason)

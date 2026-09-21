@@ -12,7 +12,7 @@ from bs4 import BeautifulSoup
 
 from collections import Counter
 
-from pdf_translator.chunking import markdown_block_structure
+from pdf_translator.chunking import markdown_block_structure, markdown_protected_block_structure
 from pdf_translator.pdf_text_repair import scan_ingest_quality
 from pdf_translator.polish import POLISH_PROMPT_VERSION, _markdown_link_specs, _protected_literals
 from pdf_translator.polish import protected_spans as polish_protected_spans
@@ -57,7 +57,7 @@ RAW_TRANSLATION_QUALITY_REPORT = "raw-translation-quality-report.json"
 POLISHED_OUTPUT_QUALITY_REPORT = "polished-output-quality-report.json"
 TRANSLATION_QUALITY_INDEX = "translation-quality-index.json"
 TRANSLATION_QUALITY_SOURCE = "translation-quality-source.md"
-TRANSLATION_QUALITY_RULES_VERSION = "translation_quality_v5_semantic_html"
+TRANSLATION_QUALITY_RULES_VERSION = "translation_quality_v6_protected_markdown_structure"
 
 QualityStage = Literal["source", "raw_translation", "polished_output"]
 QualitySeverity = Literal["blocking", "review"]
@@ -452,24 +452,57 @@ def build_source_quality_report(
     else:
         source_text = translation_input_path.read_text(encoding="utf-8")
         ingest = scan_ingest_quality(source_text)
+        ingest_locations: dict[tuple[str, str], dict[str, Any]] = {}
+        ingest_report_path = run_dir / INGEST_QUALITY_REPORT
+        if ingest_report_path.is_file():
+            try:
+                ingest_report = json.loads(ingest_report_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                ingest_report = {}
+            if isinstance(ingest_report, dict):
+                for key in ("blocking_issues", "warning_issues"):
+                    for item in ingest_report.get(key) or []:
+                        if not isinstance(item, dict):
+                            continue
+                        location = {
+                            field: item.get(field)
+                            for field in ("page", "block_index", "block_excerpt", "source_format")
+                            if item.get(field) is not None
+                        }
+                        if location:
+                            ingest_locations[(str(item.get("code") or ""), str(item.get("match") or ""))] = location
         for issue in ingest.blocking_issues:
+            evidence = dict(issue)
+            evidence.update(
+                ingest_locations.get(
+                    (str(issue.get("code") or ""), str(issue.get("match") or "")),
+                    {},
+                )
+            )
             findings.append(
                 _finding(
                     stage="source",
                     code=str(issue.get("code") or "blocking_ingest"),
                     severity="blocking",
                     message="Blocking ingest pattern detected before translation.",
-                    evidence=dict(issue),
+                    evidence=evidence,
                 )
             )
         for issue in ingest.warning_issues:
+            evidence = dict(issue)
+            evidence.update(
+                ingest_locations.get(
+                    (str(issue.get("code") or ""), str(issue.get("match") or "")),
+                    {},
+                )
+            )
             findings.append(
                 _finding(
                     stage="source",
                     code=str(issue.get("code") or "ingest_warning"),
                     severity="review",
                     message="Ingest warning detected before translation.",
-                    evidence=dict(issue),
+                    evidence=evidence,
                 )
             )
 
@@ -561,11 +594,21 @@ def confirmation_quality_issues_from_source_report(
         chapter = evidence.get("chapter")
         line = evidence.get("line")
         excerpt = evidence.get("excerpt")
+        page = evidence.get("page")
+        block_index = evidence.get("block_index")
+        source_format = evidence.get("source_format")
         location_parts: list[str] = []
         if chapter:
             location_parts.append(f"章节「{chapter}」")
         if isinstance(line, int) and line > 0:
-            location_parts.append(f"约第 {line} 行")
+            if not isinstance(page, int) or page <= 0:
+                location_parts.append(f"约第 {line} 行")
+        if isinstance(page, int) and page > 0:
+            page_label = "EPUB 阅读页" if source_format == "epub" else "PDF"
+            page_location = f"{page_label} 第 {page} 页"
+            if isinstance(block_index, int) and block_index > 0:
+                page_location += f"第 {block_index} 段"
+            location_parts.append(page_location)
         location = "，".join(location_parts) if location_parts else "待翻译输入稿"
         blocking = finding.get("severity") == "blocking"
         message = (
@@ -578,16 +621,24 @@ def confirmation_quality_issues_from_source_report(
             if len(snippet) > 96:
                 snippet = f"{snippet[:93]}…"
             message = f"{message}；片段：{snippet}"
-        issues.append(
-            {
-                "severity": "error" if blocking else "warning",
-                "code": code,
-                "message": message,
-                "chapter": chapter,
-                "line": line,
-                "excerpt": excerpt,
-            }
-        )
+        issue = {
+            "severity": "error" if blocking else "warning",
+            "code": code,
+            "message": message,
+            "chapter": chapter,
+            "line": line,
+            "excerpt": excerpt,
+        }
+        if isinstance(page, int) and page > 0:
+            issue["page"] = page
+        if isinstance(block_index, int) and block_index > 0:
+            issue["block_index"] = block_index
+        block_excerpt = evidence.get("block_excerpt")
+        if isinstance(block_excerpt, str) and block_excerpt.strip():
+            issue["block_excerpt"] = block_excerpt
+        if source_format in {"pdf", "epub"}:
+            issue["source_format"] = source_format
+        issues.append(issue)
         if len(issues) >= limit:
             break
     return issues
@@ -813,16 +864,36 @@ def build_raw_translation_quality_report(
             if comparison_source_markdown is not None
             else source_markdown
         )
-        if markdown_block_structure(comparison_source) != markdown_block_structure(raw_text):
+        source_structure = markdown_block_structure(comparison_source)
+        raw_structure = markdown_block_structure(raw_text)
+        source_protected_structure = markdown_protected_block_structure(comparison_source)
+        raw_protected_structure = markdown_protected_block_structure(raw_text)
+        if source_protected_structure != raw_protected_structure:
             findings.append(
                 _finding(
                     stage="raw_translation",
                     code="markdown_block_structure_loss",
                     severity="blocking",
-                    message="Raw translation changed Markdown block structure relative to source input.",
+                    message="Raw translation changed protected Markdown document structure.",
                     evidence={
-                        "source_structure": list(markdown_block_structure(comparison_source)),
-                        "raw_structure": list(markdown_block_structure(raw_text)),
+                        "source_structure": list(source_protected_structure),
+                        "raw_structure": list(raw_protected_structure),
+                    },
+                )
+            )
+        elif source_structure != raw_structure:
+            findings.append(
+                _finding(
+                    stage="raw_translation",
+                    code="markdown_prose_block_shape_changed",
+                    severity="review",
+                    message=(
+                        "Raw translation changed prose paragraph boundaries; "
+                        "review the aligned text, but protected document structure is intact."
+                    ),
+                    evidence={
+                        "source_structure": list(source_structure),
+                        "raw_structure": list(raw_structure),
                     },
                 )
             )
