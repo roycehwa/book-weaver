@@ -218,7 +218,8 @@ GLOSSARY_PROFILES: dict[str, GlossaryProfilePolicy] = {
         single_word_markers=LOGIC_DOMAIN_MARKERS,
         principles=(
             "优先逻辑、语义、模态与真理理论术语",
-            "允许高频单词术语（modal、syntax、truth 等）",
+            "单词术语须有引号、索引或显式定义证据",
+            "领域高频词 alone 不构成术语",
             "索引章与连接词短语加权",
             "哲学家专名保留但不过度扩张",
         ),

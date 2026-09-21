@@ -249,6 +249,31 @@ CONNECTOR_PHRASE_RE = re.compile(
 INDEX_ENTRY_RE = re.compile(r"^([A-Z][^,\n;]{2,80}?)(?:,\s*\d)", re.MULTILINE)
 DOMAIN_WORD_RE = re.compile(r"\b([A-Za-z]{4,})\b")
 QUOTED_TERM_RE = re.compile(r'"([^"]{3,60})"')
+DEFINITION_TERM_RE = re.compile(
+    r"\b([A-Z][A-Za-z'’-]+(?:\s+[A-Za-z'’-]+){0,3})\s+"
+    r"(?:is defined as|are defined as|means|denotes|refers to)\b",
+    re.IGNORECASE,
+)
+
+EVIDENCE_MULTIWORD_PHRASE = "multiword_phrase"
+EVIDENCE_CONNECTOR_PHRASE = "connector_phrase"
+EVIDENCE_QUOTED = "quoted"
+EVIDENCE_INDEX = "index"
+EVIDENCE_DEFINITION = "definition"
+EVIDENCE_DOMAIN_FREQUENCY = "domain_frequency"
+
+STRONG_SINGLE_WORD_EVIDENCE = frozenset(
+    {EVIDENCE_QUOTED, EVIDENCE_INDEX, EVIDENCE_DEFINITION},
+)
+MULTIWORD_TERMHOOD_EVIDENCE = frozenset(
+    {
+        EVIDENCE_MULTIWORD_PHRASE,
+        EVIDENCE_CONNECTOR_PHRASE,
+        EVIDENCE_INDEX,
+        EVIDENCE_QUOTED,
+        EVIDENCE_DEFINITION,
+    },
+)
 
 
 def _normalize_phrase(value: str) -> str:
@@ -525,18 +550,18 @@ def candidate_integrity_rejection(phrase: str) -> str | None:
     return None
 
 
-def _allows_single_word_candidate(
-    word: str,
+def has_independent_termhood(
+    phrase: str,
     *,
-    occurrences: int,
-    policy: GlossaryProfilePolicy,
+    evidence_kinds: frozenset[str] | set[str],
 ) -> bool:
-    if not policy.allow_single_word_domain:
-        return False
-    lowered = word.lower()
-    if lowered in policy.single_word_markers:
-        return occurrences >= 2
-    return word[0].isupper() and occurrences >= 4
+    """Frequency and chapter spread may rank only after termhood is established."""
+    words = _phrase_words(_normalize_phrase(phrase))
+    if len(words) >= 2:
+        return bool(evidence_kinds & MULTIWORD_TERMHOOD_EVIDENCE)
+    if len(words) == 1:
+        return bool(evidence_kinds & STRONG_SINGLE_WORD_EVIDENCE)
+    return False
 
 
 def score_glossary_candidate(
@@ -547,6 +572,7 @@ def score_glossary_candidate(
     body_chapter_count: int = 0,
     exclusions: set[str],
     in_index: bool,
+    evidence_kinds: frozenset[str] | set[str] | None = None,
     policy: GlossaryProfilePolicy | None = None,
 ) -> tuple[float, list[str], bool]:
     """Return (score, reasons, rejected)."""
@@ -555,13 +581,12 @@ def score_glossary_candidate(
     active_policy = policy or GLOSSARY_PROFILES[SOCIAL_ECON_PHILOSOPHY]
     normalized = _normalize_phrase(phrase)
     words = _phrase_words(normalized)
-    min_len = 3 if active_policy.allow_single_word_domain and len(words) == 1 else 5
+    kinds = frozenset(evidence_kinds or ())
+    min_len = 3 if len(words) == 1 and kinds & STRONG_SINGLE_WORD_EVIDENCE else 5
     if len(words) < active_policy.min_word_count or len(normalized) < min_len:
-        if not (
-            len(words) == 1
-            and _allows_single_word_candidate(words[0], occurrences=occurrences, policy=active_policy)
-        ):
-            return 0.0, [], True
+        return 0.0, [], True
+    if not has_independent_termhood(normalized, evidence_kinds=kinds):
+        return 0.0, ["缺乏独立术语证据（需引号、索引、定义或多词专名）"], True
     if normalized in exclusions or normalized in GENERIC_STOP_PHRASES:
         return 0.0, [f"排除：与书名/作者/出版社或通用地名重复（{normalized}）"], True
 
@@ -599,9 +624,17 @@ def score_glossary_candidate(
         profile_boosts.append("domain_marker")
 
     if len(words) == 1:
-        score += 2.5
-        reasons.append("逻辑/语义领域单词术语")
-        profile_boosts.append("single_word_domain")
+        if EVIDENCE_QUOTED in kinds:
+            score += 2.0
+            reasons.append("正文引号标明的术语")
+            profile_boosts.append("quoted_term")
+        if EVIDENCE_INDEX in kinds:
+            score += 1.5
+            profile_boosts.append("index_single")
+        if EVIDENCE_DEFINITION in kinds:
+            score += 2.0
+            reasons.append("显式定义表述")
+            profile_boosts.append("definition")
     elif len(words) >= 3:
         score += 2.0
         reasons.append("多词专名，比两词通用短语更具体")
@@ -671,14 +704,33 @@ def extract_connector_phrases(text: str) -> list[str]:
 
 
 def extract_domain_single_words(text: str, markers: frozenset[str], *, min_occurrences: int = 2) -> list[str]:
+    """Surface marker hits for diagnostics only; not independent termhood evidence."""
     counts: dict[str, int] = {}
     for match in DOMAIN_WORD_RE.finditer(text):
         word = match.group(1)
         if word.lower() not in markers:
             continue
-        canonical = word if word[0].isupper() else word.capitalize()
-        counts[canonical] = counts.get(canonical, 0) + 1
+        start = match.start()
+        if start > 0 and text[start - 1] in ".!?\n":
+            continue
+        if word[0].islower():
+            continue
+        counts[word] = counts.get(word, 0) + 1
     return sorted(word for word, count in counts.items() if count >= min_occurrences)
+
+
+def extract_definition_terms(text: str) -> list[str]:
+    phrases: set[str] = set()
+    for match in DEFINITION_TERM_RE.finditer(text):
+        phrase = _normalize_phrase(match.group(1).strip(" ."))
+        if len(phrase) < 3:
+            continue
+        words = _phrase_words(phrase)
+        if len(words) >= 2 and _is_glossary_phrase_candidate(phrase):
+            phrases.add(phrase)
+        elif len(words) == 1 and len(phrase) >= 4:
+            phrases.add(phrase)
+    return sorted(phrases)
 
 
 def extract_quoted_terms(text: str) -> list[str]:
@@ -699,7 +751,10 @@ def extract_index_phrases(text: str) -> list[str]:
     phrases: set[str] = set()
     for match in INDEX_ENTRY_RE.finditer(text):
         phrase = _normalize_phrase(match.group(1).strip(" ."))
-        if len(_phrase_words(phrase)) >= 2 and len(phrase) >= 5 and _is_glossary_phrase_candidate(phrase):
+        word_count = len(_phrase_words(phrase))
+        if word_count >= 2 and len(phrase) >= 5 and _is_glossary_phrase_candidate(phrase):
+            phrases.add(phrase)
+        elif word_count == 1 and len(phrase) >= 4:
             phrases.add(phrase)
     for chunk in re.split(r"[,;\n]", text):
         chunk = _normalize_phrase(chunk.strip(" ."))

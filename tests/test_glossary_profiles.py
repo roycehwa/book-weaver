@@ -10,8 +10,12 @@ from pdf_translator.glossary import (
     extract_glossary_candidates,
 )
 from pdf_translator.glossary_extraction import (
+    EVIDENCE_INDEX,
+    EVIDENCE_MULTIWORD_PHRASE,
+    EVIDENCE_QUOTED,
     extract_connector_phrases,
     extract_domain_single_words,
+    has_independent_termhood,
     score_glossary_candidate,
 )
 from pdf_translator.glossary_profiles import (
@@ -135,10 +139,13 @@ def test_detect_logic_book_profile() -> None:
     assert detection["glossary_profile_confidence"] >= 0.5
 
 
-def test_domain_single_word_extraction_for_logic_profile() -> None:
-    text = "Modal logic and modality appear often. Modal operators and truth recur."
-    words = extract_domain_single_words(text, profile_policy(FORMAL_LOGIC_PHILOSOPHY).single_word_markers)
-    assert "Modal" in words or "Truth" in words
+def test_domain_single_word_extraction_ignores_sentence_starts_and_lowercase() -> None:
+    text = "Truth is important. Later Truth appears mid-sentence. truth stays lowercase."
+    markers = profile_policy(FORMAL_LOGIC_PHILOSOPHY).single_word_markers
+    words = extract_domain_single_words(text, markers)
+    assert "Truth" in words
+    assert "truth" not in words
+    assert "Truth" not in extract_domain_single_words("Truth begins the chapter.", markers)
 
 
 def test_connector_phrase_extraction() -> None:
@@ -150,12 +157,14 @@ def test_connector_phrase_extraction() -> None:
 def test_cultural_revolution_ranks_higher_under_humanities_policy() -> None:
     humanities = profile_policy(HUMANITIES_HISTORY)
     social = profile_policy(SOCIAL_ECON_PHILOSOPHY)
+    termhood = frozenset({EVIDENCE_MULTIWORD_PHRASE, EVIDENCE_INDEX})
     h_score, _, h_rejected = score_glossary_candidate(
         "Cultural Revolution",
         occurrences=78,
         chapter_count=12,
         exclusions=set(),
         in_index=True,
+        evidence_kinds=termhood,
         policy=humanities,
     )
     s_score, _, s_rejected = score_glossary_candidate(
@@ -164,6 +173,7 @@ def test_cultural_revolution_ranks_higher_under_humanities_policy() -> None:
         chapter_count=12,
         exclusions=set(),
         in_index=True,
+        evidence_kinds=termhood,
         policy=social,
     )
     assert not h_rejected
@@ -178,6 +188,7 @@ def test_fragment_phrase_penalized_for_humanities() -> None:
         chapter_count=10,
         exclusions=set(),
         in_index=False,
+        evidence_kinds=frozenset({EVIDENCE_MULTIWORD_PHRASE}),
         policy=humanities,
     )
     assert any("碎片" in reason for reason in reasons)
@@ -187,6 +198,7 @@ def test_fragment_phrase_penalized_for_humanities() -> None:
         chapter_count=10,
         exclusions=set(),
         in_index=False,
+        evidence_kinds=frozenset({EVIDENCE_MULTIWORD_PHRASE}),
         policy=humanities,
     )
     assert good_score > score or rejected
@@ -201,7 +213,7 @@ def test_extract_writes_profile_v2_policy(tmp_path: Path) -> None:
     assert policy["schema"] == "phase_a_glossary_extraction_v2"
     assert policy["glossary_profile"] == HUMANITIES_HISTORY
     assert policy["glossary_profile_label"] == "人文·历史·艺术"
-    assert policy["profile_policy_version"] == 2
+    assert policy["profile_policy_version"] == 3
     sources = [item["source"] for item in result["candidates"]]
     assert "Cultural Revolution" in sources
     assert "Gang of Four" in sources
@@ -214,24 +226,76 @@ def test_logic_profile_surfaces_more_domain_terms(tmp_path: Path) -> None:
     (run_dir / "book.json").write_text(json.dumps(_logic_book()), encoding="utf-8")
     result = extract_glossary_candidates(run_dir, profile=FORMAL_LOGIC_PHILOSOPHY)
     sources = {item["source"] for item in result["candidates"]}
-    assert len(sources) >= 8
-    assert any("Modal" in source or "Truth" in source or "Paradox" in source for source in sources)
+    assert len(sources) >= 4
+    assert any("Modal logic" in source or "Liar paradox" in source for source in sources)
+    assert "Truth" not in sources
+    assert "Possible" not in sources
+    assert "Logic" not in sources
+
+
+def test_logic_profile_termhood_requires_evidence_not_frequency(tmp_path: Path) -> None:
+    body = (
+        "Possible worlds semantics links necessity and possibility across chapters. "
+        "Truth and reference recur in every section. Formal logic and paradox appear often. "
+        "Necessary conditions and logical consequence are discussed repeatedly."
+    )
+    chapters = [
+        {
+            "chapter_id": f"ch-{index:03d}",
+            "title": f"Chapter {index}",
+            "markdown": body,
+        }
+        for index in range(1, 9)
+    ]
+    chapters.append(
+        {
+            "chapter_id": "ch-index",
+            "title": "Index",
+            "markdown": "Supervenience, 12-40\n",
+        }
+    )
+    chapters[3]["markdown"] += ' Authors write that "Supervenience" marks a key relation.'
+    book = {
+        "metadata": {"title": "Modal Metaphysics", "author": "Example"},
+        "chapters": chapters,
+    }
+    run_dir = tmp_path / "run-termhood"
+    run_dir.mkdir()
+    (run_dir / "book.json").write_text(json.dumps(book), encoding="utf-8")
+    result = extract_glossary_candidates(run_dir, profile=FORMAL_LOGIC_PHILOSOPHY)
+    sources = {item["source"] for item in result["candidates"]}
+    forbidden = {
+        "Possible",
+        "Truth",
+        "Reference",
+        "Formal",
+        "Logic",
+        "Paradox",
+        "Necessary",
+        "Necessity",
+        "Logical",
+    }
+    assert forbidden.isdisjoint(sources)
+    assert "Supervenience" in sources
+    assert has_independent_termhood(
+        "Supervenience",
+        evidence_kinds=frozenset({EVIDENCE_QUOTED, EVIDENCE_INDEX}),
+    )
+    assert not has_independent_termhood("Truth", evidence_kinds=frozenset({EVIDENCE_MULTIWORD_PHRASE}))
 
 
 def test_profile_switch_changes_candidate_set(tmp_path: Path) -> None:
-    run_dir = tmp_path / "run"
-    run_dir.mkdir()
-    (run_dir / "book.json").write_text(json.dumps(_logic_book()), encoding="utf-8")
-    logic = extract_glossary_candidates(run_dir, max_candidates=40, profile=FORMAL_LOGIC_PHILOSOPHY)
-    humanities = extract_glossary_candidates(
-        run_dir,
-        max_candidates=40,
-        profile=HUMANITIES_HISTORY,
-        profile_source="user",
-    )
+    run_logic = tmp_path / "run-logic"
+    run_logic.mkdir()
+    (run_logic / "book.json").write_text(json.dumps(_logic_book()), encoding="utf-8")
+    run_policy = tmp_path / "run-policy"
+    run_policy.mkdir()
+    (run_policy / "book.json").write_text(json.dumps(_policy_book()), encoding="utf-8")
+    logic = extract_glossary_candidates(run_logic, max_candidates=40, profile=FORMAL_LOGIC_PHILOSOPHY)
+    social = extract_glossary_candidates(run_policy, max_candidates=40, profile=SOCIAL_ECON_PHILOSOPHY)
     logic_sources = {item["source"] for item in logic["candidates"]}
-    humanities_sources = {item["source"] for item in humanities["candidates"]}
-    assert logic_sources != humanities_sources
+    social_sources = {item["source"] for item in social["candidates"]}
+    assert logic_sources != social_sources
 
 
 def test_compute_max_candidates_scales_with_book() -> None:

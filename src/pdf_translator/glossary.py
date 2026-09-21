@@ -12,7 +12,12 @@ from pdf_translator.glossary_extraction import (
     _metadata_exclusions,
     extract_candidate_phrases,
     extract_connector_phrases,
-    extract_domain_single_words,
+    EVIDENCE_CONNECTOR_PHRASE,
+    EVIDENCE_DEFINITION,
+    EVIDENCE_INDEX,
+    EVIDENCE_MULTIWORD_PHRASE,
+    EVIDENCE_QUOTED,
+    extract_definition_terms,
     extract_index_phrases,
     extract_quoted_terms,
     score_glossary_candidate,
@@ -171,17 +176,21 @@ def extract_glossary_candidates(
         chapter_id = str(chapter.get("chapter_id") or chapter.get("id") or "unknown")
         markdown = chapter_text.get(chapter_id, "")
         in_index = _is_index_chapter(chapter)
-        phrase_sources = list(extract_candidate_phrases(markdown))
+        phrase_sources: list[tuple[str, str]] = [
+            (phrase, EVIDENCE_MULTIWORD_PHRASE) for phrase in extract_candidate_phrases(markdown)
+        ]
         if active_policy.enable_connector_phrases:
-            phrase_sources.extend(extract_connector_phrases(markdown))
-        if active_policy.allow_single_word_domain:
             phrase_sources.extend(
-                extract_domain_single_words(markdown, active_policy.single_word_markers)
+                (phrase, EVIDENCE_CONNECTOR_PHRASE) for phrase in extract_connector_phrases(markdown)
             )
-            phrase_sources.extend(extract_quoted_terms(markdown))
+        if active_policy.allow_single_word_domain:
+            phrase_sources.extend((phrase, EVIDENCE_QUOTED) for phrase in extract_quoted_terms(markdown))
+            phrase_sources.extend(
+                (phrase, EVIDENCE_DEFINITION) for phrase in extract_definition_terms(markdown)
+            )
         if active_policy.enable_index_parse and in_index:
-            phrase_sources.extend(extract_index_phrases(markdown))
-        for phrase in phrase_sources:
+            phrase_sources.extend((phrase, EVIDENCE_INDEX) for phrase in extract_index_phrases(markdown))
+        for phrase, evidence_kind in phrase_sources:
             canonical_term = canonical_source_term(phrase)
             canonical_key = canonical_source_key(phrase)
             if not canonical_key:
@@ -195,8 +204,10 @@ def extract_glossary_candidates(
                     "chapters": set(),
                     "body_chapters": set(),
                     "in_index": False,
+                    "evidence_kinds": set(),
                 },
             )
+            entry["evidence_kinds"].add(evidence_kind)
             entry["variants"].add(phrase)
             entry["occurrences"] += _count_occurrences(markdown, phrase)
             entry["chapters"].add(chapter_id)
@@ -240,6 +251,7 @@ def extract_glossary_candidates(
             chapter_count=len(entry["chapters"]),
             exclusions=exclusions,
             in_index=bool(entry["in_index"]),
+            evidence_kinds=frozenset(entry.get("evidence_kinds") or ()),
             policy=active_policy,
         )
         if rejected:
@@ -259,6 +271,7 @@ def extract_glossary_candidates(
                 "body_chapter_count": len(entry["body_chapters"]),
                 "reasons": reasons,
                 "evidence": sorted(entry["chapters"]),
+                "extraction_evidence": sorted(entry.get("evidence_kinds") or ()),
                 "updated_by": "machine",
             }
         )
@@ -292,7 +305,7 @@ def extract_glossary_candidates(
         "schema": EXTRACTION_POLICY_SCHEMA,
         "generated_at": _now(),
         "max_candidates": limit,
-        "profile_policy_version": 2,
+        "profile_policy_version": 3,
         "principles": list(active_policy.principles),
         "stats": {
             "raw_phrases_seen": len(stats),
@@ -513,6 +526,10 @@ def migrate_glossary_variants(run_dir: Path) -> dict[str, int]:
             preferred["occurrences"] = max(
                 int(current.get("occurrences") or 0),
                 int(candidate.get("occurrences") or 0),
+            )
+            preferred["extraction_evidence"] = sorted(
+                set(current.get("extraction_evidence") or [])
+                | set(candidate.get("extraction_evidence") or [])
             )
             candidates_by_key[key] = preferred
         payload["candidates"] = sorted(
