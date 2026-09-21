@@ -46,6 +46,9 @@ _COORDINATION_FLOW_MARKER = re.compile(
     re.IGNORECASE,
 )
 _WORD_TOKEN = re.compile(r"[A-Za-z]+")
+_HYPHENATED_LINE_BREAK = re.compile(
+    r"(?<![A-Za-z-])([A-Za-z]{2,})-\s*\n+\s*([a-z]{2,})(?![A-Za-z])"
+)
 
 INGEST_ISSUE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("orphan_footnote_y", re.compile(r"\. y\.|^\s*y\.\s*$", re.IGNORECASE | re.MULTILINE)),
@@ -54,19 +57,15 @@ INGEST_ISSUE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         re.compile(r"(?<![A-Za-z'’])\b[b-hj-z] [a-z]{3,}\b"),
     ),
     ("glued_words", re.compile(r"\bformalsystems\b", re.IGNORECASE)),
+    # A text-only scan cannot prove whether this is a broken word, a valid
+    # hyphenated compound, or a page extraction gap.  High-confidence cases
+    # are repaired first; residual cases remain visible but cannot freeze the
+    # entire book after chapter confirmation.
+    ("hyphenated_line_break", _HYPHENATED_LINE_BREAK),
 )
 BLOCKING_INGEST_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("replacement_character", re.compile("\ufffd")),
     ("soft_hyphen", re.compile("\u00ad")),
-    (
-        "hyphenated_line_break",
-        re.compile(
-            r"(?<=[^\W\d_])"
-            r"(?<!-[A-Za-z])(?<!--[A-Za-z])(?<!---[A-Za-z])"
-            r"-\s*\n\s*(?=[^\W\d_])",
-            re.UNICODE,
-        ),
-    ),
     ("control_character", re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")),
 )
 
@@ -182,6 +181,32 @@ def _repair_split_words(text: str, known_words: set[str]) -> str:
     return text
 
 
+def _repair_hyphenated_line_breaks(text: str, known_words: set[str]) -> str:
+    """Resolve lexical line-wrap hyphens only when dictionary evidence is strong.
+
+    The replacement may either remove the layout hyphen (``trans-\nformation``)
+    or retain a genuine compound hyphen (``self-\nconscious``).  If neither
+    spelling has adequate evidence, the source stays unchanged and becomes a
+    nonblocking quality warning.
+    """
+
+    def replace(match: re.Match[str]) -> str:
+        left, right = match.group(1), match.group(2)
+        joined = f"{left}{right}"
+        hyphenated = f"{left}-{right}"
+        joined_score = zipf_frequency(joined, "en")
+        hyphenated_score = zipf_frequency(hyphenated, "en")
+        if joined.casefold() in known_words:
+            return joined
+        if hyphenated_score >= 2.5 and hyphenated_score > joined_score + 0.6:
+            return hyphenated
+        if joined_score >= 2.5 and joined_score >= hyphenated_score - 0.25:
+            return joined
+        return match.group(0)
+
+    return _HYPHENATED_LINE_BREAK.sub(replace, text)
+
+
 def repair_pdf_markdown(text: str, *, known_words: set[str] | None = None) -> str:
     if not text:
         return text
@@ -198,6 +223,7 @@ def repair_pdf_markdown(text: str, *, known_words: set[str] | None = None) -> st
     repaired = _SENTENCE_END_FLOW_MARKER.sub("", repaired)
     repaired = _PROSE_PARAGRAPH_FLOW_MARKER.sub(" ", repaired)
     repaired = _COORDINATION_FLOW_MARKER.sub(" ", repaired)
+    repaired = _repair_hyphenated_line_breaks(repaired, known_words or _known_words([repaired]))
     repaired = _repair_split_words(repaired, known_words or _known_words([repaired]))
     repaired = _DOUBLE_SPACED_WORD.sub(r"\1 \2", repaired)
     repaired = re.sub(r"[ \t]+(?=\n|$)", "", repaired)

@@ -68,6 +68,53 @@ def test_confirmation_quality_issues_include_nonblocking_source_warnings() -> No
     ]
 
 
+def test_preconfirmation_loads_ingest_warnings_before_source_report_exists(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "ingest-quality-report.json").write_text(
+        json.dumps(
+            {
+                "acceptable": True,
+                "blocking_issues": [],
+                "warning_issues": [
+                    {
+                        "code": "hyphenated_line_break",
+                        "chapter": "Acknowledgments",
+                        "line": 1176,
+                        "excerpt": "steadfast sup-\\n\\nnevitably changed",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    issues = load_confirmation_quality_issues(run_dir)
+
+    assert issues[0]["severity"] == "warning"
+    assert issues[0]["code"] == "hyphenated_line_break"
+    assert "不会阻止继续" in issues[0]["message"]
+
+
+def test_source_preflight_does_not_block_ambiguous_hyphenated_break(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _write_synthetic(run_dir)
+    (run_dir / "translation-input.md").write_text(
+        "# Acknowledgments\n\nsteadfast sup-\n\nnevitably changed\n",
+        encoding="utf-8",
+    )
+
+    result = write_source_quality_preflight(run_dir, text_operation="translate")
+
+    assert result["blocked"] is False
+    issues = load_confirmation_quality_issues(run_dir)
+    assert any(
+        item["code"] == "hyphenated_line_break" and item["severity"] == "warning"
+        for item in issues
+    )
+
+
 def test_preflight_writes_artifacts_and_blocks(tmp_path: Path) -> None:
     run_dir = tmp_path / "run"
     run_dir.mkdir()

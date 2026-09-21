@@ -80,14 +80,37 @@ def test_scan_ingest_quality_records_blocking_character_corruption_with_evidence
     assert all(issue["excerpt"] for issue in report.blocking_issues)
 
 
-def test_scan_ingest_quality_blocks_unrepaired_hyphenated_line_break() -> None:
-    report = scan_ingest_quality("# Chapter\n\ntrans-\nformation failed")
+def test_scan_ingest_quality_keeps_ambiguous_hyphenated_break_nonblocking() -> None:
+    report = scan_ingest_quality("# Chapter\n\nsteadfast sup-\n\nnevitably changed")
 
-    assert report.acceptable is False
-    assert report.blocking_issues[0]["code"] == "hyphenated_line_break"
-    assert report.blocking_issues[0]["chapter"] == "Chapter"
-    assert report.blocking_issues[0]["line"] == 3
-    assert "trans-\\nformation" in report.blocking_issues[0]["excerpt"]
+    assert report.acceptable is True
+    assert report.blocking_issues == []
+    assert report.warning_issues[0]["code"] == "hyphenated_line_break"
+    assert report.warning_issues[0]["chapter"] == "Chapter"
+    assert report.warning_issues[0]["line"] == 3
+    assert "sup-\\n\\nnevitably" in report.warning_issues[0]["excerpt"]
+
+
+def test_repair_resolves_lexical_line_wrap_hyphens_and_preserves_compounds() -> None:
+    repaired = repair_pdf_markdown(
+        "A trans-\nformation needs steadfast sup-\n\nport and self-\nconscious care."
+    )
+
+    assert "transformation" in repaired
+    assert "support" in repaired
+    assert "self-conscious" in repaired
+    assert scan_ingest_quality(repaired).issue_counts["hyphenated_line_break"] == 0
+
+
+def test_repair_does_not_guess_when_broken_fragments_have_no_lexical_evidence() -> None:
+    source = "forever grateful for steadfast sup-\n\nnevitably changed"
+
+    repaired = repair_pdf_markdown(source)
+
+    assert repaired == source
+    report = scan_ingest_quality(repaired)
+    assert report.acceptable is True
+    assert report.issue_counts["hyphenated_line_break"] == 1
 
 
 def test_repair_removes_structural_flow_markers_regardless_of_glyph() -> None:
@@ -113,9 +136,9 @@ def test_repair_removes_structural_flow_markers_regardless_of_glyph() -> None:
     assert "involuntary and voluntary" in repaired
     assert "Let -x- denote" in repaired
     assert "The variable x-" in repaired
-    assert "trans-\nformation" in repaired
+    assert "transformation" in repaired
     report = scan_ingest_quality(repaired)
-    assert report.issue_counts["hyphenated_line_break"] == 2
+    assert report.issue_counts["hyphenated_line_break"] == 0
 
 
 def test_repair_removes_docling_flow_marker_before_lowercase_paragraph_break() -> None:

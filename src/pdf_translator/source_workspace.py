@@ -156,7 +156,7 @@ def page_issues(
             continue
         text = block['text']
         codes = []
-        if re.search(r'[A-Za-z]-\s*\n+\s*[a-z]', text):
+        if re.search(r'\b[A-Za-z]{2,}-\s*\n+\s*[a-z]{2,}', text):
             codes.append('hyphenated_line_break')
         # Cross-page continuation candidates are owned by the structured
         # continuation ledger.  A plain trailing hyphen is common in PDF

@@ -52,6 +52,7 @@ SOURCE_ISSUE_LABELS_ZH: dict[str, str] = {
 }
 
 SOURCE_QUALITY_REPORT = "source-quality-report.json"
+INGEST_QUALITY_REPORT = "ingest-quality-report.json"
 RAW_TRANSLATION_QUALITY_REPORT = "raw-translation-quality-report.json"
 POLISHED_OUTPUT_QUALITY_REPORT = "polished-output-quality-report.json"
 TRANSLATION_QUALITY_INDEX = "translation-quality-index.json"
@@ -601,6 +602,7 @@ def load_confirmation_quality_issues(run_dir: Path) -> list[dict[str, Any]]:
     run_dir = run_dir.expanduser().resolve()
     issues = list(confirmation_quality_issues_from_ledger(load_continuation_ledger(run_dir)))
     report_path = run_dir / SOURCE_QUALITY_REPORT
+    ingest_report_path = run_dir / INGEST_QUALITY_REPORT
     if report_path.is_file():
         try:
             report = json.loads(report_path.read_text(encoding="utf-8"))
@@ -608,6 +610,25 @@ def load_confirmation_quality_issues(run_dir: Path) -> list[dict[str, Any]]:
             report = {}
         if isinstance(report, dict):
             issues.extend(confirmation_quality_issues_from_source_report(report))
+    elif ingest_report_path.is_file():
+        try:
+            ingest_report = json.loads(ingest_report_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            ingest_report = {}
+        if isinstance(ingest_report, dict):
+            findings = [
+                {
+                    "severity": severity,
+                    "code": item.get("code"),
+                    "evidence": item,
+                }
+                for severity, key in (("blocking", "blocking_issues"), ("review", "warning_issues"))
+                for item in ingest_report.get(key) or []
+                if isinstance(item, dict)
+            ]
+            issues.extend(
+                confirmation_quality_issues_from_source_report({"findings": findings})
+            )
     return issues
 
 

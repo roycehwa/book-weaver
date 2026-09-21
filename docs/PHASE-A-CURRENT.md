@@ -56,7 +56,7 @@
 
 ## 5. 当前验证状态
 
-- 2026-09-21 当前工作区验证：Python 993 passed、4 skipped；前端 70 passed；前端生产构建、lint 与差异空白检查通过。Python 有 30 条既有弃用警告；前端仍有 Browserslist、PDF.js eval 和包体积提示，均未阻断本轮验证。
+- 2026-09-22 当前工作区验证：Python 997 passed、4 skipped；前端 70 passed；前端生产构建、lint 与差异空白检查通过。Python 有 30 条既有弃用警告；前端仍有 Browserslist、PDF.js eval 和包体积提示，均未阻断本轮验证。
 - 2026-09-21 已通过应用删除接口清空全部测试任务及其运行产物，任务总数为 0；桌面原始书籍未删除。诊断样品任务 `73dd7521161c48c18e8a5c1ded286354` 已删除，它暴露的流程问题保留在通用代码和合成测试中，不保留成书产物。下一轮必须从上传入口创建全新任务。
 - 同一任务在用户确认章节后暴露的 20 条词内空格提示和 2 个隐藏阻断已修复：高把握单字形拆分在翻译前按整书词汇证据合并，新增 `-x-` Docling 流标记清理；确认版 `chapter-segments.json` 与 `book.json`、`reading-units.json` 固定写入同一运行目录。原样重算已得到 source quality `passed`、0 blocking、0 review，并进入 `awaiting_glossary`；界面同时正确区分红色错误与不阻断提示，并提供“重新检查确认版”入口。
 - 流程级方案见 `PHASE-A-PIPELINE-REDESIGN-2026-09-19.md`。流程主干已改造：新增 `bookweaver_reading_units_v1` 及 `reading-units.json`，确认区可查看重建连续正文；新任务 intake 后先等待原文/章节/内容策略确认，确认后才从 canonical book 的可翻译范围提取术语；Notes/Bibliography/Glossary 建议保留原文，Index 建议略过，确认时动作固化为 translate/preserve/exclude；确认后的 reading units 冻结为 `translation_authority: true`，chapter segments 和实际运输分块由它生成，产物保存 reading-units 指纹和 unit IDs。
@@ -89,6 +89,7 @@
 - Docling 句中段尾的包裹式单字形流标记（例如 `-x-` 后接空行和小写续文）会在确认版重建时自动移除，并将被打断的句子重新接为一个连续段落；内联数学 `-x-` 和未获充分证据的真实连字符保留。罕见但有词频证据的单字形拆分（例如 `c oncatenation`）也在翻译前自动合并。真实任务复算得到 source quality `passed`、0 finding，未调用翻译模型。
 - 成功重建确认版会清除旧的 `failed_stage` 和错误信息，避免修复后界面仍显示失败。术语排除是持久用户决定，章节重建、术语重提取和专业类型切换不得清空 `excluded_sources`。
 - 模型偶发回显完整 `<SOURCE_MARKDOWN>...</SOURCE_MARKDOWN>` 运输包装时，翻译入口只在该包装覆盖整个回复时自动剝离，不影响正文内联 HTML。脚注标记或语义 HTML 标签被模型改动时，现在会在单个翻译片段写入缓存前失败并有界重试，不再到全书审阅完成后才形成无法定位的导出死路。
+- PDF 断行词不再由脱离页面与版面证据的正则表达式一律当作全书阻断。系统先用词形频率和整书词形证据自动区分并修复版面断词与真实连字复合词；无法证明的残留只作为重建质量提示，不再在章节确认后冻结整书。解析阶段的质量报告现在会在首次章节确认前显示；替换字符、控制字符、阅读单元失效等确定性损坏仍继续阻断。
 
 故障恢复自动验收矩阵：
 
