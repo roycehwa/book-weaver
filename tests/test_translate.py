@@ -59,6 +59,26 @@ def test_required_glossary_appendix_is_removed() -> None:
     assert sanitize_translation_output(translated) == "## 缩略语\n\n正文译文。"
 
 
+def test_source_markdown_transport_wrapper_is_removed() -> None:
+    from pdf_translator.glossary_convergence import sanitize_translation_output
+
+    translated = (
+        "<SOURCE_MARKDOWN>\n"
+        "## 第七章\n\n这是正文译文。[^41]\n"
+        "</SOURCE_MARKDOWN>"
+    )
+
+    assert sanitize_translation_output(translated) == "## 第七章\n\n这是正文译文。[^41]"
+
+
+def test_source_markdown_inline_tag_is_not_removed() -> None:
+    from pdf_translator.glossary_convergence import sanitize_translation_output
+
+    translated = "正文中的 <SOURCE_MARKDOWN>是示例</SOURCE_MARKDOWN> 标记。"
+
+    assert sanitize_translation_output(translated) == translated
+
+
 def test_translator_meta_response_is_rejected() -> None:
     from pdf_translator.translate import _assert_translation_quality
 
@@ -74,6 +94,29 @@ def test_translator_meta_response_is_rejected() -> None:
         _assert_translation_quality(
             chunk=chunk,
             translated=polluted,
+            target_language="zh-CN",
+            translator_name="minimax",
+        )
+
+
+@pytest.mark.parametrize(
+    ("source", "translated", "message"),
+    [
+        ("Text.[^41]", "译文。", "protected footnote markers"),
+        ("<span id=\"note\">Text</span>", "<span id=\"changed\">译文</span>", "protected HTML tags"),
+    ],
+)
+def test_translation_rejects_changed_protected_markup(
+    source: str,
+    translated: str,
+    message: str,
+) -> None:
+    from pdf_translator.translate import _assert_translation_quality
+
+    with pytest.raises(ValueError, match=message):
+        _assert_translation_quality(
+            chunk=TranslationChunk(index=0, markdown=source),
+            translated=translated,
             target_language="zh-CN",
             translator_name="minimax",
         )

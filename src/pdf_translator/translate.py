@@ -19,6 +19,8 @@ from typing import Protocol
 from openai import OpenAI
 import requests
 
+from pdf_translator.zh_markdown_cleanup import FOOTNOTE_REF_RE, HTML_TAG_RE
+
 from pdf_translator.book_views import (
     ensure_chapter_top_heading,
     join_chapter_delivery_markdown,
@@ -473,6 +475,12 @@ def _assert_translation_quality(
         raise ValueError(f"Translation for chunk {chunk.index} contains copied untranslated prose paragraphs.")
     if _looks_like_translator_meta_response(translated) and not _looks_like_translator_meta_response(chunk.markdown):
         raise ValueError(f"Translation for chunk {chunk.index} contains translator meta response.")
+    source_footnotes = sorted(FOOTNOTE_REF_RE.findall(chunk.markdown))
+    translated_footnotes = sorted(FOOTNOTE_REF_RE.findall(translated))
+    if source_footnotes != translated_footnotes:
+        raise ValueError(
+            f"Translation for chunk {chunk.index} changed protected footnote markers."
+        )
     # Parse rendered links, including reference-style and raw HTML anchors. A
     # numeric footnote marker is not a filename and must not become one.
     import markdown as markdown_renderer
@@ -485,6 +493,17 @@ def _assert_translation_quality(
     }
     if link_targets(translated) - source_targets:
         raise ValueError(f"Translation for chunk {chunk.index} contains invented link targets.")
+    def semantic_html(text: str) -> list[str]:
+        return sorted(
+            tag
+            for tag in HTML_TAG_RE.findall(text)
+            if re.match(r"</?\s*[A-Za-z][\w:.-]*(?:\s|/?>)", tag)
+        )
+
+    if semantic_html(chunk.markdown) != semantic_html(translated):
+        raise ValueError(
+            f"Translation for chunk {chunk.index} changed protected HTML tags."
+        )
     if _looks_untranslated_for_target(chunk.markdown, translated, target_language):
         raise ValueError(
             f"Translation for chunk {chunk.index} looks untranslated "
