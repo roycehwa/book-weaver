@@ -1573,6 +1573,14 @@ class BookJobService:
         book = self._read_json_any(baseline if baseline.exists() else book_path)
         if not isinstance(book, dict):
             raise JobServiceError("书籍结构不可用于确认章节。")
+        try:
+            source_path = self.source_path(job_id)
+        except JobNotFound:
+            source_path = None
+        if source_path is not None and source_path.suffix.lower() == ".pdf":
+            from pdf_translator.pdf_text_repair import repair_book_dict
+
+            book = repair_book_dict(book)
         return book
 
     def _content_policy_dependency_payload(

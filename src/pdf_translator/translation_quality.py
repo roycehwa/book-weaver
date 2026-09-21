@@ -37,6 +37,9 @@ SOURCE_QUALITY_BLOCKED_ERROR_CODE = "source_quality_blocked"
 
 SOURCE_ISSUE_LABELS_ZH: dict[str, str] = {
     "hyphenated_line_break": "疑似跨行断词",
+    "midword_space": "词内异常空格",
+    "glued_words": "单词粘连",
+    "orphan_footnote_y": "孤立脚注标记",
     "soft_hyphen": "软连字符",
     "replacement_character": "替换字符",
     "control_character": "控制字符",
@@ -544,12 +547,12 @@ def confirmation_quality_issues_from_source_report(
     *,
     limit: int = 25,
 ) -> list[dict[str, Any]]:
-    if not report or report.get("status") != "blocked":
+    if not report:
         return []
     issues: list[dict[str, Any]] = []
     findings = report.get("findings") if isinstance(report.get("findings"), list) else []
     for finding in findings:
-        if not isinstance(finding, dict) or finding.get("severity") != "blocking":
+        if not isinstance(finding, dict) or finding.get("severity") not in {"blocking", "review"}:
             continue
         code = str(finding.get("code") or "source_quality")
         evidence = finding.get("evidence") if isinstance(finding.get("evidence"), dict) else {}
@@ -571,7 +574,7 @@ def confirmation_quality_issues_from_source_report(
             message = f"{message}；片段：{snippet}"
         issues.append(
             {
-                "severity": "error",
+                "severity": "error" if finding.get("severity") == "blocking" else "warning",
                 "code": code,
                 "message": message,
                 "chapter": chapter,

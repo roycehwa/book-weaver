@@ -38,6 +38,36 @@ def test_confirmation_quality_issues_from_blocked_source_report() -> None:
     assert "12" in issues[0]["message"]
 
 
+def test_confirmation_quality_issues_include_nonblocking_source_warnings() -> None:
+    report = {
+        "status": "passed",
+        "findings": [
+            {
+                "severity": "review",
+                "code": "midword_space",
+                "evidence": {
+                    "chapter": "Introduction",
+                    "line": 8,
+                    "excerpt": "an d hundreds of articles",
+                },
+            }
+        ],
+    }
+
+    issues = confirmation_quality_issues_from_source_report(report)
+
+    assert issues == [
+        {
+            "severity": "warning",
+            "code": "midword_space",
+            "message": "源文存在需处理的「词内异常空格」（章节「Introduction」，约第 8 行）；片段：an d hundreds of articles",
+            "chapter": "Introduction",
+            "line": 8,
+            "excerpt": "an d hundreds of articles",
+        }
+    ]
+
+
 def test_preflight_writes_artifacts_and_blocks(tmp_path: Path) -> None:
     run_dir = tmp_path / "run"
     run_dir.mkdir()

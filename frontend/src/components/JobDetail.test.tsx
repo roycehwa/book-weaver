@@ -82,6 +82,38 @@ afterEach(() => {
 })
 
 describe('JobDetail Notes dependency acknowledgement', () => {
+  it('shows the confirmed-input rebuild work while chapter confirmation is pending', async () => {
+    vi.spyOn(jobsApi, 'get').mockResolvedValue(job)
+    vi.spyOn(jobsApi, 'sourceInfo').mockResolvedValue({
+      job_id: 'job-1', filename: 'synthetic.pdf', size: 10, kind: 'other', download_url: '/source',
+    })
+    vi.spyOn(jobsApi, 'getChapterDraft').mockResolvedValue({
+      job_id: 'job-1',
+      chapters: [
+        { index: 1, chapter_id: 'body', title: 'Body', page_start: 1, page_end: 2, content_policy: 'translate' },
+      ],
+    })
+    vi.spyOn(workspaceApi, 'listBooks').mockResolvedValue({ total_books: 1, books: [workspaceBook] })
+    let resolveConfirmation: ((value: { job: BookJob; workspace_book: WorkspaceBook }) => void) | undefined
+    vi.spyOn(jobsApi, 'confirmChapterDraft').mockImplementation(() => new Promise(resolve => {
+      resolveConfirmation = resolve
+    }))
+
+    render(
+      <MemoryRouter initialEntries={['/jobs/job-1']}>
+        <Routes><Route path="/jobs/:id" element={<JobDetail />} /></Routes>
+      </MemoryRouter>,
+    )
+
+    await userEvent.click((await screen.findAllByRole('button', { name: '确认源书章节目录' }))[0])
+
+    expect(await screen.findByText('正在根据章节目录重建确认版内容')).toBeInTheDocument()
+    expect(screen.getAllByRole('button', { name: '正在重建书籍、阅读单元与术语…' })[0]).toBeDisabled()
+
+    resolveConfirmation?.({ job, workspace_book: workspaceBook })
+    await waitFor(() => expect(screen.queryByText('正在根据章节目录重建确认版内容')).not.toBeInTheDocument())
+  })
+
   it('opens a continuation record in its owning chapter without exposing range edits', async () => {
     vi.spyOn(jobsApi, 'get').mockResolvedValue(job)
     vi.spyOn(jobsApi, 'sourceInfo').mockResolvedValue({
