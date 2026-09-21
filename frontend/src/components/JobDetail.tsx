@@ -1363,7 +1363,7 @@ function JobDetail() {
                     <div>
                       <div className="text-sm font-medium text-slate-900">确认前质量控制</div>
                       <div className="mt-1 text-xs text-slate-500">
-                        检查页码范围、重叠页和未覆盖页。红色问题会阻止确认，黄色问题需要判断，绿色记录无需操作。
+                        检查页码范围、重叠页、未覆盖页和跨页段落记录。红色问题会阻止确认，黄色问题需要判断，绿色记录无需操作。
                       </div>
                     </div>
                     <span className={`rounded-full px-3 py-1 text-xs font-medium ${
@@ -1409,7 +1409,7 @@ function JobDetail() {
                               </p>
                               {!presentation.needsAction && (
                                 <p className="mt-2 text-xs font-medium leading-5 text-emerald-900">
-                                  无需处理。系统已按保守规则保持分开；当前内容策略不会让这个边界进入翻译。
+                                  无需处理。系统已依据结构证据保留为两个独立段落；它们仍会分别遵循所属章节的处理策略。
                                 </p>
                               )}
                               {presentation.needsAction && (
