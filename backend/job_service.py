@@ -1558,8 +1558,8 @@ class BookJobService:
             if detail:
                 message = f"生成章节拆分预览失败：{detail}"
             raise JobServiceError(message) from exc
-        job_dir = self._job_dir(job_id)
-        segment_path = job_dir / "artifacts" / "chapter-segments.json"
+        run_dir = book_path.parent
+        segment_path = run_dir / "chapter-segments.json"
         segment_path.parent.mkdir(parents=True, exist_ok=True)
         self._write_json_atomic(segment_path, segment_plan)
         return segment_path

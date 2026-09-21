@@ -703,6 +703,61 @@ def test_confirming_translation_chapters_extracts_glossary_from_confirmed_book(t
     assert reading_units["units"][0]["policy_confirmed"] is True
 
 
+def test_confirm_chapters_writes_chapter_segments_next_to_nested_run_book(tmp_path: Path) -> None:
+    service = BookJobService(project_home=tmp_path, jobs_dir=tmp_path / "jobs")
+    job_dir = service.jobs_dir / "job-nested-run"
+    run_dir = job_dir / "artifacts" / "run"
+    run_dir.mkdir(parents=True)
+    book = {
+        "metadata": {"chapter_source": "automatic"},
+        "chapters": [{
+            "title": "Automatic",
+            "source_pages": [1],
+            "trace_markdown": "[[page: 1]]\n\nEmbodied Agency shapes practice.",
+            "markdown": "Embodied Agency shapes practice.",
+        }],
+        "pages": [{"page_no": 1, "has_content": True, "page_kind": "body"}],
+    }
+    (run_dir / "book.json").write_text(json.dumps(book), encoding="utf-8")
+    snapshot = _snapshot("job-nested-run")
+    snapshot["state"] = "awaiting_chapter_confirmation"
+    snapshot["request"] = {
+        "processing_mode": "translate",
+        "source_language": "en",
+        "target_language": "zh-CN",
+    }
+    snapshot["resolved"] = {"text_operation": "translate", "source_language": "en"}
+    snapshot["artifacts"] = {"book": {"href": "artifacts/run/book.json"}}
+    (job_dir / "job.json").write_text(json.dumps(snapshot), encoding="utf-8")
+
+    result = service.confirm_chapters(
+        "job-nested-run",
+        expected_job_revision=int(snapshot.get("revision") or 0),
+        chapters=[{
+            "index": 1,
+            "chapter_id": "body",
+            "title": "Body",
+            "page_start": 1,
+            "page_end": 1,
+            "source_pages": [1],
+            "content_policy": "auto",
+        }],
+    )
+
+    segment_path = run_dir / "chapter-segments.json"
+    assert segment_path.is_file()
+    assert not (job_dir / "artifacts" / "chapter-segments.json").exists()
+    assert result["state"] == "awaiting_glossary"
+    assert result["artifacts"]["chapter_segments"]["href"] == "artifacts/run/chapter-segments.json"
+    quality = json.loads((run_dir / "source-quality-report.json").read_text(encoding="utf-8"))
+    blocking_codes = {
+        issue["code"]
+        for issue in quality.get("findings") or []
+        if issue.get("severity") == "blocking"
+    }
+    assert "reading_units_invalid" not in blocking_codes
+
+
 def test_confirm_chapters_blocks_glossary_when_source_quality_fails(tmp_path: Path) -> None:
     service = BookJobService(project_home=tmp_path, jobs_dir=tmp_path / "jobs")
     job_dir = service.jobs_dir / "job-soft-hyphen"
