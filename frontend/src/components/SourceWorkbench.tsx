@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { jobsApi, type SourceBlock, type SourceWorkspace } from '../api'
+import { jobsApi, type JobChapterDraft, type SourceBlock, type SourceWorkspace } from '../api'
 
 const labels: Record<string, string> = {
   hyphenated_line_break: '疑似跨行断词',
@@ -8,7 +8,32 @@ const labels: Record<string, string> = {
 }
 const issueStatusLabels: Record<string, string> = { open: '待核对', accepted: '已注明接受理由', reconciled: '已由续接决策核对' }
 
-export default function SourceWorkbench({ jobId, page, onSaved, onSelectPage }: { jobId: string; page: number; onSaved: () => void; onSelectPage?: (page: number) => void }) {
+interface SourceWorkbenchProps {
+  jobId: string
+  page: number
+  onSaved: () => void
+  onSelectPage?: (page: number) => void
+  onDirtyChange?: (dirty: boolean) => void
+  chapterTitle?: string
+  chapterPolicy?: JobChapterDraft['content_policy']
+}
+
+const chapterPolicyLabel = (policy: JobChapterDraft['content_policy'] | undefined): string | null => {
+  if (policy === 'preserve') return '保留原文（不翻译）'
+  if (policy === 'exclude') return '略过（不翻译、不导出）'
+  if (policy === 'translate') return '翻译'
+  return null
+}
+
+export default function SourceWorkbench({
+  jobId,
+  page,
+  onSaved,
+  onSelectPage,
+  onDirtyChange,
+  chapterTitle,
+  chapterPolicy,
+}: SourceWorkbenchProps) {
   const [data, setData] = useState<SourceWorkspace | null>(null)
   const [blocks, setBlocks] = useState<SourceBlock[]>([])
   const [dirty, setDirty] = useState(false)
@@ -26,7 +51,13 @@ export default function SourceWorkbench({ jobId, page, onSaved, onSelectPage }: 
     finally { if (sequence === requestSequence.current) setBusy(false) }
   }
   useEffect(() => { if (!dirty) void load() }, [jobId, page]) // Unsaved edits stay pinned to their original page.
-  const update = (next: SourceBlock[]) => { setBlocks(next); setDirty(true); setMessage('') }
+  useEffect(() => { onDirtyChange?.(dirty) }, [dirty, onDirtyChange])
+  const update = (next: SourceBlock[]) => {
+    setBlocks(next)
+    setDirty(true)
+    setError('')
+    setMessage('')
+  }
   const change = (patch: Partial<SourceBlock>) => update(blocks.map((b, i) => i === selected ? { ...b, ...patch } : b))
   const save = async (undo = false) => {
     if (!data) return
@@ -57,11 +88,29 @@ export default function SourceWorkbench({ jobId, page, onSaved, onSelectPage }: 
     const next = [...blocks]; [next[selected], next[target]] = [next[target], next[selected]]; update(next); setSelected(target)
   }
   const current = blocks[selected]
+  useEffect(() => {
+    if (
+      error.includes('必须填写理由')
+      && current?.policy !== 'translate'
+      && current?.reason.trim()
+    ) {
+      setError('')
+    }
+  }, [current?.policy, current?.reason, error])
+  const activeChapterPolicyLabel = chapterPolicyLabel(chapterPolicy)
   return <section className="mt-4 rounded-lg border border-slate-300 bg-white p-3" aria-label="原文修正台">
-    <h3 className="font-semibold">原文修正 · 第 {data?.page ?? page} 页</h3>
+    <h3 className="font-semibold">高级原文修正 · 第 {data?.page ?? page} 页</h3>
     <p className="my-2 text-xs text-slate-500">
-      对照右侧原页修正段落文字、顺序与处理方式（翻译／保留原文／排除）。这里不能裁决跨页续接边界；顶部「确认前质量控制」中的续接提示请用预览核对，只有确实要改章界时才勾选「调整章节范围」。
+      只在某一段原文的文字、顺序或去留有误时使用。整章是否翻译，由上方章节列表的「处理方式」决定。
     </p>
+    {activeChapterPolicyLabel && (
+      <div className="my-2 rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs leading-5 text-emerald-900">
+        当前章节「{chapterTitle || '未命名章节'}」已设为「{activeChapterPolicyLabel}」。
+        {chapterPolicy === 'preserve' || chapterPolicy === 'exclude'
+          ? '无需在这里逐段重复设置；直接确认源书章节目录即可应用整章策略。'
+          : '如果只有个别段落例外，可在下方单独设置。'}
+      </div>
+    )}
     {!!data?.issue_groups?.length && <label className="block text-xs">按问题跳转<select aria-label="待核对问题页" className="my-2 w-full rounded border p-2" value="" disabled={dirty || busy} onChange={e => onSelectPage?.(Number(e.target.value))}>
       <option value="">选择待核对页（同类问题已归组）</option>
       {data.issue_groups.map(group => <optgroup key={group.code} label={`${labels[group.code] || group.code} · ${group.count} 处`}>
@@ -82,14 +131,21 @@ export default function SourceWorkbench({ jobId, page, onSaved, onSelectPage }: 
         <button type="button" onClick={() => move(-1)} disabled={selected === 0}>上移</button><button type="button" onClick={() => move(1)} disabled={selected === blocks.length - 1}>下移</button>
         <button type="button" onClick={() => change({ text: /^#{1,6} /.test(current.text) ? current.text.replace(/^#{1,6} /, '') : `## ${current.text}` })}>标题／正文</button>
       </div>
-      <label className="block text-sm">处理方式<select aria-label="原文处理方式" className="ml-2 rounded border p-1" value={current.policy} onChange={e => change({ policy: e.target.value as SourceBlock['policy'] })}>
+      <label className="block text-sm">当前段落的例外处理<select aria-label="原文处理方式" className="ml-2 rounded border p-1" value={current.policy} onChange={e => change({ policy: e.target.value as SourceBlock['policy'] })}>
         <option value="translate">翻译</option><option value="preserve">保留原文</option><option value="exclude">排除非正文</option>
       </select></label>
-      <input aria-label="修正或接受理由" className="my-2 w-full rounded border p-2 text-sm" placeholder="修正／接受理由（保留或排除必填）" value={current.reason} onChange={e => change({ reason: e.target.value })} />
+      <label className="mt-2 block text-sm">
+        当前段落的处理理由
+        <input aria-label="修正或接受理由" className="mt-1 w-full rounded border p-2 text-sm" placeholder="仅当本段选择保留或排除时必填" value={current.reason} onChange={e => change({ reason: e.target.value })} />
+      </label>
+      {current.policy !== 'translate' && (
+        <p className="mt-1 text-xs text-slate-500">这是对当前段落例外处理的审计说明，不用来设置整个章节。</p>
+      )}
     </fieldset>}
-    <div className="mt-2 flex flex-wrap gap-2 text-sm">
-      <button disabled={!dirty || busy} onClick={() => void save()} className="rounded bg-blue-600 px-3 py-2 text-white disabled:opacity-40">保存原文修正</button>
-      <button disabled={busy} onClick={() => { if (!dirty || window.confirm('放弃未保存修改并读取当前页？')) void load() }} className="rounded border px-3 py-2">读取当前页／放弃修改</button>
+    {dirty && <p className="mt-2 text-xs font-medium text-amber-800">当前页有未保存的逐段修改。请先保存或放弃，再确认章节目录。</p>}
+    <div className="sticky bottom-0 -mx-3 mt-2 flex flex-wrap gap-2 border-t border-slate-200 bg-white/95 px-3 py-3 text-sm shadow-[0_-4px_10px_rgba(15,23,42,0.06)] backdrop-blur">
+      <button disabled={!dirty || busy} onClick={() => void save()} className="rounded bg-blue-600 px-3 py-2 text-white disabled:opacity-40">保存当前页的逐段修正</button>
+      <button disabled={busy} onClick={() => { if (!dirty || window.confirm('放弃未保存修改并读取当前页？')) void load() }} className="rounded border px-3 py-2">{dirty ? '放弃未保存修改' : '重新读取当前页'}</button>
       <button disabled={!data?.can_undo || dirty || busy} onClick={() => void save(true)} className="rounded border px-3 py-2">撤销最近一次保存</button>
     </div>
   </section>

@@ -293,6 +293,7 @@ function JobDetail() {
   const [chapterDraftSource, setChapterDraftSource] = useState<string | null>(null)
   const [chapterDraftSourceDetail, setChapterDraftSourceDetail] = useState<string | null>(null)
   const [confirmationQualityIssues, setConfirmationQualityIssues] = useState<ChapterQualityIssue[]>([])
+  const [sourceWorkbenchDirty, setSourceWorkbenchDirty] = useState(false)
   const [chapterRangeAdjustMode, setChapterRangeAdjustMode] = useState(false)
   const [chapterSectionExpanded, setChapterSectionExpanded] = useState(true)
   const [tocPageStart, setTocPageStart] = useState('')
@@ -921,8 +922,10 @@ function JobDetail() {
   const qualityWarnings = combinedQualityIssues.filter(
     issue => issue.severity === 'warning' && !informationalContinuationSet.has(issue),
   )
-  const chapterConfirmLabel = confirmingChapters
-    ? '正在确认...'
+  const chapterConfirmLabel = sourceWorkbenchDirty
+    ? '先保存或放弃原文修改'
+    : confirmingChapters
+      ? '正在确认...'
     : chapterQuality.blocking
       ? '先处理章节错误'
       : needsChapterConfirmation
@@ -1497,7 +1500,15 @@ function JobDetail() {
                       </div>
                     )
                   })}
-                  <SourceWorkbench jobId={id} page={currentPdfPage} onSelectPage={inspectSourcePage} onSaved={() => { void loadJob() }} />
+                  <SourceWorkbench
+                    jobId={id}
+                    page={currentPdfPage}
+                    chapterTitle={selectedChapter?.title}
+                    chapterPolicy={selectedChapter?.content_policy}
+                    onSelectPage={inspectSourcePage}
+                    onDirtyChange={setSourceWorkbenchDirty}
+                    onSaved={() => { void loadJob() }}
+                  />
                 </div>
 
                 <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
@@ -1603,14 +1614,16 @@ function JobDetail() {
               {showChapterConfirmButton && (
                 <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-200 bg-amber-50 p-4">
                   <p className="text-sm text-amber-900">
-                    {needsChapterConfirmation
+                    {sourceWorkbenchDirty
+                      ? '原文修正台中还有未保存的当前页修改。请先保存或放弃，避免把未完成的内容带入章节确认。'
+                      : needsChapterConfirmation
                       ? '核对原文、标题与页码后确认，再手动启动翻译。修改原文会使旧确认和受影响译文过期。'
                       : '章节目录已确认；修改标题或页码后需重新确认，原有人工审阅记录会保留。'}
                   </p>
                   <button
                     type="button"
                     className="rounded-lg bg-amber-600 px-5 py-2.5 text-sm font-medium text-white disabled:cursor-not-allowed disabled:opacity-50"
-                    disabled={confirmingChapters || chapterQuality.blocking}
+                    disabled={sourceWorkbenchDirty || confirmingChapters || chapterQuality.blocking}
                     onClick={confirmEditedChapters}
                   >
                     {chapterConfirmLabel}
@@ -1748,7 +1761,7 @@ function JobDetail() {
             <button
               type="button"
               className="rounded-lg bg-amber-600 px-4 py-2 text-sm font-medium text-white disabled:cursor-not-allowed disabled:opacity-50"
-              disabled={confirmingChapters || chapterQuality.blocking}
+              disabled={sourceWorkbenchDirty || confirmingChapters || chapterQuality.blocking}
               onClick={confirmEditedChapters}
             >
               {chapterConfirmLabel}

@@ -11,8 +11,17 @@ import JobDetail from './JobDetail'
 
 vi.mock('./GlossaryWorkbench', () => ({ default: () => null }))
 vi.mock('./SourceWorkbench', () => ({
-  default: ({ onSelectPage }: { onSelectPage?: (page: number) => void }) => (
-    <button type="button" onClick={() => onSelectPage?.(223)}>模拟跳到问题页</button>
+  default: ({
+    onSelectPage,
+    onDirtyChange,
+  }: {
+    onSelectPage?: (page: number) => void
+    onDirtyChange?: (dirty: boolean) => void
+  }) => (
+    <>
+      <button type="button" onClick={() => onSelectPage?.(223)}>模拟跳到问题页</button>
+      <button type="button" onClick={() => onDirtyChange?.(true)}>模拟未保存原文</button>
+    </>
   ),
 }))
 vi.mock('./TranslationFailures', () => ({ default: () => null }))
@@ -106,6 +115,10 @@ describe('JobDetail Notes dependency acknowledgement', () => {
 
     await userEvent.click(screen.getByRole('button', { name: '需要修改本章起止页' }))
     expect(screen.getByRole('button', { name: '当前页设为开始' })).toBeInTheDocument()
+
+    await userEvent.click(screen.getByRole('button', { name: '模拟未保存原文' }))
+    expect(screen.getAllByRole('button', { name: '先保存或放弃原文修改' })).not.toHaveLength(0)
+    expect(screen.getAllByRole('button', { name: '先保存或放弃原文修改' })[0]).toBeDisabled()
   })
 
   it('explains that translating a contents chapter rebuilds the target TOC', async () => {

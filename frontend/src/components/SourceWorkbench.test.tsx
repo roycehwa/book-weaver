@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+import '@testing-library/jest-dom/vitest'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, expect, test, vi } from 'vitest'
 import { jobsApi, type SourceWorkspace } from '../api'
@@ -19,7 +20,7 @@ test('merges selected paragraphs and sends optimistic revision', async () => {
   await screen.findByDisplayValue('First paragraph.')
   fireEvent.click(screen.getByText('合并下一段'))
   expect((screen.getByLabelText('原文段落内容') as HTMLTextAreaElement).value).toBe('First paragraph. Second paragraph.')
-  fireEvent.click(screen.getByText('保存原文修正'))
+  fireEvent.click(screen.getByText('保存当前页的逐段修正'))
   await waitFor(() => expect(onSaved).toHaveBeenCalled())
   expect(jobsApi.saveSourceWorkspace).toHaveBeenCalledWith('test', expect.objectContaining({ expected_revision: 3, page: 1, blocks: [expect.objectContaining({ text: 'First paragraph. Second paragraph.' })] }))
 })
@@ -31,7 +32,7 @@ test('conflict preserves local edit and does not claim success', async () => {
   render(<SourceWorkbench jobId="test" page={1} onSaved={onSaved} />)
   await screen.findByDisplayValue('First paragraph.')
   fireEvent.change(screen.getByLabelText('原文段落内容'), { target: { value: 'My correction' } })
-  fireEvent.click(screen.getByText('保存原文修正'))
+  fireEvent.click(screen.getByText('保存当前页的逐段修正'))
   await screen.findByText('版本冲突')
   expect((screen.getByLabelText('原文段落内容') as HTMLTextAreaElement).value).toBe('My correction')
   expect(onSaved).not.toHaveBeenCalled()
@@ -45,4 +46,32 @@ test('changing preview page does not discard unsaved source text', async () => {
   view.rerender(<SourceWorkbench jobId="test" page={2} onSaved={() => {}} />)
   expect((screen.getByLabelText('原文段落内容') as HTMLTextAreaElement).value).toBe('Keep draft')
   expect(jobsApi.sourceWorkspace).toHaveBeenCalledTimes(1)
+})
+
+test('explains chapter policy, exposes actions, and clears a stale validation error while editing', async () => {
+  vi.mocked(jobsApi.sourceWorkspace).mockResolvedValue(fixture)
+  vi.mocked(jobsApi.saveSourceWorkspace).mockRejectedValue(new Error('保留原文或排除内容时必须填写理由。'))
+  const onDirtyChange = vi.fn()
+  render(
+    <SourceWorkbench
+      jobId="test"
+      page={1}
+      chapterTitle="Notes"
+      chapterPolicy="preserve"
+      onSaved={() => {}}
+      onDirtyChange={onDirtyChange}
+    />,
+  )
+  await screen.findByDisplayValue('First paragraph.')
+  expect(screen.getByText(/Notes.*保留原文/)).toBeInTheDocument()
+  expect(screen.getByText(/无需在这里逐段重复设置/)).toBeInTheDocument()
+
+  fireEvent.change(screen.getByLabelText('原文处理方式'), { target: { value: 'preserve' } })
+  fireEvent.click(screen.getByText('保存当前页的逐段修正'))
+  expect(await screen.findByRole('alert')).toHaveTextContent('必须填写理由')
+
+  fireEvent.change(screen.getByLabelText('修正或接受理由'), { target: { value: '保留本段引文' } })
+  expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  expect(screen.getByText('放弃未保存修改')).toBeInTheDocument()
+  expect(onDirtyChange).toHaveBeenLastCalledWith(true)
 })
