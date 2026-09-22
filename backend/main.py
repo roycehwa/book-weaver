@@ -3969,8 +3969,34 @@ def _build_review_project_payload(path: Path) -> dict:
         if isinstance(groups, list):
             chapter_groups = groups
     from pdf_translator.translation_quality import translation_quality_summary
+    from pdf_translator.review import translation_policy_coverage_failures
 
     quality_summary = translation_quality_summary(path)
+    book_path = path / "book.json"
+    if not book_path.is_file():
+        policy_coverage = {
+            "blocking": True,
+            "chapters": [],
+            "message": "导出缺少确认版书籍结构，请新建任务。",
+        }
+    else:
+        book = _read_review_json(path, "book.json")
+        if not book.get("chapters"):
+            policy_coverage = {
+                "blocking": True,
+                "chapters": [],
+                "message": "导出缺少确认版章节，请新建任务。",
+            }
+        else:
+            skipped_chapters = translation_policy_coverage_failures(book, segments)
+            policy_coverage = {
+                "blocking": bool(skipped_chapters),
+                "chapters": skipped_chapters,
+                "message": (
+                    "导出被阻止：以下正文章节被错误跳过翻译：" + "；".join(skipped_chapters)
+                    if skipped_chapters else None
+                ),
+            }
     return {
         "run_dir": str(path),
         "manifest": manifest,
@@ -3983,6 +4009,7 @@ def _build_review_project_payload(path: Path) -> dict:
         "chapter_groups": chapter_groups if isinstance(chapter_groups, list) else [],
         "workflow": workflow,
         "translation_quality": quality_summary,
+        "policy_coverage": policy_coverage,
     }
 
 

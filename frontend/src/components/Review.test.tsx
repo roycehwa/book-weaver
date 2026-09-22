@@ -350,6 +350,28 @@ describe('Review draft navigation', () => {
     expect(screen.getByText('已修订并保存的译文')).toBeTruthy()
   })
 
+  test('shows backend chapter coverage blocking before an export attempt', async () => {
+    getProject.mockResolvedValue({
+      ...project,
+      review_items: [{ item_id: 'i1', segment_id: 's1', issue_type: 'untranslated', severity: 'high', status: 'approved' }],
+      review_state: {
+        ...project.review_state,
+        decisions: { s1: { status: 'approved' } },
+      },
+      workflow: { human_review_mode: 'issues_only' },
+      policy_coverage: {
+        blocking: true,
+        chapters: ['Body'],
+        message: '导出被阻止：以下正文章节被错误跳过翻译：Body',
+      },
+    })
+
+    render(<Review />)
+    expect(await screen.findByText(/以下正文章节被错误跳过翻译：Body/)).toBeTruthy()
+    expect(screen.queryByText(/现在可以直接导出/)).toBeNull()
+    expect(screen.getByRole('button', { name: '导出定稿' }).hasAttribute('disabled')).toBe(true)
+  })
+
   test('renders structured OCR evidence without raw markdown paths', async () => {
     getProject.mockResolvedValue({
       ...project,

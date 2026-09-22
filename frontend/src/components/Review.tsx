@@ -423,6 +423,8 @@ function Review() {
   const isScopeComplete = scopeTotal > 0 && scopeReviewedCount >= scopeTotal
   const isFullReviewComplete = orderedSegments.length > 0 && reviewedCount >= orderedSegments.length
   const translationQualityBlocking = Boolean(project?.translation_quality?.translation_quality_blocking)
+  const policyCoverageBlocking = Boolean(project?.policy_coverage?.blocking)
+  const policyCoverageMessage = project?.policy_coverage?.message
   const qualityBlockingFindings = project?.translation_quality?.effective_blocking_findings || []
   const exportCompletionMessage = reviewExportCompletionMessage({
     pendingRewriteCount,
@@ -430,6 +432,8 @@ function Review() {
     humanReviewMode,
     isFullReviewComplete,
     translationQualityBlocking,
+    policyCoverageBlocking,
+    policyCoverageMessage,
   })
   const qualityExportReady = reviewExportReady({
     pendingRewriteCount,
@@ -437,6 +441,8 @@ function Review() {
     humanReviewMode,
     isFullReviewComplete,
     translationQualityBlocking,
+    policyCoverageBlocking,
+    policyCoverageMessage,
   })
 
   const goToIssueSegment = (segmentId: string) => {

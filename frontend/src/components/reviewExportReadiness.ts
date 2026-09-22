@@ -6,6 +6,8 @@ export interface ReviewExportReadinessInput {
   humanReviewMode: HumanReviewMode
   isFullReviewComplete: boolean
   translationQualityBlocking: boolean
+  policyCoverageBlocking?: boolean
+  policyCoverageMessage?: string | null
 }
 
 export function reviewExportCompletionMessage(input: ReviewExportReadinessInput): string {
@@ -18,6 +20,9 @@ export function reviewExportCompletionMessage(input: ReviewExportReadinessInput)
   if (input.translationQualityBlocking) {
     return '审阅决定已保存，但翻译质量阻断项仍未解除；请处理剩余质量阻断后再导出定稿。'
   }
+  if (input.policyCoverageBlocking) {
+    return input.policyCoverageMessage || '章节翻译策略检查未通过，请先处理被跳过的章节。'
+  }
   if (input.humanReviewMode === 'issues_only' && !input.isFullReviewComplete) {
     return '现在可以直接导出，也可以切换到全书逐段继续检查。'
   }
@@ -27,6 +32,7 @@ export function reviewExportCompletionMessage(input: ReviewExportReadinessInput)
 export function reviewExportReady(input: ReviewExportReadinessInput): boolean {
   return (
     !input.translationQualityBlocking
+    && !input.policyCoverageBlocking
     && input.pendingRewriteCount === 0
     && input.rewritesNeedingInstruction === 0
   )

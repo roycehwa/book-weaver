@@ -37,4 +37,18 @@ describe('reviewExportReadiness', () => {
       translationQualityBlocking: false,
     })).toBe(true)
   })
+
+  test('does not offer export when the backend finds a skipped body chapter', () => {
+    const input = {
+      pendingRewriteCount: 0,
+      rewritesNeedingInstruction: 0,
+      humanReviewMode: 'issues_only' as const,
+      isFullReviewComplete: false,
+      translationQualityBlocking: false,
+      policyCoverageBlocking: true,
+      policyCoverageMessage: '导出被阻止：以下正文章节被错误跳过翻译：Body',
+    }
+    expect(reviewExportCompletionMessage(input)).toContain('Body')
+    expect(reviewExportReady(input)).toBe(false)
+  })
 })

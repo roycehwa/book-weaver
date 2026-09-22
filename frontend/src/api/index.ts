@@ -249,6 +249,11 @@ export interface ReviewProject {
       segment_ids?: string[]
     }>
   }
+  policy_coverage?: {
+    blocking: boolean
+    chapters: string[]
+    message?: string | null
+  }
   review_state: {
     revision?: number
     schema: string

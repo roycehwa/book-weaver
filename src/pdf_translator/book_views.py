@@ -354,6 +354,11 @@ def join_chapter_delivery_markdown(chapters: list[dict]) -> str:
     return "\n\n".join(parts) + "\n"
 
 
+def is_rebuilt_delivery_toc_chapter(chapter: dict) -> bool:
+    """Whether this chapter's text is generated from final chapter titles."""
+    return chapter.get("kind") == "toc" and chapter.get("rebuild_toc") is True
+
+
 def rebuild_delivery_toc_chapters(
     chapters: list[dict],
     *,
@@ -375,11 +380,11 @@ def rebuild_delivery_toc_chapters(
         str(chapter.get("title") or "").strip()
         for chapter in rebuilt
         if chapter.get("toc", True)
-        and not chapter.get("rebuild_toc")
+        and not is_rebuilt_delivery_toc_chapter(chapter)
         and str(chapter.get("title") or "").strip()
     ]
     for chapter in rebuilt:
-        if not chapter.get("rebuild_toc"):
+        if not is_rebuilt_delivery_toc_chapter(chapter):
             continue
         chapter["title"] = contents_title
         chapter["toc"] = False
@@ -394,6 +399,7 @@ def rebuild_delivery_toc_chapters(
 __all__ = [
     "dedupe_markdown_image_blocks",
     "ensure_chapter_top_heading",
+    "is_rebuilt_delivery_toc_chapter",
     "is_scrape_watermark_block",
     "join_chapter_delivery_markdown",
     "normalize_chapter_headings",

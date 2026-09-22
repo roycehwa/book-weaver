@@ -9,6 +9,7 @@ from typing import Any
 
 from pdf_translator.book_views import (
     ensure_chapter_top_heading,
+    is_rebuilt_delivery_toc_chapter,
     pop_leading_markdown_heading,
     resolve_translated_chapter_heading,
 )
@@ -1511,16 +1512,29 @@ def translated_segments_to_chapters(translated_segments_payload: Any) -> list[di
     return chapters
 
 
-def assert_translation_policy_coverage(book: dict[str, Any], segments: list[dict[str, Any]]) -> None:
-    """Reject a whole prose chapter silently reclassified as untranslated."""
-    failures = []
+def translation_policy_coverage_failures(
+    book: dict[str, Any], segments: list[dict[str, Any]]
+) -> list[str]:
+    """Find confirmed chapters silently skipped by the translation pipeline."""
+    failures: list[str] = []
     for chapter in book.get("chapters", []):
         if chapter.get("translate") is not True or chapter.get("preserve_original"):
+            continue
+        if is_rebuilt_delivery_toc_chapter(chapter) and chapter.get("translation_policy_confirmed") is True:
+            # The confirmed main contents is generated from final translated
+            # chapter titles during delivery, so its source entries are not
+            # prose segments to translate.
             continue
         owned = [segment for segment in segments if segment.get("chapter_id") == chapter.get("chapter_id")]
         explicitly_preserved = owned and all((segment.get("human_resolution") or {}).get("kind") == "preserve_source" and (segment.get("human_resolution") or {}).get("reason") for segment in owned)
         if owned and not explicitly_preserved and not any(segment.get("translate", True) for segment in owned):
             failures.append(str(chapter.get("title") or chapter.get("chapter_id")))
+    return failures
+
+
+def assert_translation_policy_coverage(book: dict[str, Any], segments: list[dict[str, Any]]) -> None:
+    """Reject a whole prose chapter silently reclassified as untranslated."""
+    failures = translation_policy_coverage_failures(book, segments)
     if failures:
         raise ValueError("导出被阻止：以下正文章节被错误跳过翻译：" + "；".join(failures))
 

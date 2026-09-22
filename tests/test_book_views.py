@@ -233,7 +233,7 @@ def test_rebuild_delivery_toc_uses_final_display_titles() -> None:
 
     chapters = rebuild_delivery_toc_chapters(
         [
-            {"title": "Contents", "markdown": "", "toc": False, "rebuild_toc": True},
+            {"title": "Contents", "markdown": "", "toc": False, "kind": "toc", "rebuild_toc": True},
             {"title": "第一章", "markdown": "# 第一章\n\n正文。", "toc": True},
             {"title": "第二章", "markdown": "# 第二章\n\n正文。", "toc": True},
         ],
@@ -242,6 +242,17 @@ def test_rebuild_delivery_toc_uses_final_display_titles() -> None:
 
     assert chapters[0]["title"] == "目录"
     assert chapters[0]["markdown"] == "# 目录\n\n- 第一章\n- 第二章\n"
+
+
+def test_rebuild_delivery_toc_does_not_replace_narrative_with_stray_flag() -> None:
+    from pdf_translator.book_views import rebuild_delivery_toc_chapters
+
+    chapters = rebuild_delivery_toc_chapters(
+        [{"title": "Body", "markdown": "正文。", "kind": "narrative", "rebuild_toc": True}],
+        target_language="zh-CN",
+    )
+    assert chapters[0]["title"] == "Body"
+    assert chapters[0]["markdown"] == "正文。"
 
 
 def test_sanitize_cover_chapter_markdown_keeps_single_cover_image() -> None:

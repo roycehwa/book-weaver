@@ -62,6 +62,31 @@ def test_export_blocks_silently_skipped_body_but_accepts_user_preservation():
     assert_translation_policy_coverage(book, segments)
 
 
+def test_export_exempts_only_confirmed_delivery_generated_contents():
+    book = {'chapters': [
+        {'chapter_id': 'contents', 'title': 'Contents', 'kind': 'toc',
+         'translate': True, 'translation_policy_confirmed': True, 'rebuild_toc': True},
+        {'chapter_id': 'body', 'title': 'Body', 'kind': 'narrative', 'translate': True},
+    ]}
+    segments = [
+        {'chapter_id': 'contents', 'translate': False},
+        {'chapter_id': 'body', 'translate': True},
+    ]
+    assert_translation_policy_coverage(book, segments)
+
+    book['chapters'][0]['rebuild_toc'] = False
+    with pytest.raises(ValueError, match='Contents'):
+        assert_translation_policy_coverage(book, segments)
+    book['chapters'][0]['rebuild_toc'] = True
+    book['chapters'][0]['translation_policy_confirmed'] = False
+    with pytest.raises(ValueError, match='Contents'):
+        assert_translation_policy_coverage(book, segments)
+    book['chapters'][0]['translation_policy_confirmed'] = True
+    book['chapters'][0]['kind'] = 'narrative'
+    with pytest.raises(ValueError, match='Contents'):
+        assert_translation_policy_coverage(book, segments)
+
+
 def test_nested_document_index_uses_text_not_crop(tmp_path, monkeypatch):
     monkeypatch.setattr('pdf_translator.book_rebuild._crop_pdf_regions', lambda *a, **k: {1: {1: tmp_path/'toc.png'}})
     structured = {'tables': [{'label': 'document_index', 'prov': [{'page_no': 1}], 'data': {'grid': [[{'text': ''}]]}, 'children': [{'$ref': '#/groups/0'}]}],

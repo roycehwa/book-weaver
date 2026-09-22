@@ -160,6 +160,37 @@ def _write_current_review_contract(run_dir: Path) -> None:
     (run_dir / "integrity-ledger.json").write_text("{}", encoding="utf-8")
 
 
+def test_review_project_exposes_same_chapter_policy_gate_as_export(tmp_path: Path, monkeypatch):
+    module = importlib.import_module("main")
+    run_dir = tmp_path / "review"
+    _write_review_project(run_dir)
+    monkeypatch.setattr(
+        "pdf_translator.translation_quality.translation_quality_summary",
+        lambda _path: {},
+    )
+    book = {"chapters": [
+        {"chapter_id": "toc", "title": "Contents", "kind": "toc", "translate": True,
+         "translation_policy_confirmed": True, "rebuild_toc": True},
+        {"chapter_id": "body", "title": "Body", "kind": "narrative", "translate": True},
+    ]}
+    (run_dir / "book.json").write_text(json.dumps(book), encoding="utf-8")
+    (run_dir / "segments.json").write_text(json.dumps({"segments": [
+        {"segment_id": "toc-1", "chapter_id": "toc", "translate": False},
+        {"segment_id": "body-1", "chapter_id": "body", "translate": False},
+    ]}), encoding="utf-8")
+
+    blocked = module._build_review_project_payload(run_dir)["policy_coverage"]
+    assert blocked["blocking"] is True
+    assert blocked["chapters"] == ["Body"]
+
+    (run_dir / "segments.json").write_text(json.dumps({"segments": [
+        {"segment_id": "toc-1", "chapter_id": "toc", "translate": False},
+        {"segment_id": "body-1", "chapter_id": "body", "translate": True},
+    ]}), encoding="utf-8")
+    ready = module._build_review_project_payload(run_dir)["policy_coverage"]
+    assert ready["blocking"] is False
+
+
 def test_review_project_export_does_not_imply_review_completed(tmp_path: Path):
     module = importlib.import_module("main")
     run_dir = tmp_path / "review"

@@ -2859,6 +2859,7 @@ def render_translation_quality_source(book: dict) -> str:
                 "title": str(chapter.get("title") or f"Chapter {fallback_index}"),
                 "markdown": markdown,
                 "toc": bool(chapter.get("toc", True)),
+                "kind": str(chapter.get("kind") or ""),
                 "rebuild_toc": bool(chapter.get("rebuild_toc")),
             }
         )
