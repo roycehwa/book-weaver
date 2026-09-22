@@ -2866,6 +2866,11 @@ def render_translation_quality_source(book: dict) -> str:
                 source_parts,
                 [str(segment.get("separator_before", "\n\n")) for segment in planned],
             ).strip()
+            # A chapter consisting solely of its title has no body after the
+            # title unit is consumed. Delivery still emits its visible H1, so
+            # the quality comparison must include the same heading.
+            if title_heading_evidence and not markdown:
+                markdown = f"# {str(chapter.get('title') or f'Chapter {fallback_index}').strip()}"
         else:
             markdown = _chapter_markdown_for_translation(chapter).strip()
         delivery.append(

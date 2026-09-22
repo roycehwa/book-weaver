@@ -238,6 +238,44 @@ def test_raw_report_accepts_existing_body_headings_and_preserved_link(tmp_path: 
     assert not blocking
 
 
+def test_title_only_chapter_keeps_delivery_heading_in_quality_source(tmp_path: Path) -> None:
+    from pdf_translator.translate import render_translation_quality_source
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    write_synthetic_reading_units(run_dir)
+    book = {
+        "chapters": [
+            {"index": 1, "chapter_id": "part-title", "title": "Part Two",
+             "kind": "narrative", "translate": True, "toc": True,
+             "markdown": "## Part Two"},
+            {"index": 2, "chapter_id": "chapter-body", "title": "Chapter",
+             "kind": "narrative", "translate": True, "toc": True,
+             "markdown": "## Chapter\n\nBody text."},
+        ],
+        "chapter_segments": [
+            {"chapter_id": "part-title", "chapter_title": "Part Two",
+             "markdown": "## Part Two", "role": "heading", "is_chapter_title": True},
+            {"chapter_id": "chapter-body", "chapter_title": "Chapter",
+             "markdown": "## Chapter", "role": "heading", "is_chapter_title": True},
+            {"chapter_id": "chapter-body", "chapter_title": "Chapter",
+             "markdown": "Body text.", "role": "prose", "separator_before": "\n\n"},
+        ],
+    }
+    comparison = render_translation_quality_source(book)
+    assert comparison == "# Part Two\n\n# Chapter\n\nBody text.\n"
+    transport = "## Part Two\n\n## Chapter\n\nBody text.\n"
+    (run_dir / "translation-input.md").write_text(transport, encoding="utf-8")
+    (run_dir / "translated.raw.md").write_text(
+        "# 第二部分\n\n# 章节\n\n正文。\n", encoding="utf-8",
+    )
+    report = build_raw_translation_quality_report(
+        run_dir, text_operation="translate", source_markdown=transport,
+        comparison_source_markdown=comparison, review_items=[],
+    )
+    assert not [finding for finding in report["findings"] if finding["severity"] == "blocking"]
+
+
 def test_lost_link_finding_points_to_review_segment(tmp_path: Path) -> None:
     run_dir = tmp_path / "run"
     run_dir.mkdir()
