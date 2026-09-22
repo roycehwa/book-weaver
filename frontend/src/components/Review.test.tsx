@@ -298,6 +298,58 @@ describe('Review draft navigation', () => {
     expect(await screen.findByText('当前修改已保存到项目文件。')).toBeTruthy()
   })
 
+  test('shows a saved manual revision in paired reading and after reload instead of stale aligned parts', async () => {
+    let current: ReviewProject = {
+      ...project,
+      segments: [
+        {
+          ...project.segments[0],
+          aligned_parts: [
+            { part_id: 'p1', source: 'Source one', translation: '旧对齐译文' },
+          ],
+        },
+      ],
+      translated_segments: [
+        { ...project.translated_segments[0], translated_text: '旧对齐译文' },
+      ],
+    }
+    getProject.mockImplementation(async () => current)
+    saveDecision.mockImplementation(async (_run, segmentId, data) => {
+      const review_state = {
+        ...current.review_state,
+        revision: (current.review_state.revision || 0) + 1,
+        decisions: {
+          ...current.review_state.decisions,
+          [segmentId]: { ...data, updated_at: new Date().toISOString() },
+        },
+      }
+      current = { ...current, review_state }
+      return { status: 'saved', segment_id: segmentId, review_state }
+    })
+
+    const user = userEvent.setup()
+    const firstView = render(<Review />)
+    expect(await screen.findByText('旧对齐译文')).toBeTruthy()
+    await user.click(screen.getByRole('button', { name: '手动修改' }))
+    fireEvent.change(firstView.container.querySelector('textarea') as HTMLTextAreaElement, {
+      target: { value: '已修订并保存的译文' },
+    })
+    await user.click(screen.getByRole('button', { name: '保存当前修改' }))
+
+    await waitFor(() => expect(screen.getByText(/当前显示：人工修订 · 已保存，待确认/)).toBeTruthy())
+    expect(screen.getAllByText('已修订并保存的译文').length).toBeGreaterThan(0)
+    expect(screen.queryByText('旧对齐译文')).toBeNull()
+
+    firstView.unmount()
+    render(<Review />)
+    expect(await screen.findByText('已修订并保存的译文')).toBeTruthy()
+    expect(screen.getByText(/当前显示：人工修订 · 已保存，待确认/)).toBeTruthy()
+
+    await user.click(screen.getByRole('button', { name: '确认当前内容并继续' }))
+    await waitFor(() => expect(screen.getByText(/当前显示：人工修订 · 已确认/)).toBeTruthy())
+    expect(screen.getByText('已修订并保存的译文')).toBeTruthy()
+  })
+
   test('renders structured OCR evidence without raw markdown paths', async () => {
     getProject.mockResolvedValue({
       ...project,

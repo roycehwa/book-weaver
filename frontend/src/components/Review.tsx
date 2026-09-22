@@ -985,14 +985,33 @@ function Review() {
   }
 
   const progressPercent = orderedSegments.length ? Math.round((reviewedCount / orderedSegments.length) * 100) : 0
-  const displayTranslation = selectedDecision?.approved_text || selectedTranslation?.translated_text || ''
+  const editorIsCurrentSegment = initializedEditorKeyRef.current === `${runDir}\u0000${selectedSegmentId}`
+  const showingLocalDraft = editorIsCurrentSegment && ['dirty', 'saving', 'error'].includes(draftSaveState)
+  const displayTranslation = showingLocalDraft
+    ? approvedText
+    : selectedDecision?.approved_text ?? selectedTranslation?.translated_text ?? ''
+  const translationDisplayState = showingLocalDraft
+    ? draftSaveState === 'error'
+      ? '本机草稿 · 同步失败'
+      : draftSaveState === 'saving'
+        ? '本机修改 · 正在保存'
+        : '本机修改 · 待保存'
+    : selectedDecision?.status === 'candidate'
+      ? '模型候选 · 待采纳'
+      : selectedDecision?.action === 'manual_edit' && selectedDecision?.approved_text !== undefined
+        ? selectedDecision.status === 'approved' || selectedDecision.status === 'resolved'
+          ? '人工修订 · 已确认'
+          : '人工修订 · 已保存，待确认'
+        : '机器译文'
   const alignedBlocks = useMemo(
     () => buildAlignedBlocks(
       selectedSource?.source_text || '',
       displayTranslation,
-      selectedSource?.aligned_parts,
+      displayTranslation === (selectedTranslation?.translated_text ?? '')
+        ? selectedSource?.aligned_parts
+        : undefined,
     ),
-    [displayTranslation, selectedSource?.aligned_parts, selectedSource?.source_text]
+    [displayTranslation, selectedSource?.aligned_parts, selectedSource?.source_text, selectedTranslation?.translated_text]
   )
 
   useEffect(() => {
@@ -1486,6 +1505,13 @@ function Review() {
             </div>
           </div>
         )}
+
+        <div className="shrink-0 border-b border-slate-200 bg-white px-4 py-2 text-xs text-slate-600" role="status">
+          当前显示：{translationDisplayState}
+          {selectedDecision?.updated_at && !showingLocalDraft
+            ? ` · ${new Date(selectedDecision.updated_at).toLocaleTimeString()}`
+            : ''}
+        </div>
 
         {readingMode === 'paired' ? (
           <main className="min-h-0 flex-1 overflow-y-auto bg-slate-100 px-3 py-3">
