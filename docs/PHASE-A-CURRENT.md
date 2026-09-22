@@ -56,8 +56,8 @@
 
 ## 5. 当前验证状态
 
-- 2026-09-22 当前工作区验证：Python 1014 passed、4 skipped；前端 79 passed；前端生产构建、lint 与差异空白检查通过。Python 有 30 条既有弃用警告；前端仍有 Browserslist、PDF.js eval 和包体积提示，均未阻断本轮验证。
-- 2026-09-22 已通过应用删除接口清空上一轮测试任务及其运行产物；清理后任务和审阅项目均为 0，桌面原始书籍未删除。随后用户从上传入口创建了新任务，本轮验收以新任务为准。
+- 2026-09-22 当前工作区验证：Python 1016 passed、4 skipped；前端 79 passed；前端生产构建、lint 与差异空白检查通过。Python 有 30 条既有弃用警告；前端仍有 Browserslist、PDF.js eval 和包体积提示，均未阻断本轮验证。
+- 2026-09-22 已通过应用删除接口清空上一轮测试任务及其运行产物。随后上传新建的合成 EPUB 任务，解析顺利进入章节确认，1 章、0 项确认质量问题；合成任务也已删除。任务和审阅项目当前均为 0，桌面原始书籍未删除。下一本真实书须由用户在干净入口重新上传并确认章节与术语。
 - 同一任务在用户确认章节后暴露的 20 条词内空格提示和 2 个隐藏阻断已修复：高把握单字形拆分在翻译前按整书词汇证据合并，新增 `-x-` Docling 流标记清理；确认版 `chapter-segments.json` 与 `book.json`、`reading-units.json` 固定写入同一运行目录。原样重算已得到 source quality `passed`、0 blocking、0 review，并进入 `awaiting_glossary`；界面同时正确区分红色错误与不阻断提示，并提供“重新检查确认版”入口。
 - 流程级方案见 `PHASE-A-PIPELINE-REDESIGN-2026-09-19.md`。流程主干已改造：新增 `bookweaver_reading_units_v1` 及 `reading-units.json`，确认区可查看重建连续正文；新任务 intake 后先等待原文/章节/内容策略确认，确认后才从 canonical book 的可翻译范围提取术语；Notes/Bibliography/Glossary 建议保留原文，Index 建议略过，确认时动作固化为 translate/preserve/exclude；确认后的 reading units 冻结为 `translation_authority: true`，chapter segments 和实际运输分块由它生成，产物保存 reading-units 指纹和 unit IDs。
 - PDF 已保留 Docling 节点与字符范围；同一源节点跨相邻页时，确定性恢复源分隔符并消除有证据的页末断词。不同节点只有在相邻页、页边位置、栏位、缩进、字体/样式、语法和中间结构均提供高把握证据时才续接；标题、列表、表格、图片、题注等结构断点会阻断。对应 reading unit 保存两侧 span provenance。
