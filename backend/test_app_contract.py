@@ -343,6 +343,34 @@ def test_old_review_page_cannot_overwrite_new_decision(tmp_path: Path, monkeypat
     assert state['decisions']['s1']['approved_text'] == '最新人工译文'
 
 
+def test_manual_review_approval_clears_stale_model_rewrite_failure(tmp_path: Path, monkeypatch):
+    module = importlib.import_module('main')
+    run_dir = tmp_path / 'review'
+    _write_review_project(run_dir, open_items=1)
+    state_path = run_dir / 'review_state.json'
+    state = json.loads(state_path.read_text())
+    state['decisions']['s1'] = {
+        'status': 'open', 'action': 'model_rewrite',
+        'rewrite_error': 'Model rewrite did not satisfy mandatory glossary constraints.',
+        'rewrite_error_details': {'missing_glossary_terms': [{'source': 'Term', 'target': '术语'}]},
+        'rewrite_candidate': '旧候选',
+    }
+    state_path.write_text(json.dumps(state), encoding='utf-8')
+    monkeypatch.setattr(module, '_resolve_review_run_dir', lambda _: run_dir)
+
+    response = TestClient(module.app).post(
+        '/api/review/segments/s1/decision', params={'run_dir': str(run_dir)},
+        json={'expected_revision': 0, 'status': 'approved', 'action': 'manual_edit',
+              'approved_text': '人工修订后的译文。'},
+    )
+
+    assert response.status_code == 200
+    decision = json.loads(state_path.read_text())['decisions']['s1']
+    assert decision['status'] == 'approved'
+    assert decision['approved_text'] == '人工修订后的译文。'
+    assert not any(key in decision for key in ('rewrite_error', 'rewrite_error_details', 'rewrite_candidate'))
+
+
 def test_deferred_review_cannot_approve_unchanged_source(tmp_path: Path, monkeypatch):
     module = importlib.import_module("main")
     run_dir = tmp_path / "review"

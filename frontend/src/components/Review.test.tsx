@@ -226,6 +226,49 @@ describe('Review draft navigation', () => {
       status: 'approved',
       approved_text: '需要持久保存的修订',
     })
+    expect(await screen.findByText('Source two')).toBeTruthy()
+  })
+
+  test('footer confirmation saves the edited text instead of an older rewrite candidate', async () => {
+    let current: ReviewProject = {
+      ...project,
+      review_state: {
+        ...project.review_state,
+        revision: 0,
+        decisions: {
+          s1: { status: 'open', action: 'model_rewrite', approved_text: '旧候选译文',
+            rewrite_error: 'Model rewrite did not satisfy mandatory glossary constraints.' },
+        },
+      },
+    }
+    getProject.mockImplementation(async () => current)
+    saveDecision.mockImplementation(async (_run, segmentId, data) => {
+      const review_state = {
+        ...current.review_state,
+        revision: (current.review_state.revision || 0) + 1,
+        decisions: {
+          ...current.review_state.decisions,
+          [segmentId]: { ...current.review_state.decisions[segmentId], ...data,
+            updated_at: new Date().toISOString() },
+        },
+      }
+      current = { ...current, review_state }
+      return { status: 'saved', segment_id: segmentId, review_state }
+    })
+
+    const user = userEvent.setup()
+    const { container } = render(<Review />)
+    await screen.findByText('Source one')
+    await user.click(screen.getByRole('button', { name: '手动修订' }))
+    fireEvent.change(container.querySelector('textarea') as HTMLTextAreaElement, {
+      target: { value: '本次手工修改的译文' },
+    })
+    await user.click(screen.getByRole('button', { name: '确认当前内容并继续' }))
+
+    await waitFor(() => expect(saveDecision.mock.calls.some(([, , data]) =>
+      data.status === 'approved' && data.approved_text === '本次手工修改的译文'
+    )).toBe(true))
+    expect(await screen.findByText('Source two')).toBeTruthy()
   })
 
   test('offers an explicit project-file save without approving the paragraph', async () => {

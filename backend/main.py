@@ -4117,6 +4117,9 @@ async def _save_review_decision_unlocked(segment_id: str, request: ReviewDecisio
     updated = dict(previous)
     updated["status"] = request.status
     updated["action"] = request.action
+    if request.action == "manual_edit":
+        for key in ("rewrite_error", "rewrite_error_details", "rewrite_candidate"):
+            updated.pop(key, None)
     if request.reviewer_comment is not None:
         updated["reviewer_comment"] = request.reviewer_comment
     if request.approved_text is not None:

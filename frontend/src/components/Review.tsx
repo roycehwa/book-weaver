@@ -835,8 +835,11 @@ function Review() {
       if (advance && nextIndex !== currentIndex) {
         setCurrentIndex(nextIndex)
         setShowEditPanel(false)
+        setActionMessage('本段修改已保存并确认，已进入下一项。')
       } else if (advance && humanReviewMode === 'issues_only') {
-        setActionMessage('可疑段落已处理完，可切换全书模式或导出。')
+        setActionMessage('本段修改已保存；本轮可疑段落已处理完。')
+      } else if (advance) {
+        setActionMessage('本段修改已保存；已经到达全书最后一段。')
       }
       return true
     } catch (err) {
@@ -867,12 +870,7 @@ function Review() {
       approvedText,
       selectedTranslation?.translated_text
     )
-    const ok = await saveDecision('approved', true, { approvedTextOverride: text, actionOverride: 'manual_edit' })
-    if (ok) setActionMessage('本段已通过并保存，可随时关闭页面后继续。')
-  }
-
-  const handleSaveAndContinue = async () => {
-    await saveDecision('approved', true)
+    await saveDecision('approved', true, { approvedTextOverride: text, actionOverride: 'manual_edit' })
   }
 
   const handleRewrite = async (segmentId?: string) => {
@@ -1646,7 +1644,7 @@ function Review() {
             {resolutionMode === 'manual_edit' ? (
               <button
                 disabled={!selectedSegmentId || saving}
-                onClick={handleSaveAndContinue}
+                onClick={handlePassAndContinue}
                 className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white disabled:opacity-50"
               >
                 确认修改并到下一审阅项
@@ -1670,7 +1668,7 @@ function Review() {
               </>
             )}
           </div>
-          {selectedDecision?.rewrite_error && (
+          {selectedDecision?.status === 'open' && selectedDecision?.action === 'model_rewrite' && selectedDecision.rewrite_error && (
             <div role="alert" className="mt-2 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-800">
               <p>{selectedDecision.rewrite_error === 'Model rewrite did not satisfy mandatory glossary constraints.'
                 ? '模型重译后仍未使用已确认的固定译法，因此这次候选译文未被采用，原有译文保持不变。'
@@ -1688,6 +1686,8 @@ function Review() {
               )}
             </div>
           )}
+          {error && <p role="alert" className="mt-2 text-xs text-red-700">保存未完成：{error}</p>}
+          {actionMessage && <p role="status" className="mt-2 text-xs text-emerald-700">保存结果：{actionMessage}</p>}
           </div>
         </section>
       )}

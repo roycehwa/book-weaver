@@ -37,8 +37,9 @@ describe('review drafts', () => {
     expect(draftKey('/run/a', 'segment-1')).not.toBe(draftKey('/run/b', 'segment-1'))
   })
 
-  it('preserves previously approved text when reconfirming a reviewed item', () => {
-    expect(selectConfirmedText('已批准译文', '编辑框文本', '原始机器译文')).toBe('已批准译文')
+  it('confirms the current editor text before an older saved decision', () => {
+    expect(selectConfirmedText('已批准译文', '编辑框文本', '原始机器译文')).toBe('编辑框文本')
+    expect(selectConfirmedText('已批准译文', '', '原始机器译文')).toBe('已批准译文')
     expect(selectConfirmedText(undefined, '编辑框文本', '原始机器译文')).toBe('编辑框文本')
   })
 })

@@ -43,5 +43,5 @@ export function selectConfirmedText(
   editedText: string,
   translatedText: string | undefined
 ): string {
-  return approvedText || editedText || translatedText || ''
+  return editedText || approvedText || translatedText || ''
 }
