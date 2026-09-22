@@ -199,6 +199,101 @@ def test_raw_report_still_blocks_real_external_link_change_with_delivery_shape(
     assert "urls_regression" in codes
 
 
+def test_raw_report_accepts_existing_body_headings_and_preserved_link(tmp_path: Path) -> None:
+    from pdf_translator.translate import render_translation_quality_source
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    write_synthetic_reading_units(run_dir)
+    transport = "## Two\n\n## Alternative Heading\n\nRead [source](https://example.org/source).\n"
+    book = {
+        "chapters": [{
+            "index": 1, "chapter_id": "chapter-two", "title": "2. Source TOC Label",
+            "kind": "narrative", "translate": True, "toc": True,
+            "markdown": transport,
+        }],
+        "chapter_segments": [
+            {"chapter_id": "chapter-two", "chapter_title": "2. Source TOC Label",
+             "markdown": "## Two", "role": "heading", "separator_before": "\n\n"},
+            {"chapter_id": "chapter-two", "chapter_title": "2. Source TOC Label",
+             "markdown": "## Alternative Heading", "role": "heading", "separator_before": "\n\n"},
+            {"chapter_id": "chapter-two", "chapter_title": "2. Source TOC Label",
+             "markdown": "Read [source](https://example.org/source).", "role": "prose",
+             "separator_before": "\n\n"},
+        ],
+    }
+    raw = "## Two\n\n## 另一标题\n\n请阅读[来源](https://example.org/source)。\n"
+    (run_dir / "translation-input.md").write_text(transport, encoding="utf-8")
+    (run_dir / "translated.raw.md").write_text(raw, encoding="utf-8")
+
+    report = build_raw_translation_quality_report(
+        run_dir,
+        text_operation="translate",
+        source_markdown=transport,
+        comparison_source_markdown=render_translation_quality_source(book),
+    )
+
+    blocking = {item["code"] for item in report["findings"] if item["severity"] == "blocking"}
+    assert not blocking
+
+
+def test_lost_link_finding_points_to_review_segment(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    write_synthetic_reading_units(run_dir)
+    source = "# Chapter\n\nRead [source](chapter.xhtml#note-2).\n"
+    raw = "# 章节\n\n请阅读来源。\n"
+    (run_dir / "translation-input.md").write_text(source, encoding="utf-8")
+    (run_dir / "translated.raw.md").write_text(raw, encoding="utf-8")
+    (run_dir / "segments.json").write_text(json.dumps({"segments": [{
+        "segment_id": "s2", "source_text": "Read [source](chapter.xhtml#note-2).",
+        "source_location": {"page_start": 12},
+    }]}), encoding="utf-8")
+    (run_dir / "translated_segments.json").write_text(json.dumps({"segments": [{
+        "segment_id": "s2", "translated_text": "请阅读来源。",
+        "source_location": {"page_start": 12},
+    }]}), encoding="utf-8")
+
+    report = build_raw_translation_quality_report(
+        run_dir, text_operation="translate", source_markdown=source,
+    )
+    finding = next(item for item in report["findings"] if item["code"] == "lost_link_targets")
+    assert finding["segment_ids"] == ["s2"]
+    assert finding["source_location"] == {"page_start": 12}
+
+
+def test_reviewed_link_repair_unblocks_only_after_target_is_restored(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    write_synthetic_reading_units(run_dir)
+    source = "# Chapter\n\nRead [source](chapter.xhtml#note-2).\n"
+    raw = "# 章节\n\n请阅读来源。\n"
+    (run_dir / "translation-input.md").write_text(source, encoding="utf-8")
+    (run_dir / "segments.json").write_text(json.dumps({"segments": [{
+        "segment_id": "s2", "source_text": "Read [source](chapter.xhtml#note-2).",
+        "source_location": {"page_start": 12},
+    }]}), encoding="utf-8")
+    (run_dir / "translated_segments.json").write_text(json.dumps({"segments": [{
+        "segment_id": "s2", "translated_text": "请阅读来源。",
+        "source_location": {"page_start": 12},
+    }]}), encoding="utf-8")
+    _write_passing_translation_outputs(run_dir, source=source, raw=raw)
+
+    def decide(value: str) -> None:
+        (run_dir / "review_state.json").write_text(json.dumps({"decisions": {
+            "s2": {"status": "approved", "action": "manual_edit", "approved_text": value},
+        }}), encoding="utf-8")
+
+    assert translation_quality_summary(run_dir)["translation_quality_blocking"] is True
+    decide("请阅读来源。")
+    assert translation_quality_summary(run_dir)["translation_quality_blocking"] is True
+    decide("请阅读[来源](chapter.xhtml#wrong)。")
+    assert translation_quality_summary(run_dir)["translation_quality_blocking"] is True
+    decide("请阅读[来源](chapter.xhtml#note-2)。")
+    assert translation_quality_summary(run_dir)["translation_quality_blocking"] is False
+    assert_translation_quality_current(run_dir)
+
+
 def test_raw_report_still_blocks_semantic_html_tag_change(tmp_path: Path) -> None:
     run_dir = tmp_path / "run"
     run_dir.mkdir()

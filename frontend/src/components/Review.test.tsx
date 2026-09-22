@@ -463,4 +463,30 @@ describe('Review draft navigation', () => {
 
     expect(revalidateQuality).toHaveBeenCalledWith('/tmp/review-run')
   })
+
+  test('shows a link blocker and jumps to its source segment', async () => {
+    getProject.mockResolvedValue({
+      ...project,
+      translation_quality: {
+        translation_quality_blocking: true,
+        effective_blocking_findings: [{
+          code: 'lost_link_targets',
+          stage: 'raw_translation',
+          message: 'Raw translation lost link targets present in source.',
+          segment_ids: ['s2'],
+          evidence: { targets: ['chapter.xhtml#note-2'] },
+        }],
+      },
+      review_state: {
+        ...project.review_state,
+        decisions: { s1: { status: 'approved' }, s2: { status: 'approved' } },
+      },
+    })
+
+    render(<Review />)
+    expect(await screen.findByText('译文丢失了原文中的链接')).toBeTruthy()
+    expect(screen.getByText('chapter.xhtml#note-2')).toBeTruthy()
+    await userEvent.click(screen.getByRole('button', { name: '定位对应段落' }))
+    expect(await screen.findByText('Source two')).toBeTruthy()
+  })
 })

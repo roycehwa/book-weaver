@@ -33,6 +33,21 @@ const issueGuidance: Record<string, string> = {
   suspect_ocr: '该块未进入正文或翻译。请根据原始页证据确认它是噪声，或恢复为阅读内容。',
 }
 
+const qualityFindingLabels: Record<string, string> = {
+  markdown_block_structure_loss: '章节标题或受保护版式与原文不一致',
+  invented_link_targets: '译文增加了原文没有的链接',
+  lost_link_targets: '译文丢失了原文中的链接',
+  urls_regression: '译文中的网址与原文不一致',
+  html_anchors_regression: '译文中的链接地址与原文不一致',
+  link_destinations_regression: '译文中的链接目标与原文不一致',
+  markdown_link_structure_loss: '链接或图片的目标结构发生变化',
+}
+
+function qualityFindingTargets(evidence?: Record<string, unknown>): string[] {
+  const values = [evidence?.targets, evidence?.missing_values, evidence?.added_values]
+  return values.flatMap((value) => Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []).slice(0, 3)
+}
+
 const ocrReasonLabels: Record<string, string> = {
   symbol_density: '符号密度异常',
   fragmented_tokens: '碎片化数字/字符',
@@ -1230,9 +1245,30 @@ function Review() {
             {translationQualityBlocking && qualityBlockingFindings.length > 0 && (
               <ul className="mt-2 space-y-1 text-xs text-red-800">
                 {qualityBlockingFindings.map((finding, index) => (
-                  <li key={`${finding.code}-${index}`}>{finding.message}</li>
+                  <li key={`${finding.code}-${index}`} className="rounded border border-red-200 bg-white p-2">
+                    <span>{qualityFindingLabels[finding.code] || finding.message}</span>
+                    {qualityFindingTargets(finding.evidence).map((target, targetIndex) => (
+                      <div key={targetIndex} className="mt-1 break-all text-[11px] text-red-700">
+                        {target.length > 160 ? `${target.slice(0, 160)}…` : target}
+                      </div>
+                    ))}
+                    {finding.segment_ids?.[0] && (
+                      <button
+                        type="button"
+                        className="mt-1 rounded border border-red-300 px-2 py-1 font-medium text-red-800"
+                        onClick={() => goToIssueSegment(finding.segment_ids?.[0] || '')}
+                      >
+                        定位对应段落
+                      </button>
+                    )}
+                  </li>
                 ))}
               </ul>
+            )}
+            {translationQualityBlocking && qualityBlockingFindings.some((finding) => finding.code.includes('link') || finding.code === 'urls_regression') && (
+              <p className="mt-2 text-xs text-red-800">
+                点击“定位对应段落”，把译文中的链接地址改回原文目标并确认。仅批准未修改的译文不会解除链接阻断。
+              </p>
             )}
             <div className="mt-2 flex flex-wrap gap-2">
               {project?.translation_quality?.revalidation_required && (

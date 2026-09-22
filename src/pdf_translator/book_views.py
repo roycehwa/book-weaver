@@ -67,6 +67,17 @@ def pop_leading_markdown_heading(markdown: str) -> tuple[str | None, str]:
     return (title or None), "\n\n".join(blocks[1:]).strip()
 
 
+def should_synthesize_chapter_heading(markdown: str, *, title_heading_evidence: bool) -> bool:
+    """Use a chapter label as visible H1 only when the body needs one.
+
+    A translated source heading is deliberately consumed and promoted to the
+    display title. Otherwise an existing leading body heading owns the page;
+    the source TOC label remains navigation metadata.
+    """
+
+    return title_heading_evidence or pop_leading_markdown_heading(markdown)[0] is None
+
+
 def resolve_translated_chapter_heading(
     markdown: str,
     source_title: str,
@@ -408,6 +419,7 @@ __all__ = [
     "render_book_markdown",
     "render_translation_input_markdown",
     "resolve_translated_chapter_heading",
+    "should_synthesize_chapter_heading",
     "sanitize_apparatus_chapter_markdown",
     "sanitize_cover_chapter_markdown",
     "strip_scrape_watermarks",

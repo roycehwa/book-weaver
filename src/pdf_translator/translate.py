@@ -13,13 +13,14 @@ from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, replace
 import re
+from collections import Counter
 from pathlib import Path
 from typing import Protocol
 
 from openai import OpenAI
 import requests
 
-from pdf_translator.zh_markdown_cleanup import FOOTNOTE_REF_RE, HTML_TAG_RE
+from pdf_translator.zh_markdown_cleanup import FOOTNOTE_REF_RE, HTML_TAG_RE, URL_RE
 
 from pdf_translator.book_views import (
     ensure_chapter_top_heading,
@@ -27,6 +28,7 @@ from pdf_translator.book_views import (
     pop_leading_markdown_heading,
     rebuild_delivery_toc_chapters,
     resolve_translated_chapter_heading,
+    should_synthesize_chapter_heading,
 )
 from pdf_translator.chunking import split_markdown_into_chunks, join_chunk_texts, markdown_block_structure, untranslated_prose_blocks, markdown_source_blocks
 from pdf_translator.segment_conservation import (
@@ -202,7 +204,7 @@ def _translation_prompt(
             )
         elif "paragraph/block structure" in quality_retry:
             retry_note += "\nStructure retry: restore the exact source block sequence. Do not add or remove paragraphs or heading markers.\n"
-        elif "translator meta response" in quality_retry or "invented link targets" in quality_retry:
+        elif "translator meta response" in quality_retry or "link targets" in quality_retry or "protected urls" in quality_retry:
             retry_note += "\nFidelity retry: return only translated source content. Do not add translator notes or invent Markdown links for footnote numbers. Preserve source link destinations exactly.\n"
         else:
             retry_note += (
@@ -485,14 +487,22 @@ def _assert_translation_quality(
     # numeric footnote marker is not a filename and must not become one.
     import markdown as markdown_renderer
     from bs4 import BeautifulSoup
-    def link_targets(text: str) -> set[str]:
+    def link_targets(text: str) -> Counter[str]:
         soup = BeautifulSoup(markdown_renderer.markdown(text), "html.parser")
-        return {str(a["href"]) for a in soup.find_all("a", href=True)}
-    source_targets = link_targets(chunk.markdown) | {
-        url.rstrip(".,;:!?)]") for url in re.findall(r"https?://[^\s<>]+", chunk.markdown)
-    }
-    if link_targets(translated) - source_targets:
+        return Counter(
+            [str(a["href"]) for a in soup.find_all("a", href=True)]
+            + [str(img["src"]) for img in soup.find_all("img", src=True)]
+        )
+    source_targets = link_targets(chunk.markdown)
+    translated_targets = link_targets(translated)
+    if translated_targets - source_targets:
         raise ValueError(f"Translation for chunk {chunk.index} contains invented link targets.")
+    if source_targets - translated_targets:
+        raise ValueError(f"Translation for chunk {chunk.index} lost link targets.")
+    def urls(text: str) -> Counter[str]:
+        return Counter(url.rstrip(".,;:!?)]}，。；：！？）】》」』") for url in URL_RE.findall(text))
+    if urls(chunk.markdown) != urls(translated):
+        raise ValueError(f"Translation for chunk {chunk.index} changed protected urls.")
     def semantic_html(text: str) -> list[str]:
         return sorted(
             tag
@@ -2558,7 +2568,6 @@ def translate_book_chapters(
             translated_parts,
             [str(part.get("separator_before", "\n\n")) for part in nonempty_planned_segments],
         ).strip()
-        has_leading_body_heading = bool(pop_leading_markdown_heading(translated_markdown)[0])
         if translated_heading_evidence:
             display_title, translated_markdown = resolve_translated_chapter_heading(
                 translated_markdown,
@@ -2584,7 +2593,9 @@ def translate_book_chapters(
                 source_title=source_title,
                 kind=chapter_kind,
                 rebuild_toc=bool(chapter.get("rebuild_toc")),
-                synthesize_heading=translated_heading_evidence or not has_leading_body_heading,
+                synthesize_heading=should_synthesize_chapter_heading(
+                    translated_markdown, title_heading_evidence=translated_heading_evidence
+                ),
             )
         )
 
@@ -2844,14 +2855,25 @@ def render_translation_quality_source(book: dict) -> str:
         chapter_id = str(
             chapter.get("chapter_id") or chapter.get("id") or f"chapter-{fallback_index:03d}"
         )
-        if should_translate_chapter(chapter):
+        chapter_translates = should_translate_chapter(chapter)
+        title_heading_evidence = False
+        if chapter_translates:
             planned = [
                 segment
                 for segment in segments_by_chapter.get(chapter_id, [])
                 if str(segment.get("markdown") or "").strip()
             ]
+            source_parts = [str(segment.get("markdown") or "") for segment in planned]
+            for position, segment in enumerate(planned):
+                if not _segment_is_chapter_title_heading(segment, str(chapter.get("title") or "")):
+                    continue
+                source_heading, remainder = pop_leading_markdown_heading(source_parts[position])
+                if source_heading:
+                    source_parts[position] = remainder
+                    title_heading_evidence = True
+                break
             markdown = join_chunk_texts(
-                [str(segment.get("markdown") or "") for segment in planned],
+                source_parts,
                 [str(segment.get("separator_before", "\n\n")) for segment in planned],
             ).strip()
         else:
@@ -2863,6 +2885,12 @@ def render_translation_quality_source(book: dict) -> str:
                 "toc": bool(chapter.get("toc", True)),
                 "kind": str(chapter.get("kind") or ""),
                 "rebuild_toc": bool(chapter.get("rebuild_toc")),
+                "synthesize_heading": (
+                    should_synthesize_chapter_heading(
+                        markdown, title_heading_evidence=title_heading_evidence,
+                    )
+                    if chapter_translates else True
+                ),
             }
         )
     delivery = rebuild_delivery_toc_chapters(delivery, target_language="en")

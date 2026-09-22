@@ -57,7 +57,7 @@ RAW_TRANSLATION_QUALITY_REPORT = "raw-translation-quality-report.json"
 POLISHED_OUTPUT_QUALITY_REPORT = "polished-output-quality-report.json"
 TRANSLATION_QUALITY_INDEX = "translation-quality-index.json"
 TRANSLATION_QUALITY_SOURCE = "translation-quality-source.md"
-TRANSLATION_QUALITY_RULES_VERSION = "translation_quality_v6_protected_markdown_structure"
+TRANSLATION_QUALITY_RULES_VERSION = "translation_quality_v7_delivery_headings_and_link_localization"
 
 QualityStage = Literal["source", "raw_translation", "polished_output"]
 QualitySeverity = Literal["blocking", "review"]
@@ -389,6 +389,32 @@ def _raw_protected_multisets(text: str) -> dict[str, list[str]]:
         "html_anchors": _html_anchor_targets(text),
         "link_destinations": sorted(destination for _is_image, destination in _markdown_link_specs(text)),
     }
+
+
+def _review_segment_locations_for_targets(
+    run_dir: Path, targets: list[str], *, translated: bool,
+) -> tuple[list[str], dict[str, Any]]:
+    """Locate link drift in the review list without changing its blocking status."""
+
+    if not targets:
+        return [], {}
+    filename = "translated_segments.json" if translated else "segments.json"
+    payload = _read_json(run_dir / filename)
+    field = "translated_text" if translated else "source_text"
+    segment_ids: list[str] = []
+    first_location: dict[str, Any] = {}
+    for segment in payload.get("segments") or []:
+        if not isinstance(segment, dict):
+            continue
+        value = str(segment.get(field) or "")
+        if not any(target in value for target in targets):
+            continue
+        segment_id = str(segment.get("segment_id") or "")
+        if segment_id and segment_id not in segment_ids:
+            segment_ids.append(segment_id)
+            if not first_location and isinstance(segment.get("source_location"), dict):
+                first_location = dict(segment["source_location"])
+    return segment_ids[:20], first_location
 
 
 def _relative_report_path(run_dir: Path, path: Path) -> str:
@@ -902,6 +928,9 @@ def build_raw_translation_quality_report(
         invented = raw_targets - source_targets
         lost = source_targets - raw_targets
         if invented:
+            segment_ids, source_location = _review_segment_locations_for_targets(
+                run_dir, sorted(invented), translated=True,
+            )
             findings.append(
                 _finding(
                     stage="raw_translation",
@@ -909,9 +938,14 @@ def build_raw_translation_quality_report(
                     severity="blocking",
                     message="Raw translation introduced link targets absent from source.",
                     evidence={"targets": sorted(invented)[:20], "count": len(invented)},
+                    segment_ids=segment_ids,
+                    source_location=source_location,
                 )
             )
         if lost:
+            segment_ids, source_location = _review_segment_locations_for_targets(
+                run_dir, sorted(lost), translated=False,
+            )
             findings.append(
                 _finding(
                     stage="raw_translation",
@@ -919,11 +953,24 @@ def build_raw_translation_quality_report(
                     severity="blocking",
                     message="Raw translation lost link targets present in source.",
                     evidence={"targets": sorted(lost)[:20], "count": len(lost)},
+                    segment_ids=segment_ids,
+                    source_location=source_location,
                 )
             )
         source_specs = _markdown_link_specs(comparison_source)
         raw_specs = _markdown_link_specs(raw_text)
         if Counter(source_specs) != Counter(raw_specs):
+            lost_destinations = [target for _image, target in (Counter(source_specs) - Counter(raw_specs)).elements()]
+            added_destinations = [target for _image, target in (Counter(raw_specs) - Counter(source_specs)).elements()]
+            segment_ids: list[str] = []
+            source_location: dict[str, Any] = {}
+            for destinations, translated_side in ((lost_destinations, False), (added_destinations, True)):
+                ids, location = _review_segment_locations_for_targets(
+                    run_dir, destinations, translated=translated_side,
+                )
+                segment_ids.extend(item for item in ids if item not in segment_ids)
+                if not source_location:
+                    source_location = location
             findings.append(
                 _finding(
                     stage="raw_translation",
@@ -933,16 +980,24 @@ def build_raw_translation_quality_report(
                     evidence={
                         "source_count": len(source_specs),
                         "raw_count": len(raw_specs),
+                        "missing_values": lost_destinations[:5],
+                        "added_values": added_destinations[:5],
                     },
+                    segment_ids=segment_ids[:20],
+                    source_location=source_location,
                 )
             )
         source_protected = _raw_protected_multisets(comparison_source)
         raw_protected = _raw_protected_multisets(raw_text)
         for key, source_values in source_protected.items():
             if Counter(source_values) != Counter(raw_protected.get(key, [])):
+                missing_values = sorted((Counter(source_values) - Counter(raw_protected.get(key, []))).elements())
+                added_values = sorted((Counter(raw_protected.get(key, [])) - Counter(source_values)).elements())
                 evidence: dict[str, Any] = {
                     "source_count": len(source_values),
                     "raw_count": len(raw_protected.get(key, [])),
+                    "missing_values": missing_values[:5],
+                    "added_values": added_values[:5],
                 }
                 message = f"Raw translation changed protected {key} relative to source."
                 if key == "html_tags":
@@ -957,6 +1012,16 @@ def build_raw_translation_quality_report(
                         f"(source: {', '.join(source_names) or 'none'}; "
                         f"raw: {', '.join(raw_names) or 'none'})."
                     )
+                segment_ids: list[str] = []
+                source_location: dict[str, Any] = {}
+                if key in {"urls", "html_anchors", "link_destinations"}:
+                    for values, translated_side in ((missing_values, False), (added_values, True)):
+                        ids, location = _review_segment_locations_for_targets(
+                            run_dir, values, translated=translated_side,
+                        )
+                        segment_ids.extend(item for item in ids if item not in segment_ids)
+                        if not source_location:
+                            source_location = location
                 findings.append(
                     _finding(
                         stage="raw_translation",
@@ -964,6 +1029,8 @@ def build_raw_translation_quality_report(
                         severity="blocking",
                         message=message,
                         evidence=evidence,
+                        segment_ids=segment_ids[:20],
+                        source_location=source_location,
                     )
                 )
 
@@ -1331,12 +1398,64 @@ def _finding_review_adjudicable(finding: dict[str, Any]) -> bool:
     return bool(segment_ids)
 
 
+_LINK_REPAIRABLE_CODES = {
+    "invented_link_targets", "lost_link_targets", "markdown_link_structure_loss",
+    "urls_regression", "html_anchors_regression", "link_destinations_regression",
+}
+
+
+def _link_finding_repaired_by_review(
+    run_dir: Path, finding: dict[str, Any], decisions: dict[str, dict[str, Any]],
+) -> bool:
+    """Clear a raw link finding only after approved text restores every source target."""
+
+    if finding.get("stage") != "raw_translation" or finding.get("code") not in _LINK_REPAIRABLE_CODES:
+        return False
+    segment_ids = [str(value) for value in finding.get("segment_ids") or [] if str(value)]
+    if not segment_ids:
+        return False
+    source_segments = {
+        str(item.get("segment_id")): item
+        for item in _read_json(run_dir / "segments.json").get("segments") or []
+        if isinstance(item, dict)
+    }
+    translated_segments = {
+        str(item.get("segment_id")): item
+        for item in _read_json(run_dir / "translated_segments.json").get("segments") or []
+        if isinstance(item, dict)
+    }
+    for segment_id in segment_ids:
+        decision = decisions.get(segment_id) or {}
+        source = source_segments.get(segment_id) or {}
+        translated = translated_segments.get(segment_id) or {}
+        approved_text = str(decision.get("approved_text") or "")
+        if (
+            not _segment_review_adjudicated(segment_id, decisions)
+            or not approved_text.strip()
+            or approved_text == str(translated.get("translated_text") or "")
+            or not source
+            or not translated
+        ):
+            return False
+        source_text = str(source.get("source_text") or "")
+        if Counter(_markdown_link_specs(source_text)) != Counter(_markdown_link_specs(approved_text)):
+            return False
+        if Counter(_html_anchor_targets(source_text)) != Counter(_html_anchor_targets(approved_text)):
+            return False
+        if Counter(_url_literals(source_text)) != Counter(_url_literals(approved_text)):
+            return False
+    return True
+
+
 def _finding_effectively_blocking(
     finding: dict[str, Any],
     *,
     decisions: dict[str, dict[str, Any]],
+    run_dir: Path,
 ) -> bool:
     if str(finding.get("severity") or "") != "blocking":
+        return False
+    if _link_finding_repaired_by_review(run_dir, finding, decisions):
         return False
     if not _finding_review_adjudicable(finding):
         return True
@@ -1352,6 +1471,8 @@ def _public_blocking_finding(finding: dict[str, Any]) -> dict[str, Any]:
         "segment_ids": [
             str(value) for value in finding.get("segment_ids") or [] if str(value)
         ],
+        "source_location": finding.get("source_location") or {},
+        "evidence": finding.get("evidence") or {},
     }
 
 
@@ -1502,7 +1623,9 @@ def effective_translation_quality_evaluation(run_dir: Path) -> dict[str, Any]:
             ],
         }
     effective_blocking = [
-        finding for finding in findings if _finding_effectively_blocking(finding, decisions=decisions)
+        finding for finding in findings if _finding_effectively_blocking(
+            finding, decisions=decisions, run_dir=run_dir,
+        )
     ]
     effective_blocking_count = len(effective_blocking)
     return {

@@ -247,6 +247,8 @@ export interface ReviewProject {
       stage: string
       message: string
       segment_ids?: string[]
+      source_location?: Record<string, unknown>
+      evidence?: Record<string, unknown>
     }>
   }
   policy_coverage?: {

@@ -12,6 +12,7 @@ from pdf_translator.book_views import (
     is_rebuilt_delivery_toc_chapter,
     pop_leading_markdown_heading,
     resolve_translated_chapter_heading,
+    should_synthesize_chapter_heading,
 )
 from pdf_translator.glossary import (
     apply_glossary_source_substitutions,
@@ -1483,7 +1484,6 @@ def translated_segments_to_chapters(translated_segments_payload: Any) -> list[di
             translated_parts,
             [str(segment.get("separator_before", "\n\n")) for segment in ordered],
         ).strip()
-        has_leading_body_heading = bool(pop_leading_markdown_heading(markdown)[0])
         first = chapter_segments[0] if chapter_segments else {}
         if translated_heading_evidence:
             display_title, markdown = resolve_translated_chapter_heading(
@@ -1504,7 +1504,9 @@ def translated_segments_to_chapters(translated_segments_payload: Any) -> list[di
                 "chapter_id": chapter_id or None,
                 "title": display_title,
                 "source_title": source_title,
-                "synthesize_heading": translated_heading_evidence or not has_leading_body_heading,
+                "synthesize_heading": should_synthesize_chapter_heading(
+                    markdown, title_heading_evidence=translated_heading_evidence
+                ),
                 "page_start": min(pages) if pages else (first.get("source_location") or {}).get("page_start"),
                 "page_end": max(pages) if pages else (first.get("source_location") or {}).get("page_end"),
                 "source_pages": pages,

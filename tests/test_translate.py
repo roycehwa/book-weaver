@@ -140,6 +140,29 @@ def test_translation_retains_real_source_links() -> None:
         translated="[一个标题](chapter.xhtml#note-1)", target_language="zh-CN", translator_name="minimax")
 
 
+@pytest.mark.parametrize(
+    ("source", "translated", "error"),
+    [
+        ("Read [source](chapter.xhtml#note-1).", "请阅读来源。", "lost link targets"),
+        ("Read https://example.org/source.", "请阅读 https://example.org/changed。", "protected urls"),
+        ("Read [one](chapter.xhtml) and [two](chapter.xhtml).",
+         "请阅读[一](chapter.xhtml)和二。", "lost link targets"),
+    ],
+)
+def test_translation_rejects_lost_links_before_review(
+    source: str, translated: str, error: str,
+) -> None:
+    from pdf_translator.translate import _assert_translation_quality
+
+    with pytest.raises(ValueError, match=error):
+        _assert_translation_quality(
+            chunk=TranslationChunk(index=0, markdown=source),
+            translated=translated,
+            target_language="zh-CN",
+            translator_name="minimax",
+        )
+
+
 def test_translate_markdown_never_persists_prompt_glossary_appendix(
     tmp_path: Path,
 ) -> None:
@@ -1330,7 +1353,10 @@ def test_translate_book_sends_numbered_citation_blocks_for_translation(tmp_path:
             target_language: str,
         ) -> str:
             self.sources.append(chunk.markdown)
-            return "# 第一章\n\n" + "这是正文的完整中文翻译。" * 30 + "\n\n- 引文书目信息。"
+            return (
+                "# 第一章\n\n" + "这是正文的完整中文翻译。" * 30
+                + "\n\n- [**16.**](OPS/chapter.xhtml#note-16) 引文书目信息。"
+            )
 
     citation = (
         "- [**16.**](OPS/chapter.xhtml#note-16) "
@@ -1511,7 +1537,7 @@ def test_translate_markdown_accepts_short_note_with_preserved_citations(
                 "大学采取的行动并非仅仅基于课堂中使用 n-word。"
                 "该情境涉及一系列保密问题。"
                 "Stein (2019) quoting Augsburg spokesperson Rebecca John. "
-                "Chronicle of Higher Education, New York Times, https://example.com. "
+                "Chronicle of Higher Education, New York Times. "
                 * 8
             )
 
@@ -1958,6 +1984,39 @@ def test_translate_book_chapters_uses_translated_heading_for_title_and_rebuilds_
     assert markdown_block_structure(comparison_source) == markdown_block_structure(
         result.translated_markdown
     )
+
+
+def test_quality_source_keeps_body_headings_without_extra_source_toc_title() -> None:
+    from pdf_translator.translate import render_translation_quality_source
+
+    source_title = '2. Using "Good" Business to Fight "Bad" Business'
+    book = {
+        "chapters": [{
+            "index": 1,
+            "chapter_id": "chapter-two",
+            "title": source_title,
+            "kind": "narrative",
+            "translate": True,
+            "toc": True,
+            "markdown": "## Two\n\n## Alternative Heading\n\nBody.",
+        }],
+        "chapter_segments": [
+            {"chapter_id": "chapter-two", "chapter_title": source_title,
+             "markdown": "## Two", "role": "heading", "is_chapter_title": False,
+             "separator_before": "\n\n"},
+            {"chapter_id": "chapter-two", "chapter_title": source_title,
+             "markdown": "## Alternative Heading", "role": "heading",
+             "is_chapter_title": False, "separator_before": "\n\n"},
+            {"chapter_id": "chapter-two", "chapter_title": source_title,
+             "markdown": "Body.", "role": "prose", "is_chapter_title": False,
+             "separator_before": "\n\n"},
+        ],
+    }
+
+    result = render_translation_quality_source(book)
+
+    assert result == "## Two\n\n## Alternative Heading\n\nBody.\n"
+    assert f"# {source_title}" not in result
 
 
 def test_translate_book_chapters_restores_media_blocks_after_translation(tmp_path: Path) -> None:
