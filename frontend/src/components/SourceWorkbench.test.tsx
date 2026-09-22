@@ -66,7 +66,7 @@ test('explains chapter policy, exposes actions, and clears a stale validation er
   expect(screen.getByText(/Notes.*保留原文/)).toBeInTheDocument()
   expect(screen.getByText(/无需在这里逐段重复设置/)).toBeInTheDocument()
 
-  expect(screen.getByText(/当前段落：/).parentElement).toHaveTextContent('保留原文（不翻译）')
+  expect(screen.getByText(/内容去留：/).parentElement).toHaveTextContent('保留原文（不翻译）')
   expect(screen.queryByLabelText('原文处理方式')).not.toBeInTheDocument()
   fireEvent.click(screen.getByText('为本段设置例外'))
   expect(screen.getByLabelText('原文处理方式')).toHaveDisplayValue('翻译')
@@ -159,10 +159,10 @@ test('cancelling an exception in a preserved chapter returns to inherited preser
   await screen.findByDisplayValue('First paragraph.')
 
   fireEvent.click(screen.getByText('为本段设置例外'))
-  expect(screen.getByText(/当前段落：/).parentElement).toHaveTextContent('翻译')
+  expect(screen.getByText(/内容去留：/).parentElement).toHaveTextContent('翻译')
   fireEvent.click(screen.getByText('取消本段例外，恢复继承章节'))
 
-  expect(screen.getByText(/当前段落：/).parentElement).toHaveTextContent('保留原文（不翻译）')
+  expect(screen.getByText(/内容去留：/).parentElement).toHaveTextContent('保留原文（不翻译）')
   expect(screen.getByText('保存本页全部修改')).toBeDisabled()
   expect(onDirtyChange).toHaveBeenLastCalledWith(false)
 })
@@ -187,9 +187,9 @@ test('removing a saved paragraph exception remains a pending page change', async
   )
   await screen.findByDisplayValue('First paragraph.')
 
-  expect(screen.getByText(/当前段落：/).parentElement).toHaveTextContent('翻译')
+  expect(screen.getByText(/内容去留：/).parentElement).toHaveTextContent('翻译')
   fireEvent.click(screen.getByText('取消本段例外，恢复继承章节'))
 
-  expect(screen.getByText(/当前段落：/).parentElement).toHaveTextContent('保留原文（不翻译）')
+  expect(screen.getByText(/内容去留：/).parentElement).toHaveTextContent('保留原文（不翻译）')
   expect(screen.getByText('保存本页全部修改')).toBeEnabled()
 })

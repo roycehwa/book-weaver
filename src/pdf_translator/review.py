@@ -635,18 +635,23 @@ def detect_review_items(
         )
         if resource_chapter:
             continue
+        deferred_to_review = (source.get("human_resolution") or {}).get("kind") == "defer_to_review"
         has_fail_open_placeholder = FAIL_OPEN_MARKER in translated_text
         missing_prose_part = any(
             not str(part.get("translation") or "").strip()
             and not _is_non_prose_review_segment(str(part.get("source") or ""))
             for part in source.get("aligned_parts", [])
         )
-        if _is_non_prose_review_segment(source_text):
+        if _is_non_prose_review_segment(source_text) and not deferred_to_review:
             if not has_fail_open_placeholder and not missing_prose_part:
                 continue
         if not bool(source.get("translate", True)) and text_operation == "translate":
             continue
-        if has_fail_open_placeholder:
+        if deferred_to_review:
+            issue_type = "translation_failed_open"
+            severity = "high"
+            evidence = {"reason": "Provider could not translate this segment; human translation is required before export."}
+        elif has_fail_open_placeholder:
             issue_type = "translation_failed_open"
             severity = "high"
             evidence = {
@@ -1085,7 +1090,7 @@ def build_review_artifacts(
     review_state = create_review_state(review_items)
     for segment in translated_segments_list:
         resolution = segment.get('human_resolution')
-        if resolution:
+        if resolution and resolution.get('kind') != 'defer_to_review':
             review_state.setdefault('decisions', {})[segment['segment_id']] = {
                 'status': 'approved', 'action': resolution['kind'],
                 'approved_text': resolution['text'], 'note': resolution.get('reason', ''),

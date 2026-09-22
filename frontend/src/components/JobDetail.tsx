@@ -121,6 +121,9 @@ function describeLanguage(job: BookJob): string {
 
 function humanizeTranslationError(message: string | null | undefined): string | null {
   if (!message) return null
+  if (/new_sensitive|content_filter/i.test(message)) {
+    return '模型因内容限制拒绝了一个片段；其余已完成译文保留。可人工补译，或将该片段留到审阅时补译。'
+  }
   if (message.includes('looks untranslated') || message.includes('looks incomplete')) {
     return '模型返回了过多英文，质量检查未通过。这通常是 API 或分段策略问题，不是内容无法翻译。'
   }
@@ -806,6 +809,7 @@ function JobDetail() {
   const viewContinuationBoundary = useCallback((fromPage: number | undefined) => {
     setChapterRangeAdjustMode(false)
     const page = toPositivePage(fromPage) || 1
+    setSourceWorkbenchBlockIndex(Number.MAX_SAFE_INTEGER)
     const chapterIndex = findChapterIndexForPage(chapterDraft, page)
     if (chapterIndex !== null) {
       setSelectedChapterIndex(chapterIndex)
@@ -1410,24 +1414,18 @@ function JobDetail() {
                               }`}
                             >
                               <p className="font-medium">跨页段落：{presentation.statusLabel}</p>
-                              <p className="mt-1 text-xs leading-5">
-                                {presentation.boundaryLabel} 之间没有自动合并。这是段落重建记录，不是章节页码错误。
-                              </p>
+                              <p className="mt-1 text-xs leading-5">{presentation.detailText}</p>
                               <p className="mt-2 text-xs leading-5">
                                 归属章节：
                                 {presentation.owningChapterTitle
                                   ? `「${presentation.owningChapterTitle}」`
                                   : '（未能根据页码匹配章节）'}
-                                · 处理策略：{presentation.policyLabel}
                               </p>
-                              {!presentation.needsAction && (
-                                <p className="mt-2 text-xs font-medium leading-5 text-emerald-900">
-                                  无需处理。系统已依据结构证据保留为两个独立段落；它们仍会分别遵循所属章节的处理策略。
-                                </p>
-                              )}
-                              {presentation.needsAction && (
-                                <p className="mt-2 text-xs leading-5 text-amber-900">
-                                  请查看前后页。可接受当前分段时直接确认章节；若原文明显是同一段，请暂不确认。
+                              {presentation.footnote && (
+                                <p className={`mt-2 text-xs leading-5 ${
+                                  presentation.needsAction ? 'text-amber-900' : 'font-medium text-emerald-900'
+                                }`}>
+                                  {presentation.footnote}
                                 </p>
                               )}
                               {issue.from_page && (

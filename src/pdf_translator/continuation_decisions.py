@@ -919,15 +919,16 @@ def confirmation_quality_issues_from_ledger(ledger: dict[str, Any] | None) -> li
             continue
         from_page = int(decision.get("from_page") or 0)
         to_page = int(decision.get("to_page") or 0)
-        status_label = "不确定" if status == "uncertain" else "已拒绝"
+        message = (
+            f"第 {from_page} 页到第 {to_page} 页的段落边界证据不足，暂时保持分开；可对照前后页核对。"
+            if status == "uncertain"
+            else f"第 {from_page} 页到第 {to_page} 页的段落边界已判定保持分开，仅作记录。"
+        )
         issues.append(
             {
                 "severity": "warning",
                 "code": "unresolved_continuation",
-                "message": (
-                    f"第 {from_page} 页到第 {to_page} 页之间存在{status_label}的高置信续接候选，"
-                    "请在原文修正台核对。"
-                ),
+                "message": message,
                 "decision_id": decision.get("decision_id"),
                 "from_page": from_page,
                 "to_page": to_page,

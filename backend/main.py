@@ -4080,6 +4080,16 @@ async def _save_review_decision_unlocked(segment_id: str, request: ReviewDecisio
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Review segment not found: {segment_id}",
         )
+    source_segment = next(segment for segment in segments if segment.get("segment_id") == segment_id)
+    deferred = (source_segment.get("human_resolution") or {}).get("kind") == "defer_to_review"
+    if deferred and request.status in {"approved", "resolved"}:
+        candidate = (request.approved_text or "").strip()
+        source_text = str(source_segment.get("source_text") or "").strip()
+        if not candidate or candidate == source_text or not re.search(r"[\u3400-\u9fff]", candidate):
+            raise HTTPException(
+                status_code=400,
+                detail="此片段仍待补译。请先填写中文译文，再批准审阅。",
+            )
     state = _read_review_json(path, "review_state.json")
     if int(state.get("revision") or 0) != request.expected_revision:
         raise HTTPException(status_code=409, detail="审阅内容已更新，请刷新后重新保存；当前编辑内容不会被覆盖。")

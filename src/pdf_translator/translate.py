@@ -807,6 +807,8 @@ def _repair_glossary_in_chunk(
 
 def _is_transient_translation_error(exc: Exception) -> bool:
     message = str(exc).lower()
+    if "new_sensitive" in message or "content_filter" in message:
+        return False
     if "token plan" in message or "(2062)" in message:
         return False
     if "timeout" in message or "connection" in message or "temporarily" in message:
@@ -2459,7 +2461,7 @@ def translate_book_chapters(
             input_hash = _chunk_input_hash(global_chunks[0])
             previous_failure = read_failures(run_dir)["items"].get(failure_key, {})
             resolution = previous_failure.get("resolution", {})
-            if previous_failure.get("input_hash") == input_hash and resolution.get("kind") in {"manual_translation", "preserve_source"}:
+            if previous_failure.get("input_hash") == input_hash and resolution.get("kind") in {"manual_translation", "preserve_source", "defer_to_review"}:
                 translated_parts.append(resolution["text"])
                 if observer is not None and hasattr(observer, 'human_resolution'):
                     observer.human_resolution(chunk_index=chunk_index, kind=resolution['kind'])

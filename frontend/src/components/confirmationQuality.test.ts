@@ -70,7 +70,7 @@ describe('confirmationQuality helpers', () => {
     expect(findChapterIndexForPage(chapters, 999)).toBeNull()
   })
 
-  test('presentUnresolvedContinuationIssue marks preserve/exclude as no extra action', () => {
+  test('presentUnresolvedContinuationIssue treats preserved uncertain ranges as records', () => {
     const chapters = [chapter('Notes', 200, 240, 'preserve')]
     const issue = mapConfirmationQualityIssues([
       {
@@ -86,8 +86,28 @@ describe('confirmationQuality helpers', () => {
 
     expect(view.owningChapterIndex).toBe(0)
     expect(view.owningChapterTitle).toBe('Notes')
-    expect(view.policy).toBe('preserve')
     expect(view.needsAction).toBe(false)
+    expect(view.statusLabel).toBe('暂时保持分开，仅作记录')
+    expect(view.footnote).toContain('无需处理')
+  })
+
+  test('presentUnresolvedContinuationIssue describes accepted merges as informational records', () => {
+    const chapters = [chapter('Body', 1, 300, 'translate')]
+    const issue = mapConfirmationQualityIssues([
+      {
+        severity: 'warning',
+        code: 'unresolved_continuation',
+        message: 'msg',
+        from_page: 3,
+        to_page: 4,
+        continuation_status: 'accepted',
+      },
+    ])[0]
+    const view = presentUnresolvedContinuationIssue(issue, chapters)
+
+    expect(view.statusLabel).toBe('已接受续接并合并')
+    expect(view.needsAction).toBe(false)
+    expect(view.detailText).toContain('合并为同一段落')
   })
 
   test('presentUnresolvedContinuationIssue treats rejected decisions as completed records', () => {

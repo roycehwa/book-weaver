@@ -625,6 +625,10 @@ class BookJobRunner:
                     if recovery_pass == 2:
                         raise
                     run_dir = self._run_output_dir(job_id)
+                    if isinstance(exc, TranslationInterventionRequired):
+                        from pdf_translator.translation_failures import pending_sensitive_failures_only
+                        if pending_sensitive_failures_only(run_dir):
+                            raise
                     from pdf_translator.translate import _require_translation_not_paused
                     _require_translation_not_paused(run_dir / 'translation-cache')
                     self.repository.update(job_id, state='translating', error=None,

@@ -879,8 +879,14 @@ def run_translation_pipeline(
 
         if settings.target_language.lower().startswith("zh") and book is not None:
             from pdf_translator.polish import run_polish, scan_polish_candidates
+            from pdf_translator.translation_failures import has_deferred_review_translation
 
-            if scan_polish_candidates(downstream_markdown):
+            if has_deferred_review_translation(artifacts.output_dir):
+                # A provider-refused source placeholder is still awaiting a human
+                # translation. Do not send it through another model during polish.
+                _clear_stale_polish_artifacts()
+                polish_outcome = "needs_review"
+            elif scan_polish_candidates(downstream_markdown):
                 try:
                     polish_result = run_polish(
                         run_dir=artifacts.output_dir,

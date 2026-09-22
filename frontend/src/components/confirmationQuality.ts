@@ -69,20 +69,79 @@ export const contentPolicyLabel = (policy: EffectiveChapterPolicy): string => {
   }
 }
 
+export type ContinuationBoundaryStatus = 'accepted' | 'rejected' | 'uncertain'
+
+export const normalizeContinuationBoundaryStatus = (
+  status: string | undefined | null,
+): ContinuationBoundaryStatus => {
+  if (status === 'accepted' || status === 'rejected') return status
+  return 'uncertain'
+}
+
+/** Preserve/exclude ranges do not create a translation-boundary task. */
 export const continuationNeedsUserAction = (
   policy: EffectiveChapterPolicy,
-  status: string,
+  status: string | undefined | null,
 ): boolean =>
-  policy !== 'preserve' && policy !== 'exclude' && status !== 'rejected'
+  policy !== 'preserve' && policy !== 'exclude'
+  && normalizeContinuationBoundaryStatus(status) === 'uncertain'
+
+export const continuationBoundaryStatusLabel = (
+  status: ContinuationBoundaryStatus,
+  needsAction: boolean,
+): string => {
+  switch (status) {
+    case 'accepted':
+      return '已接受续接并合并'
+    case 'rejected':
+      return '系统判定保持分开'
+    default:
+      return needsAction ? '暂时保持分开，待核对前后页' : '暂时保持分开，仅作记录'
+  }
+}
+
+export const continuationBoundaryDetail = (
+  status: ContinuationBoundaryStatus,
+  boundaryLabel: string,
+  needsAction: boolean,
+): string => {
+  switch (status) {
+    case 'accepted':
+      return `${boundaryLabel} 的边界已由续接决策核对并合并为同一段落。`
+    case 'rejected':
+      return `${boundaryLabel} 之间未自动合并。系统已依据结构证据保留为两个独立段落。`
+    default:
+      return needsAction
+        ? `${boundaryLabel} 之间未自动合并。请查看前后页确认分段是否合理。`
+        : `${boundaryLabel} 之间未自动合并，暂时保留为两个独立段落。`
+  }
+}
+
+export const continuationBoundaryFootnote = (
+  status: ContinuationBoundaryStatus,
+  needsAction: boolean,
+): string | null => {
+  switch (status) {
+    case 'accepted':
+      return '无需处理。这是已完成的续接决策记录，不是章节页码错误。'
+    case 'rejected':
+      return '无需处理。这是边界审计记录，不是章节页码错误。'
+    default:
+      return needsAction
+        ? '若前后页明显属于同一段，请记下位置并反馈；当前确认不会自动合并这一边界。'
+        : '无需处理。这条记录保留供核对，不要求逐段修改。'
+  }
+}
 
 export interface UnresolvedContinuationPresentation {
   owningChapterIndex: number | null
   owningChapterTitle: string | null
-  policy: EffectiveChapterPolicy
-  policyLabel: string
+  boundaryStatus: ContinuationBoundaryStatus
   needsAction: boolean
   boundaryLabel: string
   statusLabel: string
+  detailText: string
+  footnote: string | null
 }
 
 export const presentUnresolvedContinuationIssue = (
@@ -93,24 +152,22 @@ export const presentUnresolvedContinuationIssue = (
   const toPage = toPositivePage(issue.to_page)
   const owningChapterIndex = fromPage !== null ? findChapterIndexForPage(chapters, fromPage) : null
   const owningChapter = owningChapterIndex !== null ? chapters[owningChapterIndex] : null
-  const policy = effectiveChapterPolicy(
-    (owningChapter as JobChapterDraft | undefined)?.content_policy,
-  )
-  const continuationStatus = issue.continuation_status || 'uncertain'
-  const statusLabel = continuationStatus === 'rejected'
-    ? '系统判定保持分开'
-    : '系统无法确定，暂时保持分开'
+  const policy = effectiveChapterPolicy((owningChapter as JobChapterDraft | undefined)?.content_policy)
+  const boundaryStatus = normalizeContinuationBoundaryStatus(issue.continuation_status)
+  const needsAction = continuationNeedsUserAction(policy, issue.continuation_status)
   const boundaryLabel = fromPage && toPage
     ? `第 ${fromPage} 页 → 第 ${toPage} 页`
     : issue.message
+  const statusLabel = continuationBoundaryStatusLabel(boundaryStatus, needsAction)
 
   return {
     owningChapterIndex,
     owningChapterTitle: owningChapter?.title ?? null,
-    policy,
-    policyLabel: contentPolicyLabel(policy),
-    needsAction: continuationNeedsUserAction(policy, continuationStatus),
+    boundaryStatus,
+    needsAction,
     boundaryLabel,
     statusLabel,
+    detailText: continuationBoundaryDetail(boundaryStatus, boundaryLabel, needsAction),
+    footnote: continuationBoundaryFootnote(boundaryStatus, needsAction),
   }
 }

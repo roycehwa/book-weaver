@@ -148,7 +148,8 @@ describe('JobDetail Notes dependency acknowledgement', () => {
     )
 
     expect(await screen.findByText('1 条记录，无需处理')).toBeInTheDocument()
-    expect(screen.getByText('无需处理。系统已依据结构证据保留为两个独立段落；它们仍会分别遵循所属章节的处理策略。')).toBeInTheDocument()
+    expect(screen.getByText('无需处理。这是边界审计记录，不是章节页码错误。')).toBeInTheDocument()
+    expect(screen.queryByText(/处理策略/)).not.toBeInTheDocument()
     await userEvent.click(screen.getByRole('button', { name: '查看相关页面（第 223 页）' }))
     expect(screen.getByText('当前查看章节：Notes')).toBeInTheDocument()
     expect(screen.getByLabelText('原文修正台章节策略')).toHaveTextContent('Notes:preserve')

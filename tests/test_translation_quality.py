@@ -672,6 +672,27 @@ def test_effective_quality_allows_adjudicated_missing_translation_finding(tmp_pa
     assert_translation_quality_current(run_dir)
 
 
+def test_deferred_provider_refusal_blocks_export_until_review_translation(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    write_synthetic_reading_units(run_dir)
+    source = (run_dir / "translation-input.md").read_text(encoding="utf-8")
+    _write_passing_translation_outputs(
+        run_dir,
+        source=source,
+        review_items=[{"issue_type": "translation_failed_open", "segment_id": "seg-1", "evidence": {}}],
+    )
+    (run_dir / "review_state.json").write_text(json.dumps({"decisions": {}}), encoding="utf-8")
+    assert effective_translation_quality_evaluation(run_dir)["translation_quality_blocking"] is True
+    with pytest.raises(ValueError, match="blocking"):
+        assert_translation_quality_current(run_dir)
+    (run_dir / "review_state.json").write_text(
+        json.dumps({"decisions": {"seg-1": {"status": "approved", "approved_text": "人工补译"}}}),
+        encoding="utf-8",
+    )
+    assert effective_translation_quality_evaluation(run_dir)["translation_quality_blocking"] is False
+
+
 def test_effective_quality_blocks_unresolved_segment_finding(tmp_path: Path) -> None:
     run_dir = tmp_path / "run"
     run_dir.mkdir()

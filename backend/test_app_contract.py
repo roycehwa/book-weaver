@@ -307,6 +307,28 @@ def test_old_review_page_cannot_overwrite_new_decision(tmp_path: Path, monkeypat
     assert state['decisions']['s1']['approved_text'] == '最新人工译文'
 
 
+def test_deferred_review_cannot_approve_unchanged_source(tmp_path: Path, monkeypatch):
+    module = importlib.import_module("main")
+    run_dir = tmp_path / "review"
+    _write_review_project(run_dir, open_items=1)
+    (run_dir / "segments.json").write_text(json.dumps({"segments": [{
+        "segment_id": "s1", "source_text": "Original prose.",
+        "human_resolution": {"kind": "defer_to_review", "text": "Original prose."},
+    }]}), encoding="utf-8")
+    monkeypatch.setattr(module, "_resolve_review_run_dir", lambda _: run_dir)
+    client = TestClient(module.app)
+    url = '/api/review/segments/s1/decision'
+    unchanged = client.post(url, params={'run_dir': str(run_dir)}, json={
+        'expected_revision': 0, 'status': 'approved', 'action': 'manual_edit',
+        'approved_text': 'Original prose.'})
+    assert unchanged.status_code == 400
+    assert '待补译' in unchanged.json()['detail']
+    corrected = client.post(url, params={'run_dir': str(run_dir)}, json={
+        'expected_revision': 0, 'status': 'approved', 'action': 'manual_edit',
+        'approved_text': '这段原文已由用户补译。'})
+    assert corrected.status_code == 200
+
+
 def test_review_rewrite_uses_nested_cli_command(tmp_path: Path, monkeypatch):
     module = importlib.import_module("main")
     run_dir = tmp_path / "review"

@@ -393,6 +393,30 @@ def test_quality_recovery_runs_without_manual_resume_and_is_bounded(tmp_path, mo
     assert sum(e['type'] == 'job_failed' for e in events) == int(persistent)
 
 
+def test_sensitive_provider_refusal_skips_identical_job_recovery(tmp_path, monkeypatch):
+    from pdf_translator.translation_failures import TranslationInterventionRequired, put_failure
+    source = tmp_path / 'source.pdf'
+    source.write_bytes(b'pdf')
+    repository = JobRepository(tmp_path / 'jobs')
+    created = repository.create(source_path=source, translator='mock')
+    calls = []
+
+    def pipeline(settings, on_stage):
+        calls.append(settings)
+        on_stage('translating', {'stage_percent': 90})
+        run_dir = settings.output_dir / source.stem
+        run_dir.mkdir(parents=True, exist_ok=True)
+        put_failure(run_dir, 's1', {'source': 'Source.', 'error': 'HTTP 500: input new_sensitive (1026)'})
+        raise TranslationInterventionRequired(1)
+
+    runner = BookJobRunner(repository, pipeline_runner=pipeline)
+    with pytest.raises(TranslationInterventionRequired):
+        runner.run(created['job_id'])
+    assert len(calls) == 1
+    assert not any(event['type'] == 'translation_auto_recovery'
+                   for event in repository.list_events(created['job_id']))
+
+
 def test_job_runner_persists_canonical_polish_outcome(tmp_path: Path) -> None:
     source = tmp_path / "source.pdf"
     source.write_bytes(b"%PDF")

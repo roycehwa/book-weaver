@@ -168,7 +168,7 @@ export default function SourceWorkbench({
   return <section className="mt-4 rounded-lg border border-slate-300 bg-white p-3" aria-label="原文修正台">
     <h3 className="font-semibold">高级原文修正 · 第 {data?.page ?? page} 页</h3>
     <p className="my-2 text-xs text-slate-500">
-      只在某一段原文的文字、顺序或去留有误时使用。整章是否翻译，由上方章节列表的「处理方式」决定。
+      这里用于个别段落的文字、顺序和去留修正。跨页是否续接请以上方边界记录为准；整章是否翻译由章节列表决定。
     </p>
     <p className="my-2 rounded-md bg-slate-50 px-3 py-2 text-xs leading-5 text-slate-700">
       操作方式：可在本页切换不同段落，完成所有文字修正和少量段落例外后，一次保存本页全部修改。不需要每改一段就保存。
@@ -203,7 +203,7 @@ export default function SourceWorkbench({
       </div>
       <div className="mt-3 rounded-md border border-slate-200 bg-slate-50 p-3 text-sm">
         <div className="flex flex-wrap items-center justify-between gap-2">
-          <span>当前段落：<span className="font-medium">{overrideActive ? chapterPolicyLabel(current.policy) : inheritedPolicyLabel}</span></span>
+          <span>内容去留：<span className="font-medium">{overrideActive ? chapterPolicyLabel(current.policy) : inheritedPolicyLabel}</span></span>
           <span className="text-xs text-slate-500">{overrideActive ? '本段例外' : `继承章节「${chapterTitle || '未命名章节'}」`}</span>
         </div>
         {!overrideActive && chapterPolicy !== 'exclude' && (

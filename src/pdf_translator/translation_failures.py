@@ -22,6 +22,24 @@ def read_failures(run_dir: Path) -> dict:
     return json.loads(path.read_text()) if path.exists() else {"revision": 0, "items": {}}
 
 
+def pending_sensitive_failures_only(run_dir: Path) -> bool:
+    """A provider content refusal will not improve through identical job retries."""
+    pending = [item for item in read_failures(run_dir)["items"].values()
+               if not item.get("resolution")]
+    return bool(pending) and all(
+        any(marker in str(item.get("error") or "").lower()
+            for marker in ("new_sensitive", "content_filter"))
+        for item in pending
+    )
+
+
+def has_deferred_review_translation(run_dir: Path) -> bool:
+    return any(
+        (item.get("resolution") or {}).get("kind") == "defer_to_review"
+        for item in read_failures(run_dir)["items"].values()
+    )
+
+
 def put_failure(run_dir: Path, key: str, item: dict) -> None:
     state = read_failures(run_dir)
     previous = state["items"].get(key)
@@ -58,16 +76,25 @@ def resolve_failure(run_dir: Path, key: str, revision: int, text: str, kind: str
     state = read_failures(run_dir)
     if revision != state["revision"]:
         raise SourceConflict("失败清单已更新，请刷新后重试。")
-    if kind not in {"manual_translation", "preserve_source"}:
+    if kind not in {"manual_translation", "preserve_source", "defer_to_review"}:
         raise ValueError("未知处理方式。")
     if key not in state["items"] or (kind == "manual_translation" and not text.strip()):
         raise ValueError("请选择失败片段并填写人工译文。")
     if kind == "preserve_source" and not reason.strip():
         raise ValueError("保留原文必须填写理由。")
     item = state["items"][key]
+    if kind == "defer_to_review" and key.startswith("footnote:"):
+        raise ValueError("脚注暂不能转入逐段审阅，请在此填写人工译文。")
+    if kind == "defer_to_review" and text.strip():
+        raise ValueError("请先保存或清空已填写的人工译文，再转入审阅补译。")
+    if kind == "defer_to_review" and not any(marker in str(item.get("error") or "").lower()
+                                              for marker in ("new_sensitive", "content_filter")):
+        raise ValueError("只有模型明确拒绝处理的正文片段才能转入审阅补译。")
+    if kind == "manual_translation" and text.strip() == str(item.get("source") or "").strip():
+        raise ValueError("人工译文与原文相同；如需保留原文，请选择保留并填写理由。")
     if item.get('resolution'):
         state.setdefault('history', []).append(dict(item))
-    item["resolution"] = {"kind": kind, "text": item["source"] if kind == "preserve_source" else text.strip(), "reason": reason.strip(), "actor": "user", "updated_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat()}
+    item["resolution"] = {"kind": kind, "text": item["source"] if kind in {"preserve_source", "defer_to_review"} else text.strip(), "reason": reason.strip(), "actor": "user", "updated_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat()}
     state["revision"] += 1
     atomic_json(run_dir / "translation-failures.json", state)
     return state

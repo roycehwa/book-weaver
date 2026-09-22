@@ -89,6 +89,70 @@ def test_manual_resolution_reaches_review_without_model_cache(tmp_path, monkeypa
     assert result['review_state']['decisions'][translated['segment_id']]['approved_text'] == '人工确认译文。'
 
 
+def test_provider_refusal_can_be_deferred_to_open_review_item(tmp_path, monkeypatch):
+    import pdf_translator.translate as module
+    from pdf_translator.review import build_review_artifacts
+    source = 'The provider cannot translate this complete source paragraph.'
+    plan = [dict(segment_id='s1', chapter_id='c', chapter_index=1, chapter_title='Chapter',
+                 segment_index_in_chapter=1, markdown=source, translate=True, role='prose')]
+    monkeypatch.setattr(module, 'chapter_segments_for_translation', lambda *a, **k: plan)
+    monkeypatch.setattr('pdf_translator.review.chapter_segments_for_translation', lambda *a, **k: plan)
+
+    class RefusingTranslator(BaseTranslator):
+        name = 'minimax'
+
+        def translate_chunk(self, chunk, source_language, target_language):
+            raise ValueError('HTTP 500: input new_sensitive (1026)')
+
+    settings = RunSettings(source_pdf=tmp_path / 'book.pdf', output_dir=tmp_path,
+                           target_language='zh-CN', source_language='en', max_chunk_chars=5000,
+                           translator='minimax')
+    book = {'chapters': [{'chapter_id': 'c', 'index': 1, 'title': 'Chapter',
+                          'kind': 'body', 'markdown': source}]}
+    cache = tmp_path / 'cache'
+    with pytest.raises(ValueError, match='require intervention'):
+        translate_book_chapters(book=book, settings=settings, translator=RefusingTranslator(),
+                                cache_dir=cache, retry_count=1)
+    ledger = read_failures(tmp_path)
+    assert list(ledger['items']) == ['s1']
+    resolve_failure(tmp_path, 's1', ledger['revision'], '', kind='defer_to_review')
+    from pdf_translator.translation_failures import has_deferred_review_translation
+    assert has_deferred_review_translation(tmp_path)
+    translated = translate_book_chapters(book=book, settings=settings,
+                                         translator=RefusingTranslator(), cache_dir=cache,
+                                         retry_count=1)
+    assert source in translated.translated_markdown
+    review = build_review_artifacts(source_path=tmp_path / 'book.pdf',
+                                    target_language='zh-CN', book=book,
+                                    translated_chapters=[], cache_dir=cache,
+                                    run_dir=tmp_path)
+    assert review['translated_segments']['segments'][0]['translated_text'] == source
+    assert review['review_items']['items'][0]['issue_type'] == 'translation_failed_open'
+    assert review['review_state']['summary']['open_items'] == 1
+    assert 's1' not in review['review_state']['decisions']
+
+
+def test_manual_translation_cannot_silently_copy_source_and_footnote_cannot_defer(tmp_path):
+    from pdf_translator.translation_failures import put_failure
+    put_failure(tmp_path, 's1', {'source': 'Original prose.'})
+    with pytest.raises(ValueError, match='与原文相同'):
+        resolve_failure(tmp_path, 's1', 1, 'Original prose.')
+    put_failure(tmp_path, 'footnote:one', {'source': 'Original note.'})
+    with pytest.raises(ValueError, match='脚注暂不能'):
+        resolve_failure(tmp_path, 'footnote:one', 2, '', kind='defer_to_review')
+    with pytest.raises(ValueError, match='明确拒绝'):
+        resolve_failure(tmp_path, 's1', 2, '', kind='defer_to_review')
+    put_failure(tmp_path, 'sensitive', {'source': 'Source text.', 'error': 'input new_sensitive (1026)'})
+    with pytest.raises(ValueError, match='先保存或清空'):
+        resolve_failure(tmp_path, 'sensitive', 3, '已填写的草稿', kind='defer_to_review')
+
+
+def test_sensitive_http_500_is_not_a_transient_network_failure():
+    from pdf_translator.translate import _is_transient_translation_error
+    assert not _is_transient_translation_error(ValueError('HTTP 500: input new_sensitive (1026)'))
+    assert _is_transient_translation_error(ValueError('HTTP 500: upstream unavailable'))
+
+
 def test_footnotes_continue_after_body_failure_and_accept_manual_resolution(tmp_path, monkeypatch):
     import pdf_translator.translate as module
     monkeypatch.setattr(module.time, 'sleep', lambda _: None)
