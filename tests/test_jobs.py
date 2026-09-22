@@ -406,7 +406,8 @@ def test_sensitive_provider_refusal_skips_identical_job_recovery(tmp_path, monke
         on_stage('translating', {'stage_percent': 90})
         run_dir = settings.output_dir / source.stem
         run_dir.mkdir(parents=True, exist_ok=True)
-        put_failure(run_dir, 's1', {'source': 'Source.', 'error': 'HTTP 500: input new_sensitive (1026)'})
+        put_failure(run_dir, 's1', {'source': 'Source.', 'error': 'HTTP 500: input new_sensitive (1026)',
+                                    'failure_kind': 'provider_content_refusal'})
         raise TranslationInterventionRequired(1)
 
     runner = BookJobRunner(repository, pipeline_runner=pipeline)

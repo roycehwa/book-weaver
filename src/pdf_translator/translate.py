@@ -2514,12 +2514,17 @@ def translate_book_chapters(
                         if observer is not None:
                             observer.attempt_failure(chunk_index=chunk.index, input_hash=_chunk_input_hash(chunk),
                                 attempt=max(1, retry_count), error_type=type(exc).__name__, message=str(exc), retryable=False)
+                        from pdf_translator.translation_failures import is_provider_content_refusal
                         put_failure(run_dir, key, {
                             'segment_id': key, 'chunk_index': chunk.index,
                             'chapter_id': chapter_id, 'chapter_title': chapter.get('title'),
                             'source_pages': segment.get('source_pages', []),
                             'source': chunk.markdown, 'input_hash': _chunk_input_hash(chunk),
                             'error': str(exc), 'status': 'failed',
+                            'failure_kind': (
+                                'provider_content_refusal' if is_provider_content_refusal(str(exc))
+                                else 'translation_failure'
+                            ),
                         })
                         pending_failures.append(key)
                         if _is_transient_translation_error(exc):

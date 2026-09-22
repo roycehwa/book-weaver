@@ -1724,7 +1724,7 @@ async def get_translation_failures(job_id: str):
 
 
 @api_router.post("/jobs/{job_id}/translation-failures")
-async def resolve_translation_failure(job_id: str, request: FailureResolutionRequest):
+async def resolve_translation_failure(job_id: str, request: FailureResolutionRequest, background_tasks: BackgroundTasks):
     from pdf_translator.translation_failures import resolve_failure
     from pdf_translator.source_workspace import SourceConflict, source_lock
     service = get_job_service()
@@ -1742,10 +1742,26 @@ async def resolve_translation_failure(job_id: str, request: FailureResolutionReq
         try:
             if service.get(job_id).get("state") != "failed":
                 raise HTTPException(status_code=409, detail="任务状态已变化，请刷新后重试。")
+            total_chunks = int((snapshot.get("progress") or {}).get("translation_chunks_total") or 0)
+            content_exception_limit = min(5, max(1, (total_chunks + 99) // 100))
             with source_lock(run_dir):
-                return resolve_failure(run_dir, request.key, request.revision, request.text, request.kind, request.reason)
+                ledger = resolve_failure(
+                    run_dir, request.key, request.revision, request.text,
+                    request.kind, request.reason, max_content_exceptions=content_exception_limit,
+                )
         finally:
             service._release_worker_lock(job_id)
+        # A complete set of human decisions is the continuation signal. The
+        # worker must start after the edit lock is released so it sees the
+        # saved ledger and can acquire its own lock.
+        all_resolved = bool(ledger["items"]) and all(
+            item.get("resolution") for item in ledger["items"].values()
+        )
+        if all_resolved and not (run_dir / "translation-pause.json").exists():
+            service.record_resume_request(job_id)
+            background_tasks.add_task(_run_job_in_background, service, job_id, resume=True)
+            return {**ledger, "resume_scheduled": True}
+        return ledger
     except JobServiceError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except SourceConflict as exc:

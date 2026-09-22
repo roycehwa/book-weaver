@@ -12,20 +12,56 @@ def test_failure_resolution_api_revision_lock_and_missing_reason(tmp_path, monke
     from pdf_translator.translation_failures import put_failure
     put_failure(tmp_path, 's1', {'source': 'Original', 'input_hash': 'hash', 'status': 'failed'})
     locks = []
+    resumes = []
     service = SimpleNamespace(
         get=lambda _: {'state': 'failed'},
         artifact_path=lambda *_: tmp_path / 'book.json',
         _acquire_worker_lock=lambda _: locks.append('acquire'),
         _release_worker_lock=lambda _: locks.append('release'),
+        record_resume_request=lambda _: resumes.append('requested'),
     )
     monkeypatch.setattr(module, 'get_job_service', lambda: service)
+    monkeypatch.setattr(module, '_run_job_in_background', lambda *args, **kwargs: resumes.append('started'))
     client = TestClient(module.app)
     url = '/api/jobs/test/translation-failures'
     assert client.get(url).json()['revision'] == 1
     assert client.post(url, json={'key': 's1', 'revision': 1, 'text': '', 'kind': 'preserve_source'}).status_code == 400
-    assert client.post(url, json={'key': 's1', 'revision': 1, 'text': '人工译文'}).status_code == 200
+    response = client.post(url, json={'key': 's1', 'revision': 1, 'text': '人工译文'})
+    assert response.status_code == 200
+    assert response.json()['resume_scheduled'] is True
     assert client.post(url, json={'key': 's1', 'revision': 1, 'text': '过期页面'}).status_code == 409
     assert locks == ['acquire', 'release'] * 3
+    assert resumes == ['requested', 'started']
+
+
+def test_failure_resolution_waits_for_every_segment_and_respects_pause(tmp_path, monkeypatch):
+    module = importlib.import_module('main')
+    from pdf_translator.translation_failures import put_failure
+    put_failure(tmp_path, 's1', {'source': 'First.', 'input_hash': 'one', 'status': 'failed'})
+    put_failure(tmp_path, 's2', {'source': 'Second.', 'input_hash': 'two', 'status': 'failed'})
+    resumes = []
+    service = SimpleNamespace(
+        get=lambda _: {'state': 'failed'},
+        artifact_path=lambda *_: tmp_path / 'book.json',
+        _acquire_worker_lock=lambda _: None,
+        _release_worker_lock=lambda _: None,
+        record_resume_request=lambda _: resumes.append('requested'),
+    )
+    monkeypatch.setattr(module, 'get_job_service', lambda: service)
+    monkeypatch.setattr(module, '_run_job_in_background', lambda *args, **kwargs: resumes.append('started'))
+    client = TestClient(module.app)
+    url = '/api/jobs/test/translation-failures'
+
+    first = client.post(url, json={'key': 's1', 'revision': 2, 'text': '第一段。'})
+    assert first.status_code == 200
+    assert 'resume_scheduled' not in first.json()
+    assert resumes == []
+
+    (tmp_path / 'translation-pause.json').write_text('{}')
+    second = client.post(url, json={'key': 's2', 'revision': 3, 'text': '第二段。'})
+    assert second.status_code == 200
+    assert 'resume_scheduled' not in second.json()
+    assert resumes == []
 
 
 def test_application_imports_without_tencent_sdk():

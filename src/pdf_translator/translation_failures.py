@@ -1,6 +1,7 @@
 """Durable, input-bound failures and explicit human resolutions."""
 from pathlib import Path
 import json
+import re
 from datetime import datetime, timezone
 from pdf_translator.source_workspace import atomic_json
 
@@ -17,6 +18,14 @@ class TranslationProviderUnavailable(ValueError):
     """Transient provider circuit breaker; eligible for bounded job recovery."""
 
 
+def is_provider_content_refusal(error: str) -> bool:
+    """Recognize explicit provider refusal codes, never a generic failed chunk."""
+    return bool(
+        re.search(r"\b(?:input\s+new_sensitive\s*\(\s*1026\s*\)|output\s+new_sensitive\s*\(\s*1027\s*\))", error, re.I)
+        or re.search(r"\bcontent_filter\b", error, re.I)
+    )
+
+
 def read_failures(run_dir: Path) -> dict:
     path = run_dir / "translation-failures.json"
     return json.loads(path.read_text()) if path.exists() else {"revision": 0, "items": {}}
@@ -27,9 +36,7 @@ def pending_sensitive_failures_only(run_dir: Path) -> bool:
     pending = [item for item in read_failures(run_dir)["items"].values()
                if not item.get("resolution")]
     return bool(pending) and all(
-        any(marker in str(item.get("error") or "").lower()
-            for marker in ("new_sensitive", "content_filter"))
-        for item in pending
+        item.get("failure_kind") == "provider_content_refusal" for item in pending
     )
 
 
@@ -71,7 +78,7 @@ def archive_obsolete_failures(run_dir: Path, active_keys: set[str]) -> None:
     atomic_json(run_dir / 'translation-failures.json', state)
 
 
-def resolve_failure(run_dir: Path, key: str, revision: int, text: str, kind: str = "manual_translation", reason: str = "") -> dict:
+def resolve_failure(run_dir: Path, key: str, revision: int, text: str, kind: str = "manual_translation", reason: str = "", max_content_exceptions: int = 1) -> dict:
     from pdf_translator.source_workspace import SourceConflict
     state = read_failures(run_dir)
     if revision != state["revision"]:
@@ -87,9 +94,15 @@ def resolve_failure(run_dir: Path, key: str, revision: int, text: str, kind: str
         raise ValueError("脚注暂不能转入逐段审阅，请在此填写人工译文。")
     if kind == "defer_to_review" and text.strip():
         raise ValueError("请先保存或清空已填写的人工译文，再转入审阅补译。")
-    if kind == "defer_to_review" and not any(marker in str(item.get("error") or "").lower()
-                                              for marker in ("new_sensitive", "content_filter")):
-        raise ValueError("只有模型明确拒绝处理的正文片段才能转入审阅补译。")
+    if kind in {"defer_to_review", "preserve_source"} and item.get("failure_kind") != "provider_content_refusal":
+        raise ValueError("只有模型明确拒绝处理的片段才能留到审阅或保留原文；其他失败请重试或填写人工译文。")
+    if kind in {"defer_to_review", "preserve_source"} and (item.get("resolution") or {}).get("kind") not in {"defer_to_review", "preserve_source"}:
+        exception_count = sum(
+            (entry.get("resolution") or {}).get("kind") in {"defer_to_review", "preserve_source"}
+            for entry in state["items"].values()
+        )
+        if exception_count >= max_content_exceptions:
+            raise ValueError("模型拒绝片段已超过本书的零星例外上限；请在此填写人工译文。")
     if kind == "manual_translation" and text.strip() == str(item.get("source") or "").strip():
         raise ValueError("人工译文与原文相同；如需保留原文，请选择保留并填写理由。")
     if item.get('resolution'):

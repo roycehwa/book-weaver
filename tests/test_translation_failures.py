@@ -142,9 +142,32 @@ def test_manual_translation_cannot_silently_copy_source_and_footnote_cannot_defe
         resolve_failure(tmp_path, 'footnote:one', 2, '', kind='defer_to_review')
     with pytest.raises(ValueError, match='明确拒绝'):
         resolve_failure(tmp_path, 's1', 2, '', kind='defer_to_review')
-    put_failure(tmp_path, 'sensitive', {'source': 'Source text.', 'error': 'input new_sensitive (1026)'})
+    put_failure(tmp_path, 'sensitive', {'source': 'Source text.', 'error': 'input new_sensitive (1026)',
+                                        'failure_kind': 'provider_content_refusal'})
     with pytest.raises(ValueError, match='先保存或清空'):
         resolve_failure(tmp_path, 'sensitive', 3, '已填写的草稿', kind='defer_to_review')
+
+
+def test_only_explicit_provider_refusals_can_be_deferred_and_the_exception_is_bounded(tmp_path):
+    from pdf_translator.translation_failures import is_provider_content_refusal, put_failure
+    assert is_provider_content_refusal('HTTP 500: input new_sensitive (1026)')
+    assert is_provider_content_refusal('HTTP 400: content_filter')
+    assert not is_provider_content_refusal('HTTP 500: upstream unavailable')
+    assert not is_provider_content_refusal('Translation failed; new_sensitive mentioned in source')
+
+    put_failure(tmp_path, 'timeout', {'source': 'First.', 'error': 'HTTP 500: upstream unavailable',
+                                      'failure_kind': 'translation_failure'})
+    with pytest.raises(ValueError, match='只有模型明确拒绝'):
+        resolve_failure(tmp_path, 'timeout', 1, '', kind='defer_to_review')
+    with pytest.raises(ValueError, match='只有模型明确拒绝'):
+        resolve_failure(tmp_path, 'timeout', 1, '', kind='preserve_source', reason='保留')
+    put_failure(tmp_path, 'refused-one', {'source': 'Second.', 'error': 'input new_sensitive (1026)',
+                                          'failure_kind': 'provider_content_refusal'})
+    put_failure(tmp_path, 'refused-two', {'source': 'Third.', 'error': 'content_filter',
+                                          'failure_kind': 'provider_content_refusal'})
+    resolve_failure(tmp_path, 'refused-one', 3, '', kind='defer_to_review', max_content_exceptions=1)
+    with pytest.raises(ValueError, match='零星例外上限'):
+        resolve_failure(tmp_path, 'refused-two', 4, '', kind='preserve_source', reason='用户确认', max_content_exceptions=1)
 
 
 def test_sensitive_http_500_is_not_a_transient_network_failure():
