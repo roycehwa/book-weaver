@@ -464,12 +464,12 @@ describe('Review draft navigation', () => {
     expect(revalidateQuality).toHaveBeenCalledWith('/tmp/review-run')
   })
 
-  test('shows a link blocker and jumps to its source segment', async () => {
+  test('offers optional link hints without blocking export', async () => {
     getProject.mockResolvedValue({
       ...project,
       translation_quality: {
-        translation_quality_blocking: true,
-        effective_blocking_findings: [{
+        translation_quality_blocking: false,
+        navigation_hints: [{
           code: 'lost_link_targets',
           stage: 'raw_translation',
           message: 'Raw translation lost link targets present in source.',
@@ -484,9 +484,12 @@ describe('Review draft navigation', () => {
     })
 
     render(<Review />)
-    expect(await screen.findByText('译文丢失了原文中的链接')).toBeTruthy()
+    expect(await screen.findByText('链接提示（1 项，可选查看，不影响导出）')).toBeTruthy()
+    await userEvent.click(screen.getByText('链接提示（1 项，可选查看，不影响导出）'))
+    expect(screen.getByText('译文丢失了原文中的链接')).toBeTruthy()
     expect(screen.getByText('chapter.xhtml#note-2')).toBeTruthy()
-    await userEvent.click(screen.getByRole('button', { name: '定位对应段落' }))
+    expect(screen.getByRole('button', { name: '导出定稿' }).hasAttribute('disabled')).toBe(false)
+    await userEvent.click(screen.getByRole('button', { name: '查看对应段落' }))
     expect(await screen.findByText('Source two')).toBeTruthy()
   })
 })

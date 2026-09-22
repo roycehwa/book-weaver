@@ -175,7 +175,7 @@ def test_raw_report_compares_delivery_shape_separately_from_transport_input(
     )
 
 
-def test_raw_report_still_blocks_real_external_link_change_with_delivery_shape(
+def test_raw_report_advises_on_real_external_link_change_with_delivery_shape(
     tmp_path: Path,
 ) -> None:
     run_dir = tmp_path / "run"
@@ -197,6 +197,7 @@ def test_raw_report_still_blocks_real_external_link_change_with_delivery_shape(
     assert "invented_link_targets" in codes
     assert "lost_link_targets" in codes
     assert "urls_regression" in codes
+    assert all(item["severity"] == "review" for item in report["findings"] if item["code"] in codes)
 
 
 def test_raw_report_accepts_existing_body_headings_and_preserved_link(tmp_path: Path) -> None:
@@ -262,7 +263,7 @@ def test_lost_link_finding_points_to_review_segment(tmp_path: Path) -> None:
     assert finding["source_location"] == {"page_start": 12}
 
 
-def test_reviewed_link_repair_unblocks_only_after_target_is_restored(tmp_path: Path) -> None:
+def test_link_difference_does_not_require_manual_repair(tmp_path: Path) -> None:
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     write_synthetic_reading_units(run_dir)
@@ -284,11 +285,13 @@ def test_reviewed_link_repair_unblocks_only_after_target_is_restored(tmp_path: P
             "s2": {"status": "approved", "action": "manual_edit", "approved_text": value},
         }}), encoding="utf-8")
 
-    assert translation_quality_summary(run_dir)["translation_quality_blocking"] is True
+    summary = translation_quality_summary(run_dir)
+    assert summary["translation_quality_blocking"] is False
+    assert any(item["code"] == "lost_link_targets" for item in summary["navigation_hints"])
     decide("请阅读来源。")
-    assert translation_quality_summary(run_dir)["translation_quality_blocking"] is True
+    assert translation_quality_summary(run_dir)["translation_quality_blocking"] is False
     decide("请阅读[来源](chapter.xhtml#wrong)。")
-    assert translation_quality_summary(run_dir)["translation_quality_blocking"] is True
+    assert translation_quality_summary(run_dir)["translation_quality_blocking"] is False
     decide("请阅读[来源](chapter.xhtml#note-2)。")
     assert translation_quality_summary(run_dir)["translation_quality_blocking"] is False
     assert_translation_quality_current(run_dir)
@@ -310,6 +313,41 @@ def test_raw_report_still_blocks_semantic_html_tag_change(tmp_path: Path) -> Non
         review_items=[],
     )
     assert any(item["code"] == "html_tags_regression" for item in report["findings"])
+
+
+def test_raw_link_changes_do_not_mask_required_image_loss(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    write_synthetic_reading_units(run_dir)
+    source = "# Chapter\n\n![Map](assets/map.png)\n\n[Source](old.xhtml#note).\n"
+    raw = "# 章\n\n![图](assets/other.png)\n\n[来源](new.xhtml#note)。\n"
+    (run_dir / "translation-input.md").write_text(source, encoding="utf-8")
+    (run_dir / "translated.raw.md").write_text(raw, encoding="utf-8")
+    report = build_raw_translation_quality_report(
+        run_dir, text_operation="translate", source_markdown=source, review_items=[],
+    )
+    findings = {item["code"]: item for item in report["findings"]}
+    assert findings["markdown_link_structure_loss"]["severity"] == "blocking"
+    assert findings["lost_link_targets"]["severity"] == "review"
+
+
+def test_polished_link_digits_are_advisory_but_prose_digits_stay_strict(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    cleaned = "# Chapter\n\n第 12 页请看[资料](https://old.example/123)。\n"
+    (run_dir / "translated.cleaned.md").write_text(cleaned, encoding="utf-8")
+    (run_dir / "translated.md").write_text(
+        "# Chapter\n\n第 12 页请看[资料](https://new.example/456)。\n", encoding="utf-8",
+    )
+    report = build_polished_output_quality_report(run_dir, text_operation="translate")
+    assert any(item["severity"] == "review" for item in report["findings"])
+    assert not any(item["severity"] == "blocking" for item in report["findings"])
+    (run_dir / "translated.md").write_text(
+        "# Chapter\n\n第 13 页请看[资料](https://new.example/456)。\n", encoding="utf-8",
+    )
+    report = build_polished_output_quality_report(run_dir, text_operation="translate")
+    assert any(item["code"] == "numeric_literal_regression" and item["severity"] == "blocking"
+               for item in report["findings"])
 
 
 def test_revalidate_translation_quality_rebuilds_only_derived_reports(tmp_path: Path) -> None:

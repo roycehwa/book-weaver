@@ -133,7 +133,7 @@ def test_even_draft_export_blocks_missing_output(tmp_path, monkeypatch):
 @pytest.mark.parametrize("validation", [
     {"unresolved_internal_hrefs": 1}, {"absolute_paths": [{"member": "body.xhtml"}]},
 ])
-def test_draft_export_does_not_publish_broken_links_or_local_paths(tmp_path, monkeypatch, validation):
+def test_draft_export_treats_broken_links_as_advisory_but_rejects_local_paths(tmp_path, monkeypatch, validation):
     from pdf_translator import cli
     segment = {'segment_id': 'one', 'chapter_id': 'chapter', 'chapter_index': 1,
                'chapter_title': 'Chapter', 'source_text': 'A title', 'translated_text': '一个标题'}
@@ -151,10 +151,16 @@ def test_draft_export_does_not_publish_broken_links_or_local_paths(tmp_path, mon
     })
     monkeypatch.setattr(cli, 'render_epub_from_book', lambda **kw: kw['output_path'].write_bytes(b'epub'))
     monkeypatch.setattr(cli, 'validate_epub_internal_hrefs', lambda _: validation)
-    with pytest.raises(ValueError, match='无效内部链接|本机文件路径'):
-        cli._run_review_export(run_dir=tmp_path, version_name='draft', parent_version=None,
-                              target_language='zh-CN', output_format='epub', approve=False)
-    assert not (tmp_path/'versions'/'draft').exists()
+    if validation.get('unresolved_internal_hrefs'):
+        result = cli._run_review_export(run_dir=tmp_path, version_name='draft', parent_version=None,
+                                        target_language='zh-CN', output_format='epub', approve=False)
+        assert result['rendered_files']['epub_href_validation']['unresolved_internal_hrefs'] == 1
+        assert (tmp_path/'versions'/'draft').exists()
+    else:
+        with pytest.raises(ValueError, match='本机文件路径'):
+            cli._run_review_export(run_dir=tmp_path, version_name='draft', parent_version=None,
+                                  target_language='zh-CN', output_format='epub', approve=False)
+        assert not (tmp_path/'versions'/'draft').exists()
     assert not list(tmp_path.glob('.export-*'))
 
 

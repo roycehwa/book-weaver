@@ -904,8 +904,6 @@ def _render_review_export(
         rendered_files["epub_href_validation"] = validate_epub_internal_hrefs(epub_path)
         if rendered_files["epub_href_validation"].get("missing_assets"):
             raise ValueError("导出缺少资源文件，请修正图片或资源路径后重试。")
-        if rendered_files["epub_href_validation"].get("unresolved_internal_hrefs"):
-            raise ValueError("导出包含无效内部链接，请修正脚注或章节链接后重试。")
         if rendered_files["epub_href_validation"].get("absolute_paths"):
             raise ValueError("导出包含本机文件路径，请修正资源引用后重试。")
 

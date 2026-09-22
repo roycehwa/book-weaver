@@ -20,7 +20,7 @@ from typing import Protocol
 from openai import OpenAI
 import requests
 
-from pdf_translator.zh_markdown_cleanup import FOOTNOTE_REF_RE, HTML_TAG_RE, URL_RE
+from pdf_translator.zh_markdown_cleanup import FOOTNOTE_REF_RE, HTML_TAG_RE
 
 from pdf_translator.book_views import (
     ensure_chapter_top_heading,
@@ -483,31 +483,21 @@ def _assert_translation_quality(
         raise ValueError(
             f"Translation for chunk {chunk.index} changed protected footnote markers."
         )
-    # Parse rendered links, including reference-style and raw HTML anchors. A
-    # numeric footnote marker is not a filename and must not become one.
+    # Image resources are required for delivery. Navigation targets can be
+    # outdated in the source or intentionally omitted by a content policy.
     import markdown as markdown_renderer
     from bs4 import BeautifulSoup
-    def link_targets(text: str) -> Counter[str]:
+    def image_targets(text: str) -> Counter[str]:
         soup = BeautifulSoup(markdown_renderer.markdown(text), "html.parser")
-        return Counter(
-            [str(a["href"]) for a in soup.find_all("a", href=True)]
-            + [str(img["src"]) for img in soup.find_all("img", src=True)]
-        )
-    source_targets = link_targets(chunk.markdown)
-    translated_targets = link_targets(translated)
-    if translated_targets - source_targets:
-        raise ValueError(f"Translation for chunk {chunk.index} contains invented link targets.")
-    if source_targets - translated_targets:
-        raise ValueError(f"Translation for chunk {chunk.index} lost link targets.")
-    def urls(text: str) -> Counter[str]:
-        return Counter(url.rstrip(".,;:!?)]}，。；：！？）】》」』") for url in URL_RE.findall(text))
-    if urls(chunk.markdown) != urls(translated):
-        raise ValueError(f"Translation for chunk {chunk.index} changed protected urls.")
+        return Counter(str(img["src"]) for img in soup.find_all("img", src=True))
+    if image_targets(chunk.markdown) != image_targets(translated):
+        raise ValueError(f"Translation for chunk {chunk.index} changed required image targets.")
     def semantic_html(text: str) -> list[str]:
         return sorted(
             tag
             for tag in HTML_TAG_RE.findall(text)
             if re.match(r"</?\s*[A-Za-z][\w:.-]*(?:\s|/?>)", tag)
+            and not re.match(r"</?\s*a(?:\s|/?>)", tag, re.IGNORECASE)
         )
 
     if semantic_html(chunk.markdown) != semantic_html(translated):

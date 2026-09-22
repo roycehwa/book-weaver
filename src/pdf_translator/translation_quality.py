@@ -14,8 +14,7 @@ from collections import Counter
 
 from pdf_translator.chunking import markdown_block_structure, markdown_protected_block_structure
 from pdf_translator.pdf_text_repair import scan_ingest_quality
-from pdf_translator.polish import POLISH_PROMPT_VERSION, _markdown_link_specs, _protected_literals
-from pdf_translator.polish import protected_spans as polish_protected_spans
+from pdf_translator.polish import POLISH_PROMPT_VERSION, _markdown_link_specs
 from pdf_translator.reading_units import validate_reading_units
 from pdf_translator.source_workspace import atomic_json, glossary_fingerprint
 from pdf_translator.translate import TRANSLATION_PROMPT_VERSION
@@ -57,7 +56,7 @@ RAW_TRANSLATION_QUALITY_REPORT = "raw-translation-quality-report.json"
 POLISHED_OUTPUT_QUALITY_REPORT = "polished-output-quality-report.json"
 TRANSLATION_QUALITY_INDEX = "translation-quality-index.json"
 TRANSLATION_QUALITY_SOURCE = "translation-quality-source.md"
-TRANSLATION_QUALITY_RULES_VERSION = "translation_quality_v7_delivery_headings_and_link_localization"
+TRANSLATION_QUALITY_RULES_VERSION = "translation_quality_v8_navigation_advisory"
 
 QualityStage = Literal["source", "raw_translation", "polished_output"]
 QualitySeverity = Literal["blocking", "review"]
@@ -355,6 +354,7 @@ def _semantic_html_tags(text: str) -> list[str]:
         tag
         for tag in HTML_TAG_RE.findall(text)
         if re.match(r"</?\s*[A-Za-z][\w:.-]*(?:\s|/?>)", tag)
+        and not re.match(r"</?\s*a(?:\s|/?>)", tag, re.IGNORECASE)
     )
 
 
@@ -368,12 +368,18 @@ def _html_tag_names(tags: list[str]) -> list[str]:
 
 
 def _protected_literal_multiset(text: str) -> list[str]:
+    # Keep required content and image resources strict; URLs, hyperlinks and
+    # anchor attributes are reported separately as optional navigation hints.
+    from pdf_translator.zh_markdown_cleanup import IMAGE_MARKER_RE
     literals: list[str] = []
-    for line in text.splitlines():
-        literals.extend(_protected_literals(line))
-    spans = polish_protected_spans(text)
-    if spans and not literals:
-        literals.extend(text[start:end] for start, end in spans)
+    for pattern in (FOOTNOTE_REF_RE, PRESERVE_MARKER_RE, INLINE_CODE_RE, IMAGE_MARKER_RE):
+        literals.extend(pattern.findall(text))
+    navigation_spans = _navigation_target_spans(text)
+    literals.extend(
+        match.group(0) for match in EMAIL_RE.finditer(text)
+        if not any(start <= match.start() < end for start, end in navigation_spans)
+    )
+    literals.extend(_semantic_html_tags(text))
     return sorted(literals)
 
 
@@ -384,7 +390,8 @@ def _raw_protected_multisets(text: str) -> dict[str, list[str]]:
         "inline_code": sorted(INLINE_CODE_RE.findall(text)),
         "auto_links": sorted(AUTO_LINK_RE.findall(text)),
         "urls": _url_literals(text),
-        "emails": sorted(EMAIL_RE.findall(text)),
+        "emails": sorted(match.group(0) for match in EMAIL_RE.finditer(text)
+                         if not any(start <= match.start() < end for start, end in _navigation_target_spans(text))),
         "html_tags": _semantic_html_tags(text),
         "html_anchors": _html_anchor_targets(text),
         "link_destinations": sorted(destination for _is_image, destination in _markdown_link_specs(text)),
@@ -394,7 +401,7 @@ def _raw_protected_multisets(text: str) -> dict[str, list[str]]:
 def _review_segment_locations_for_targets(
     run_dir: Path, targets: list[str], *, translated: bool,
 ) -> tuple[list[str], dict[str, Any]]:
-    """Locate link drift in the review list without changing its blocking status."""
+    """Locate optional navigation differences in the review list."""
 
     if not targets:
         return [], {}
@@ -439,8 +446,24 @@ def _write_translation_source_revision(run_dir: Path, *, context: dict[str, Any]
     )
 
 
+def _navigation_target_spans(text: str) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    spans.extend(match.span() for match in AUTO_LINK_RE.finditer(text))
+    spans.extend(match.span() for match in re.finditer(r"</?\s*a(?:\s[^>]*)?>", text, re.IGNORECASE))
+    for match in re.finditer(r"(?<!!)\[[^\]]+\]\(([^)]+)\)", text):
+        spans.append(match.span(1))
+    return spans
+
+
 def _numeric_literals(text: str) -> list[str]:
-    return [match.group(0) for match in _NUMERIC_LITERAL_RE.finditer(text)]
+    # Navigation addresses can contain arbitrary digits. Their changes are
+    # advisory, while numbers in prose, citations and image names stay strict.
+    spans = _navigation_target_spans(text)
+    spans.extend(match.span() for match in URL_RE.finditer(text))
+    return [
+        match.group(0) for match in _NUMERIC_LITERAL_RE.finditer(text)
+        if not any(start <= match.start() < end for start, end in spans)
+    ]
 
 
 def build_source_quality_report(
@@ -935,7 +958,7 @@ def build_raw_translation_quality_report(
                 _finding(
                     stage="raw_translation",
                     code="invented_link_targets",
-                    severity="blocking",
+                    severity="review",
                     message="Raw translation introduced link targets absent from source.",
                     evidence={"targets": sorted(invented)[:20], "count": len(invented)},
                     segment_ids=segment_ids,
@@ -950,7 +973,7 @@ def build_raw_translation_quality_report(
                 _finding(
                     stage="raw_translation",
                     code="lost_link_targets",
-                    severity="blocking",
+                    severity="review",
                     message="Raw translation lost link targets present in source.",
                     evidence={"targets": sorted(lost)[:20], "count": len(lost)},
                     segment_ids=segment_ids,
@@ -975,7 +998,8 @@ def build_raw_translation_quality_report(
                 _finding(
                     stage="raw_translation",
                     code="markdown_link_structure_loss",
-                    severity="blocking",
+                    severity=("blocking" if Counter(target for image, target in source_specs if image)
+                              != Counter(target for image, target in raw_specs if image) else "review"),
                     message="Raw translation changed Markdown link/image destination structure.",
                     evidence={
                         "source_count": len(source_specs),
@@ -1026,7 +1050,7 @@ def build_raw_translation_quality_report(
                     _finding(
                         stage="raw_translation",
                         code=f"{key}_regression",
-                        severity="blocking",
+                        severity="review" if key in {"auto_links", "urls", "html_anchors", "link_destinations"} else "blocking",
                         message=message,
                         evidence=evidence,
                         segment_ids=segment_ids[:20],
@@ -1164,7 +1188,8 @@ def build_polished_output_quality_report(
                 _finding(
                     stage="polished_output",
                     code="link_structure_regression",
-                    severity="blocking",
+                    severity=("blocking" if Counter(target for image, target in _markdown_link_specs(cleaned_text) if image)
+                              != Counter(target for image, target in _markdown_link_specs(final_text) if image) else "review"),
                     message="Final translation changed Markdown link structure.",
                     evidence={},
                 )
@@ -1219,7 +1244,7 @@ def build_polished_output_quality_report(
                     _finding(
                         stage="polished_output",
                         code=f"polished_{key}_regression",
-                        severity="blocking",
+                        severity="review" if key in {"urls", "html_anchors", "auto_links"} else "blocking",
                         message=f"Final translation changed {key} relative to cleaned translation.",
                         evidence={},
                     )
@@ -1398,64 +1423,12 @@ def _finding_review_adjudicable(finding: dict[str, Any]) -> bool:
     return bool(segment_ids)
 
 
-_LINK_REPAIRABLE_CODES = {
-    "invented_link_targets", "lost_link_targets", "markdown_link_structure_loss",
-    "urls_regression", "html_anchors_regression", "link_destinations_regression",
-}
-
-
-def _link_finding_repaired_by_review(
-    run_dir: Path, finding: dict[str, Any], decisions: dict[str, dict[str, Any]],
-) -> bool:
-    """Clear a raw link finding only after approved text restores every source target."""
-
-    if finding.get("stage") != "raw_translation" or finding.get("code") not in _LINK_REPAIRABLE_CODES:
-        return False
-    segment_ids = [str(value) for value in finding.get("segment_ids") or [] if str(value)]
-    if not segment_ids:
-        return False
-    source_segments = {
-        str(item.get("segment_id")): item
-        for item in _read_json(run_dir / "segments.json").get("segments") or []
-        if isinstance(item, dict)
-    }
-    translated_segments = {
-        str(item.get("segment_id")): item
-        for item in _read_json(run_dir / "translated_segments.json").get("segments") or []
-        if isinstance(item, dict)
-    }
-    for segment_id in segment_ids:
-        decision = decisions.get(segment_id) or {}
-        source = source_segments.get(segment_id) or {}
-        translated = translated_segments.get(segment_id) or {}
-        approved_text = str(decision.get("approved_text") or "")
-        if (
-            not _segment_review_adjudicated(segment_id, decisions)
-            or not approved_text.strip()
-            or approved_text == str(translated.get("translated_text") or "")
-            or not source
-            or not translated
-        ):
-            return False
-        source_text = str(source.get("source_text") or "")
-        if Counter(_markdown_link_specs(source_text)) != Counter(_markdown_link_specs(approved_text)):
-            return False
-        if Counter(_html_anchor_targets(source_text)) != Counter(_html_anchor_targets(approved_text)):
-            return False
-        if Counter(_url_literals(source_text)) != Counter(_url_literals(approved_text)):
-            return False
-    return True
-
-
 def _finding_effectively_blocking(
     finding: dict[str, Any],
     *,
     decisions: dict[str, dict[str, Any]],
-    run_dir: Path,
 ) -> bool:
     if str(finding.get("severity") or "") != "blocking":
-        return False
-    if _link_finding_repaired_by_review(run_dir, finding, decisions):
         return False
     if not _finding_review_adjudicable(finding):
         return True
@@ -1624,7 +1597,7 @@ def effective_translation_quality_evaluation(run_dir: Path) -> dict[str, Any]:
         }
     effective_blocking = [
         finding for finding in findings if _finding_effectively_blocking(
-            finding, decisions=decisions, run_dir=run_dir,
+            finding, decisions=decisions,
         )
     ]
     effective_blocking_count = len(effective_blocking)
@@ -1635,6 +1608,17 @@ def effective_translation_quality_evaluation(run_dir: Path) -> dict[str, Any]:
         "static_blocking_count": static_blocking_count,
         "effective_blocking_findings": [
             _public_blocking_finding(finding) for finding in effective_blocking
+        ],
+        "navigation_hints": [
+            _public_blocking_finding(finding) for finding in findings
+            if finding.get("severity") == "review"
+            and finding.get("code") in {
+                "invented_link_targets", "lost_link_targets", "markdown_link_structure_loss",
+                "urls_regression", "html_anchors_regression", "link_destinations_regression",
+                "auto_links_regression", "link_structure_regression",
+                "polished_urls_regression", "polished_html_anchors_regression",
+                "polished_auto_links_regression",
+            }
         ],
     }
 

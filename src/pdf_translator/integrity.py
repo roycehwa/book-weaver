@@ -87,10 +87,8 @@ def build_integrity_ledger(
     failures["missing_assets"].extend(
         str(value) for value in epub_validation.get("missing_assets", [])
     )
-    failures["broken_footnote_links"].extend(
-        str(value) for value in epub_validation.get("unresolved_hrefs", [])
-    )
-    failures["broken_footnote_links"].extend(
+    navigation_hints = [str(value) for value in epub_validation.get("unresolved_hrefs", [])]
+    navigation_hints.extend(
         str(note.get("footnote_id") or "unknown")
         for note in semantic_notes
         if not note.get("backlinks") and not bool(note.get("standalone"))
@@ -117,7 +115,7 @@ def build_integrity_ledger(
         for note in semantic_notes
         if not bool(note.get("standalone"))
     )
-    link_missing = len(failures["broken_footnote_links"])
+    link_missing = len(navigation_hints)
     dimensions = {
         "pages": {
             "covered": covered_pages,
@@ -162,6 +160,7 @@ def build_integrity_ledger(
         "schema": "integrity_ledger_v1",
         "dimensions": dimensions,
         "failures": failures,
+        "navigation_hints": navigation_hints,
         "technical_ready": technical_ready,
         "approved_ready": approved_ready,
         # Backward-compatible alias: "ready" always means approved export ready.
@@ -195,6 +194,13 @@ def refresh_review_readiness(
 
     refreshed = copy.deepcopy(ledger)
     failures = refreshed.setdefault("failures", {})
+    # Existing completed tasks retain their signed integrity record. Apply
+    # the current navigation policy when projecting review readiness, without
+    # changing the persisted book or relaxing any other technical failure.
+    old_links = failures.get("broken_footnote_links") or []
+    if old_links:
+        refreshed["navigation_hints"] = list(refreshed.get("navigation_hints") or []) + list(old_links)
+        failures["broken_footnote_links"] = []
     decisions = review_state.get("decisions")
     decisions = decisions if isinstance(decisions, dict) else {}
     unresolved: list[str] = []

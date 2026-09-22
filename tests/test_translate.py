@@ -123,13 +123,11 @@ def test_translation_rejects_changed_protected_markup(
 
 
 @pytest.mark.parametrize("extra", [
-    "\n\n[1](141)",
     "\n\n*[Translation notes: Footnote markers appear outside the paragraphs.]*",
-    '\n\n<a href="invented.xhtml">注</a>',
 ])
-def test_translation_rejects_invented_links_and_commentary(extra: str) -> None:
+def test_translation_rejects_commentary(extra: str) -> None:
     from pdf_translator.translate import _assert_translation_quality
-    with pytest.raises(ValueError, match="invented link targets|translator meta response"):
+    with pytest.raises(ValueError, match="translator meta response"):
         _assert_translation_quality(chunk=TranslationChunk(index=0, markdown="A title"),
             translated="一个标题" + extra, target_language="zh-CN", translator_name="minimax")
 
@@ -141,25 +139,32 @@ def test_translation_retains_real_source_links() -> None:
 
 
 @pytest.mark.parametrize(
-    ("source", "translated", "error"),
+    ("source", "translated"),
     [
-        ("Read [source](chapter.xhtml#note-1).", "请阅读来源。", "lost link targets"),
-        ("Read https://example.org/source.", "请阅读 https://example.org/changed。", "protected urls"),
+        ("Read [source](chapter.xhtml#note-1).", "请阅读来源。"),
+        ("Read https://example.org/source.", "请阅读 https://example.org/changed。"),
         ("Read [one](chapter.xhtml) and [two](chapter.xhtml).",
-         "请阅读[一](chapter.xhtml)和二。", "lost link targets"),
+         "请阅读[一](chapter.xhtml)和二。"),
+        ("Read <a href='old.xhtml'>one</a>.", "请阅读 <a href='new.xhtml'>一</a>。"),
     ],
 )
-def test_translation_rejects_lost_links_before_review(
-    source: str, translated: str, error: str,
+def test_translation_allows_navigation_differences(
+    source: str, translated: str,
 ) -> None:
     from pdf_translator.translate import _assert_translation_quality
 
-    with pytest.raises(ValueError, match=error):
+    _assert_translation_quality(
+        chunk=TranslationChunk(index=0, markdown=source),
+        translated=translated, target_language="zh-CN", translator_name="minimax",
+    )
+
+
+def test_translation_still_rejects_missing_image_asset() -> None:
+    from pdf_translator.translate import _assert_translation_quality
+    with pytest.raises(ValueError, match="required image targets"):
         _assert_translation_quality(
-            chunk=TranslationChunk(index=0, markdown=source),
-            translated=translated,
-            target_language="zh-CN",
-            translator_name="minimax",
+            chunk=TranslationChunk(index=0, markdown="![Figure](assets/a.png)"),
+            translated="![图](assets/b.png)", target_language="zh-CN", translator_name="minimax",
         )
 
 

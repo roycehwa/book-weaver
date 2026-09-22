@@ -40,7 +40,7 @@ const qualityFindingLabels: Record<string, string> = {
   urls_regression: '译文中的网址与原文不一致',
   html_anchors_regression: '译文中的链接地址与原文不一致',
   link_destinations_regression: '译文中的链接目标与原文不一致',
-  markdown_link_structure_loss: '链接或图片的目标结构发生变化',
+  markdown_link_structure_loss: '链接目标发生变化',
 }
 
 function qualityFindingTargets(evidence?: Record<string, unknown>): string[] {
@@ -441,6 +441,7 @@ function Review() {
   const policyCoverageBlocking = Boolean(project?.policy_coverage?.blocking)
   const policyCoverageMessage = project?.policy_coverage?.message
   const qualityBlockingFindings = project?.translation_quality?.effective_blocking_findings || []
+  const navigationHints = project?.translation_quality?.navigation_hints || []
   const exportCompletionMessage = reviewExportCompletionMessage({
     pendingRewriteCount,
     rewritesNeedingInstruction,
@@ -1265,10 +1266,26 @@ function Review() {
                 ))}
               </ul>
             )}
-            {translationQualityBlocking && qualityBlockingFindings.some((finding) => finding.code.includes('link') || finding.code === 'urls_regression') && (
-              <p className="mt-2 text-xs text-red-800">
-                点击“定位对应段落”，把译文中的链接地址改回原文目标并确认。仅批准未修改的译文不会解除链接阻断。
-              </p>
+            {navigationHints.length > 0 && (
+              <details className="mt-2 rounded border border-amber-200 bg-amber-50 p-2 text-xs text-amber-900">
+                <summary className="cursor-pointer font-medium">链接提示（{navigationHints.length} 项，可选查看，不影响导出）</summary>
+                <p className="mt-1">原书链接也可能失效；只有需要使用这些链接时才检查。</p>
+                <ul className="mt-2 space-y-1">
+                  {navigationHints.map((finding, index) => (
+                    <li key={`${finding.code}-${index}`} className="rounded bg-white p-2">
+                      <span>{qualityFindingLabels[finding.code] || finding.message}</span>
+                      {qualityFindingTargets(finding.evidence).map((target, targetIndex) => (
+                        <div key={targetIndex} className="break-all text-[11px]">{target.length > 160 ? `${target.slice(0, 160)}…` : target}</div>
+                      ))}
+                      {finding.segment_ids?.[0] && (
+                        <button type="button" className="mt-1 underline" onClick={() => goToIssueSegment(finding.segment_ids?.[0] || '')}>
+                          查看对应段落
+                        </button>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              </details>
             )}
             <div className="mt-2 flex flex-wrap gap-2">
               {project?.translation_quality?.revalidation_required && (

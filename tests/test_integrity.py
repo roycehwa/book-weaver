@@ -76,7 +76,6 @@ def test_complete_ledger_reports_each_dimension() -> None:
         "missing_translations",
         "unresolved_ocr",
         "missing_assets",
-        "broken_footnote_links",
         "absolute_paths",
         "pdf_body_flow_notes",
         "unresolved_review",
@@ -101,16 +100,17 @@ def test_missing_explanatory_translation_is_blocking_but_citation_is_not() -> No
     assert "citation-a" not in ledger["failures"]["missing_translations"]
 
 
-def test_footnote_without_backlink_is_blocking() -> None:
+def test_footnote_without_backlink_is_navigation_hint() -> None:
     book = _complete_book()
     book["semantic_content"]["footnotes"][0]["backlinks"] = []
 
     ledger = build_integrity_ledger(book)
 
-    assert ledger["failures"]["broken_footnote_links"] == ["footnote-a"]
+    assert ledger["failures"]["broken_footnote_links"] == []
+    assert ledger["navigation_hints"] == ["footnote-a"]
     assert ledger["dimensions"]["footnote_links"]["total"] == 1
     assert ledger["dimensions"]["footnote_links"]["ratio"] == 0.0
-    assert ledger["ready"] is False
+    assert ledger["ready"] is True
 
 
 def test_standalone_table_note_does_not_require_backlink() -> None:
@@ -123,6 +123,27 @@ def test_standalone_table_note_does_not_require_backlink() -> None:
 
     assert ledger["failures"]["broken_footnote_links"] == []
     assert ledger["dimensions"]["footnote_links"]["ratio"] == 1.0
+
+
+def test_unresolved_epub_href_is_reported_without_blocking_export() -> None:
+    ledger = build_integrity_ledger(
+        _complete_book(),
+        epub_validation={"unresolved_hrefs": [{"href": "old.xhtml#missing"}]},
+    )
+    assert ledger["navigation_hints"]
+    assert ledger["ready"] is True
+    assert_approved_export_ready(ledger)
+
+
+def test_existing_ledger_reprojects_only_link_failures() -> None:
+    ledger = build_integrity_ledger(_complete_book())
+    ledger["failures"]["broken_footnote_links"] = ["old.xhtml#missing"]
+    refreshed = refresh_review_readiness(ledger, review_items=[], review_state={"decisions": {}})
+    assert refreshed["ready"] is True
+    assert refreshed["navigation_hints"] == ["old.xhtml#missing"]
+    ledger["failures"]["missing_assets"] = ["assets/map.png"]
+    refreshed = refresh_review_readiness(ledger, review_items=[], review_state={"decisions": {}})
+    assert refreshed["ready"] is False
 
 
 def test_open_review_blocks_approval_but_not_technical_readiness() -> None:
