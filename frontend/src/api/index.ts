@@ -260,6 +260,9 @@ export interface ReviewProject {
       reviewer_comment?: string
       approved_text?: string
       rewrite_error?: string
+      rewrite_error_details?: {
+        missing_glossary_terms?: Array<{ source: string; target: string }>
+      }
       updated_at?: string
     }>
   }

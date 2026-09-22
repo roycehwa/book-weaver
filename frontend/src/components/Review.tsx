@@ -1671,7 +1671,22 @@ function Review() {
             )}
           </div>
           {selectedDecision?.rewrite_error && (
-            <p className="mt-2 text-xs text-red-700">{selectedDecision.rewrite_error}</p>
+            <div role="alert" className="mt-2 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-800">
+              <p>{selectedDecision.rewrite_error === 'Model rewrite did not satisfy mandatory glossary constraints.'
+                ? '模型重译后仍未使用已确认的固定译法，因此这次候选译文未被采用，原有译文保持不变。'
+                : selectedDecision.rewrite_error}</p>
+              {Boolean(selectedDecision.rewrite_error_details?.missing_glossary_terms?.length) && (
+                <div className="mt-2">
+                  <p className="font-medium">未遵守的术语：</p>
+                  <ul className="mt-1 list-disc pl-5">
+                    {selectedDecision.rewrite_error_details?.missing_glossary_terms?.map((term, index) => (
+                      <li key={`${term.source}-${index}`}>{term.source} → {term.target}</li>
+                    ))}
+                  </ul>
+                  <p className="mt-2">若固定译法正确，请按上列译法修改重译要求或手动修订；若固定译法不合适，需要先调整术语决定。</p>
+                </div>
+              )}
+            </div>
           )}
           </div>
         </section>
