@@ -214,6 +214,19 @@ def test_join_chapter_delivery_markdown_adds_chapter_headings() -> None:
     assert "# Chapter 2\n\n更多。" in joined
 
 
+def test_join_translated_chapter_keeps_existing_body_headings_without_source_title() -> None:
+    joined = join_chapter_delivery_markdown(
+        [{
+            "title": '2. Using "Good" Business to Fight "Bad" Business',
+            "source_title": '2. Using "Good" Business to Fight "Bad" Business',
+            "markdown": "## Two\n\n## 用良善商业对抗不良商业\n\n正文。",
+            "toc": True,
+            "synthesize_heading": False,
+        }]
+    )
+    assert joined == "## Two\n\n## 用良善商业对抗不良商业\n\n正文。\n"
+
+
 def test_resolve_translated_chapter_heading_promotes_target_title_once() -> None:
     from pdf_translator.book_views import resolve_translated_chapter_heading
 

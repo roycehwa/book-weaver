@@ -53,6 +53,9 @@ class TranslatedChapter:
     source_title: str | None = None
     kind: str | None = None
     rebuild_toc: bool = False
+    # A source TOC label is navigation metadata, not authority to add visible
+    # source-language text above an already translated chapter body.
+    synthesize_heading: bool = True
 
 
 @dataclass(slots=True)

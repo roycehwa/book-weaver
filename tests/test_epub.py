@@ -3,6 +3,63 @@ from zipfile import ZipFile
 
 from pdf_translator.epub import render_epub_from_book
 from pdf_translator.models import TranslatedChapter
+from pdf_translator.review import translated_segments_to_chapters
+
+
+def test_review_export_keeps_body_titles_without_injecting_source_toc_label(tmp_path: Path) -> None:
+    chapters = translated_segments_to_chapters(
+        [
+            {
+                "segment_id": "chapter-two:seg0001",
+                "chapter_id": "chapter-two",
+                "chapter_index": 2,
+                "chapter_title": '2. Using "Good" Business to Fight "Bad" Business',
+                "chapter_kind": "narrative",
+                "block_index": 1,
+                "translated_text": "## Two",
+                "role": "heading",
+                "is_chapter_title": False,
+            },
+            {
+                "segment_id": "chapter-two:seg0002",
+                "chapter_id": "chapter-two",
+                "chapter_index": 2,
+                "chapter_title": '2. Using "Good" Business to Fight "Bad" Business',
+                "chapter_kind": "narrative",
+                "block_index": 2,
+                "translated_text": '## 用“良善”商业对抗“不良”商业',
+                "role": "heading",
+                "is_chapter_title": False,
+            },
+            {
+                "segment_id": "chapter-two:seg0003",
+                "chapter_id": "chapter-two",
+                "chapter_index": 2,
+                "chapter_title": '2. Using "Good" Business to Fight "Bad" Business',
+                "chapter_kind": "narrative",
+                "block_index": 3,
+                "translated_text": "正文。",
+                "role": "prose",
+                "is_chapter_title": False,
+            },
+        ]
+    )
+    output = tmp_path / "reviewed.epub"
+    render_epub_from_book(
+        book={}, translated_chapters=chapters, output_path=output,
+        title="Synthetic", language="zh-CN",
+    )
+    with ZipFile(output) as archive:
+        chapter_path = next(name for name in archive.namelist() if name.startswith("OEBPS/chapters/"))
+        chapter = archive.read(chapter_path).decode("utf-8")
+        nav = archive.read("OEBPS/nav.xhtml").decode("utf-8")
+    body = chapter.split("<body", 1)[1]
+    assert '<h2>Two</h2>' in body
+    assert '<h2>用“良善”商业对抗“不良”商业</h2>' in body
+    assert "正文。" in body
+    assert "<h1>" not in body
+    assert 'Using &quot;Good&quot; Business' not in body
+    assert 'Using &quot;Good&quot; Business' in nav
 
 
 def test_export_has_resource_budget_and_no_automatic_fonts(tmp_path, monkeypatch):

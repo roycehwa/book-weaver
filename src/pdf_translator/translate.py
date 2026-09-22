@@ -2558,6 +2558,7 @@ def translate_book_chapters(
             translated_parts,
             [str(part.get("separator_before", "\n\n")) for part in nonempty_planned_segments],
         ).strip()
+        has_leading_body_heading = bool(pop_leading_markdown_heading(translated_markdown)[0])
         if translated_heading_evidence:
             display_title, translated_markdown = resolve_translated_chapter_heading(
                 translated_markdown,
@@ -2583,6 +2584,7 @@ def translate_book_chapters(
                 source_title=source_title,
                 kind=chapter_kind,
                 rebuild_toc=bool(chapter.get("rebuild_toc")),
+                synthesize_heading=translated_heading_evidence or not has_leading_body_heading,
             )
         )
 
@@ -2786,7 +2788,7 @@ def translate_book_chapters(
     delivery_chapters: list[TranslatedChapter] = []
     for chapter in translated_chapters:
         markdown = str(chapter.markdown or "").strip()
-        if chapter.toc and (markdown or chapter.title):
+        if chapter.toc and chapter.synthesize_heading and (markdown or chapter.title):
             markdown = ensure_chapter_top_heading(markdown, chapter.title).strip()
         if markdown:
             markdown += "\n"

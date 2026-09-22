@@ -1435,9 +1435,13 @@ def translated_segments_to_markdown(translated_segments_payload: Any) -> str:
     chapters = translated_segments_to_chapters(translated_segments_payload)
     return (
         "\n\n".join(
-            ensure_chapter_top_heading(
-                str(chapter.get("markdown") or ""),
-                str(chapter.get("title") or "Chapter"),
+            (
+                ensure_chapter_top_heading(
+                    str(chapter.get("markdown") or ""),
+                    str(chapter.get("title") or "Chapter"),
+                )
+                if chapter.get("synthesize_heading", True)
+                else str(chapter.get("markdown") or "")
             ).strip()
             for chapter in chapters
             if str(chapter.get("markdown") or "").strip()
@@ -1479,6 +1483,7 @@ def translated_segments_to_chapters(translated_segments_payload: Any) -> list[di
             translated_parts,
             [str(segment.get("separator_before", "\n\n")) for segment in ordered],
         ).strip()
+        has_leading_body_heading = bool(pop_leading_markdown_heading(markdown)[0])
         first = chapter_segments[0] if chapter_segments else {}
         if translated_heading_evidence:
             display_title, markdown = resolve_translated_chapter_heading(
@@ -1499,6 +1504,7 @@ def translated_segments_to_chapters(translated_segments_payload: Any) -> list[di
                 "chapter_id": chapter_id or None,
                 "title": display_title,
                 "source_title": source_title,
+                "synthesize_heading": translated_heading_evidence or not has_leading_body_heading,
                 "page_start": min(pages) if pages else (first.get("source_location") or {}).get("page_start"),
                 "page_end": max(pages) if pages else (first.get("source_location") or {}).get("page_end"),
                 "source_pages": pages,
@@ -1551,6 +1557,8 @@ def merge_reviewed_chapters_with_resources(
             for key in ("preserve_original", "resource_only", "toc", "kind", "rebuild_toc"):
                 if key in source:
                     chapter[key] = source[key]
+            if source.get("preserve_original") or source.get("resource_only"):
+                chapter["synthesize_heading"] = True
     covered_pages = {
         int(page)
         for chapter in reviewed_chapters

@@ -575,7 +575,7 @@ def render_epub_from_book(
             or APPARATUS_TITLE_RE.match(chapter_title)
         ):
             markdown_text = sanitize_apparatus_chapter_markdown(markdown_text)
-        if chapter.get("toc", True):
+        if chapter.get("toc", True) and chapter.get("synthesize_heading", True):
             markdown_text = normalize_chapter_headings(markdown_text, chapter_title)
         markdown_text = dedupe_markdown_image_blocks(
             markdown_text,

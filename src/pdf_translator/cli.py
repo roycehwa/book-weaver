@@ -851,7 +851,7 @@ def _render_review_export(
     for chapter in delivery_chapters:
         body = strip_fail_open_notices(str(chapter.get("markdown") or "")).strip()
         title = str(chapter.get("title") or "").strip()
-        if title and body and chapter.get("toc", True) and not body.startswith("#"):
+        if title and body and chapter.get("toc", True) and chapter.get("synthesize_heading", True) and not body.startswith("#"):
             body = f"# {title}\n\n{body}"
         if body:
             delivery_markdown_parts.append(body)

@@ -346,7 +346,7 @@ def join_chapter_delivery_markdown(chapters: list[dict]) -> str:
         if not markdown:
             continue
         title = str(chapter.get("title") or "")
-        if chapter.get("toc", True):
+        if chapter.get("toc", True) and chapter.get("synthesize_heading", True):
             markdown = normalize_chapter_headings(markdown, title).strip()
         parts.append(markdown)
     if not parts:
