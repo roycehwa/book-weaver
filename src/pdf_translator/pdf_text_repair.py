@@ -20,6 +20,11 @@ _HEADING_TRAILING_FOOTNOTE = re.compile(r"^(#{1,6}\s+.+?)\s+y\.\s*$", re.IGNOREC
 _GLUE_FORMALS = re.compile(r"\bformalsystems\b", re.IGNORECASE)
 _GLUE_EACHOF = re.compile(r"\bEachofthe\b", re.IGNORECASE)
 _SPACED_OF_QUOTE = re.compile(r"of'\s*")
+_SPACED_POSSESSIVE_S = re.compile(r"(?<=[A-Za-z])['’][ \t]+s\b")
+_MIDWORD_SPACE_RE = re.compile(
+    r"(?<!['’]\s)(?<![A-Za-z'’])\b([b-hj-z]) ([a-z]{3,})\b",
+    re.IGNORECASE,
+)
 _DOUBLE_SPACED_WORD = re.compile(r"\b([a-z]+)  +([a-z]+)\b", re.IGNORECASE)
 _LOGIC_SYMBOL_LINE = re.compile(r"[◻◇φ∀∃⊢⊨≤≥]")
 # Docling can leak a single glyph wrapped in dashes at a flow boundary.  The
@@ -54,7 +59,7 @@ INGEST_ISSUE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("orphan_footnote_y", re.compile(r"\. y\.|^\s*y\.\s*$", re.IGNORECASE | re.MULTILINE)),
     (
         "midword_space",
-        re.compile(r"(?<![A-Za-z'’])\b[b-hj-z] [a-z]{3,}\b"),
+        _MIDWORD_SPACE_RE,
     ),
     ("glued_words", re.compile(r"\bformalsystems\b", re.IGNORECASE)),
     # A text-only scan cannot prove whether this is a broken word, a valid
@@ -219,6 +224,7 @@ def repair_pdf_markdown(text: str, *, known_words: set[str] | None = None) -> st
     repaired = _GLUE_FORMALS.sub("formal systems", repaired)
     repaired = _GLUE_EACHOF.sub("Each of the", repaired)
     repaired = _SPACED_OF_QUOTE.sub("of' ", repaired)
+    repaired = _SPACED_POSSESSIVE_S.sub("'s", repaired)
     repaired = _STANDALONE_FLOW_MARKER.sub("", repaired)
     repaired = _SENTENCE_END_FLOW_MARKER.sub("", repaired)
     repaired = _PROSE_PARAGRAPH_FLOW_MARKER.sub(" ", repaired)
@@ -231,10 +237,23 @@ def repair_pdf_markdown(text: str, *, known_words: set[str] | None = None) -> st
     return repaired.strip() + ("\n" if text.endswith("\n") else "")
 
 
+def _midword_space_is_lexical(match: re.Match[str]) -> bool:
+    """A one-letter gap counts only when the joined spelling is a real word."""
+    joined = f"{match.group(1)}{match.group(2)}"
+    return zipf_frequency(joined, "en") >= 3.0
+
+
+def _pattern_matches(code: str, pattern: re.Pattern[str], text: str) -> list[re.Match[str]]:
+    matches = list(pattern.finditer(text))
+    if code != "midword_space":
+        return matches
+    return [match for match in matches if _midword_space_is_lexical(match)]
+
+
 def scan_ingest_quality(text: str) -> IngestQualityReport:
     issue_counts: dict[str, int] = {}
     for name, pattern in INGEST_ISSUE_PATTERNS:
-        issue_counts[name] = len(pattern.findall(text))
+        issue_counts[name] = len(_pattern_matches(name, pattern, text))
     for name, pattern in BLOCKING_INGEST_PATTERNS:
         issue_counts[name] = len(pattern.findall(text))
     total_chars = max(len(text), 1)
@@ -260,7 +279,7 @@ def _quality_evidence(
         for match in re.finditer(r"^#{1,6}\s+(.+?)\s*$", text, flags=re.MULTILINE)
     ]
     for code, pattern in patterns:
-        for match in pattern.finditer(text):
+        for match in _pattern_matches(code, pattern, text):
             chapter = next(
                 (title for offset, title in reversed(headings) if offset <= match.start()),
                 None,

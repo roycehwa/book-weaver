@@ -301,6 +301,8 @@ _SCRAPE_WATERMARK_INLINE_RE = re.compile(
     r"\b(?:ocean\s*of\s*pdf(?:\s*\.\s*f\s*)?|oceanofpdf)\.\s*com\b",
     re.IGNORECASE,
 )
+_EPUB_AD_MARKER_RE = re.compile(r"(?i)^[\w.-]+-epub-ad$")
+_EPUB_AD_LINK_RE = re.compile(r"(?i)lokepub\.com|[\w.-]+-epub-ad")
 _STRAY_RULE_HEADING_RE = re.compile(r"^#{1,6}\s*[-–—\s]{1,6}$")
 
 
@@ -328,13 +330,44 @@ def is_scrape_watermark_block(block: str) -> bool:
     return False
 
 
-def strip_scrape_watermarks(markdown: str) -> str:
-    """Remove OceanofPDF/Z-Library watermarks from chapter markdown before export."""
+def _is_epub_ad_marker(block: str) -> bool:
+    return bool(_EPUB_AD_MARKER_RE.match(str(block or "").strip()))
 
+
+def _is_epub_ad_link(block: str) -> bool:
+    return bool(_EPUB_AD_LINK_RE.search(str(block or "")))
+
+
+def strip_scrape_watermarks(markdown: str) -> str:
+    """Remove site watermarks and inserted distributor ads before export."""
+
+    raw_blocks = [block.strip() for block in str(markdown or "").split("\n\n")]
     kept_blocks: list[str] = []
-    for block in str(markdown or "").split("\n\n"):
-        stripped = block.strip()
+    index = 0
+    while index < len(raw_blocks):
+        stripped = raw_blocks[index]
         if not stripped or is_scrape_watermark_block(stripped):
+            index += 1
+            continue
+        if _is_epub_ad_marker(stripped):
+            index += 1
+            skipped = 0
+            while index < len(raw_blocks) and skipped < 3:
+                follower = raw_blocks[index].strip()
+                if not follower:
+                    index += 1
+                    continue
+                if _is_epub_ad_link(follower):
+                    index += 1
+                    break
+                if len(follower) <= 80:
+                    index += 1
+                    skipped += 1
+                    continue
+                break
+            continue
+        if _is_epub_ad_link(stripped) and len(stripped) <= 200:
+            index += 1
             continue
         lines: list[str] = []
         for line in stripped.splitlines():
@@ -343,6 +376,7 @@ def strip_scrape_watermarks(markdown: str) -> str:
                 lines.append(cleaned)
         if lines:
             kept_blocks.append("\n".join(lines))
+        index += 1
     if not kept_blocks:
         return ""
     return "\n\n".join(kept_blocks).strip() + "\n"
@@ -363,6 +397,30 @@ def join_chapter_delivery_markdown(chapters: list[dict]) -> str:
     if not parts:
         return ""
     return "\n\n".join(parts) + "\n"
+
+
+_PUBLISHER_PROMO_TITLE_RE = re.compile(
+    r"(?ix)^(?:"
+    r"what['’]?s\s+next\s+on\s+your\s+reading\s+list\??"
+    r"|你的阅读清单下一本是什么？?"
+    r"|discover\s+your\s+next\s+(?:read|book)\b.*"
+    r"|also\s+by\s+(?:this\s+)?author"
+    r"|more\s+books\s+by\s+(?:the\s+|this\s+)?author"
+    r")$"
+)
+
+
+def is_publisher_promo_title(title: str) -> bool:
+    """Publisher end-matter marketing pages are not chapters of the book."""
+    return bool(_PUBLISHER_PROMO_TITLE_RE.match(str(title or "").strip()))
+
+
+def delivery_toc_skips_chapter(chapter: dict) -> bool:
+    """Drop promo pages and image-description titles from the rebuilt contents."""
+    title = str(chapter.get("title") or "").strip()
+    if not title or is_publisher_promo_title(title):
+        return True
+    return len(title) > 160
 
 
 def is_rebuilt_delivery_toc_chapter(chapter: dict) -> bool:
@@ -387,12 +445,16 @@ def rebuild_delivery_toc_chapters(
     rebuilt = [dict(chapter) for chapter in chapters]
     language = str(target_language or "").lower()
     contents_title = "目录" if language.startswith("zh") else "Contents"
+    for chapter in rebuilt:
+        if is_rebuilt_delivery_toc_chapter(chapter) or not delivery_toc_skips_chapter(chapter):
+            continue
+        chapter["toc"] = False
     entries = [
         str(chapter.get("title") or "").strip()
         for chapter in rebuilt
         if chapter.get("toc", True)
         and not is_rebuilt_delivery_toc_chapter(chapter)
-        and str(chapter.get("title") or "").strip()
+        and not delivery_toc_skips_chapter(chapter)
     ]
     for chapter in rebuilt:
         if not is_rebuilt_delivery_toc_chapter(chapter):
@@ -410,6 +472,8 @@ def rebuild_delivery_toc_chapters(
 __all__ = [
     "dedupe_markdown_image_blocks",
     "ensure_chapter_top_heading",
+    "delivery_toc_skips_chapter",
+    "is_publisher_promo_title",
     "is_rebuilt_delivery_toc_chapter",
     "is_scrape_watermark_block",
     "join_chapter_delivery_markdown",

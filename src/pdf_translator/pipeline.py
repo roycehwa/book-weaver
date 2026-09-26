@@ -711,6 +711,53 @@ def _pre_translation_stages(*, using_existing_run: bool) -> tuple[str, ...]:
     return () if using_existing_run else ("ingesting", "reconstructing")
 
 
+def _polish_review_structure(
+    review_artifacts: dict[str, Any],
+    *,
+    translator_name: str,
+    images_dir: Path | None,
+) -> None:
+    """Correct structure lines in the draft the reader will review."""
+
+    from pdf_translator.repair import polish_structure_markdown, polish_wrapped_lines
+    from pdf_translator.translate import complete_repair
+
+    translated_payload = review_artifacts.get("translated_segments") or {}
+    translated_segments = translated_payload.get("segments") or []
+    source_payload = review_artifacts.get("segments") or {}
+    source_by_id = {
+        item.get("segment_id"): str(item.get("source_text") or "")
+        for item in source_payload.get("segments") or []
+        if isinstance(item, dict)
+    }
+    image_names: list[str] = []
+    if images_dir is not None and images_dir.is_dir():
+        image_names = [path.name for path in images_dir.iterdir() if path.is_file()]
+    try:
+        translator = build_translator(translator_name)
+        complete = lambda system, user: complete_repair(translator, system, user)
+    except Exception:
+        return
+    for item in translated_segments:
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("translated_text") or "")
+        if not text.strip():
+            continue
+        try:
+            item["translated_text"] = polish_wrapped_lines(
+                polish_structure_markdown(
+                    text,
+                    source_markdown=source_by_id.get(item.get("segment_id"), ""),
+                    complete=complete,
+                    available_image_names=image_names,
+                ),
+                complete=complete,
+            )
+        except Exception:
+            continue
+
+
 def run_translation_pipeline(
     settings: RunSettings,
     on_stage: Callable[[str, dict[str, Any]], None] | None = None,
@@ -963,6 +1010,19 @@ def run_translation_pipeline(
         max_chunk_chars=settings.max_chunk_chars,
         run_dir=artifacts.output_dir,
     )
+    if (
+        not skip_translation
+        and text_operation == "translate"
+        and str(settings.target_language or "").lower().startswith("zh")
+    ):
+        from pdf_translator.translation_failures import has_deferred_review_translation
+
+        if not has_deferred_review_translation(artifacts.output_dir):
+            _polish_review_structure(
+                review_artifacts,
+                translator_name=settings.translator,
+                images_dir=normalized_images_dir,
+            )
     extra_files.update(write_review_artifacts(artifacts.output_dir, review_artifacts))
     from pdf_translator.source_workspace import atomic_json
     from pdf_translator.translation_quality import write_translation_quality_bundle

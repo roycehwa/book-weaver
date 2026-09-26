@@ -21,6 +21,7 @@ from pdf_translator.reconstruct import (
 from pdf_translator.semantic_content import (
     SEMANTIC_CONTENT_SCHEMA,
     build_semantic_footnote,
+    empty_semantic_content,
     stable_semantic_id,
 )
 from pdf_translator.ocr_quality import assess_ocr_block
@@ -100,6 +101,15 @@ OUTLINE_SKIP_TITLE_RE = re.compile(
 OUTLINE_DROP_TITLE_RE = re.compile(
     r"^(?:title page|half title|start of frontmatter|navigation|page list)$",
     re.IGNORECASE,
+)
+PUBLISHER_PROMO_TITLE_RE = re.compile(
+    r"(?ix)^(?:"
+    r"what['’]?s\s+next\s+on\s+your\s+reading\s+list\??"
+    r"|你的阅读清单下一本是什么？?"
+    r"|discover\s+your\s+next\s+(?:read|book)\b.*"
+    r"|also\s+by\s+(?:this\s+)?author"
+    r"|more\s+books\s+by\s+(?:the\s+|this\s+)?author"
+    r")$"
 )
 
 
@@ -2149,6 +2159,8 @@ def apply_canonical_chapter_plan(
                 if record.get("source_page", record.get("page_no")) not in excluded_pages]
     result["full_markdown"] = "\n\n".join(part for part in full_parts if part).strip()
     result["trace_markdown"] = "\n\n".join(part for part in trace_parts if part).strip()
+    if not isinstance(result.get("semantic_content"), dict):
+        result["semantic_content"] = empty_semantic_content()
     return result
 
 
@@ -2445,10 +2457,12 @@ def _build_book_from_epub_meta(meta: dict[str, Any], source_path: Path | None) -
             in_outline_index
             and re.fullmatch(r"[A-Z]", title.strip(), flags=re.IGNORECASE)
         )
+        is_publisher_promo = bool(PUBLISHER_PROMO_TITLE_RE.match(title.strip()))
         is_preserved_resource = bool(
             is_cover_title
             or OUTLINE_SKIP_TITLE_RE.match(title)
             or is_index_continuation
+            or is_publisher_promo
         )
         if INDEX_TITLE_RE.match(title):
             in_outline_index = True
@@ -2586,6 +2600,7 @@ def _build_book_from_epub_meta(meta: dict[str, Any], source_path: Path | None) -
         "chapter_count": len(chapters),
         "chapters": chapters,
         "assets": assets,
+        "semantic_content": empty_semantic_content(),
         "pages": [
             {
                 "page_no": page["page_no"],

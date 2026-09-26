@@ -11,9 +11,8 @@ import PhaseAWorkspace from './components/PhaseAWorkspace'
 
 function App() {
   return (
-    <div className="min-h-screen bg-slate-50">
+    <div className="min-h-screen">
       <Routes>
-        <Route path="/review-center" element={<ReviewCenter />} />
         <Route
           path="/review"
           element={
@@ -28,6 +27,7 @@ function App() {
           <Route path="book/:id" element={<Reader />} />
           <Route path="reader/:id" element={<Navigate to="/book/:id" replace />} />
           <Route path="upload" element={<Upload />} />
+          <Route path="review-center" element={<ReviewCenter />} />
           <Route path="jobs" element={<Jobs />} />
           <Route
             path="jobs/:id"

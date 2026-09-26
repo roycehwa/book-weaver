@@ -350,6 +350,98 @@ def test_ingest_epub_resolves_parent_relative_image_paths(tmp_path: Path) -> Non
     assert "![Fig]" in md
 
 
+def test_ingest_epub_keeps_svg_package_cover_and_drops_inserted_ad(tmp_path: Path) -> None:
+    tiny = b"\x89PNG\r\n\x1a\ncover"
+    titlepage = """<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:xlink="http://www.w3.org/1999/xlink">
+<head><title>Cover</title><meta name="calibre:cover" content="true"/></head>
+<body><div><svg xmlns="http://www.w3.org/2000/svg"><image xlink:href="cover.jpeg"/></svg></div></body>
+</html>"""
+    chapter = """<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>One</title></head><body>
+<p>She woke early.</p>
+<!-- noveldb-epub-ad -->
+<div><p>When one story ends, another is nearby.</p><p>Browse Lokepub.</p></div>
+<p>She climbed the stairs.</p>
+</body></html>"""
+    epub = tmp_path / "svg-cover.epub"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        z.writestr("mimetype", "application/epub+zip", compress_type=zipfile.ZIP_STORED)
+        z.writestr(
+            "META-INF/container.xml",
+            """<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>""",
+        )
+        z.writestr("cover.jpeg", tiny)
+        z.writestr("titlepage.xhtml", titlepage)
+        z.writestr("OEBPS/c1.xhtml", chapter)
+        z.writestr(
+            "content.opf",
+            """<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" unique-identifier="id" version="2.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="id">urn:t</dc:identifier><dc:title>T</dc:title><dc:language>en</dc:language>
+    <meta name="cover" content="cover"/>
+  </metadata>
+  <manifest>
+    <item id="cover" href="cover.jpeg" media-type="image/jpeg"/>
+    <item id="titlepage" href="titlepage.xhtml" media-type="application/xhtml+xml"/>
+    <item id="c1" href="OEBPS/c1.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine><itemref idref="titlepage"/><itemref idref="c1"/></spine>
+</package>""",
+        )
+    epub.write_bytes(buf.getvalue())
+    doc = ingest_epub(epub)
+    chapters = doc.structured["_epub_meta"]["chapters"]
+    assert chapters[0]["title"] == "Cover"
+    assert "![Cover]" in chapters[0]["markdown"]
+    assert "cover.jpeg" in chapters[0]["markdown"]
+    body = chapters[1]["markdown"]
+    assert "She woke early." in body
+    assert "She climbed the stairs." in body
+    assert "noveldb" not in body.lower()
+    assert "lokepub" not in body.lower()
+
+
+def test_restore_declared_epub_cover_replaces_logo_mistaken_for_cover(tmp_path: Path) -> None:
+    from pdf_translator.ingest import restore_declared_epub_cover
+
+    tiny = b"\x89PNG\r\n\x1a\ncover"
+    epub = tmp_path / "book.epub"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        z.writestr("mimetype", "application/epub+zip", compress_type=zipfile.ZIP_STORED)
+        z.writestr(
+            "META-INF/container.xml",
+            """<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>""",
+        )
+        z.writestr("cover.jpeg", tiny)
+        z.writestr(
+            "content.opf",
+            """<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" unique-identifier="id" version="2.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="id">urn:t</dc:identifier><dc:title>T</dc:title><dc:language>en</dc:language><meta name="cover" content="cover"/></metadata>
+  <manifest><item id="cover" href="cover.jpeg" media-type="image/jpeg"/><item id="c1" href="c1.xhtml" media-type="application/xhtml+xml"/></manifest>
+  <spine><itemref idref="c1"/></spine>
+</package>""",
+        )
+        z.writestr("c1.xhtml", "<html><body><p>Body</p></body></html>")
+    epub.write_bytes(buf.getvalue())
+    book = {
+        "metadata": {"schema": "book_ir"},
+        "chapters": [
+            {"title": "Cover", "markdown": "![Publisher mark](logo.jpg)\n", "source_pages": [1]},
+            {"title": "One", "markdown": "Body\n", "source_pages": [2]},
+        ],
+    }
+    restored = restore_declared_epub_cover(book, epub, tmp_path / "book-images")
+    assert restored["chapters"][0]["title"] == "Cover"
+    assert "cover.jpeg" in restored["chapters"][0]["markdown"]
+    assert restored["chapters"][1]["title"] == "Publisher mark"
+    assert restored["metadata"]["cover_image_path"].endswith("cover.jpeg")
+
+
 def test_ingest_epub_no_duplicate_cover_when_spine_references_file(tmp_path: Path) -> None:
     tiny_png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xf8\xcf\xc0\x00\x00\x03\x01\x01\x00\x18\xdd\x8d\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
     xhtml = f"""<?xml version="1.0" encoding="utf-8"?>

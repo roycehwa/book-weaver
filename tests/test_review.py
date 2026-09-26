@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from pdf_translator.review import (
+    MIXED_ENGLISH_REWRITE_ERROR,
     apply_review_state,
     build_aligned_review_segments,
     build_review_artifacts,
@@ -954,6 +955,45 @@ def test_merge_reviewed_chapters_adds_only_uncovered_resources() -> None:
     assert merged[1]["preserve_original"] is True
 
 
+def test_merge_does_not_repeat_a_resource_already_present_in_review() -> None:
+    reviewed = [
+        {
+            "chapter_id": "cover",
+            "title": "Cover",
+            "page_start": 0,
+            "source_pages": [],
+            "markdown": "reviewed cover",
+        }
+    ]
+    book = {
+        "chapters": [
+            {
+                "chapter_id": "cover",
+                "title": "Cover",
+                "page_start": 1,
+                "source_pages": [1],
+                "markdown": "![A very long cover description that must not become a second chapter](cover.jpg)",
+                "resource_only": True,
+                "preserve_original": True,
+                "toc": True,
+            }
+        ]
+    }
+
+    merged = merge_reviewed_chapters_with_resources(reviewed, book)
+
+    assert [chapter["chapter_id"] for chapter in merged] == ["cover"]
+    assert merged[0]["markdown"] == "reviewed cover"
+    assert merged[0]["source_pages"] == [1]
+
+
+def test_create_review_state_with_no_items_stays_on_issue_scope() -> None:
+    state = create_review_state([])
+
+    assert state["workflow"]["human_review_mode"] == "issues_only"
+    assert state["summary"]["total_items"] == 0
+
+
 def test_review_project_from_run_loads_json_contract(tmp_path: Path) -> None:
     run_dir = tmp_path / "run"
     run_dir.mkdir()
@@ -1070,6 +1110,14 @@ def test_is_valid_rewrite_candidate_rejects_placeholder() -> None:
     )
     assert _looks_like_model_refusal("您未在消息中提供需要翻译的 Markdown 内容。")
     assert _is_valid_rewrite_candidate(source, "第二段被翻译模型遗漏，现已补译恢复。", "zh-CN")
+    short = "She spoke."
+    assert _is_valid_rewrite_candidate(short, "Sage 早早醒来，看见 Rafe。", "zh-CN")
+    assert not _is_valid_rewrite_candidate(short, "清晨的 mist 还没散。", "zh-CN")
+    assert not _is_valid_rewrite_candidate(
+        short,
+        "她说 the mist in autumn is a bugger several。",
+        "zh-CN",
+    )
 
 
 def test_rewrite_review_requests_skips_invalid_candidate_for_missing_translation(tmp_path: Path) -> None:
@@ -1112,6 +1160,49 @@ def test_rewrite_review_requests_skips_invalid_candidate_for_missing_translation
     assert result["rewritten_count"] == 0
     assert decision["status"] == "open"
     assert decision["rewrite_error"]
+
+
+def test_rewrite_review_requests_rejects_candidate_that_keeps_mixed_english(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    artifacts = build_review_artifacts(
+        source_path=Path("book.epub"),
+        target_language="zh-CN",
+        book=sample_book(),
+        translated_chapters=[
+            {"index": 1, "chapter_id": "ch-001-intro", "title": "Introduction", "markdown": "第一段。\n\n"},
+            {"index": 2, "chapter_id": "ch-002-body", "title": "Body", "markdown": ""},
+        ],
+    )
+    artifacts["review_state"]["decisions"] = {
+        "ch-001-intro:s002": {
+            "status": "open",
+            "action": "model_rewrite",
+            "reviewer_comment": "请把残留英文译成中文。",
+        }
+    }
+    for name, payload in artifacts.items():
+        (run_dir / f"{name}.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    class MixedEnglishTranslator:
+        name = "mixed-english"
+
+        def translate_chunk(self, chunk, source_language: str | None, target_language: str) -> str:
+            return "她说 the mist in autumn is a bugger several。"
+
+    result = rewrite_review_requests(
+        run_dir=run_dir,
+        translator=MixedEnglishTranslator(),
+        source_language="en",
+        target_language="zh-CN",
+    )
+
+    state = json.loads((run_dir / "review_state.json").read_text(encoding="utf-8"))
+    decision = state["decisions"]["ch-001-intro:s002"]
+    assert result["rewritten_count"] == 0
+    assert decision["status"] == "open"
+    assert decision["rewrite_error"] == MIXED_ENGLISH_REWRITE_ERROR
+    assert "approved_text" not in decision
 
 
 def test_rewrite_review_requests_injects_and_validates_active_glossary(tmp_path: Path) -> None:

@@ -675,10 +675,23 @@ def _load_complete_review_book(
         )
     book: dict[str, object] = json.loads(book_path.read_text(encoding="utf-8"))
     semantic_content = book.get("semantic_content")
+    metadata = book.get("metadata")
     if not isinstance(semantic_content, dict) or semantic_content.get("schema") != "semantic_content_v1":
-        raise ValueError(
-            "Review export blocked: current semantic content is required. Create a new task."
-        )
+        # EPUB reconstruction used to omit this section when a book had no
+        # detached notes. A current book_ir still has that section; it is empty.
+        if (
+            semantic_content is None
+            and isinstance(metadata, dict)
+            and metadata.get("schema") == "book_ir"
+        ):
+            from pdf_translator.semantic_content import empty_semantic_content
+
+            book = dict(book)
+            book["semantic_content"] = empty_semantic_content()
+        else:
+            raise ValueError(
+                "Review export blocked: current semantic content is required. Create a new task."
+            )
     if not (run_dir / "integrity-ledger.json").exists():
         raise ValueError(
             "Review export blocked: current integrity-ledger.json is required. Create a new task."
@@ -833,6 +846,11 @@ def _render_review_export(
             base_translated = json.loads(translated_chapters_file.read_text(encoding="utf-8"))
             reviewed_chapters = restore_review_chapter_apparatus(reviewed_chapters, base_translated)
     book = _load_complete_review_book(run_dir, manifest)
+    source_file = Path(str(manifest.get("source_pdf") or ""))
+    if source_file.suffix.lower() == ".epub" and source_file.is_file():
+        from pdf_translator.ingest import restore_declared_epub_cover
+
+        book = restore_declared_epub_cover(book, source_file, run_dir / "book-images")
     from pdf_translator.review import assert_translation_policy_coverage
     assert_translation_policy_coverage(book, applied_segments)
     if not book.get("chapters"):
@@ -847,6 +865,7 @@ def _render_review_export(
         delivery_chapters,
         target_language=target_language,
     )
+    image_roots = _review_image_roots(run_dir, manifest)
     delivery_markdown_parts: list[str] = []
     for chapter in delivery_chapters:
         body = strip_fail_open_notices(str(chapter.get("markdown") or "")).strip()
@@ -856,14 +875,17 @@ def _render_review_export(
         if body:
             delivery_markdown_parts.append(body)
     delivery_markdown = "\n\n".join(delivery_markdown_parts).strip() + "\n"
-    image_roots = _review_image_roots(run_dir, manifest)
-    from pdf_translator.epub import _markdown_to_body_html, _resolve_image_source_path
+    from pdf_translator.epub import _is_image_resource_src, _markdown_to_body_html, _resolve_image_source_path
     from bs4 import BeautifulSoup
-    missing_images = [str(img.get('src') or '')
-                      for img in BeautifulSoup(_markdown_to_body_html(delivery_markdown), 'html.parser').find_all('img')
-                      if _resolve_image_source_path(str(img.get('src') or ''), image_roots) is None]
+    missing_images = []
+    for img in BeautifulSoup(_markdown_to_body_html(delivery_markdown), "html.parser").find_all("img"):
+        src = str(img.get("src") or "")
+        if _is_image_resource_src(src) and _resolve_image_source_path(src, image_roots) is None:
+            missing_images.append(src)
     if missing_images:
-        raise ValueError(f"导出被阻止：{len(missing_images)} 个必需图片无法读取，请回原文修正台处理。")
+        from pdf_translator.repair import missing_required_images, record_system_repair
+
+        record_system_repair(run_dir, missing_required_images(len(missing_images)))
 
     version = write_versioned_outputs(
         run_dir=run_dir,
@@ -902,14 +924,15 @@ def _render_review_export(
         )
         rendered_files["translated_epub"] = str(epub_path)
         rendered_files["epub_href_validation"] = validate_epub_internal_hrefs(epub_path)
-        if rendered_files["epub_href_validation"].get("missing_assets"):
-            raise ValueError("导出缺少资源文件，请修正图片或资源路径后重试。")
-        if rendered_files["epub_href_validation"].get("absolute_paths"):
-            raise ValueError("导出包含本机文件路径，请修正资源引用后重试。")
 
     version_manifest_path = version_dir / "version-manifest.json"
     version_manifest = json.loads(version_manifest_path.read_text(encoding="utf-8"))
     version_manifest["render"] = {"format": output_format}
+    repair_log_path = run_dir / "repair-log.json"
+    if repair_log_path.is_file():
+        repair_log = json.loads(repair_log_path.read_text(encoding="utf-8"))
+        if isinstance(repair_log, dict):
+            version_manifest["system_repairs"] = repair_log.get("items", [])
     version_manifest["excluded_sections"] = book.get("excluded_sections", [])
     version_manifest["source_decisions"] = [decision for chapter in book.get("chapters", [])
                                              for decision in chapter.get("source_decisions", [])]

@@ -121,9 +121,12 @@ function ReviewCenter() {
 
   return (
     <div className="mx-auto max-w-6xl px-4 py-6">
-      <div className="rounded-xl border border-slate-200 bg-white p-4">
+      <div className="rounded-3xl border border-paper-200 bg-paper-50/90 p-5 shadow-sheet">
         <div className="flex flex-wrap items-center justify-between gap-3">
-          <h1 className="text-xl font-semibold text-slate-900">审阅控制台</h1>
+          <div>
+            <p className="text-[11px] font-semibold tracking-[0.28em] text-primary-700">REVIEW</p>
+            <h1 className="mt-1 text-3xl text-ink-900">审阅控制台</h1>
+          </div>
           <button
             onClick={() => navigate('/')}
             className="rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-700 hover:bg-slate-50"
@@ -162,7 +165,7 @@ function ReviewCenter() {
           <button
             onClick={syncProjects}
             disabled={syncing}
-            className="rounded-lg bg-indigo-600 px-3 py-2 text-sm font-medium text-white disabled:opacity-50"
+            className="rounded-full bg-primary-600 px-4 py-2 text-sm font-medium text-white disabled:opacity-50"
           >
             {syncing ? '同步中...' : '同步新书'}
           </button>
@@ -174,7 +177,7 @@ function ReviewCenter() {
       {message && <div className="mt-4 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-800">{message}</div>}
 
       {!loading && !error && (
-        <div className="mt-4 overflow-hidden rounded-xl border border-slate-200 bg-white">
+        <div className="mt-4 overflow-hidden rounded-3xl border border-paper-200 bg-paper-50/90 shadow-sheet">
           <div className="border-b border-slate-200 px-4 py-3 text-sm text-slate-600">
             共 {filteredProjects.length} 本（总项目 {projects.length}）
           </div>
@@ -200,7 +203,7 @@ function ReviewCenter() {
                     )}
                     <button
                       onClick={() => openReview(project.run_dir)}
-                      className="rounded-lg bg-blue-600 px-3 py-1.5 text-xs font-medium text-white"
+                      className="rounded-full bg-primary-600 px-3 py-1.5 text-xs font-medium text-white"
                     >
                       {project.review_completed ? '查看审阅' : project.review_status === 'unreviewed' ? '开始审阅' : '继续审阅'}
                     </button>

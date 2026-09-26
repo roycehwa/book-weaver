@@ -973,7 +973,7 @@ def create_review_state(review_items: list[dict[str, Any]]) -> dict[str, Any]:
         },
         "workflow": {
             "pre_review_completed": True,
-            "human_review_mode": "issues_only" if flagged_count else "full",
+            "human_review_mode": "issues_only",
         },
         "decisions": {},
     }
@@ -1185,6 +1185,18 @@ def apply_review_state(translated_segments_payload: Any, review_state: dict[str,
     return segments
 
 
+MIXED_ENGLISH_REWRITE_ERROR = (
+    "Model rewrite kept untranslated English in the Chinese text."
+)
+
+
+def _candidate_keeps_mixed_english(candidate: str, target_language: str) -> bool:
+    if not target_language.lower().startswith("zh"):
+        return False
+    mixed_words, _mixed_lines = _mixed_english_signal(candidate)
+    return mixed_words >= 1
+
+
 def _rewrite_prompt(
     source_text: str,
     current_translation: str,
@@ -1197,7 +1209,9 @@ def _rewrite_prompt(
     current_section = current if current else "(none — translate the source text from scratch)"
     prompt = (
         "Rewrite this translation according to the reviewer instruction.\n"
-        "Return only the revised target-language text. Do not include explanations or placeholders.\n\n"
+        "Return only the revised target-language text. Do not include explanations or placeholders.\n"
+        "Translate ordinary English words that remain inside the current translation. "
+        "Proper names and mandatory glossary terms may stay in their original form.\n\n"
         "SOURCE TEXT:\n"
         f"{source}\n\n"
         "CURRENT TRANSLATION:\n"
@@ -1284,6 +1298,8 @@ def _is_valid_rewrite_candidate(source_text: str, candidate: str, target_languag
         source_letters = sum(1 for char in source_text if char.isascii() and char.isalpha())
         if source_letters >= 40 and _cjk_count(text) < max(12, source_letters // 8):
             return False
+    if _candidate_keeps_mixed_english(text, target_language):
+        return False
     return True
 
 
@@ -1413,6 +1429,32 @@ def _rewrite_review_requests(
                     }
                     decision["rewrite_candidate"] = candidate
                     continue
+        if _candidate_keeps_mixed_english(candidate, target_language):
+            retry_instruction = (
+                reviewer_comment
+                + "\n译文里仍有未译成中文的普通英文词。请完整重译，把这些词译成中文。"
+                + "专有名词和术语表中的词可以保留原文。"
+            )
+            retry_prompt = _rewrite_prompt(
+                source_text,
+                candidate,
+                retry_instruction,
+                relevant_glossary,
+            )
+            candidate = translator.translate_chunk(
+                TranslationChunk(
+                    index=rewritten_count,
+                    markdown=retry_prompt,
+                    glossary_entries=relevant_glossary or None,
+                ),
+                source_language=source_language or "en",
+                target_language=target_language,
+            ).strip()
+            candidate = _strip_fail_open_notice(candidate)
+            if _candidate_keeps_mixed_english(candidate, target_language):
+                decision["rewrite_error"] = MIXED_ENGLISH_REWRITE_ERROR
+                decision["rewrite_candidate"] = candidate
+                continue
         if not _is_valid_rewrite_candidate(source_text, candidate, target_language):
             decision["rewrite_error"] = "Model returned an invalid rewrite candidate; segment remains open."
             continue
@@ -1561,6 +1603,23 @@ def merge_reviewed_chapters_with_resources(
                     chapter[key] = source[key]
             if source.get("preserve_original") or source.get("resource_only"):
                 chapter["synthesize_heading"] = True
+    for chapter in reviewed_chapters:
+        source = source_by_id.get(chapter.get("chapter_id"))
+        if not source or chapter.get("source_pages"):
+            continue
+        source_pages = [int(page) for page in source.get("source_pages") or []]
+        if not source_pages:
+            continue
+        chapter["source_pages"] = source_pages
+        if not chapter.get("page_start"):
+            chapter["page_start"] = source.get("page_start")
+        if not chapter.get("page_end"):
+            chapter["page_end"] = source.get("page_end")
+    reviewed_ids = {
+        chapter.get("chapter_id")
+        for chapter in reviewed_chapters
+        if chapter.get("chapter_id")
+    }
     covered_pages = {
         int(page)
         for chapter in reviewed_chapters
@@ -1571,6 +1630,7 @@ def merge_reviewed_chapters_with_resources(
         for chapter in book.get("chapters", [])
         if chapter.get("resource_only")
         and chapter.get("preserve_original")
+        and chapter.get("chapter_id") not in reviewed_ids
         and not covered_pages.intersection(
             int(page) for page in chapter.get("source_pages", [])
         )

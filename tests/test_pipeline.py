@@ -430,6 +430,30 @@ def test_translate_pipeline_records_no_candidates_polish_outcome(tmp_path: Path,
     assert ("polishing", {"stage_percent": 100, "polish_outcome": "no_candidates"}) in stages
 
 
+def test_structure_polish_is_what_review_reads(tmp_path: Path, monkeypatch) -> None:
+    _patch_intake_dependencies(monkeypatch)
+    monkeypatch.setattr(polish_module, "scan_polish_candidates", lambda _text: [])
+
+    def mark(markdown: str, *, source_markdown: str, complete, available_image_names=None) -> str:
+        return markdown + "\nPOLISH-MARK\n"
+
+    monkeypatch.setattr("pdf_translator.repair.polish_structure_markdown", mark)
+    settings = RunSettings(
+        source_pdf=tmp_path / "english-book.epub",
+        output_dir=tmp_path / "runs",
+        target_language="zh-CN",
+        source_language="en",
+        translator="mock",
+        max_chunk_chars=9000,
+        profile_name="book",
+        output_format="none",
+    )
+
+    artifacts = pipeline_module.run_translation_pipeline(settings)
+    segments = json.loads((artifacts.output_dir / "translated_segments.json").read_text(encoding="utf-8"))
+    assert "POLISH-MARK" in json.dumps(segments, ensure_ascii=False)
+
+
 def test_translate_pipeline_e2e_source_gate_blocks_model_construction(tmp_path: Path, monkeypatch) -> None:
     from pdf_translator.translation_quality import (
         TranslationQualityBlockedError,

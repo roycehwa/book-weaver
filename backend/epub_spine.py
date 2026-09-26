@@ -180,8 +180,8 @@ class EpubPage:
 
 
 from pdf_translator.epub_page_anchors import (
-    EPUB_PAGE_ANCHOR_RE as _PAGE_ANCHOR_RE,
     EPUB_PAGE_MARKER_TAG_RE as _PAGE_MARKER_TAG_RE,
+    iter_xhtml_page_spans as _iter_xhtml_page_spans,
     page_label_from_anchor as _page_label_from_anchor,
 )
 
@@ -232,14 +232,13 @@ def resolve_epub_pages(path: Path) -> list[EpubPage]:
             xhtml = _read_member(path, entry.href)
         except KeyError:
             continue
-        anchors = list(_PAGE_ANCHOR_RE.finditer(xhtml))
-        anchor_ids: list[str] = [m.group("anchor").decode("utf-8", "replace") for m in anchors]
+        anchor_ids: list[str] = [anchor_id for anchor_id, _start, _end in _iter_xhtml_page_spans(xhtml)]
         chapter_pages.append((entry.href, entry.title, anchor_ids))
-    # 按 spine 顺序展开页；无锚点的章节整章作为 1 个 page，page_anchor 留空。
-    # 真实 EPUB 经常没有印刷页锚点，这时按 spine 章节降级预览，避免 UI 中断。
+    # 按 spine 顺序展开页。没有印刷页锚点的文件整章作为 1 页。
+    # 锚点之前的正文单独成页，避免章节开头被切掉。
     page_index = 0
     for href, title, anchor_ids in chapter_pages:
-        if not anchor_ids:
+        if anchor_ids == [""]:
             page_index += 1
             pages.append(
                 EpubPage(
@@ -253,6 +252,19 @@ def resolve_epub_pages(path: Path) -> list[EpubPage]:
             )
             continue
         for anchor_id in anchor_ids:
+            if not anchor_id:
+                page_index += 1
+                pages.append(
+                    EpubPage(
+                        index=page_index,
+                        page_number=0,
+                        page_label="",
+                        chapter_title=title,
+                        chapter_href=href,
+                        page_anchor="",
+                    )
+                )
+                continue
             num_str = _page_label_from_anchor(anchor_id)
             if num_str.isdigit():
                 page_number = int(num_str)
@@ -272,27 +284,59 @@ def resolve_epub_pages(path: Path) -> list[EpubPage]:
     return pages
 
 
+def align_chapters_to_epub_pages(
+    chapters: list[dict],
+    pages: list[EpubPage],
+) -> list[dict]:
+    """Map each EPUB spine chapter onto the virtual pages of its XHTML file.
+
+    Book structure stores one synthetic page per spine item. The preview uses
+    print-page anchors, so confirmation ranges must follow that same index.
+    Chapters without a matching resource keep their existing page numbers.
+    """
+
+    ranges: dict[str, list[int]] = {}
+    for page in pages:
+        span = ranges.setdefault(page.chapter_href, [page.index, page.index])
+        span[0] = min(span[0], page.index)
+        span[1] = max(span[1], page.index)
+    aligned: list[dict] = []
+    for chapter in chapters:
+        if not isinstance(chapter, dict):
+            continue
+        href = str(chapter.get("source_internal_path") or "").replace("\\", "/")
+        span = ranges.get(href)
+        if span is None:
+            aligned.append(chapter)
+            continue
+        start, end = span
+        updated = dict(chapter)
+        updated["page_start"] = start
+        updated["page_end"] = end
+        updated["source_pages"] = list(range(start, end + 1))
+        aligned.append(updated)
+    return aligned
+
+
 def render_epub_page_by_anchor(path: Path, chapter_href: str, page_anchor: str, job_id: str = "") -> str:
     """取出包含该 page 锚点、且到下一个 page 锚点之前的 xhtml 片段，包成完整 HTML。
 
     若 page_anchor 为空，则取整个 xhtml 章节。
     """
     xhtml = _read_member(path, chapter_href)
+    spans = _iter_xhtml_page_spans(xhtml)
     if not page_anchor:
-        # 整章
-        return _wrap_fragment(xhtml, chapter_href, job_id, path)
-    anchors = list(_PAGE_ANCHOR_RE.finditer(xhtml))
-    target_idx = None
-    for i, m in enumerate(anchors):
-        if m.group("anchor").decode("utf-8", "replace") == page_anchor:
-            target_idx = i
-            break
-    if target_idx is None:
-        raise ValueError(f"{chapter_href} 缺少锚点 {page_anchor}")
-    start = anchors[target_idx].start()
-    end = anchors[target_idx + 1].start() if target_idx + 1 < len(anchors) else _find_body_close(xhtml)
-    fragment = xhtml[start:end]
-    return _wrap_fragment(fragment, chapter_href, job_id, path)
+        leading = next((span for span in spans if span[0] == ""), None)
+        if leading is None:
+            return _wrap_fragment(xhtml, chapter_href, job_id, path)
+        _anchor, start, end = leading
+        if spans == [leading]:
+            return _wrap_fragment(xhtml, chapter_href, job_id, path)
+        return _wrap_fragment(xhtml[start:end], chapter_href, job_id, path)
+    for anchor_id, start, end in spans:
+        if anchor_id == page_anchor:
+            return _wrap_fragment(xhtml[start:end], chapter_href, job_id, path)
+    raise ValueError(f"{chapter_href} 缺少锚点 {page_anchor}")
 
 
 def _find_body_close(xhtml: bytes) -> int:

@@ -1190,6 +1190,21 @@ class BookJobService:
         ]
         if not canonical:
             raise JobServiceError("Book structure does not contain valid chapters.")
+        try:
+            source = self.source_path(job_id)
+        except JobNotFound:
+            source = None
+        if source is not None and source.suffix.lower() == ".epub":
+            from epub_spine import align_chapters_to_epub_pages, resolve_epub_pages
+
+            canonical = [
+                self._canonical_chapter(chapter, index)
+                for index, chapter in enumerate(
+                    align_chapters_to_epub_pages(chapters, resolve_epub_pages(source)),
+                    start=1,
+                )
+                if isinstance(chapter, dict)
+            ]
         return canonical, "book_structure", "解析阶段生成的章节结构", meta
 
     def _pdf_embedded_toc_draft_chapters(

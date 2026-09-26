@@ -23,6 +23,7 @@ def is_provider_content_refusal(error: str) -> bool:
     return bool(
         re.search(r"\b(?:input\s+new_sensitive\s*\(\s*1026\s*\)|output\s+new_sensitive\s*\(\s*1027\s*\))", error, re.I)
         or re.search(r"\bcontent_filter\b", error, re.I)
+        or "bookweaver_soft_content_refusal" in error
     )
 
 

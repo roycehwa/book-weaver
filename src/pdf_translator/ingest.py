@@ -12,7 +12,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 from zipfile import ZipFile
 
-from bs4 import BeautifulSoup, NavigableString, Tag
+from bs4 import BeautifulSoup, Comment, NavigableString, Tag
 from langdetect import LangDetectException, detect
 
 from pdf_translator.models import NormalizedDocument
@@ -894,6 +894,29 @@ def _epub_phrasing_to_markdown(node: Any, internal_xhtml_path: str) -> str:
     return str(node.get_text("", strip=False) or "")
 
 
+def _embedded_image_href(tag: Tag) -> str | None:
+    for key, value in tag.attrs.items():
+        name = str(key).lower()
+        if name == "src" or name.endswith("href"):
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
+def _drop_epub_inserted_ads(body: Tag) -> None:
+    """Drop distributor inserts marked by an epub-ad comment and the block they introduce."""
+
+    for comment in list(body.find_all(string=lambda value: isinstance(value, Comment))):
+        if "epub-ad" not in str(comment).casefold():
+            continue
+        sibling = comment.next_sibling
+        while isinstance(sibling, NavigableString) and not str(sibling).strip():
+            sibling = sibling.next_sibling
+        comment.extract()
+        if isinstance(sibling, Tag):
+            sibling.decompose()
+
+
 def _clean_epub_prose_markup(body: Tag) -> None:
     """Repair only word breaks that are explicit in the XHTML structure."""
     for text_node in list(body.find_all(string=True)):
@@ -1085,6 +1108,7 @@ def _extract_epub_body_chapter(
     for tag in soup.find_all(["script", "style"]):
         tag.decompose()
     body = soup.find("body") or soup
+    _drop_epub_inserted_ads(body)
     _clean_epub_prose_markup(body)
     _epub_replace_toc_nav_regions(body, internal_xhtml_path)
     def resolve_media_href(src: str) -> str | None:
@@ -1126,8 +1150,15 @@ def _extract_epub_body_chapter(
         else:
             figure.replace_with(NavigableString(f"\n\n![{alt}]({path_str})\n\n"))
 
-    for img in list(body.find_all("img")):
-        raw_src = img.get("src")
+    cover_page = False
+    cover_meta = soup.find("meta", attrs={"name": "calibre:cover"})
+    if cover_meta is not None and str(cover_meta.get("content") or "").casefold() == "true":
+        cover_page = True
+    if soup.title and soup.title.get_text(" ", strip=True).casefold() == "cover":
+        cover_page = True
+
+    for img in list(body.find_all(["img", "image"])):
+        raw_src = _embedded_image_href(img)
         if not isinstance(raw_src, str):
             img.decompose()
             continue
@@ -1145,7 +1176,9 @@ def _extract_epub_body_chapter(
                 n += 1
             dest.write_bytes(zipf.read(resolved))
             written_assets[resolved] = dest.resolve()
-        alt = (img.get("alt") or img.get("title") or "").strip() or "Image"
+        alt = (img.get("alt") or img.get("title") or "").strip()
+        if not alt:
+            alt = "Cover" if cover_page else "Image"
         img.replace_with(NavigableString(f"![{alt}]({written_assets[resolved].as_posix()})"))
 
     for sup in body.find_all("sup"):
@@ -1231,6 +1264,68 @@ def _extract_epub_body_chapter(
         "title_element": title_element,
     }
     return title_guess, body_md, title_meta
+
+
+def restore_declared_epub_cover(
+    book: dict[str, Any],
+    source_path: Path,
+    asset_dir: Path,
+) -> dict[str, Any]:
+    """Put the package cover back when a spine page only referenced it through SVG."""
+
+    if source_path.suffix.lower() != ".epub" or not source_path.is_file():
+        return book
+    with ZipFile(source_path, "r") as zipf:
+        if "META-INF/encryption.xml" in zipf.namelist():
+            return book
+        opf_path = _epub_container_opf_path(zipf)
+        manifest, _spine_ids = _epub_parse_opf(zipf, opf_path)
+        cover_internal = _epub_find_cover_internal(zipf, opf_path, manifest)
+        if not cover_internal or cover_internal not in zipf.namelist():
+            return book
+        cover_name = Path(cover_internal).name
+        chapters = [
+            dict(chapter)
+            for chapter in book.get("chapters") or []
+            if isinstance(chapter, dict)
+        ]
+        if any(cover_name in str(chapter.get("markdown") or "") for chapter in chapters):
+            return book
+        asset_dir.mkdir(parents=True, exist_ok=True)
+        dest = asset_dir / cover_name
+        if not dest.exists():
+            dest.write_bytes(zipf.read(cover_internal))
+        for chapter in chapters:
+            if str(chapter.get("title") or "").casefold() != "cover":
+                continue
+            if cover_name in str(chapter.get("markdown") or ""):
+                continue
+            alt_match = re.search(r"!\[([^\]]*)\]", str(chapter.get("markdown") or ""))
+            alt = alt_match.group(1).strip() if alt_match else ""
+            chapter["title"] = alt if alt and len(alt) <= 80 else "Front matter"
+        chapters.insert(
+            0,
+            {
+                "index": 0,
+                "chapter_id": "declared-cover",
+                "title": "Cover",
+                "markdown": f"![Cover]({dest.resolve().as_posix()})\n",
+                "translate": False,
+                "preserve_original": True,
+                "resource_only": True,
+                "toc": False,
+                "cover": True,
+                "page_start": 0,
+                "page_end": 0,
+                "source_pages": [],
+            },
+        )
+    result = dict(book)
+    result["chapters"] = chapters
+    metadata = dict(result.get("metadata") or {})
+    metadata["cover_image_path"] = dest.resolve().as_posix()
+    result["metadata"] = metadata
+    return result
 
 
 def ingest_epub(path: Path) -> NormalizedDocument:

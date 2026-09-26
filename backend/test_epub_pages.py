@@ -72,18 +72,17 @@ def test_resolve_epub_pages_includes_cover_roman_and_digit(tmp_path: Path) -> No
         ],
     )
     pages = resolve_epub_pages(epub)
-    assert [p.page_label for p in pages] == ["", "i", "ii", "1", "2"]
-    # page_number is 0 for cover and roman, real value for digit
+    # Headings before the first anchor stay as their own leading page.
+    assert [p.page_label for p in pages] == ["", "", "i", "ii", "", "1", "2"]
     assert pages[0].page_number == 0
-    assert pages[1].page_number == 0
-    assert pages[3].page_number == 1
-    assert pages[4].page_number == 2
-    # indices are 1-based, contiguous
-    assert [p.index for p in pages] == [1, 2, 3, 4, 5]
-    # chapter titles match
+    assert pages[2].page_number == 0
+    assert pages[5].page_number == 1
+    assert pages[6].page_number == 2
+    assert [p.index for p in pages] == [1, 2, 3, 4, 5, 6, 7]
     assert pages[0].chapter_title == "cover"
     assert pages[1].chapter_title == "ch01"
-    assert pages[3].chapter_title == "ch02"
+    assert pages[1].page_anchor == ""
+    assert pages[5].chapter_title == "ch02"
 
 
 def test_resolve_epub_pages_chapter_with_no_anchors_is_single_page(tmp_path: Path) -> None:
@@ -96,11 +95,13 @@ def test_resolve_epub_pages_chapter_with_no_anchors_is_single_page(tmp_path: Pat
         ],
     )
     pages = resolve_epub_pages(epub)
-    assert len(pages) == 2
+    assert len(pages) == 3
     assert pages[0].page_anchor == ""
     assert pages[0].page_label == ""
-    assert pages[1].page_anchor == "page_1"
-    assert pages[1].page_label == "1"
+    assert pages[1].page_anchor == ""
+    assert pages[1].chapter_href.endswith("ch01.xhtml")
+    assert pages[2].page_anchor == "page_1"
+    assert pages[2].page_label == "1"
 
 
 def test_resolve_epub_pages_accepts_span_pagebreak_anchors(tmp_path: Path) -> None:
@@ -145,6 +146,34 @@ def test_resolve_epub_pages_accepts_compact_page_ids_without_underscore(tmp_path
     assert [p.page_anchor for p in pages] == ["page3", "page4"]
     assert [p.page_label for p in pages] == ["3", "4"]
     assert [p.page_number for p in pages] == [3, 4]
+
+
+def test_resolve_epub_pages_keeps_text_before_first_anchor(tmp_path: Path) -> None:
+    epub = tmp_path / "book.epub"
+    _write_minimal_epub(
+        epub,
+        [("c1R.xhtml", "c1R", [])],
+        {
+            "c1R.xhtml": (
+                "<h1>CHAPTER ONE</h1>"
+                "<p>Sage woke early after a long night.</p>"
+                "<p>make her <span id=\"page_2\"></span>escape from the island</p>"
+                "<p><span id=\"page_3\"></span>Next page.</p>"
+            )
+        },
+    )
+
+    pages = resolve_epub_pages(epub)
+
+    assert [p.page_anchor for p in pages] == ["", "page_2", "page_3"]
+    assert [p.page_label for p in pages] == ["", "2", "3"]
+    opening = render_epub_page_by_anchor(epub, "OEBPS/c1R.xhtml", "", "job-1")
+    later = render_epub_page_by_anchor(epub, "OEBPS/c1R.xhtml", "page_2", "job-1")
+    assert "CHAPTER ONE" in opening
+    assert "Sage woke early" in opening
+    assert "escape from the island" not in opening
+    assert "escape from the island" in later
+    assert "CHAPTER ONE" not in later
 
 
 def test_resolve_epub_pages_falls_back_to_spine_when_no_anchors_anywhere(tmp_path: Path) -> None:

@@ -8,6 +8,17 @@ from typing import Any, Literal
 SEMANTIC_CONTENT_SCHEMA = "semantic_content_v1"
 
 
+def empty_semantic_content() -> dict[str, Any]:
+    """Current semantic section for a book that has no detached notes."""
+
+    return {
+        "schema": SEMANTIC_CONTENT_SCHEMA,
+        "footnotes": [],
+        "ocr_quarantine": [],
+        "evidence_assets": [],
+    }
+
+
 class SemanticContentError(ValueError):
     """Raised when semantic content cannot be represented losslessly."""
 

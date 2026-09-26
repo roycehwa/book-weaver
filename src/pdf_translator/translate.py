@@ -893,6 +893,7 @@ def _translate_chunk_resumable(
                 return cached
     last_error: Exception | None = None
     had_sensitive_failure = False
+    saw_untranslated = False
     last_glossary_candidate: str | None = None
     max_attempts = max(1, retry_count) + 4
     for attempt in range(max_attempts):
@@ -932,6 +933,8 @@ def _translate_chunk_resumable(
             )
         except Exception as exc:
             last_error = exc
+            if _is_untranslated_quality_error(exc):
+                saw_untranslated = True
             if _is_glossary_quality_error(exc):
                 substituted = _apply_deterministic_glossary_repairs(
                     source_text=chunk.markdown,
@@ -1131,7 +1134,24 @@ def _translate_chunk_resumable(
             input_hash=input_hash,
             allow_glossary_drift=True,
         )
-    raise ValueError(f"Translation failed for chunk {chunk.index} after {retry_count} attempts: {last_error}") from last_error
+    from pdf_translator.translation_failures import is_provider_content_refusal
+
+    terminal_error = split_error or last_error
+    glossary_after_untranslated = bool(
+        saw_untranslated
+        and (
+            (terminal_error is not None and _is_glossary_quality_error(terminal_error))
+            or (split_error is not None and _is_glossary_quality_error(split_error))
+        )
+    )
+    if terminal_error is not None and (had_sensitive_failure or glossary_after_untranslated):
+        if "bookweaver_soft_content_refusal" not in str(terminal_error) and not is_provider_content_refusal(str(terminal_error)):
+            terminal_error = ValueError(f"bookweaver_soft_content_refusal: {terminal_error}")
+    else:
+        terminal_error = last_error
+    raise ValueError(
+        f"Translation failed for chunk {chunk.index} after {retry_count} attempts: {terminal_error}"
+    ) from terminal_error
 
 
 def _deepl_usage_state_path() -> Path:
@@ -1879,11 +1899,11 @@ class MiniMaxAnthropicTranslator(BaseTranslator):
             chunk_index=chunk.index,
         )
 
-    def translate_prompt(self, prompt: str, *, chunk_index: int) -> str:
+    def translate_prompt(self, prompt: str, *, chunk_index: int, system: str | None = None) -> str:
         payload = {
             "model": self.model,
             "max_tokens": self.max_tokens,
-            "system": SYSTEM_PROMPT,
+            "system": system or SYSTEM_PROMPT,
             "messages": [
                 {
                     "role": "user",
@@ -2069,6 +2089,34 @@ def _complete_translation_attempt(
         source_language=source_language,
         target_language=target_language,
     )
+
+
+def complete_repair(translator: BaseTranslator, system: str, user: str) -> str:
+    """Ask the configured model to repair one image, structure, or link fragment."""
+
+    if isinstance(translator, MiniMaxAnthropicTranslator):
+        return translator.translate_prompt(user, chunk_index=0, system=system)
+    if isinstance(translator, OpenAITranslator):
+        response = translator.client.responses.create(
+            model=translator.model,
+            input=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+        )
+        return response.output_text.strip()
+    if isinstance(translator, OpenAICompatibleTranslator):
+        response = translator.client.chat.completions.create(
+            model=translator.model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+        )
+        return (response.choices[0].message.content or "").strip()
+    if isinstance(translator, MockTranslator):
+        return user
+    raise ValueError(f"Translator {translator.name} cannot repair image, structure, or link fragments.")
 
 
 def build_translator(name: str) -> BaseTranslator:

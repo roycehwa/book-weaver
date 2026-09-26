@@ -586,11 +586,11 @@ export default function GlossaryWorkbench({
   ) : null
 
   return (
-    <div className="mt-4 rounded-xl border border-slate-200 bg-white p-3 shadow-sm">
+    <div className="mt-4 rounded-3xl border border-paper-200 bg-paper-50/90 p-4 shadow-sheet">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
-            <h2 className="font-semibold text-slate-900">术语定稿</h2>
+            <h2 className="text-xl text-ink-900">术语定稿</h2>
             <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs text-slate-600">{stageLabel}</span>
             <span className="text-xs text-slate-500">
               已采纳 {glossary.status.active_count} / 候选 {glossary.status.candidate_count}

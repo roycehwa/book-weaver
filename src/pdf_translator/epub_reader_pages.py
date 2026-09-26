@@ -20,7 +20,7 @@ from pdf_translator.ingest import (
     _extract_epub_body_chapter,
 )
 
-from pdf_translator.epub_page_anchors import EPUB_PAGE_ANCHOR_RE as _PAGE_ANCHOR_RE
+from pdf_translator.epub_page_anchors import iter_xhtml_page_spans as _iter_xhtml_page_spans
 
 
 def _find_body_close(xhtml: bytes) -> int:
@@ -130,8 +130,8 @@ def build_epub_reader_page_records(
             if internal not in zipf.namelist():
                 continue
             xhtml = zipf.read(internal)
-            anchors = list(_PAGE_ANCHOR_RE.finditer(xhtml))
-            if not anchors:
+            spans = _iter_xhtml_page_spans(xhtml)
+            if spans == [("", 0, len(xhtml))]:
                 page_index += 1
                 _title, body_md, _title_meta = _extract_epub_body_chapter(
                     zipf,
@@ -148,15 +148,9 @@ def build_epub_reader_page_records(
                 }
                 continue
 
-            for anchor_index, match in enumerate(anchors):
-                start = match.start()
-                end = (
-                    anchors[anchor_index + 1].start()
-                    if anchor_index + 1 < len(anchors)
-                    else _find_body_close(xhtml)
-                )
+            for anchor_id, start, end in spans:
                 page_index += 1
-                page_records[page_index] = {
+                record = {
                     "markdown": _fragment_bytes_to_markdown(
                         xhtml[start:end],
                         zipf=zipf,
@@ -166,10 +160,12 @@ def build_epub_reader_page_records(
                     ),
                     "source_internal_path": internal,
                     "whole_resource": False,
-                    "anchor_id": match.group("anchor").decode("utf-8", errors="replace"),
                     "source_byte_start": start,
                     "source_byte_end": end,
                 }
+                if anchor_id:
+                    record["anchor_id"] = anchor_id
+                page_records[page_index] = record
 
     return page_records
 

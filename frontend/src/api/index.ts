@@ -250,6 +250,13 @@ export interface ReviewProject {
       source_location?: Record<string, unknown>
       evidence?: Record<string, unknown>
     }>
+    structure_repairs?: Array<{
+      code: string
+      stage: string
+      message: string
+      segment_ids?: string[]
+      evidence?: Record<string, unknown>
+    }>
     navigation_hints?: Array<{
       code: string
       stage: string

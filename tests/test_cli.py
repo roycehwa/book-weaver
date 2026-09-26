@@ -185,6 +185,27 @@ def test_review_export_rejects_book_without_current_contract(tmp_path: Path) -> 
         _load_complete_review_book(run_dir, manifest)
 
 
+def test_review_export_accepts_current_epub_book_without_detached_notes(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "integrity-ledger.json").write_text("{}", encoding="utf-8")
+    (run_dir / "book.json").write_text(
+        json.dumps(
+            {
+                "metadata": {"schema": "book_ir", "chapter_source": "epub_spine"},
+                "pages": [{"page_no": 1, "has_content": True}],
+                "chapters": [{"chapter_id": "body", "source_pages": [1]}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    book = _load_complete_review_book(run_dir, {})
+
+    assert book["semantic_content"]["schema"] == "semantic_content_v1"
+    assert book["semantic_content"]["footnotes"] == []
+
+
 def test_review_export_restores_chapter_notes_before_delivery(tmp_path: Path, monkeypatch) -> None:
     run_dir = tmp_path / "run"
     run_dir.mkdir()
@@ -410,6 +431,186 @@ def test_render_review_export_draft_skips_approved_review_validation(tmp_path: P
             approve=False,
             output_dir=run_dir / "versions" / "draft",
         )
+
+
+def test_render_review_export_records_unread_images_and_continues(tmp_path: Path, monkeypatch) -> None:
+    from pdf_translator.cli import _render_review_export
+    from tests.synthetic_quality_fixtures import write_minimal_translation_quality_artifacts, write_synthetic_reading_units
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    write_synthetic_reading_units(run_dir)
+    (run_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "source_pdf": str(tmp_path / "source.pdf"),
+                "text_operation": "translate",
+                "translation": {"mode": "translated"},
+                "files": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    source_markdown = (run_dir / "translation-input.md").read_text(encoding="utf-8")
+    for filename in ("translated.raw.md", "translated.cleaned.md", "translated.md"):
+        (run_dir / filename).write_text(source_markdown, encoding="utf-8")
+    write_minimal_translation_quality_artifacts(run_dir)
+    index = json.loads((run_dir / "translation-quality-index.json").read_text(encoding="utf-8"))
+    index["blocking_count"] = 0
+    index["acceptable"] = True
+    (run_dir / "translation-quality-index.json").write_text(json.dumps(index), encoding="utf-8")
+
+    monkeypatch.setattr("pdf_translator.source_workspace.require_current_translation", lambda _run_dir: None)
+    monkeypatch.setattr(
+        cli_module,
+        "review_project_from_run",
+        lambda _run_dir: {
+            "segments": [{"segment_id": "ch-001:r001", "source_text": "Body.", "translate": True}],
+            "translated_segments": [{
+                "segment_id": "ch-001:r001",
+                "chapter_id": "ch-001",
+                "translated_text": "![50](OEBPS/part.xhtml#note)\n\n![图](book-images/missing.jpg)\n\n正文。",
+                "translate": True,
+            }],
+            "review_items": [],
+            "review_state": {"decisions": {}},
+        },
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_load_complete_review_book",
+        lambda _run_dir, _manifest: {
+            "chapters": [
+                {
+                    "chapter_id": "ch-001",
+                    "title": "Chapter",
+                    "markdown": "![50](OEBPS/part.xhtml#note)\n\n![图](book-images/missing.jpg)\n\n正文。",
+                    "toc": True,
+                }
+            ]
+        },
+    )
+    monkeypatch.setattr(cli_module, "_review_image_roots", lambda _run_dir, _manifest: [run_dir])
+    continued: list[str] = []
+
+    def _stop_after_image_note(**_kwargs):
+        continued.append("write")
+        raise AssertionError("stop-before-render")
+
+    monkeypatch.setattr(cli_module, "write_versioned_outputs", _stop_after_image_note)
+
+    with pytest.raises(AssertionError, match="stop-before-render"):
+        _render_review_export(
+            run_dir=run_dir,
+            version_name="draft",
+            parent_version=None,
+            target_language="zh-CN",
+            output_format="none",
+            approve=False,
+            output_dir=run_dir / "versions" / "draft",
+        )
+
+    assert continued == ["write"]
+    log = json.loads((run_dir / "repair-log.json").read_text(encoding="utf-8"))
+    assert log["items"][0]["code"] == "missing_required_images"
+    assert "1" in log["items"][0]["user_summary"]
+    assert "missing.jpg" not in log["items"][0]["user_summary"]
+
+
+def test_export_packages_confirmed_text_without_calling_the_model(tmp_path: Path, monkeypatch) -> None:
+    from pdf_translator.cli import _render_review_export
+    from tests.synthetic_quality_fixtures import write_minimal_translation_quality_artifacts, write_synthetic_reading_units
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    write_synthetic_reading_units(run_dir)
+    (run_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "source_pdf": str(tmp_path / "source.pdf"),
+                "translator": "mock",
+                "text_operation": "translate",
+                "translation": {"mode": "translated"},
+                "files": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    source_markdown = (run_dir / "translation-input.md").read_text(encoding="utf-8")
+    for filename in ("translated.raw.md", "translated.cleaned.md", "translated.md"):
+        (run_dir / filename).write_text(source_markdown, encoding="utf-8")
+    write_minimal_translation_quality_artifacts(run_dir)
+    index = json.loads((run_dir / "translation-quality-index.json").read_text(encoding="utf-8"))
+    index["blocking_count"] = 0
+    index["acceptable"] = True
+    (run_dir / "translation-quality-index.json").write_text(json.dumps(index), encoding="utf-8")
+
+    monkeypatch.setattr("pdf_translator.source_workspace.require_current_translation", lambda _run_dir: None)
+    monkeypatch.setattr(
+        "pdf_translator.translation_quality.effective_translation_quality_evaluation",
+        lambda _run_dir: {
+            "translation_quality_blocking": False,
+            "structure_repairs": [{
+                "code": "markdown_block_structure_loss",
+                "message": "标题和列表与原文不一致",
+            }],
+            "navigation_hints": [{
+                "code": "lost_link_targets",
+                "message": "书内链接和原文不一致",
+            }],
+        },
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "review_project_from_run",
+        lambda _run_dir: {
+            "segments": [{"segment_id": "ch-001:r001", "source_text": "Body.", "translate": True}],
+            "translated_segments": [{
+                "segment_id": "ch-001:r001",
+                "chapter_id": "ch-001",
+                "translated_text": "# 第一章\n\n正文。",
+                "translate": True,
+            }],
+            "review_items": [],
+            "review_state": {"decisions": {}},
+        },
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_load_complete_review_book",
+        lambda _run_dir, _manifest: {
+            "chapters": [{"chapter_id": "ch-001", "title": "第一章", "markdown": "# 第一章\n\n正文。", "toc": True}]
+        },
+    )
+    monkeypatch.setattr(cli_module, "_review_image_roots", lambda _run_dir, _manifest: [run_dir])
+    prompts: list[str] = []
+
+    def _model(_translator, _system, user: str) -> str:
+        prompts.append(user)
+        return "# 第一章"
+
+    monkeypatch.setattr("pdf_translator.translate.complete_repair", _model)
+    exported: list[str] = []
+
+    def _capture_export(**kwargs):
+        exported.append(str(kwargs.get("translated_markdown_override") or ""))
+        raise AssertionError("stop-before-render")
+
+    monkeypatch.setattr(cli_module, "write_versioned_outputs", _capture_export)
+
+    with pytest.raises(AssertionError, match="stop-before-render"):
+        _render_review_export(
+            run_dir=run_dir,
+            version_name="draft",
+            parent_version=None,
+            target_language="zh-CN",
+            output_format="none",
+            approve=False,
+            output_dir=run_dir / "versions" / "draft",
+        )
+
+    assert prompts == []
+    assert exported == ["# 第一章\n\n正文。\n"]
 
 
 def test_render_review_export_publishes_after_segment_quality_finding_is_adjudicated(

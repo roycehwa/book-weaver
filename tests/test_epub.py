@@ -416,6 +416,62 @@ def test_render_epub_from_book_handles_control_chars(tmp_path: Path) -> None:
         assert "\x05" not in chapter
 
 
+def test_image_paths_with_title_punctuation_still_resolve(tmp_path: Path) -> None:
+    from bs4 import BeautifulSoup
+
+    from pdf_translator.epub import _markdown_to_body_html, _resolve_image_source_path
+
+    image_dir = tmp_path / "book-images"
+    image_dir.mkdir()
+    (image_dir / "photo-83.jpg").write_bytes(b"jpg")
+    stored = tmp_path / "Title's Work (Press)" / "book-images" / "photo-83.jpg"
+    markdown = f"![图]({stored})\n"
+    html = _markdown_to_body_html(markdown)
+    src = BeautifulSoup(html, "html.parser").find("img").get("src")
+    assert _resolve_image_source_path(str(src), [image_dir]) == (image_dir / "photo-83.jpg").resolve()
+
+
+def test_unresolved_image_file_is_omitted_and_a_note_marker_stays(tmp_path: Path) -> None:
+    from pdf_translator.epub import validate_epub_internal_hrefs
+
+    image_dir = tmp_path / "book-images"
+    image_dir.mkdir()
+    (image_dir / "kept.jpg").write_bytes(b"jpg")
+    missing = tmp_path / "Title's Work (Press)" / "book-images" / "gone.jpg"
+    output_path = tmp_path / "book.epub"
+
+    render_epub_from_book(
+        book={"chapters": []},
+        translated_chapters=[
+            {
+                "index": 1,
+                "title": "Chapter",
+                "markdown": (
+                    f"![Kept]({image_dir / 'kept.jpg'})\n\n"
+                    f"![Gone]({missing})\n\n"
+                    "See ![50](OEBPS/part.xhtml#note).\n"
+                ),
+            }
+        ],
+        output_path=output_path,
+        title="Images",
+        image_roots=[image_dir],
+    )
+
+    with ZipFile(output_path) as archive:
+        names = archive.namelist()
+        assert any(name.endswith("kept.jpg") for name in names)
+        assert not any("gone.jpg" in name for name in names)
+        chapter = archive.read("OEBPS/chapters/001-chapter.xhtml").decode("utf-8")
+        assert "gone.jpg" not in chapter
+        assert "kept.jpg" in chapter
+        assert "50" in chapter
+        assert "part.xhtml" not in chapter
+    validation = validate_epub_internal_hrefs(output_path)
+    assert validation["missing_assets"] == []
+    assert validation["absolute_paths"] == []
+
+
 def test_render_epub_from_book_recovers_moved_absolute_image_paths(tmp_path: Path) -> None:
     output_dir = tmp_path / "OK" / "book"
     image_dir = output_dir / "book-images"

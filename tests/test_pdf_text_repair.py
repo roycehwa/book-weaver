@@ -66,6 +66,16 @@ def test_scan_ingest_quality_reports_issues() -> None:
     assert report.issue_rate_per_1k > 0
 
 
+def test_repair_closes_spaced_possessive_and_scan_ignores_it() -> None:
+    source = "The author's note says Mao' s teachings shaped the later account."
+
+    repaired = repair_pdf_markdown(source)
+
+    assert "Mao's teachings" in repaired
+    assert scan_ingest_quality(source).issue_counts["midword_space"] == 0
+    assert scan_ingest_quality(repaired).issue_counts["midword_space"] == 0
+
+
 def test_scan_ingest_quality_does_not_treat_normal_one_letter_words_as_corruption() -> None:
     report = scan_ingest_quality("I set off as a student a few years ago.")
 

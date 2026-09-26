@@ -353,6 +353,33 @@ def test_raw_report_still_blocks_semantic_html_tag_change(tmp_path: Path) -> Non
     assert any(item["code"] == "html_tags_regression" for item in report["findings"])
 
 
+def test_endnote_markers_stored_as_images_do_not_lock_export(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    write_synthetic_reading_units(run_dir)
+    source = (
+        "# Chapter\n\n"
+        "See the note.![50](OEBPS/part0035_split_000.xhtml#aGF2)\n\n"
+        "![Map](assets/map.jpg)\n"
+    )
+    raw = "# 章\n\n见注释。\n\n![地图](assets/map.jpg)\n"
+    (run_dir / "translation-input.md").write_text(source, encoding="utf-8")
+    (run_dir / "translated.raw.md").write_text(raw, encoding="utf-8")
+    report = build_raw_translation_quality_report(
+        run_dir,
+        text_operation="translate",
+        source_markdown=source,
+        comparison_source_markdown=source,
+        review_items=[],
+    )
+    findings = {item["code"]: item for item in report["findings"]}
+    assert "markdown_block_structure_loss" not in findings
+    link_change = findings.get("markdown_link_structure_loss")
+    if link_change is not None:
+        assert link_change["severity"] == "review"
+    assert not any(item["severity"] == "blocking" for item in report["findings"])
+
+
 def test_raw_link_changes_do_not_mask_required_image_loss(tmp_path: Path) -> None:
     run_dir = tmp_path / "run"
     run_dir.mkdir()
@@ -928,9 +955,10 @@ def test_effective_quality_keeps_global_blocking_finding(tmp_path: Path) -> None
         json.dumps({"decisions": {"seg-1": {"status": "approved"}}}),
         encoding="utf-8",
     )
-    assert effective_translation_quality_evaluation(run_dir)["translation_quality_blocking"] is True
-    with pytest.raises(ValueError, match="blocking"):
-        assert_translation_quality_current(run_dir)
+    evaluation = effective_translation_quality_evaluation(run_dir)
+    assert evaluation["translation_quality_blocking"] is False
+    assert evaluation["structure_repairs"][0]["code"] == "markdown_block_structure_loss"
+    assert_translation_quality_current(run_dir)
 
 
 def test_assert_translation_quality_current_allows_review_only_index(tmp_path: Path) -> None:

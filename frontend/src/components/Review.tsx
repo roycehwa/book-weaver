@@ -74,7 +74,7 @@ function getHumanReviewMode(project: ReviewProject | null): HumanReviewMode {
   return (
     project?.workflow?.human_review_mode ||
     project?.review_state?.workflow?.human_review_mode ||
-    (project?.pre_review?.flagged_segments ? 'issues_only' : 'full')
+    (project?.pre_review ? 'issues_only' : 'full')
   )
 }
 
@@ -434,14 +434,21 @@ function Review() {
 
   const scopeTotal = humanReviewMode === 'issues_only' ? issueScopeSegments.length : orderedSegments.length
   const scopeReviewedCount = humanReviewMode === 'issues_only' ? issueScopeReviewedCount : reviewedCount
-  const scopeProgressPercent = scopeTotal ? Math.round((scopeReviewedCount / scopeTotal) * 100) : 0
-  const isScopeComplete = scopeTotal > 0 && scopeReviewedCount >= scopeTotal
+  const scopeProgressPercent = scopeTotal
+    ? Math.round((scopeReviewedCount / scopeTotal) * 100)
+    : humanReviewMode === 'issues_only'
+      ? 100
+      : 0
+  const isScopeComplete = humanReviewMode === 'issues_only'
+    ? scopeReviewedCount >= scopeTotal
+    : scopeTotal > 0 && scopeReviewedCount >= scopeTotal
   const isFullReviewComplete = orderedSegments.length > 0 && reviewedCount >= orderedSegments.length
   const translationQualityBlocking = Boolean(project?.translation_quality?.translation_quality_blocking)
   const policyCoverageBlocking = Boolean(project?.policy_coverage?.blocking)
   const policyCoverageMessage = project?.policy_coverage?.message
   const qualityBlockingFindings = project?.translation_quality?.effective_blocking_findings || []
   const navigationHints = project?.translation_quality?.navigation_hints || []
+  const structureRepairs = project?.translation_quality?.structure_repairs || []
   const exportCompletionMessage = reviewExportCompletionMessage({
     pendingRewriteCount,
     rewritesNeedingInstruction,
@@ -544,7 +551,9 @@ function Review() {
           const status = data.review_state.decisions[segment.segment_id]?.status
           return status === 'approved' || status === 'resolved'
         }).length
-        setResumeBannerVisible(reviewed > 0 || Boolean(bookmarkId))
+        const mode = getHumanReviewMode(data)
+        const issueCount = mode === 'issues_only' ? reviewIssueSegmentIds(data).length : sorted.length
+        setResumeBannerVisible(issueCount > 0 && (reviewed > 0 || Boolean(bookmarkId)))
       } catch (err) {
         setError(err instanceof Error ? err.message : '加载审阅项目失败')
       } finally {
@@ -971,10 +980,19 @@ function Review() {
       })
       const files = result.delivered_files || {}
       const outputPaths = [files.translated_pdf, files.translated_epub, files.translated_markdown].filter(Boolean)
+      const repairs = result.manifest.system_repairs
+      const repairNotes = Array.isArray(repairs)
+        ? repairs
+            .map((item) => {
+              if (!item || typeof item !== 'object' || !('user_summary' in item)) return ''
+              return String((item as { user_summary?: unknown }).user_summary || '')
+            })
+            .filter(Boolean)
+        : []
       setActionMessage(
         `版本 ${result.version} 已导出到 Desktop/文档/Translated${
           outputPaths.length ? `：${outputPaths.join('、')}` : `，目录 ${result.delivery_dir}`
-        }。`
+        }。${repairNotes.join('')}`
       )
     } catch (err) {
       setError(err instanceof Error ? err.message : '导出新版本失败')
@@ -1095,11 +1113,11 @@ function Review() {
   }
 
   return (
-    <div className="flex h-[100dvh] flex-col overflow-hidden bg-slate-100">
-      <header className="shrink-0 border-b border-slate-200 bg-white px-5 py-3">
+    <div className="flex h-[100dvh] flex-col overflow-hidden">
+      <header className="shrink-0 border-b border-paper-200 bg-paper-50/95 px-5 py-3 backdrop-blur">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
-            <h1 className="text-lg font-semibold text-slate-900">{bookTitle}</h1>
+            <h1 className="text-2xl leading-snug text-ink-900">{bookTitle}</h1>
             <p className="mt-0.5 text-xs text-slate-500">
               全书位置 {currentIndex + 1}/{orderedSegments.length || 0} · 章节 {currentChapterPosition}/{chapterOutline.length || 0} · 本章 {segmentInChapter}/
               {currentChapterEntry?.segmentCount || 0} · 约{' '}
@@ -1138,22 +1156,23 @@ function Review() {
           </div>
           <div className="text-right text-sm text-slate-600">
             {humanReviewMode === 'issues_only' ? (
-              <>
-                本轮已审 {issueScopeReviewedCount}/{issueScopeSegments.length}
-                <div className="mt-0.5 text-xs text-slate-500">
-                  全书进度 {reviewedCount}/{orderedSegments.length}（{progressPercent}%）
-                </div>
-              </>
+              issueScopeSegments.length === 0 ? (
+                <>本轮没有待处理审阅项</>
+              ) : (
+                <>
+                  本轮已审 {issueScopeReviewedCount}/{issueScopeSegments.length}
+                  <div className="mt-0.5 text-xs text-amber-700">
+                    本轮剩余 {Math.max(issueScopeSegments.length - issueScopeReviewedCount, 0)} 项
+                  </div>
+                </>
+              )
             ) : (
               <>已审 {reviewedCount}/{orderedSegments.length}（{progressPercent}%）</>
             )}
-            {humanReviewMode === 'issues_only' && (
-              <div className="mt-0.5 text-xs text-amber-700">本轮剩余 {Math.max(issueScopeSegments.length - issueScopeReviewedCount, 0)} 项</div>
-            )}
           </div>
         </div>
-        <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-slate-200">
-          <div className="h-full rounded-full bg-emerald-500 transition-all" style={{ width: `${scopeProgressPercent}%` }} />
+        <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-paper-200">
+          <div className="h-full rounded-full bg-primary-600 transition-all" style={{ width: `${scopeProgressPercent}%` }} />
         </div>
         {loading && <div className="mt-2 text-xs text-slate-500">正在加载…</div>}
         {error && <div className="mt-2 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{error}</div>}
@@ -1161,18 +1180,22 @@ function Review() {
           <div className="mt-2 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-800">{actionMessage}</div>
         )}
         {project?.pre_review && (
-          <div className="mt-2 rounded-lg border border-blue-200 bg-blue-50 px-3 py-2 text-sm text-slate-800">
+          <div className="mt-2 rounded-2xl border border-paper-200 bg-white/80 px-3 py-2 text-sm text-ink-900 shadow-sm">
             <div className="flex flex-wrap items-start justify-between gap-2">
               <div>
                 <div className="font-medium">本轮审阅范围</div>
                 <p className="mt-1 text-xs text-slate-600">
                   {humanReviewMode === 'issues_only'
-                    ? `当前工作范围是机器标记的 ${issueScopeSegments.length} 个审阅项；段落导航仍按全书顺序，审阅项导航只在标记项之间移动。`
-                    : `当前工作范围是全书 ${orderedSegments.length} 页；审阅项导航仍可回访机器标记的内容。`}
+                    ? issueScopeSegments.length === 0
+                      ? '机器没有标出需要处理的片段。可以导出，也可以改用全书阅读逐段查看。'
+                      : `当前工作范围是机器标记的 ${issueScopeSegments.length} 个审阅项；段落导航仍按全书顺序，审阅项导航只在标记项之间移动。`
+                    : `当前工作范围是全书 ${orderedSegments.length} 段；审阅项导航仍可回访机器标记的内容。`}
                 </p>
               </div>
-              <span className="rounded-full bg-white px-2.5 py-1 text-xs font-medium text-blue-800">
-                范围进度 {scopeReviewedCount}/{scopeTotal}（{scopeProgressPercent}%）
+              <span className="rounded-full border border-paper-200 bg-paper-50 px-2.5 py-1 text-xs font-medium text-primary-800">
+                {humanReviewMode === 'issues_only' && scopeTotal === 0
+                  ? '无需审阅'
+                  : `范围进度 ${scopeReviewedCount}/${scopeTotal}（${scopeProgressPercent}%）`}
               </span>
             </div>
             <div className="mt-2 flex flex-wrap items-center gap-2">
@@ -1238,7 +1261,11 @@ function Review() {
         {isScopeComplete && (
           <div className="mt-2 rounded-lg border border-emerald-300 bg-emerald-50 px-3 py-2 text-sm text-emerald-900">
             <div className="font-medium">
-              {humanReviewMode === 'issues_only' ? '本轮可疑段已全部审完' : '全书段落已全部审完'}
+              {humanReviewMode === 'issues_only'
+                ? issueScopeSegments.length === 0
+                  ? '本轮没有需要处理的审阅项'
+                  : '本轮可疑段已全部审完'
+                : '全书段落已全部审完'}
             </div>
             <p className="mt-1 text-xs">
               {exportCompletionMessage}
@@ -1266,26 +1293,10 @@ function Review() {
                 ))}
               </ul>
             )}
-            {navigationHints.length > 0 && (
-              <details className="mt-2 rounded border border-amber-200 bg-amber-50 p-2 text-xs text-amber-900">
-                <summary className="cursor-pointer font-medium">链接提示（{navigationHints.length} 项，可选查看，不影响导出）</summary>
-                <p className="mt-1">原书链接也可能失效；只有需要使用这些链接时才检查。</p>
-                <ul className="mt-2 space-y-1">
-                  {navigationHints.map((finding, index) => (
-                    <li key={`${finding.code}-${index}`} className="rounded bg-white p-2">
-                      <span>{qualityFindingLabels[finding.code] || finding.message}</span>
-                      {qualityFindingTargets(finding.evidence).map((target, targetIndex) => (
-                        <div key={targetIndex} className="break-all text-[11px]">{target.length > 160 ? `${target.slice(0, 160)}…` : target}</div>
-                      ))}
-                      {finding.segment_ids?.[0] && (
-                        <button type="button" className="mt-1 underline" onClick={() => goToIssueSegment(finding.segment_ids?.[0] || '')}>
-                          查看对应段落
-                        </button>
-                      )}
-                    </li>
-                  ))}
-                </ul>
-              </details>
+            {(structureRepairs.length > 0 || navigationHints.length > 0) && (
+              <p className="mt-2 text-xs text-ink-500">
+                标题、列表、表格、图片或书内链接仍和原文不完全一致。润色时已经交给模型处理过，导出不会再改。
+              </p>
             )}
             <div className="mt-2 flex flex-wrap gap-2">
               {project?.translation_quality?.revalidation_required && (
@@ -1486,20 +1497,41 @@ function Review() {
           <div className="grid gap-1 sm:grid-cols-2 lg:grid-cols-3">
             {chapterOutline.map((entry, index) => {
               const isActive = currentChapterEntry?.chapterId === entry.chapterId
-              const done = entry.reviewedCount >= entry.segmentCount
+              const chapterSegments = orderedSegments.slice(
+                entry.firstSegmentIndex,
+                entry.firstSegmentIndex + entry.segmentCount
+              )
+              const chapterIssues = humanReviewMode === 'issues_only'
+                ? chapterSegments.filter((segment) => issueScopeSegments.some((item) => item.segment_id === segment.segment_id))
+                : []
+              const chapterIssuesReviewed = chapterIssues.filter((segment) =>
+                isSegmentReviewed(project?.review_state.decisions ?? {}, segment.segment_id)
+              ).length
+              const done = humanReviewMode === 'issues_only'
+                ? chapterIssues.length === 0 || chapterIssuesReviewed >= chapterIssues.length
+                : entry.reviewedCount >= entry.segmentCount
+              const progressLabel = humanReviewMode === 'issues_only'
+                ? chapterIssues.length === 0
+                  ? '无审阅项'
+                  : done
+                    ? '审阅项已处理'
+                    : `审阅项 ${chapterIssuesReviewed}/${chapterIssues.length}`
+                : done
+                  ? '已审完'
+                  : `已审 ${entry.reviewedCount}/${entry.segmentCount}`
               return (
                 <button
                   key={entry.chapterId}
                   onClick={() => goToChapter(entry.firstSegmentIndex)}
                   className={`rounded-lg border px-3 py-2 text-left text-xs ${
-                    isActive ? 'border-blue-300 bg-blue-50 text-blue-900' : 'border-slate-200 bg-slate-50 text-slate-700 hover:bg-slate-100'
+                    isActive ? 'border-primary-300 bg-primary-50 text-primary-900' : 'border-paper-200 bg-paper-50 text-ink-700 hover:bg-white'
                   }`}
                 >
                   <div className="font-medium">
                     {index + 1}. {entry.displayTitle}
                   </div>
                   <div className="mt-0.5 text-[11px] opacity-70">
-                    {entry.segmentCount} 段 · {done ? '已审完' : `已审 ${entry.reviewedCount}/${entry.segmentCount}`}
+                    {entry.segmentCount} 段 · {progressLabel}
                   </div>
                 </button>
               )
@@ -1573,7 +1605,7 @@ function Review() {
         </div>
 
         {readingMode === 'paired' ? (
-          <main className="min-h-0 flex-1 overflow-y-auto bg-slate-100 px-3 py-3">
+          <main className="min-h-0 flex-1 overflow-y-auto bg-paper-100 px-3 py-3">
             <div className="space-y-3">
               {alignedBlocks.map((block) => {
                 const active = focusedBlockIndex === block.index
@@ -1608,7 +1640,7 @@ function Review() {
           </main>
         ) : (
           <main className="grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-2">
-            <section className="flex min-h-0 flex-col border-b border-slate-200 bg-slate-50 lg:border-b-0 lg:border-r">
+            <section className="flex min-h-0 flex-col border-b border-paper-200 bg-paper-100 lg:border-b-0 lg:border-r">
               <div className="flex shrink-0 items-center justify-between border-b border-slate-200 px-4 py-2">
                 <div className="text-sm font-semibold text-slate-700">原文</div>
                 {selectedIssue && (
@@ -1757,7 +1789,9 @@ function Review() {
             <div role="alert" className="mt-2 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-800">
               <p>{selectedDecision.rewrite_error === 'Model rewrite did not satisfy mandatory glossary constraints.'
                 ? '模型重译后仍未使用已确认的固定译法，因此这次候选译文未被采用，原有译文保持不变。'
-                : selectedDecision.rewrite_error}</p>
+                : selectedDecision.rewrite_error === 'Model rewrite kept untranslated English in the Chinese text.'
+                  ? '重译后仍有未译成中文的普通英文，本段没有被替换。请再试一次，或直接改译文。'
+                  : selectedDecision.rewrite_error}</p>
               {Boolean(selectedDecision.rewrite_error_details?.missing_glossary_terms?.length) && (
                 <div className="mt-2">
                   <p className="font-medium">未遵守的术语：</p>
@@ -1852,7 +1886,9 @@ function Review() {
           </div>
           <p className="mt-2 w-full text-center text-xs text-slate-500">
             {humanReviewMode === 'issues_only'
-              ? `段落导航按全书顺序；审阅项导航在 ${issueScopeSegments.length} 个标记项之间循环。手动修改会先保存草稿，确认后成为定稿。`
+              ? issueScopeSegments.length === 0
+                ? '本轮没有待处理审阅项。需要逐段查看时，可切换到全书阅读。'
+                : `段落导航按全书顺序；审阅项导航在 ${issueScopeSegments.length} 个标记项之间循环。手动修改会先保存草稿，确认后成为定稿。`
               : '段落导航按全书顺序；审阅项导航只回访机器标记内容。手动修改会先保存草稿，确认后成为定稿。'}
           </p>
         </div>

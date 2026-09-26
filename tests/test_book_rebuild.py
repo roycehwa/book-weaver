@@ -672,6 +672,8 @@ def test_book_rebuild_filters_epub_title_page_shell() -> None:
     assert [chapter["title"] for chapter in result["chapters"]] == ["Cover", "Chapter 1"]
     assert result["chapters"][0]["translate"] is False
     assert result["chapters"][1]["translate"] is True
+    assert result["semantic_content"]["schema"] == "semantic_content_v1"
+    assert result["semantic_content"]["footnotes"] == []
 
 
 def test_book_rebuild_marks_epub_cover_page_as_non_toc_resource() -> None:
@@ -693,6 +695,26 @@ def test_book_rebuild_marks_epub_cover_page_as_non_toc_resource() -> None:
     assert result["chapters"][0]["preserve_original"] is True
     assert result["chapters"][0]["toc"] is False
     assert result["metadata"]["cover_image_path"] == "/tmp/cover.png"
+
+
+def test_book_rebuild_keeps_publisher_reading_list_out_of_the_toc() -> None:
+    structured = {
+        "_epub_meta": {
+            "schema": "epub_ingest_v1",
+            "chapters": [
+                {"title": "Chapter 1", "markdown": "Real body text."},
+                {"title": "What's next on your reading list?", "markdown": "Discover your next book."},
+            ],
+        }
+    }
+
+    result = build_book_reconstruction(structured)
+
+    promo = result["chapters"][1]
+    assert promo["title"] == "What's next on your reading list?"
+    assert promo["toc"] is False
+    assert promo["translate"] is False
+    assert result["chapters"][0]["toc"] is True
 
 
 def test_book_rebuild_marks_epub_apparatus_chapters_as_non_toc_resources() -> None:

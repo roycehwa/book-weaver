@@ -152,8 +152,12 @@ def test_only_explicit_provider_refusals_can_be_deferred_and_the_exception_is_bo
     from pdf_translator.translation_failures import is_provider_content_refusal, put_failure
     assert is_provider_content_refusal('HTTP 500: input new_sensitive (1026)')
     assert is_provider_content_refusal('HTTP 400: content_filter')
+    assert is_provider_content_refusal(
+        'bookweaver_soft_content_refusal: missing mandatory glossary terms: Example => 示例'
+    )
     assert not is_provider_content_refusal('HTTP 500: upstream unavailable')
     assert not is_provider_content_refusal('Translation failed; new_sensitive mentioned in source')
+    assert not is_provider_content_refusal('Translation for chunk 4 missing mandatory glossary terms: Example => 示例')
 
     put_failure(tmp_path, 'timeout', {'source': 'First.', 'error': 'HTTP 500: upstream unavailable',
                                       'failure_kind': 'translation_failure'})
@@ -354,6 +358,37 @@ def test_long_prose_recovers_in_bounded_fragments_and_reuses_cache(tmp_path, mon
     assert 2 < count <= 14
     assert _translate_sensitive_part(**kwargs).strip() == output
     assert len(calls) == count
+
+
+def test_sensitive_refusal_followed_by_a_glossary_miss_stays_deferrable(tmp_path, monkeypatch):
+    import pdf_translator.translate as module
+    from pdf_translator.translation_failures import is_provider_content_refusal
+
+    monkeypatch.setattr(module.time, "sleep", lambda *_args, **_kwargs: None)
+
+    class Translator(BaseTranslator):
+        name = "minimax"
+
+        def translate_chunk(self, chunk, source_language, target_language):
+            if len(chunk.markdown) > 500:
+                raise ValueError("MiniMax translation failed: output new_sensitive (1027)")
+            return "这段中文没有带上规定译名，但其余内容已经译出。"
+
+    chunk = TranslationChunk(
+        index=84,
+        markdown=("Al Qaeda remained part of the account. " * 30).strip(),
+        glossary_entries=[{"source": "Al Qaeda", "target": "基地组织", "status": "active"}],
+    )
+    with pytest.raises(ValueError, match="bookweaver_soft_content_refusal") as exc_info:
+        module._translate_chunk_resumable(
+            chunk=chunk,
+            source_language="en",
+            target_language="zh-CN",
+            translator=Translator(),
+            cache_dir=tmp_path / "cache",
+            retry_count=2,
+        )
+    assert is_provider_content_refusal(str(exc_info.value))
 
 
 def test_intervention_is_distinguished_from_worker_crash():

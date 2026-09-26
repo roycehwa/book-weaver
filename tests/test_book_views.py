@@ -257,6 +257,25 @@ def test_rebuild_delivery_toc_uses_final_display_titles() -> None:
     assert chapters[0]["markdown"] == "# 目录\n\n- 第一章\n- 第二章\n"
 
 
+def test_rebuild_delivery_toc_omits_promo_pages_and_image_descriptions() -> None:
+    from pdf_translator.book_views import rebuild_delivery_toc_chapters
+
+    long_alt = "Cover of Example: " + ("illustration " * 20)
+    chapters = rebuild_delivery_toc_chapters(
+        [
+            {"title": "Contents", "markdown": "", "toc": True, "kind": "toc", "rebuild_toc": True},
+            {"title": "Chapter 1", "markdown": "正文。", "toc": True},
+            {"title": "What's next on your reading list?", "markdown": "Sign up.", "toc": True},
+            {"title": long_alt, "markdown": "![x](cover.jpg)", "toc": True},
+        ],
+        target_language="zh-CN",
+    )
+
+    assert chapters[0]["markdown"] == "# 目录\n\n- Chapter 1\n"
+    assert chapters[2]["toc"] is False
+    assert chapters[3]["toc"] is False
+
+
 def test_rebuild_delivery_toc_does_not_replace_narrative_with_stray_flag() -> None:
     from pdf_translator.book_views import rebuild_delivery_toc_chapters
 
@@ -317,6 +336,24 @@ def test_strip_scrape_watermarks_removes_oceanpdf_and_stray_rules() -> None:
     assert "OceanofPDF" not in cleaned
     assert "CHAPTER 7" in cleaned
     assert cleaned.startswith("Body paragraph.")
+
+
+def test_strip_scrape_watermarks_removes_translated_distributor_insert() -> None:
+    from pdf_translator.book_views import strip_scrape_watermarks
+
+    markdown = (
+        "她知道必须离开。\n\n"
+        "noveldb-epub-ad\n\n"
+        "当一个故事结束时，如果手边还有另一个故事可读，是件很美好的事。\n\n"
+        "当您想继续阅读时，请浏览 [**Lokepub**](https://www.lokepub.com/?utm_source=epub)。\n\n"
+        "她爬上楼梯。"
+    )
+    cleaned = strip_scrape_watermarks(markdown)
+
+    assert "noveldb" not in cleaned.lower()
+    assert "lokepub" not in cleaned.lower()
+    assert "她知道必须离开。" in cleaned
+    assert "她爬上楼梯。" in cleaned
 
 
 def test_split_chapter_sections_merges_orphan_concluding_heading() -> None:

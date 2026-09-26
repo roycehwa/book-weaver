@@ -165,7 +165,7 @@ export default function SourceWorkbench({
     }
   }, [current?.reason, error, overrideActive])
   const activeChapterPolicyLabel = chapterPolicyLabel(chapterPolicy)
-  return <section className="mt-4 rounded-lg border border-slate-300 bg-white p-3" aria-label="原文修正台">
+  return <section className="mt-4 rounded-3xl border border-paper-200 bg-paper-50/90 p-4 shadow-sheet" aria-label="原文修正台">
     <h3 className="font-semibold">高级原文修正 · 第 {data?.page ?? page} 页</h3>
     <p className="my-2 text-xs text-slate-500">
       这里用于个别段落的文字、顺序和去留修正。跨页是否续接请以上方边界记录为准；整章是否翻译由章节列表决定。

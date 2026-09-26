@@ -14,7 +14,7 @@ from collections import Counter
 
 from pdf_translator.chunking import markdown_block_structure, markdown_protected_block_structure
 from pdf_translator.pdf_text_repair import scan_ingest_quality
-from pdf_translator.polish import POLISH_PROMPT_VERSION, _markdown_link_specs
+from pdf_translator.polish import POLISH_PROMPT_VERSION, _find_matching_paren, _markdown_link_specs
 from pdf_translator.reading_units import validate_reading_units
 from pdf_translator.source_workspace import atomic_json, glossary_fingerprint
 from pdf_translator.translate import TRANSLATION_PROMPT_VERSION
@@ -56,7 +56,7 @@ RAW_TRANSLATION_QUALITY_REPORT = "raw-translation-quality-report.json"
 POLISHED_OUTPUT_QUALITY_REPORT = "polished-output-quality-report.json"
 TRANSLATION_QUALITY_INDEX = "translation-quality-index.json"
 TRANSLATION_QUALITY_SOURCE = "translation-quality-source.md"
-TRANSLATION_QUALITY_RULES_VERSION = "translation_quality_v8_navigation_advisory"
+TRANSLATION_QUALITY_RULES_VERSION = "translation_quality_v9_endnote_image_advisory"
 
 QualityStage = Literal["source", "raw_translation", "polished_output"]
 QualitySeverity = Literal["blocking", "review"]
@@ -332,6 +332,62 @@ def build_quality_signature(run_dir: Path, *, text_operation: str) -> dict[str, 
 def _html_anchor_targets(text: str) -> list[str]:
     soup = BeautifulSoup(markdown_renderer.markdown(text), "html.parser")
     return sorted(str(item["href"]) for item in soup.find_all("a", href=True))
+
+
+_IMAGE_RESOURCE_SUFFIXES = {
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".bmp", ".tif", ".tiff", ".avif",
+}
+
+
+def _link_destination_path(destination: str) -> str:
+    target = destination.strip()
+    if target.startswith("<"):
+        end = target.find(">")
+        if end != -1:
+            target = target[1:end]
+    for quote in (' "', " '"):
+        if quote in target:
+            target = target.split(quote, 1)[0]
+    return target.strip().split("?", 1)[0].split("#", 1)[0]
+
+
+def _is_image_resource_destination(destination: str) -> bool:
+    return Path(_link_destination_path(destination)).suffix.lower() in _IMAGE_RESOURCE_SUFFIXES
+
+
+def _document_fragment_images_as_links(text: str) -> str:
+    """Turn note markers stored as images of an HTML document into links.
+
+    EPUB endnotes sometimes survive ingest as ``![50](chapter.xhtml#note)``.
+    Those are navigation targets. A missing marker must stay an advisory
+    difference and must not be counted as a lost image resource.
+    """
+
+    pieces: list[str] = []
+    index = 0
+    while index < len(text):
+        if not text.startswith("![", index):
+            pieces.append(text[index])
+            index += 1
+            continue
+        start = index + 2
+        close = text.find("]", start)
+        if close == -1 or close + 1 >= len(text) or text[close + 1] != "(":
+            pieces.append(text[index])
+            index += 1
+            continue
+        end = _find_matching_paren(text, close + 1)
+        if end == -1:
+            pieces.append(text[index])
+            index += 1
+            continue
+        destination = text[close + 2 : end]
+        if _is_image_resource_destination(destination):
+            pieces.append(text[index : end + 1])
+        else:
+            pieces.append("[" + text[start:end + 1])
+        index = end + 1
+    return "".join(pieces)
 
 
 def _markdown_link_targets(text: str) -> set[str]:
@@ -908,11 +964,12 @@ def build_raw_translation_quality_report(
                     evidence={},
                 )
             )
-        comparison_source = (
+        comparison_source = _document_fragment_images_as_links(
             comparison_source_markdown
             if comparison_source_markdown is not None
             else source_markdown
         )
+        raw_text = _document_fragment_images_as_links(raw_text)
         source_structure = markdown_block_structure(comparison_source)
         raw_structure = markdown_block_structure(raw_text)
         source_protected_structure = markdown_protected_block_structure(comparison_source)
@@ -1595,8 +1652,16 @@ def effective_translation_quality_evaluation(run_dir: Path) -> dict[str, Any]:
                 }
             ],
         }
+    from pdf_translator.repair import STRUCTURE_MODEL_CODES
+
+    structure_repairs = [
+        finding for finding in findings
+        if finding.get("code") in STRUCTURE_MODEL_CODES
+    ]
+    structure_ids = {id(finding) for finding in structure_repairs}
     effective_blocking = [
-        finding for finding in findings if _finding_effectively_blocking(
+        finding for finding in findings
+        if id(finding) not in structure_ids and _finding_effectively_blocking(
             finding, decisions=decisions,
         )
     ]
@@ -1608,6 +1673,9 @@ def effective_translation_quality_evaluation(run_dir: Path) -> dict[str, Any]:
         "static_blocking_count": static_blocking_count,
         "effective_blocking_findings": [
             _public_blocking_finding(finding) for finding in effective_blocking
+        ],
+        "structure_repairs": [
+            _public_blocking_finding(finding) for finding in structure_repairs
         ],
         "navigation_hints": [
             _public_blocking_finding(finding) for finding in findings

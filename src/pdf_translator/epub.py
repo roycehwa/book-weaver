@@ -80,7 +80,60 @@ def _chapter_payload(chapter) -> dict:
     return dict(chapter)
 
 
+def _matching_paren(text: str, open_index: int) -> int:
+    depth = 0
+    for index in range(open_index, len(text)):
+        char = text[index]
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return index
+    return -1
+
+
+def _protect_markdown_destinations(text: str) -> str:
+    """Keep link and image paths intact when they contain spaces or punctuation.
+
+    Python-Markdown treats an apostrophe inside ``(destination)`` as a title
+    and stops at ``)``. Book directories often include both, which cuts the
+    filename off and makes extracted images look missing.
+    """
+
+    pieces: list[str] = []
+    index = 0
+    while index < len(text):
+        is_image = text.startswith("![", index)
+        if not is_image and (index >= len(text) or text[index] != "["):
+            pieces.append(text[index])
+            index += 1
+            continue
+        label_start = index + 2 if is_image else index + 1
+        close = text.find("]", label_start)
+        if close == -1 or close + 1 >= len(text) or text[close + 1] != "(":
+            pieces.append(text[index])
+            index += 1
+            continue
+        end = _matching_paren(text, close + 1)
+        if end == -1:
+            pieces.append(text[index])
+            index += 1
+            continue
+        destination = text[close + 2 : end]
+        stripped = destination.strip()
+        needs_protection = any(char in stripped for char in " \t'\"()")
+        already_quoted = stripped.startswith("<") and stripped.endswith(">")
+        if needs_protection and not already_quoted and "<" not in stripped and ">" not in stripped:
+            pieces.append(f"{text[index:close + 2]}<{stripped}>{text[end]}")
+        else:
+            pieces.append(text[index:end + 1])
+        index = end + 1
+    return "".join(pieces)
+
+
 def _markdown_to_body_html(markdown_text: str) -> str:
+    markdown_text = _protect_markdown_destinations(markdown_text)
     markdown_text = CONTROL_CHARS_RE.sub(" ", markdown_text)
     markdown_text = RAW_HTML_TAG_RE.sub(lambda match: escape(match.group(0)), markdown_text)
     html = markdown(
@@ -324,6 +377,16 @@ def rewrite_epub_internal_hrefs(
     return "".join(str(child) for child in soup.contents)
 
 
+_IMAGE_RESOURCE_SUFFIXES = {
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".bmp", ".tif", ".tiff", ".avif",
+}
+
+
+def _is_image_resource_src(raw_src: str) -> bool:
+    path = unquote(str(raw_src or "")).split("?", 1)[0].split("#", 1)[0]
+    return Path(path).suffix.lower() in _IMAGE_RESOURCE_SUFFIXES
+
+
 def _resolve_image_source_path(raw_src: str, image_roots: list[Path]) -> Path | None:
     source_path = Path(unquote(raw_src)).expanduser()
     candidates = [source_path]
@@ -365,6 +428,10 @@ def _rewrite_images(
             continue
         resolved = _resolve_image_source_path(str(raw_src), image_roots)
         if resolved is None:
+            if _is_image_resource_src(str(raw_src)):
+                image.decompose()
+            else:
+                image.replace_with(str(image.get("alt") or ""))
             continue
         if resolved in image_map:
             image["src"] = f"../{image_map[resolved]}"

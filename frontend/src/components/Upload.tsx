@@ -120,18 +120,22 @@ const Upload = () => {
 
   return (
     <div className="mx-auto max-w-3xl">
-      <div className="mb-6">
-        <h1 className="text-2xl font-bold text-slate-900">书籍处理</h1>
+      <div className="mb-8 rounded-3xl border border-paper-200 bg-paper-50/80 px-6 py-7 shadow-sheet">
+        <p className="text-[11px] font-semibold tracking-[0.28em] text-primary-700">BOOKWEAVER</p>
+        <h1 className="mt-2 text-4xl text-ink-900">书籍处理</h1>
+        <p className="mt-3 max-w-xl text-sm leading-6 text-ink-500">
+          放入一本 PDF 或 EPUB。先确认章节和术语，再进入审阅与导出。
+        </p>
       </div>
 
-      <div className="mb-6 rounded-xl border border-slate-200 bg-white p-4">
-        <div className="text-sm font-semibold text-slate-900">处理方式</div>
+      <div className="mb-6 rounded-3xl border border-paper-200 bg-paper-50/90 p-5 shadow-sheet">
+        <div className="bw-serif text-xl text-ink-900">处理方式</div>
         <div className="mt-3 grid gap-3 sm:grid-cols-3">
           <label
-            className={`cursor-pointer rounded-xl border-2 p-4 transition-colors ${
+            className={`cursor-pointer rounded-2xl border-2 p-4 transition-colors ${
               isTranslateMode
-                ? 'border-primary-500 bg-primary-50'
-                : 'border-slate-200 bg-slate-50 hover:border-slate-300'
+                ? 'border-primary-600 bg-primary-50 shadow-sheet'
+                : 'border-paper-200 bg-white/70 hover:border-primary-200'
             }`}
           >
             <input
@@ -142,14 +146,15 @@ const Upload = () => {
               onChange={() => updateProcessingMode('translate')}
               className="sr-only"
             />
-            <div className="font-medium text-slate-900">翻译并进入审阅</div>
-            <div className="mt-1 text-xs leading-5 text-slate-600">生成中文译本，走术语定稿与审阅。</div>
+            <div className="text-[11px] tracking-[0.18em] text-primary-700">01</div>
+            <div className="mt-1 font-medium text-ink-900">翻译并进入审阅</div>
+            <div className="mt-1 text-xs leading-5 text-ink-500">生成中文译本，走术语定稿与审阅。</div>
           </label>
           <label
-            className={`cursor-pointer rounded-xl border-2 p-4 transition-colors ${
+            className={`cursor-pointer rounded-2xl border-2 p-4 transition-colors ${
               isConvertMode
-                ? 'border-sky-500 bg-sky-50'
-                : 'border-slate-200 bg-slate-50 hover:border-slate-300'
+                ? 'border-primary-600 bg-primary-50 shadow-sheet'
+                : 'border-paper-200 bg-white/70 hover:border-primary-200'
             }`}
           >
             <input
@@ -160,16 +165,17 @@ const Upload = () => {
               onChange={() => updateProcessingMode('convert')}
               className="sr-only"
             />
-            <div className="font-medium text-slate-900">解析并导出 EPUB</div>
+            <div className="text-[11px] tracking-[0.18em] text-primary-700">02</div>
+            <div className="mt-1 font-medium text-ink-900">解析并导出 EPUB</div>
             <p className="mt-1 text-xs leading-5 text-slate-600">
               不翻译：确认章节后直接生成原文 EPUB。
             </p>
           </label>
           <label
-            className={`cursor-pointer rounded-xl border-2 p-4 transition-colors ${
+            className={`cursor-pointer rounded-2xl border-2 p-4 transition-colors ${
               isPreserveMode
-                ? 'border-emerald-500 bg-emerald-50'
-                : 'border-slate-200 bg-slate-50 hover:border-slate-300'
+                ? 'border-primary-600 bg-primary-50 shadow-sheet'
+                : 'border-paper-200 bg-white/70 hover:border-primary-200'
             }`}
           >
             <input
@@ -180,7 +186,8 @@ const Upload = () => {
               onChange={() => updateProcessingMode('preserve')}
               className="sr-only"
             />
-            <div className="font-medium text-slate-900">只解析结构，保留原文</div>
+            <div className="text-[11px] tracking-[0.18em] text-primary-700">03</div>
+            <div className="mt-1 font-medium text-ink-900">只解析结构，保留原文</div>
             <p className="mt-1 text-xs leading-5 text-slate-600">
               不调用翻译，只提取章节与正文结构，适合已是中文或仅需结构分析的书。
             </p>
@@ -218,8 +225,8 @@ const Upload = () => {
       </div>
 
       <div
-        className={`relative rounded-xl border-2 border-dashed p-10 text-center transition-colors ${
-          dragActive ? 'border-primary-500 bg-primary-50' : 'border-slate-300 bg-white'
+        className={`relative overflow-hidden rounded-3xl border-2 border-dashed p-12 text-center shadow-sheet transition-colors ${
+          dragActive ? 'border-primary-600 bg-primary-50' : 'border-paper-200 bg-paper-50/90'
         }`}
         onDragEnter={handleDrag}
         onDragLeave={handleDrag}
@@ -234,7 +241,10 @@ const Upload = () => {
             }}
           className="absolute inset-0 h-full w-full cursor-pointer opacity-0"
         />
-        <div className="text-lg font-medium text-slate-900">
+        <div aria-hidden="true" className="mx-auto mb-4 flex h-14 w-11 items-center justify-center border border-paper-200 bg-white font-serif text-primary-700 shadow-sm">
+          书
+        </div>
+        <div className="bw-serif text-2xl text-ink-900">
           {file ? file.name : '拖拽文件到此处，或点击选择'}
         </div>
         <div className="mt-2 text-sm text-slate-500">
@@ -293,7 +303,7 @@ const Upload = () => {
         </div>
       )}
 
-      <div className="mt-6 grid gap-4 rounded-xl border border-slate-200 bg-white p-5 sm:grid-cols-2">
+      <div className="mt-6 grid gap-4 rounded-3xl border border-paper-200 bg-paper-50/90 p-5 shadow-sheet sm:grid-cols-2">
         {!isPreserveMode && (
           <>
             <label className="text-sm font-medium text-slate-700">
@@ -375,7 +385,7 @@ const Upload = () => {
             checkingDuplicate ||
             Boolean(duplicateCheck?.has_matches && !allowDuplicate)
           }
-          className="rounded-lg bg-primary-600 px-6 py-3 font-medium text-white disabled:cursor-not-allowed disabled:opacity-50"
+          className="rounded-full bg-primary-600 px-7 py-3 font-medium text-white disabled:cursor-not-allowed disabled:opacity-50"
         >
           {uploading
             ? '创建中...'
@@ -396,7 +406,7 @@ const Upload = () => {
               setError(null)
             }}
             disabled={uploading}
-            className="rounded-lg border border-slate-300 bg-white px-6 py-3 font-medium text-slate-700"
+            className="rounded-full border border-paper-200 bg-white px-6 py-3 font-medium text-ink-700"
           >
             清除
           </button>
@@ -449,15 +459,15 @@ function BookListSection() {
   return (
     <div className="mt-10">
       <div className="mb-3 flex items-baseline justify-between">
-        <h2 className="text-lg font-semibold text-slate-900">已上传的书籍</h2>
-        <span className="text-xs text-slate-400">{books.length} 本</span>
+        <h2 className="text-2xl text-ink-900">已上传的书籍</h2>
+        <span className="text-xs tracking-[0.16em] text-ink-500">{books.length} 本</span>
       </div>
       {removeError && (
         <div className="mb-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
           {removeError}
         </div>
       )}
-      <ul className="divide-y divide-slate-100 rounded-xl border border-slate-200 bg-white">
+      <ul className="divide-y divide-paper-200 overflow-hidden rounded-3xl border border-paper-200 bg-paper-50/90 shadow-sheet">
         {books.map((book) => {
           const jobId = book.task_history?.[0]?.job_id
           if (!jobId) return null
